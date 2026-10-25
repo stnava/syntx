@@ -433,3 +433,39 @@ class TestBackwardRegistration:
         for t in range(2, n):
             assert np.corrcoef(arr[..., 0].ravel(), arr[..., t].ravel())[0, 1] > 0.98
         assert out.group_results[1]["registration_direction"] == "backward" and len(out.fd) == n
+
+
+def test_group_offsets_interleaved_shells_recovered_and_blocked_refused():
+    """Multi-shell DWI switches shell on almost every volume: a constant per-shell pose offset (cross-registration bias)
+    would be a step at every switch of the reported FD. ``_group_offsets`` recovers it under drift + a real jump, and
+    refuses a blocked layout, where the offset cannot be told from the head motion between the blocks."""
+    from syntx.motion import jenkinson_framewise_displacement
+    from syntx.motion_reference import _group_offsets, _pose_matrix
+
+    rng = np.random.default_rng(0)
+    T, com = 100, np.array([10.0, -5.0, 20.0])
+    groups = np.r_[0, np.tile([1, 2], 49), 0]
+    groups[::17] = 0                                   # interleaved b0s, as in a real 3-shell series
+    t = np.linspace(-1, 1, T)
+    head = np.c_[0.4 * t, -0.3 * t ** 2, 0.2 * t, np.radians(0.3) * t, np.zeros(T), np.radians(0.2) * t ** 2]
+    head[60:, 0] += 0.8                                # a real 0.8 mm jump
+    head += rng.normal(scale=[0.01, 0.01, 0.01, 1e-4, 1e-4, 1e-4], size=(T, 6))
+    offset = {1: np.r_[0.15, -0.25, 0.1, np.radians(0.2), 0, 0], 2: np.r_[-0.2, 0.3, 0.0, 0, np.radians(-0.3), 0]}
+    H = [_pose_matrix(head[i] + (offset[g] if g else 0.0), com) for i, g in enumerate(groups)]
+    idx = [np.flatnonzero(groups == g) for g in range(3)]
+    est = _group_offsets(H, groups, idx, com)
+    assert est is not None
+    _, got = est
+    for g in (1, 2):
+        np.testing.assert_allclose(got[g], offset[g], atol=0.02)
+    clean = [_pose_matrix(head[i], com) for i in range(T)]
+    fixed = [h if groups[i] == 0 else _pose_matrix(est[0][i] - got[int(groups[i])], com) for i, h in enumerate(H)]
+    fd_true = jenkinson_framewise_displacement(clean, 50.0, com)
+    fd_with = jenkinson_framewise_displacement(H, 50.0, com)
+    fd_fixed = jenkinson_framewise_displacement(fixed, 50.0, com)
+    assert np.mean(fd_with) > 3 * np.mean(fd_true)
+    assert abs(np.mean(fd_fixed) - np.mean(fd_true)) < 0.2 * np.mean(fd_true)
+    assert fd_fixed[60] > 0.6                          # the real jump is kept
+
+    blocked = np.repeat([0, 1, 2], [10, 45, 45])
+    assert _group_offsets(H, blocked, [np.flatnonzero(blocked == g) for g in range(3)], com) is None

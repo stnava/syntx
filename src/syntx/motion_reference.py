@@ -322,6 +322,42 @@ def build_bilateral_window_references(
     return [ants.new_image_like(frame_list[0], np.tensordot(W[t], stack, axes=(0, 0)).astype(ref_dtype)) for t in range(T)]
 
 
+def _group_offsets(H, groups, idx, com):
+    """Per-group constant pose offset of composed rigid poses ``H`` (n, 4, 4) relative to the anchor group 0, from the
+    surround Tukey projection on the group indicators. Returns ``(Y, offsets)`` with ``Y`` the (n, 6) poses
+    ``[d_com, rotvec]`` and ``offsets`` {group: (6,)}, or ``None`` when the groups are not interleaved enough to separate an
+    offset from head motion (fewer than 8 frames, or fewer than 4 active surround rows for some non-anchor group: a
+    blocked acquisition's group offset is indistinguishable from the head motion between the blocks)."""
+    from scipy.spatial.transform import Rotation as _Rot
+
+    from .motion_batched import _project_encoding_surround_tukey_np, build_encoding_covariates
+
+    n_frames, n_groups = len(H), len(idx)
+    if n_frames < 8 or n_groups < 2:
+        return None
+    ind = np.column_stack([(groups == g).astype(np.float64) for g in range(1, n_groups)])
+    surr = ind[1:-1] - 0.5 * (ind[:-2] + ind[2:])
+    if int(np.min(np.sum(np.abs(surr) > 0.1, axis=0))) < 4:
+        return None
+    H = np.asarray(H)
+    Y = np.c_[np.einsum("nij,j->ni", H[:, :3, :3], com) + H[:, :3, 3] - com, _Rot.from_matrix(H[:, :3, :3]).as_rotvec()]
+    basis = build_encoding_covariates(state_labels=groups, num_frames=n_frames, window_size=n_frames)
+    _, dY, _ = _project_encoding_surround_tukey_np(Y, basis["E"], basis["psi"])
+    off = dY - np.median(dY[idx[0]], axis=0)          # relative to the anchor group (which stays put)
+    return Y, {g: np.median(off[idx[g]], axis=0) for g in range(1, n_groups)}
+
+
+def _pose_matrix(y, com):
+    """4x4 rigid matrix of the pose ``y = [d_com, rotvec]`` about ``com``."""
+    from scipy.spatial.transform import Rotation as _Rot
+
+    R = _Rot.from_rotvec(y[3:]).as_matrix()
+    h = np.eye(4)
+    h[:3, :3] = R
+    h[:3, 3] = com + y[:3] - R @ com
+    return h
+
+
 def _debias_cross_group_offsets(chains, groups, idx, results, cross, com, outprefix):
     """Per-frame rigid corrections removing the contrast-driven offset of each non-anchor group (see
     ``motion_correct_grouped(cross_group_debias=True)``). Returns ``None`` when the groups are not interleaved enough to
@@ -329,19 +365,10 @@ def _debias_cross_group_offsets(chains, groups, idx, results, cross, com, outpre
     import os
     import tempfile
 
-    from scipy.spatial.transform import Rotation as _Rot
-
     from .motion import _extract_rigid_parameters
-    from .motion_batched import _project_encoding_surround_tukey_np, build_encoding_covariates
 
     n_frames = len(chains)
     n_groups = len(idx)
-    if n_frames < 8:
-        return None
-    ind = np.column_stack([(groups == g).astype(np.float64) for g in range(1, n_groups)])
-    surr = ind[1:-1] - 0.5 * (ind[:-2] + ind[2:])
-    if int(np.min(np.sum(np.abs(surr) > 0.1, axis=0))) < 4:
-        return None
     n_cross = [len(c["fwdtransforms"]) for c in cross]
     H = []
     for i in range(n_frames):
@@ -352,25 +379,18 @@ def _debias_cross_group_offsets(chains, groups, idx, results, cross, com, outpre
             h = _extract_rigid_parameters(ants.read_transform(f), 3)[2] @ h
         H.append(h)
     H = np.asarray(H)
-    Y = np.c_[np.einsum("nij,j->ni", H[:, :3, :3], com) + H[:, :3, 3] - com, _Rot.from_matrix(H[:, :3, :3]).as_rotvec()]
-    basis = build_encoding_covariates(state_labels=groups, num_frames=n_frames, window_size=n_frames)
-    _, dY, w = _project_encoding_surround_tukey_np(Y, basis["E"], basis["psi"])
-    anchor_dY = np.median(dY[idx[0]], axis=0)          # the offset is relative to the anchor group (which stays put)
-    off = dY - anchor_dY
+    est = _group_offsets(H, groups, idx, com)
+    if est is None:
+        return None
+    Y, per_group = est
     work = os.path.dirname(f"{outprefix}x") if outprefix else tempfile.mkdtemp(prefix="syntx_xgroup_")
     os.makedirs(work, exist_ok=True)
-    paths, per_group = {}, {}
-    for g in range(1, n_groups):
-        per_group[g] = np.median(off[idx[g]], axis=0)
+    paths = {}
     for i in range(n_frames):
         g = int(groups[i])
         if g == 0:
             continue
-        Yc = Y[i] - per_group[g]
-        R_c = _Rot.from_rotvec(Yc[3:]).as_matrix()
-        Hc = np.eye(4)
-        Hc[:3, :3] = R_c
-        Hc[:3, 3] = com + Yc[:3] - R_c @ com
+        Hc = _pose_matrix(Y[i] - per_group[g], com)
         corr = np.linalg.inv(H[i]) @ Hc                  # H_new = H @ corr: corr acts on the anchor-space point first
         tx = ants.create_ants_transform(transform_type="AffineTransform", precision="float", dimension=3)
         tx.set_parameters(np.concatenate([corr[:3, :3].ravel(), corr[:3, 3]]))
@@ -779,6 +799,25 @@ def motion_correct_grouped(
         fd = jenkinson_framewise_displacement(composed_rigid, kwargs.get("fd_radius", 50.0), com)
         nuisance = {"axis": [float(a) for a in axis], "shift_mm": shift, "coefficients": coefficients, "r2": r2}
 
+    # Interleaved groups (multi-shell DWI switches shell almost every volume): a constant per-group pose offset left by the
+    # cross-group registration is contrast-driven, not head motion, yet it would be a step at every group switch of the
+    # reported motion and FD. Report motion and FD without it; the transforms are unchanged (cross_group_debias=True also
+    # removes it from them). ``fd_with_group_offsets`` keeps the previous FD.
+    group_offset_fd = None
+    if cross_group_offset is None and n_groups > 1:
+        est = _group_offsets(composed_rigid, groups, idx, com)
+        if est is not None:
+            Y_rigid, per_group = est
+            composed_rigid = [h if int(groups[i]) == 0 else _pose_matrix(Y_rigid[i] - per_group[int(groups[i])], com)
+                              for i, h in enumerate(composed_rigid)]
+            group_offset_fd = {
+                "method": "surround_tukey_projection_on_group_indicators",
+                "offset_mm_by_group": {int(g): float(np.linalg.norm(v[:3])) for g, v in per_group.items()},
+                "offset_deg_by_group": {int(g): float(np.degrees(np.linalg.norm(v[3:]))) for g, v in per_group.items()},
+                "fd_with_group_offsets": np.asarray(fd, dtype=np.float64),
+            }
+            fd = jenkinson_framewise_displacement(composed_rigid, kwargs.get("fd_radius", 50.0), com)
+
     # Extract composed 6-DOF rigid parameters in anchor space (centered at com), matching composed_rigid / fd
     translations_mm = np.zeros((n_frames, 3), dtype=np.float64)
     rotations_deg = np.zeros((n_frames, 3), dtype=np.float64)
@@ -809,6 +848,7 @@ def motion_correct_grouped(
     out["bias"] = [r.get("bias") for r in results]
     out["encoding_pose_bias_mm_rad"] = [r.get("encoding_pose_bias_mm_rad") for r in results]
     out["cross_group_offset"] = cross_group_offset
+    out["group_offset_fd"] = group_offset_fd
     # convergence of the per-frame registrations (every stage of every frame ended on the pose-step test) and of each cross-shell
     # registration (the winning path's stages); False entries are frames/steps that were CAPPED, never silently final.
     frame_converged = np.ones(int(sum(len(i) for i in idx)), dtype=bool)

@@ -66,5 +66,21 @@ Notes and limits:
   0.046 mm), so pass `encoding_covariates` only where an encoding cycle exists.
 - **BOLD**: the separation is opt-in because it relies on the PE axis being the only B0-sensitive direction. Slice
   translation and pitch (real nodding) are never touched.
+- **Short series: the identifiability limit, not under-removal.** At T = 16 (ASL) the head error is 0.026 mm vs 0.015 mm
+  floor (3 seeds); 0.017 mm at T = 24. The excess is locked to the encoding, but it is the part of the REAL frame-to-frame
+  jitter that happens to align with `s_t` (no jitter: 0.020 -> 0.002 mm; still head: 0.000), removed with the bias
+  because nothing can tell them apart. Expected size jitter x sqrt(3 / T) (0.017 mm at T = 16, 0.04 mm jitter). Freezing
+  the shared encoding parameters once half the frames converge plays no part (never freezing: identical errors); the
+  written transforms come from the robust re-projection after every stage.
+- **A lone frame cannot be an encoding state.** Its offset is the signature of a one-frame head spike, which the robust
+  projection keeps as motion. ASL M0 volumes mixed into a control/label series are a registration GROUP
+  (`motion_correct_grouped`, control/label = group 0 with `encoding_covariates=s_tc`), not a categorical state (head
+  phantom, M0 at the start or in the middle: 0.16-0.27 mm FD at the M0 step as a group, 0.8-2.0 mm as a state).
+- **Interleaved groups and FD.** Multi-shell DWI switches shell on almost every volume; a constant per-group pose offset
+  left by the cross-group registration is a step at every switch. `motion_correct_grouped` reports motion and FD without
+  it (`group_offset_fd`: offsets, `fd_with_group_offsets`) when every non-anchor group has >= 4 active surround rows;
+  blocked layouts are left alone (their group offset is the head motion between blocks). Transforms are unchanged unless
+  `cross_group_debias=True`. Real 3-shell DWI (FPA sub-BLAST079 AP, 98 switches / 99 steps): offsets 0.16-0.17 mm /
+  0.08-0.09 deg per shell, mean FD 0.173 -> 0.163 mm; the rest of its FD is per-direction variation within a shell.
 - The phantom's rotation floor (about 0.18 deg) limits what can be resolved in rotation. Real brains have more edge
   structure; the relative ordering of the strategies is the evidence, not the absolute numbers.

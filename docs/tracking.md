@@ -1,12 +1,25 @@
 # Tracking Summary
-current phase: v6.20.0 release (encoding-locked systematic noise: wired solver, ground-truth simulation benchmark, robust estimators)
+current phase: v6.21.0 release (grouped FD without per-group offsets for interleaved groups; short-series and lone-frame limits documented)
 next WP: Multi-modal deformable registration benchmarks and GPU memory optimization
 blockers: none
-active work: none (v6.20.0 released 2026-10-24)
+active work: none (v6.21.0 released 2026-10-25)
 device: Apple Silicon MPS / CPU (macOS arm64)
-last updated: 2026-10-24
+last updated: 2026-10-25
 
 ---
+
+## R5 (Interleaved-Group FD, Encoding Identifiability Limits, v6.21.0, 2026-10-25)
+- `motion_correct_grouped` reports motion and FD without the constant per-group pose offset left by cross-group
+  registration when the groups are interleaved (every non-anchor group >= 4 active surround rows); `group_offset_fd`
+  holds the offsets and `fd_with_group_offsets`. Transforms unchanged (`cross_group_debias=True` also removes it from them).
+  Shared estimator `_group_offsets` (surround Tukey on group indicators) behind both. Real 3-shell DWI (FPA sub-BLAST079 AP,
+  98 switches / 99 steps): 0.16-0.17 mm / 0.08-0.09 deg per shell, mean FD 0.173 -> 0.163 mm.
+- Investigated short-series ASL (T = 16) excess head error (0.026 vs 0.015 mm floor): NOT under-removal and NOT the shared
+  parameter freeze (never freezing: identical errors). It is real jitter aligned with `s_t`, unidentifiable from the bias;
+  no jitter 0.020 -> 0.002 mm, still head 0.000. Documented in `docs/MOTION_SYSTEMATIC_NOISE.md` with the lone-frame limit
+  (an M0 frame as a categorical state is a one-frame spike to the robust projection: register it as a group).
+- Tests: new `test_group_offsets_interleaved_shells_recovered_and_blocked_refused`; `test_motion_reference.py` +
+  `test_motion_encoding_bias_simulation.py` 28 passed; implementation standards 10 passed; `antsxqc.lint` 0 findings.
 
 ## R4 (Encoding-Locked Systematic Noise: Wired Solver, Simulation Benchmark, Robust Estimators, v6.20.0, 2026-10-24)
 
