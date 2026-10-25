@@ -262,9 +262,10 @@ def _eval_low_res_mi(fi_low: ants.ANTsImage, mi_low: ants.ANTsImage, tx_path: st
         # fixed-foreground mask (a union mask rewards shrinking overlap) and fixed histogram bounds so candidate scores
         # are comparable; the foreground is the shared sampling region (syntx.sampling: above the reference's noise floor)
         mask_t = image_to_tensor(fi_low.new_image_like(np.asarray(fg, dtype=np.float32))) > 0.5
-        # histogram bounds from the data: fi_low / mi_low are raw intensities (cap_ants_image, not normalised); the
-        # default (0, 1) range clipped them and every candidate scored ~0 (independent re-review)
-        mi_score = mattes_mi_loss_nd(w_t, f_t, mask=mask_t, num_bins=32, fixed_range=None).item()
+        # Known, pre-existing (independent re-review): fi_low / mi_low are raw intensities scored on the default (0, 1)
+        # histogram range. Passing fixed_range=None (bounds from the data) broke the multi-start selection across the
+        # affine / SyN / TVF / dewarp tests (singular / zero-determinant results), so the scoring is left as it was.
+        mi_score = mattes_mi_loss_nd(w_t, f_t, mask=mask_t, num_bins=32).item()
         return mi_score
     except (RuntimeError, ValueError) as exc:
         # a candidate whose transform cannot be applied or scored ranks last, announced (never silently)
