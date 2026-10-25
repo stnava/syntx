@@ -176,6 +176,13 @@ class TestOverlappingWindowSlowFlow:
         # Steady-state FD across cycling states should be low while spike at frame 8 is preserved
         assert float(np.median(fd_sf[non_spike])) < 0.35
         assert float(fd_sf[8]) > 0.55
+        # The poses are in ONE common space (references averaged over the whole series, not a sliding window): the
+        # slow drift and the jump are recovered, and the state-locked x shift is not reported as head motion.
+        mp = np.asarray(res_sf["motion_parameters"], dtype=np.float64)
+        tz_err = (mp[:, 2] - mp[:, 2].mean()) - (true_tz - true_tz.mean())
+        assert float(np.sqrt(np.mean(tz_err ** 2))) < 0.05
+        assert abs(float(mp[8, 2] - mp[7, 2]) - 1.1) < 0.15
+        assert float(np.ptp(mp[:, 0])) < 0.15
 
         # Verify all written .mat transforms share the exact same FixedParameters center c_0
         fixed_centers = []
@@ -260,6 +267,7 @@ class TestOverlappingWindowBOLD:
             preset="bold",
             pe_axis=(0.0, 1.0, 0.0),
             window_size=6,
+            debias_pe_pseudomotion=True,
             verbose=False,
         )
         fd_clean = np.asarray(res_bold["fd"], dtype=np.float64)
@@ -271,3 +279,55 @@ class TestOverlappingWindowBOLD:
         assert res_bold.get("pe_pseudomotion_debias") is not None
         assert res_bold.get("pe_b0_shift_mm") is not None
 
+
+    def test_bold_default_keeps_sagittal_nodding(self):
+        """Without opt-in nothing is re-attributed; with opt-in only the PE translation changes (slice and pitch never)."""
+        base_img, _, _, _ = _make_brain_phantom_3d()
+        n_frames = 20
+        t_idx = np.arange(n_frames, dtype=np.float64)
+        # sagittal nodding: slice translation (z) + pitch about the readout axis (x), oscillating like respiration
+        nod_tz = 0.5 * np.sin(2.0 * np.pi * t_idx / 5.0)
+        nod_rx = np.radians(0.6) * np.sin(2.0 * np.pi * t_idx / 5.0)
+        frames = [_apply_rigid_shift_3d(base_img, np.array([0.0, 0.0, nod_tz[t]]), np.array([nod_rx[t], 0.0, 0.0]))
+                  for t in range(n_frames)]
+        template4d = ants.from_numpy(np.stack([f.numpy() for f in frames], axis=-1),
+                                     origin=(*base_img.origin, 0.0), spacing=(*base_img.spacing, 1.0))
+        res = motion_correction(template4d, preset="bold", pe_axis=(0.0, 1.0, 0.0), window_size=6, verbose=False)
+        assert res.get("pe_pseudomotion_debias") is None and res.get("fd_raw") is None
+        res_opt = motion_correction(template4d, preset="bold", pe_axis=(0.0, 1.0, 0.0), window_size=6,
+                                    debias_pe_pseudomotion=True, verbose=False)
+        mp = np.asarray(res["motion_parameters"], dtype=np.float64)
+        mp_opt = np.asarray(res_opt["motion_parameters"], dtype=np.float64)
+        # tz (index 2) and the three rotations are identical; only ty (PE) may differ
+        np.testing.assert_allclose(mp_opt[:, [0, 2, 3, 4, 5]], mp[:, [0, 2, 3, 4, 5]], atol=1e-6)
+        # the nodding amplitude survives in the reported trajectory
+        assert float(np.ptp(mp_opt[:, 2])) > 0.6
+
+
+class TestEncodingBiasInOptimizer:
+    def test_written_pose_plus_offset_is_the_optimised_total(self, tmp_path):
+        """B_win is a live optimisation variable: head (written) + E_psi . B_win reproduces the encoding-locked shift."""
+        base_img, brain, _, _ = _make_brain_phantom_3d()
+        n_frames = 16
+        s_t = np.array([(-1.0) ** t for t in range(n_frames)], dtype=np.float64)
+        bias_ty = 0.45 * s_t
+        frames = []
+        for t in range(n_frames):
+            mod = ants.from_numpy((base_img.numpy() + float(4.0 * s_t[t]) * brain).astype(np.float32),
+                                  origin=base_img.origin, spacing=base_img.spacing)
+            frames.append(_apply_rigid_shift_3d(mod, np.array([0.0, bias_ty[t], 0.0])))
+        template4d = ants.from_numpy(np.stack([f.numpy() for f in frames], axis=-1),
+                                     origin=(*base_img.origin, 0.0), spacing=(*base_img.spacing, 1.0))
+        res = motion_correction(template4d, preset="asl", encoding_covariates=s_t, window_size=8,
+                                outprefix=str(tmp_path / "asl_"), verbose=False)
+        enc = res["encoding_pose_bias_mm_rad"]
+        dY = np.asarray(enc["delta_Y_mm_rad"])
+        assert dY.shape == (n_frames, 6)
+        # the offset carries the alternating shift: its ty correlates with s_t with the right amplitude
+        assert np.corrcoef(dY[:, 1], s_t)[0, 1] > 0.9
+        amp = float(np.mean(dY[:, 1] * s_t))
+        assert 0.25 < abs(amp) < 0.65
+        # the written head trajectory carries (almost) none of it
+        mp = np.asarray(res["motion_parameters"], dtype=np.float64)
+        head_ty = mp[:, 1] - mp[:, 1].mean()
+        assert abs(float(np.mean(head_ty * s_t))) < 0.1

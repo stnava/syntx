@@ -567,6 +567,7 @@ def motion_correction(
     preset: Optional[str] = None,
     encoding_covariates: Optional[np.ndarray] = None,
     window_size: Optional[int] = None,
+    debias_pe_pseudomotion: bool = False,
     **kwargs: Any,
 ) -> MotionCorrectionResult:
     """
@@ -648,6 +649,13 @@ def motion_correction(
         joint estimation of encoding-induced pose bias and pure head motion.
     window_size : int, optional
         Temporal half-width (in frames) of the overlapping Hann windows for joint encoding-bias estimation.
+    debias_pe_pseudomotion : bool, default False
+        Opt-in (3-D, ``pe_axis`` required): after registration, separate respiratory B0 pseudomotion along the
+        phase-encode axis from the REPORTED head-motion trajectory (``separate_bold_pe_pseudomotion``). Only the
+        translation along ``pe_axis`` is touched; slice translation and pitch are real head motion and are never
+        modified. The transforms and the resampled series are unchanged (the B0 shift is a real image displacement), so
+        ``motion_parameters`` / ``fd`` then differ from ``fwdtransforms`` by ``pe_b0_shift_mm`` along ``pe_axis``;
+        the unmodified values are kept as ``motion_parameters_raw`` / ``fd_raw``.
     **kwargs
         'ants': passed to ``ants.registration``; 'pytorch': passed to ``syntx.robust_affine``;
         'pytorch_batched': ``num_bins`` (default 32), ``seed_mode``, ``schedule_mode``, ``resolution_cap_mm``,
@@ -814,10 +822,10 @@ def motion_correction(
         elif reference.lower() == "bilateral":
             from .motion_reference import build_bilateral_window_references
 
+            # encoding-matched references averaged over the whole series (K_time = 1): one common head position
             per_frame_refs = build_bilateral_window_references(
                 frames,
                 encoding_covariates=kwargs.get("encoding_covariates"),
-                window_size=kwargs.get("window_size") or 16,
             )
             ref_img = ants.new_image_like(
                 per_frame_refs[0],
@@ -967,8 +975,13 @@ def motion_correction(
                             pe_frames["sampling"] = pe_batch["sampling"]
                         if "bias" in pe_batch:
                             pe_frames["bias"] = pe_batch["bias"]
-                        if "encoding_pose_bias_mm_rad" in pe_batch:
-                            pe_frames["encoding_pose_bias_mm_rad"] = pe_batch["encoding_pose_bias_mm_rad"]
+                        if pe_batch.get("encoding_pose_bias_mm_rad") is not None:
+                            enc_b = dict(pe_batch["encoding_pose_bias_mm_rad"])
+                            dY_full = np.zeros((num_frames, 6), dtype=np.float64)   # the identity reference frame has no offset
+                            dY_full[list(batch_indices)] = np.asarray(enc_b["delta_Y_mm_rad"], dtype=np.float64)
+                            enc_b["delta_Y_mm_rad"] = dY_full
+                            enc_b["delta_Y"] = dY_full.tolist()
+                            pe_frames["encoding_pose_bias_mm_rad"] = enc_b
                         if "convergence" in pe_batch:
                             chunks = pe_batch["convergence"]
                             chunks = chunks if chunks and isinstance(chunks[0], list) else [chunks]   # one stage list per chunk
@@ -1204,12 +1217,13 @@ def motion_correction(
             "stages": pe_frames["stages"],
         },
     })
-    if (
-        preset == "bold"
-        and spatial_dim == 3
-        and (num_frames >= 20 or kwargs.get("pe_axis") is not None)
-        and kwargs.get("encoding_covariates") is None
-    ):
+    if debias_pe_pseudomotion:
+        if spatial_dim != 3:
+            raise ValueError("debias_pe_pseudomotion needs a 3-D (+ time) series")
+        if kwargs.get("pe_axis") is None:
+            raise ValueError("debias_pe_pseudomotion needs pe_axis (physical unit vector, or voxel axis index, of phase encode)")
+        if kwargs.get("encoding_covariates") is not None:
+            raise ValueError("debias_pe_pseudomotion and encoding_covariates both re-attribute pose; pass one of them")
         from .motion_batched import separate_bold_pe_pseudomotion
 
         result, _ = separate_bold_pe_pseudomotion(

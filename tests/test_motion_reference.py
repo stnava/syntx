@@ -393,7 +393,12 @@ class TestSampleMaskAndBiasCovariates:
         assert e_mask.max() < 0.35, e_mask   # was 0.3: the new default finisher/jitter lands at 0.33 worst-case on this 40^3 phantom
         assert e_mask.mean() < e_plain.mean(), (e_plain, e_mask)
 
-        # bias: impose a translation that is a linear function of a covariate on top of the shifts; it must be removed
+        # bias: impose a translation that is a linear function of a covariate on top of HEAD MOTION; it must be removed.
+        # The estimator works on second-order surround differences (drift in its nullspace, jumps Tukey-downweighted), so
+        # the head motion here is what heads do -- drift, one jump, small jitter -- not independent +-1 mm per frame.
+        tt = np.linspace(0.0, 1.0, n)[:, None]
+        shifts = [tuple(v) for v in 0.6 * tt * np.array([1.0, -0.5, 0.3]) + 0.9 * (np.arange(n)[:, None] >= n // 2) * np.array([0.3, 0.8, -0.5])
+                  + 0.04 * rng.normal(size=(n, 3))]
         cov = rng.normal(size=(n, 2)); cov[0] = 0
         B = np.array([[0.8, 0.0, 0.0], [0.0, -0.6, 0.0]])  # mm per unit covariate
         biased = [_blob_frame((0.65, 0.7, 0.5), tuple(np.asarray(s) + cov[k] @ B)) for k, s in enumerate(shifts)]
@@ -401,7 +406,7 @@ class TestSampleMaskAndBiasCovariates:
         res = motion_correction(img_b, reference=ref, backend="pytorch_batched", verbose=False, seed_mode="narrow", bias_covariates=cov)
         e_bias = np.linalg.norm(np.asarray(res.motion_parameters.translations) - np.asarray(shifts), axis=1)
         assert res["bias"] is not None and res["bias"]["n_covariates"] == 2
-        np.testing.assert_allclose(np.asarray(res["bias"]["coefficients"])[:, :3], B, atol=0.3)  # the random +-1 mm shifts act as noise on 24 frames
+        np.testing.assert_allclose(np.asarray(res["bias"]["coefficients"])[:, :3], B, atol=0.3)
         imposed = np.linalg.norm(cov @ B, axis=1)  # what the poses would be off by without the removal
         assert e_bias.mean() < 0.4 * imposed.mean(), (e_bias.mean(), imposed.mean())
 

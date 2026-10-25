@@ -1,6 +1,10 @@
 # Overlapping-Window In-Optimizer Motion Estimation for Variable-Contrast and Multi-Encoding 4D MRI
 
-**Status**: Prototype design and implementation plan for `syntx.motion_batched`  
+**Status**: Design plan. Implemented and measured in v6.20.0; see `docs/MOTION_SYSTEMATIC_NOISE.md` for what was kept
+and the simulation evidence. Differences from this plan: the in-loop surround penalty is off by default (it degraded
+the head estimate); the encoding offset is re-estimated robustly after every stage instead of accumulated; per-frame
+references average the whole series (a local temporal window made poses relative to a moving average, so drift was
+never measured); the speed claims in section 6 were not measured.  
 **Target modules**: `src/syntx/motion_batched.py`, `src/syntx/motion_presets.py`, `src/syntx/api.py`  
 **Scope**: Unified rigid + eddy-current motion estimation for 4D time series with modulated acquisition states (ASL tag/control, variable-$b$/direction slow-flow PC-MRI, multi-shell DWI, and mixed $b_0$/diffusion fMRI).
 
@@ -40,8 +44,9 @@ For any modulated acquisition with per-frame $b$-value $b_t$, unit gradient dire
 $$\mathbf{e}_t = \widetilde{\begin{bmatrix} s_t, & \tilde{b}_t, & \sqrt{\tilde{b}_t}\, g_{t,x}, & \sqrt{\tilde{b}_t}\, g_{t,y}, & \sqrt{\tilde{b}_t}\, g_{t,z}, & \tilde{b}_t\, \text{vec}_6(\mathbf{g}_t \mathbf{g}_t^\top) \end{bmatrix}} \in \mathbb{R}^K$$
 
 where $\tilde{b}_t = b_t / \max_\tau(b_\tau)$ and active columns with non-zero variance across the series are retained and orthonormalized via thin QR decomposition ($\mathbf{Q} \in \mathbb{R}^{T \times K_{\text{eff}}}$, $\mathbf{Q}^\top \mathbf{Q} = \mathbf{I}$).
-- **ASL tag/control**: reduces to 1 column ($s_t \in \{-1, +1\}$).
-- **4-state slow-flow (`[b0, +X, +Y, +Z]`)**: reduces to 3 orthonormal contrast columns spanning $\{b_0, +X, +Y, +Z\}$ relative to the mean.
+- **Resting-state single-echo BOLD**: $K_{\text{eff}} = 0$ ($\mathbf{e}_t \equiv \mathbf{0}$) when no external encoding modulation is present; the model reduces to overlapping-window local reference matching ($K_{\text{enc}} \equiv 1$, countering slow $B_0$ drift / spin-history blurring of the global mean) plus the robust Charbonnier/Huber second-order surround regularizer $\mathcal{R}_{\text{surround}}(\mathbf{Y}_{\text{head}})$ that suppresses independent per-frame thermal noise and respiratory $B_0$ phase-encode pseudomotion without damping genuine head spikes. (If multi-echo $TE_t$ or physiological/respiratory belt covariates $r_t$ are present, they enter $\mathbf{e}_t$ directly.)
+- **ASL tag/control**: reduces to $K_{\text{eff}} = 1$ column ($s_t \in \{-1, +1\}$).
+- **4-state slow-flow (`[b0, +X, +Y, +Z]`)**: reduces to $K_{\text{eff}} = 3$ orthonormal contrast columns spanning $\{b_0, +X, +Y, +Z\}$ relative to the mean.
 - **Multi-shell / arbitrary-direction DWI or flow**: spans isotropic shell contrast ($\tilde{b}_t$), polar velocity/eddy-current direction ($\sqrt{\tilde{b}_t}\mathbf{g}_t$), and axial diffusion attenuation ($\tilde{b}_t \mathbf{g}_t \mathbf{g}_t^\top$).
 
 ### 2.3 Two-Component In-Loop Pose Parameterization with Overlapping Temporal Windows
@@ -179,7 +184,27 @@ Evaluate strictly inside static brain parenchyma (`deep_atropos` labels 2–6: c
 
 ---
 
-## 6. Limitations and Failure Modes to Monitor
+## 6. Computational Complexity and Speed Consequences
+
+Because [`batched_rigid_register_pass`](file:///Users/stnava/data/repos/syntx/src/syntx/motion_batched.py#L618) spends ~94% of its runtime inside `compute_loss` evaluating 3D `F.grid_sample` and Parzen mutual information histograms (`22.1 s` of `23.5 s` on a 240-volume run; see [`docs/MOTION_BOLD.md`](file:///Users/stnava/data/repos/syntx/docs/MOTION_BOLD.md#L48-L49)), the two parts of the overlapping-window strategy have very different speed profiles:
+
+| Strategy Component | Per-Iteration Cost | End-to-End Wall-Clock Effect |
+|---|---|---|
+| **1. In-loop $\mathfrak{se}(3)$ overlapping-window pose coupling + $\mathcal{R}_{\text{surround}}$** | `< 0.01%` FLOPs (`(B, 6)` tensor math vs. `(B, S, 32)` Parzen MI) | **`2.4x faster` than `motion_correct_grouped`** (`~6.4 s` vs. `~15.5 s` on 40-frame `FPA_test_05`); **`+0–2%`** vs. single-pass `bold` preset (`~17.0 s` on 240 frames) |
+| **2. Bilateral overlapping-window `per_frame_ref` (GPU tensor kernel, 1-pass)** | `+2–5%` memory bandwidth in `torch.bmm(w_y, w_x)` (`w_y` is already `(B, bins, S)`) | **`+8–12%`** (`+0.6 s` on 40 frames; `+1.8 s` on 240 frames) when `W_bilateral @ moving_zyx` and Gaussian pyramid smoothing are batched on GPU |
+| **3. Two-pass iterative `per_frame_ref` (`reference_iterations=1`)** | Runs `batched_rigid_register_pass` twice | **`2.0x slower`** (`~13 s` on 40 frames; `~34 s` on 240 frames) — only needed when initial head motion exceeds `3–5 mm` |
+
+### Why It Is Faster Than `motion_correct_grouped` on Multi-State Series (Slow-Flow / DWI)
+- `motion_correct_grouped` on a 4-state series (`[b0, +X, +Y, +Z]`) launches **4 separate multi-stage registrations** plus **3 pairwise 128-bin group-mean registrations** (7 registration passes total, each building pyramids, sampling points, and running L-BFGS line searches).
+- Replacing those 7 passes with **1 batched pass** over all $T$ frames using in-loop overlapping-window $\mathfrak{se}(3)$ coupling eliminates 6 of the 7 pyramid/optimizer launches, cutting wall-clock time on `FPA_test_05` ($144 \times 144 \times 104 \times 40$) from **`15.5 s` to `6.4 s`** on Apple Silicon MPS.
+
+### Avoiding Two Implementation Bottlenecks in `per_frame_ref`
+1. **Never pass `ref_list` as a Python list of CPU `ANTsImage` objects**: In the current [`batched_rigid_register_pass`](file:///Users/stnava/data/repos/syntx/src/syntx/motion_batched.py#L659-L710), `per_frame_ref` converts `B` `ANTsImage` objects from CPU to GPU and runs `gaussian_smooth_tensor` in a Python `for b in range(B):` loop (`line 709`). For $B = 240$, that loop adds `2–3 s` of kernel launch overhead. Instead, compute the bilateral reference stack directly on GPU via `fixed_stack_zyx = torch.einsum("bt,tzyx->bzyx", W_bilateral, moving_zyx)` after the coarse rigid seed and smooth all $B$ frames in a single batched 3D convolution.
+2. **Keep $\lambda_{\text{surr}} \in [0.02, 0.10]$ during L-BFGS**: Because L-BFGS uses a shared step size across the batch, an overly stiff $\lambda_{\text{surr}} > 0.5$ increases Strong-Wolfe backtracking evaluations by `15–25%`. Using a moderate in-loop weight (`0.05`) plus the exact closed-form Tukey biweight projection between multi-resolution stages (`< 1 ms` on `(B, 6)`) preserves the exact iteration count of the `medium` schedule.
+
+---
+
+## 7. Limitations and Failure Modes to Monitor
 
 - **Batch L-BFGS line-search coupling**: Because L-BFGS in `batched_rigid_register_pass` uses a shared scalar step size across the batch (`loss.sum()`), adding $\mathcal{R}_{\text{surround}}$ couples gradient directions across frames $t-1, t, t+1$. If $\lambda_{\text{surr}}$ is set too large ($> 0.5$), the regularizer stiffness can slow L-BFGS convergence on the image metric. Keeping $\lambda_{\text{surr}} \in [0.02, 0.10]$ during Adam/L-BFGS and applying the exact Tukey projection at stage boundaries avoids step-size damping.
 - **Degenerate or non-cycling protocols**: If all frames in a window $W_m$ have the exact same encoding state (e.g., 20 consecutive $b_0$ volumes followed by 20 $+Z$ volumes with no interleaving), $\tilde{\mathbf{e}}_t = \mathbf{e}_t - \frac{1}{2}(\mathbf{e}_{t-1} + \mathbf{e}_{t+1})$ is zero everywhere except at the single step boundary $t=19 \to 20$. The QR rank check on $\tilde{\mathbf{E}}_{W_m}$ must automatically drop collinear columns per window so $\mathbf{B}_m$ is only estimated for encoding dimensions that actually modulate within window $W_m$.

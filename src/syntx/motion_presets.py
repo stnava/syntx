@@ -63,8 +63,6 @@ SLOWFLOW_MOTION_PRESET = {
     "convergence_tol_vox": 0.05,
     "max_extend_factor": 4,
     "window_size": 16,
-    "surround_weight": 0.05,
-    "surround_delta_mm": 0.25,
 }
 
 MOTION_PRESETS = {

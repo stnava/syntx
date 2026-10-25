@@ -228,6 +228,7 @@ from .motion_batched import (
 from .motion_reference import (
     build_low_motion_reference,
     build_bilateral_window_references,
+    encoding_reference_predictor,
     motion_correct_grouped,
     shell_groups,
 )
@@ -336,7 +337,7 @@ from .liouville import liouville_determinant, determinant_summary
 syngs = syngs_registration
 affine_benchmark = evaluate_affine_benchmark
 
-__version__ = "6.19.0"
+__version__ = "6.20.0"
 
 
 
@@ -540,6 +541,7 @@ __all__ = [
     "estimate_coarse_fd",
     "build_low_motion_reference",
     "build_bilateral_window_references",
+    "encoding_reference_predictor",
     "motion_correct_grouped",
     "shell_groups",
     "gaussian_temporal_average",

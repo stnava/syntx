@@ -250,16 +250,27 @@ def shell_groups(bvals: np.ndarray, b0_threshold: float = 50.0, shell_tol: float
 def build_bilateral_window_references(
     frames: Sequence[ants.ANTsImage] | ants.ANTsImage,
     encoding_covariates: Optional[np.ndarray] = None,
-    window_size: int = 16,
+    window_size: Optional[int] = None,
     sigma_enc: float = 0.5,
+    exclude_self: bool = False,
 ) -> List[ants.ANTsImage]:
-    """Build per-frame contrast-matched references using a bilateral kernel over time and encoding state:
+    """Build per-frame contrast-matched references with a kernel over encoding state (and optionally time):
 
-    ``I_ref,t(x) = sum_tau K_time(t, tau; w) K_enc(e_t, e_tau) I_tau(x) / sum_tau K_time(t, tau; w) K_enc(e_t, e_tau)``
+    ``I_ref,t(x) = sum_tau K_time(t, tau) K_enc(e_t, e_tau) I_tau(x) / sum_tau K_time(t, tau) K_enc(e_t, e_tau)``
 
-    where ``K_time(t, tau; w) = max(0, 1 - |t - tau| / w)`` restricts averaging to a local temporal window
-    so slow head drift does not blur the template, and ``K_enc(e_t, e_tau) = exp(-||e_t - e_tau||^2 / (2 sigma_enc^2))``
-    weights frames with matching or near-matching encoding state highest.
+    ``K_enc(e_t, e_tau) = exp(-||e_t - e_tau||^2 / (2 K sigma_enc^2))`` weights frames of matching encoding state; for
+    discrete states (slow-flow ``[b0, +X, +Y, +Z]``, ASL tag/control) the reference of frame t is the mean of all frames
+    in t's state. ``window_size=None`` (default, what motion correction uses) sets ``K_time = 1``: every reference is a
+    mean over the WHOLE series, so all references share one head position and the registered poses are in one common
+    space. A finite ``window_size`` (``K_time = max(0, 1 - |t - tau| / w)``) gives local references; poses against
+    them are relative to a moving average of the series, i.e. slow drift is NOT measured -- use it only to build
+    templates, never as a motion-correction target.
+
+    ``exclude_self``: leave-one-out, frame t gets no weight in its own reference. Off by default: for discrete states
+    the inclusive state mean is ONE reference shared by every frame of the state, which is what puts their poses in a
+    common space; leave-one-out gives every frame a slightly different reference (simulation, 3 seeds: slow-flow preset
+    head error 0.031 -> 0.115 mm, ASL state-matched 0.017 -> 0.060 mm). With continuous encodings (one frame per DWI
+    direction) the frame's own weight dominates the inclusive kernel; see ``encoding_reference_predictor``.
     """
     from .motion_batched import build_encoding_covariates
 
@@ -276,16 +287,18 @@ def build_bilateral_window_references(
         return [frame_list[0].clone()]
 
     stack = np.stack([f.numpy().astype(np.float32) for f in frame_list], axis=0)  # (T, X, Y, Z)
-    w = max(1.0, float(window_size))
-    t_idx = np.arange(T, dtype=np.float64)
-    dt = np.abs(t_idx[:, None] - t_idx[None, :])
-    k_time = np.maximum(0.0, 1.0 - dt / w) + 1e-3 * np.exp(-0.5 * (dt / w) ** 2)
+    if window_size is None:
+        k_time = np.ones((T, T), dtype=np.float64)
+    else:
+        w = max(1.0, float(window_size))
+        t_idx = np.arange(T, dtype=np.float64)
+        dt = np.abs(t_idx[:, None] - t_idx[None, :])
+        k_time = np.maximum(0.0, 1.0 - dt / w) + 1e-3 * np.exp(-0.5 * (dt / w) ** 2)
 
     if encoding_covariates is not None:
         enc_basis = build_encoding_covariates(
             encoding_covariates=encoding_covariates,
             num_frames=T,
-            window_size=int(w),
         )
         E = enc_basis["E"]
         K_eff = int(enc_basis["K_eff"])
@@ -300,10 +313,102 @@ def build_bilateral_window_references(
         k_enc = np.ones((T, T), dtype=np.float64)
 
     W = k_time * k_enc
+    if exclude_self:
+        np.fill_diagonal(W, 0.0)
     W = W / np.maximum(np.sum(W, axis=1, keepdims=True), 1e-12)
-    ref_stack = np.tensordot(W.astype(np.float32), stack, axes=([1], [0]))
+    W = W.astype(np.float32)
     ref_dtype = frame_list[0].dtype
-    return [ants.new_image_like(frame_list[0], ref_stack[t].astype(ref_dtype)) for t in range(T)]
+    # one reference at a time: peak memory is the input stack plus the returned images, not a second 4-D stack
+    return [ants.new_image_like(frame_list[0], np.tensordot(W[t], stack, axes=(0, 0)).astype(ref_dtype)) for t in range(T)]
+
+
+def _debias_cross_group_offsets(chains, groups, idx, results, cross, com, outprefix):
+    """Per-frame rigid corrections removing the contrast-driven offset of each non-anchor group (see
+    ``motion_correct_grouped(cross_group_debias=True)``). Returns ``None`` when the groups are not interleaved enough to
+    separate an offset from head motion (fewer than 4 active surround rows per non-anchor group)."""
+    import os
+    import tempfile
+
+    from scipy.spatial.transform import Rotation as _Rot
+
+    from .motion import _extract_rigid_parameters
+    from .motion_batched import _project_encoding_surround_tukey_np, build_encoding_covariates
+
+    n_frames = len(chains)
+    n_groups = len(idx)
+    if n_frames < 8:
+        return None
+    ind = np.column_stack([(groups == g).astype(np.float64) for g in range(1, n_groups)])
+    surr = ind[1:-1] - 0.5 * (ind[:-2] + ind[2:])
+    if int(np.min(np.sum(np.abs(surr) > 0.1, axis=0))) < 4:
+        return None
+    n_cross = [len(c["fwdtransforms"]) for c in cross]
+    H = []
+    for i in range(n_frames):
+        g = int(groups[i])
+        rigid_chain = chains[i][:sum(n_cross[:g])] + [chains[i][-1]]   # crosses + the frame's own rigid (no eddy)
+        h = np.eye(4)
+        for f in rigid_chain:
+            h = _extract_rigid_parameters(ants.read_transform(f), 3)[2] @ h
+        H.append(h)
+    H = np.asarray(H)
+    Y = np.c_[np.einsum("nij,j->ni", H[:, :3, :3], com) + H[:, :3, 3] - com, _Rot.from_matrix(H[:, :3, :3]).as_rotvec()]
+    basis = build_encoding_covariates(state_labels=groups, num_frames=n_frames, window_size=n_frames)
+    _, dY, w = _project_encoding_surround_tukey_np(Y, basis["E"], basis["psi"])
+    anchor_dY = np.median(dY[idx[0]], axis=0)          # the offset is relative to the anchor group (which stays put)
+    off = dY - anchor_dY
+    work = os.path.dirname(f"{outprefix}x") if outprefix else tempfile.mkdtemp(prefix="syntx_xgroup_")
+    os.makedirs(work, exist_ok=True)
+    paths, per_group = {}, {}
+    for g in range(1, n_groups):
+        per_group[g] = np.median(off[idx[g]], axis=0)
+    for i in range(n_frames):
+        g = int(groups[i])
+        if g == 0:
+            continue
+        Yc = Y[i] - per_group[g]
+        R_c = _Rot.from_rotvec(Yc[3:]).as_matrix()
+        Hc = np.eye(4)
+        Hc[:3, :3] = R_c
+        Hc[:3, 3] = com + Yc[:3] - R_c @ com
+        corr = np.linalg.inv(H[i]) @ Hc                  # H_new = H @ corr: corr acts on the anchor-space point first
+        tx = ants.create_ants_transform(transform_type="AffineTransform", precision="float", dimension=3)
+        tx.set_parameters(np.concatenate([corr[:3, :3].ravel(), corr[:3, 3]]))
+        tx.set_fixed_parameters(np.zeros(3))
+        path = os.path.join(work, f"{os.path.basename(outprefix) if outprefix else ''}xgroup_corr_{i:04d}.mat")
+        ants.write_transform(tx, path)
+        paths[i] = path
+    return {
+        "method": "surround_tukey_projection_on_group_indicators",
+        "offset_mm_rad_by_group": {int(g): v.tolist() for g, v in per_group.items()},
+        "offset_mm_by_group": {int(g): float(np.linalg.norm(v[:3])) for g, v in per_group.items()},
+        "offset_deg_by_group": {int(g): float(np.degrees(np.linalg.norm(v[3:]))) for g, v in per_group.items()},
+        "corrected_frames": sorted(paths),
+        "correction_paths": paths,
+    }
+
+
+def encoding_reference_predictor(encoding_covariates: np.ndarray, sigma_enc: float = 0.5, exclude_self: bool = True):
+    """``reference_predictor`` for ``motion_correct_grouped``: each frame's reference is the kernel-weighted mean of the
+    group's OTHER corrected frames with a similar encoding (``build_bilateral_window_references``, whole series, no time
+    window), i.e. a contrast-matched reference for continuous encodings. DWI: pass the even (l = 2) gradient terms --
+    the image contrast is even in g. A group with no encoding variation (b0) keeps its mean (``None``).
+
+    Measured on the simulated DWI series (b1000, 20 directions, 3 seeds, ``benchmarks/motion_encoding_bias_simulation.py``):
+    leave-one-out gives no reliable gain over the shell mean (rotation error 0.56 -> 0.51 deg without eddy, 0.63 ->
+    0.58 with). Including the frame (``exclude_self=False``) lowered it to 0.40 deg, but with 20 distinct directions the
+    frame's own weight dominates that kernel (the frame is largely registered to its own previous resampling) and some
+    frames stopped converging on antsxdwi's convergence test, so it is not used by default anywhere."""
+    cov = np.asarray(encoding_covariates, dtype=np.float64)
+    cov = cov[:, None] if cov.ndim == 1 else cov
+
+    def predictor(frames, group_index=None, frame_indices=None):
+        c = cov[np.asarray(frame_indices, dtype=int)]
+        if not np.any(np.std(c, axis=0) > 1e-8):
+            return None
+        return build_bilateral_window_references(list(frames), encoding_covariates=c, sigma_enc=sigma_enc, exclude_self=exclude_self)
+
+    return predictor
 
 
 class GroupedMotionCorrectionResult(dict):
@@ -347,6 +452,7 @@ def motion_correct_grouped(
     metric_smoothing_mm: float = 0.0,
     encoding_covariates: Optional[np.ndarray] = None,
     window_size: Optional[int] = None,
+    cross_group_debias: bool = False,
     **kwargs,
 ) -> GroupedMotionCorrectionResult:
     """Motion-correct a contrast-heterogeneous series (e.g. DWI: b0 and one group per b-shell) with same-contrast per-frame
@@ -424,6 +530,20 @@ def motion_correct_grouped(
     metric_smoothing_mm : float
         Gaussian smoothing (mm) of both images for the metric only, applied with 'backward' (2 mm: 0.148 -> 0.144 mm,
         and no loss under 1 mm / 1 deg motion; 3 mm hurt capture). The data are resampled from the originals.
+    encoding_covariates : np.ndarray, shape (n_frames,) or (n_frames, k), optional
+        Per-frame encoding covariates forwarded per group to ``motion_correction(encoding_covariates=...)`` (in-optimizer
+        overlapping-window Tukey projection of encoding-locked registration bias out of the written poses). Use terms
+        that describe the CONTRAST (DWI: even, l = 2, gradient terms), not the eddy displacement (odd in g, modelled by
+        ``pe_affine_covariates`` and applied).
+    cross_group_debias : bool, default False
+        Opt-in: remove a contrast-driven bias of the cross-group (group mean -> group mean) registrations: when the groups
+        are interleaved in time, the composed rigid trajectory is projected on the group indicators with the surround
+        Tukey estimator (``motion_batched._project_encoding_surround_tukey_np``; smooth head drift and isolated jumps
+        are in its nullspace / downweighted) and the per-frame offset of every non-anchor group relative to the anchor
+        is removed by a correction transform at the START of its chain (applied before the single resampling).
+        On the simulated DWI series (``benchmarks/motion_encoding_bias_simulation.py``, 3 seeds) the cross chain was
+        already unbiased (head translation error 0.111 -> 0.115 mm with it), hence opt-in. Reported as
+        ``cross_group_offset``; ``None`` when off or when the groups are not interleaved.
     **kwargs
         Forwarded to ``syntx.motion_correction`` (e.g. ``fd_radius``).
     """
@@ -470,9 +590,7 @@ def motion_correct_grouped(
     if verbose:
         print(f"[syntx.motion_reference] motion_correct_grouped: group sizes {[len(i) for i in idx]} of {n_frames} frames.")
 
-    # Normalise DVARS by the anchor (b=0) mean intensity across all groups, then harmonise each non-anchor shell's
-    # baseline median to the anchor shell in preset='dwi' so directional white-matter anisotropy does not create a
-    # cross-shell sawtooth or b=0 V-notches when interleaved in acquisition order.
+    # DVARS of every group is normalised against the anchor group's mean intensity (comparable across groups and subjects).
     anchor = means[0].numpy()
     anchor_fg = anchor[anchor > 0]
     ref_intensity = float(np.mean(anchor_fg)) if anchor_fg.size > 0 else None
@@ -503,22 +621,8 @@ def motion_correct_grouped(
             ec_g = np.asarray(encoding_covariates, dtype=np.float64).reshape(n_frames, -1)[np.asarray(idx[g])]
             if np.any(np.std(ec_g, axis=0) > 1e-6):
                 kw["encoding_covariates"] = ec_g
-        elif preset == "dwi":
-            ec_parts_g = []
-            if pe_affine_covariates is not None:
-                pe_g_arr = np.asarray(pe_affine_covariates, dtype=np.float64).reshape(n_frames, -1)[np.asarray(idx[g])]
-                if np.any(np.std(pe_g_arr, axis=0) > 1e-6):
-                    ec_parts_g.append(pe_g_arr)
-            if bias_covariates is not None:
-                bc_g_arr = np.asarray(bias_covariates, dtype=np.float64).reshape(n_frames, -1)[np.asarray(idx[g])]
-                if np.any(np.std(bc_g_arr, axis=0) > 1e-6):
-                    ec_parts_g.append(bc_g_arr)
-            if ec_parts_g:
-                kw["encoding_covariates"] = np.hstack(ec_parts_g) if len(ec_parts_g) > 1 else ec_parts_g[0]
-        if window_size is not None:
+        if window_size is not None and "encoding_covariates" in kw:
             kw["window_size"] = int(window_size)
-        elif preset == "dwi" and "window_size" in (cfg or {}):
-            kw.setdefault("window_size", int(cfg["window_size"]))
         group_kw.append(kw)
         if registration_direction == "backward":
             res_g = _register_group_backward(img4d[g], means[g], kw, backend, verbose, ref_int_g, metric_smoothing_mm, interp if g == 0 else "linear")
@@ -575,63 +679,17 @@ def motion_correct_grouped(
                                device=kwargs.get("device"), num_bins=cross_num_bins,
                            convergence_tol_vox=kwargs.get("convergence_tol_vox", 0.05), max_extend_factor=kwargs.get("max_extend_factor", 4)) for g in range(1, n_groups)]
 
-    # Replace leading 0.0 DVARS placeholders on non-anchor shells and harmonise per-shell DVARS medians in preset='dwi'
-    # so interleaved shells share a common baseline without a 2-volume sawtooth or b=0 V-notches.
-    for g in range(n_groups):
-        if len(idx[g]) > 1 and int(idx[g][0]) > 0:
-            for dv_key in ("dvars", "dvars_post", "dvars_pre"):
-                dv_arr = results[g].get(dv_key)
-                if dv_arr is not None and len(dv_arr) > 1 and float(dv_arr[0]) == 0.0:
-                    dv_copy = np.asarray(dv_arr, dtype=np.float64).copy()
-                    dv_copy[0] = dv_copy[1]
-                    results[g][dv_key] = dv_copy
-    if preset == "dwi" and n_groups > 1:
-        ig0 = np.asarray(idx[0], dtype=int)
-        dt0 = np.diff(ig0) if len(ig0) >= 4 else np.array([], dtype=int)
-        for dv_key in ("dvars", "dvars_post", "dvars_pre"):
-            dv0 = results[0].get(dv_key)
-            if dv0 is not None and np.any(np.asarray(dv0) > 0):
-                dv0_arr = np.asarray(dv0, dtype=np.float64).copy()
-                med0 = float(np.median(dv0_arr[dv0_arr > 0]))
-                if dt0.size >= 3 and float(np.median(dt0)) >= 4.0 and np.any(dt0 == 1):
-                    long_vals = dv0_arr[1:][dt0 >= 0.5 * float(np.median(dt0))]
-                    if long_vals.size >= 2:
-                        med0 = float(np.median(long_vals))
-                        results[0][f"{dv_key}_shell_raw"] = dv0_arr.copy()
-                        for k_short in np.where(dt0 == 1)[0]:
-                            if 0.0 < dv0_arr[k_short + 1] < med0:
-                                dv0_arr[k_short + 1] = med0
-                        results[0][dv_key] = dv0_arr
-                for g in range(1, n_groups):
-                    dvg = results[g].get(dv_key)
-                    if dvg is not None and np.any(np.asarray(dvg) > 0):
-                        medg = float(np.median(np.asarray(dvg)[np.asarray(dvg) > 0]))
-                        if medg > 0:
-                            results[g][f"{dv_key}_shell_raw"] = np.asarray(dvg, dtype=np.float64).copy()
-                            results[g][dv_key] = np.asarray(dvg, dtype=np.float64) * (med0 / medg)
-
     chains: list = [None] * n_frames
-    frames_out: list = [None] * n_frames
     for g in range(n_groups):
         pre = [t for k in range(g) for t in cross[k]["fwdtransforms"]]  # [cross_1, ..., cross_g]
         for li, gi in enumerate(idx[g]):
             chains[gi] = pre + list(results[g].fwdtransforms[li])
-            if g == 0:
-                frames_out[gi] = ants.slice_image(results[0].motion_corrected, axis=3, idx=li)
-            else:  # ONE resampling from the original through the composed chain: every interpolation blurs
-                frames_out[gi] = _apply_transforms(fixed=means[0], moving=imgs[g][li], transformlist=chains[gi],
-                                                   interpolator=interp)
-                pe_g = results[g].get("pe_affine")
-                if pe_g is not None and pe_g["jacobian"][li] != 1.0:
-                    frames_out[gi] = frames_out[gi] * float(pe_g["jacobian"][li])
-    motion_corrected = ants.list_to_ndimage(_make_4d_template_from_3d(frames_out[0], n_frames, tr=tr), frames_out)
 
     # Series-level Jenkinson FD in acquisition order: every frame's total rigid transform in group 0's space
     # (a point maps through cross_1 ... cross_g, then the frame's own transform: H = H_own @ H_cross_g @ ... @ H_cross_1).
     from .motion import jenkinson_framewise_displacement
 
     com = np.asarray(means[0].get_center_of_mass(), dtype=np.float64)
-    mats = [[_extract_rigid_parameters(ants.read_transform(f), 3)[2] for f in chain] for chain in chains]
 
     def _compose(per_frame_mats):
         homog = []
@@ -642,6 +700,28 @@ def motion_correct_grouped(
             homog.append(h)
         return homog
 
+    cross_group_offset = None
+    if cross_group_debias and n_groups > 1:
+        cross_group_offset = _debias_cross_group_offsets(chains, groups, idx, results, cross, com, kwargs.get("outprefix"))
+        if cross_group_offset is not None:
+            for gi, corr_path in cross_group_offset.pop("correction_paths").items():
+                chains[gi] = [corr_path] + chains[gi]   # first in the chain: acts on the anchor-space point first
+
+    frames_out: list = [None] * n_frames
+    for g in range(n_groups):
+        for li, gi in enumerate(idx[g]):
+            if g == 0 and len(chains[gi]) == len(results[0].fwdtransforms[li]):
+                frames_out[gi] = ants.slice_image(results[0].motion_corrected, axis=3, idx=li)
+            else:  # ONE resampling from the original through the composed chain: every interpolation blurs
+                frames_out[gi] = _apply_transforms(fixed=means[0], moving=imgs[g][li], transformlist=chains[gi],
+                                                   interpolator=interp)
+                pe_g = results[g].get("pe_affine")
+                if pe_g is not None and pe_g["jacobian"][li] != 1.0:
+                    frames_out[gi] = frames_out[gi] * float(pe_g["jacobian"][li])
+    motion_corrected = ants.list_to_ndimage(_make_4d_template_from_3d(frames_out[0], n_frames, tr=tr), frames_out)
+
+    mats = [[_extract_rigid_parameters(ants.read_transform(f), 3)[2] for f in chain] for chain in chains]
+
     composed_all = _compose(mats)
     fd_raw = jenkinson_framewise_displacement(composed_all, kwargs.get("fd_radius", 50.0), com)
     nuisance = None
@@ -651,7 +731,9 @@ def motion_correct_grouped(
     if any(r.get("pe_affine") is not None for r in results):
         # the eddy PE-affine is in the chain (and in fd_raw); FD counts the rigid part only: crosses + the frame's rigid
         n_cross = [len(c["fwdtransforms"]) for c in cross]
-        mats_rigid = [ms[:sum(n_cross[:g])] + [ms[-1]] for ms, g in zip(mats, [int(groups[i]) for i in range(n_frames)])]
+        n_corr = [0 if cross_group_offset is None or gi not in cross_group_offset["corrected_frames"] else 1 for gi in range(n_frames)]
+        mats_rigid = [ms[:n_corr[i] + sum(n_cross[:g])] + [ms[-1]]
+                      for i, (ms, g) in enumerate(zip(mats, [int(groups[i]) for i in range(n_frames)]))]
         composed_rigid = _compose(mats_rigid)
         fd = jenkinson_framewise_displacement(composed_rigid, kwargs.get("fd_radius", 50.0), com)
         a_all = np.zeros((n_frames, 4)); jac_all = np.ones(n_frames); coef = []
@@ -662,71 +744,8 @@ def motion_correct_grouped(
             if pe_g is not None:
                 a_all[np.asarray(idx[g])] = pe_g["a"]; jac_all[np.asarray(idx[g])] = pe_g["jacobian"]
         p_unit = np.asarray(pe_axis, dtype=np.float64) / np.linalg.norm(pe_axis)
-        shift_mm_all = a_all[:, 0].copy()
-        # ASL-inspired surround-difference cross-shell SE(3) debiasing + intrinsic PE-axis B0/eddy attribution:
-        # In EPI DWI, respiration-induced delta-B0(t) and residual eddy currents translate volumes purely along p_unit
-        # without rigid rotation or orthogonal translation. Transfer uncoupled high-frequency PE oscillations from
-        # composed_rigid into shift_mm_all while gating by non-PE framewise displacement so real head jerks are kept.
-        if preset == "dwi" and n_frames >= 12:
-            from scipy.spatial.transform import Rotation as _Rot
-            d_com = np.array([H[:3, 3] + (H[:3, :3] - np.eye(3)) @ com for H in composed_rigid], dtype=np.float64)
-            rv = _Rot.from_matrix(np.array([H[:3, :3] for H in composed_rigid], dtype=np.float64)).as_rotvec()
-            Y_se3 = np.c_[d_com, rv]
-            # 1) Surround-difference cross-shell offset removal: u[t] = G_surr[t] @ B_shell
-            u_se3 = Y_se3[1:-1] - 0.5 * (Y_se3[:-2] + Y_se3[2:])
-            E_shell = np.column_stack([(groups == g).astype(np.float64) for g in range(1, n_groups)])
-            G_surr = E_shell[1:-1] - 0.5 * (E_shell[:-2] + E_shell[2:])
-            active_surr = np.any(np.abs(G_surr) > 0.1, axis=1)
-            if int(np.sum(active_surr)) >= 4 * (n_groups - 1):
-                Gs = G_surr[active_surr]
-                us = u_se3[active_surr]
-                w_s = np.ones(len(Gs), dtype=np.float64)
-                B_shell = np.zeros((n_groups - 1, 6), dtype=np.float64)
-                for _ in range(3):
-                    B_shell, *_ = np.linalg.lstsq(Gs * np.sqrt(w_s)[:, None], us * np.sqrt(w_s)[:, None], rcond=None)
-                    res_s = us - Gs @ B_shell
-                    nrm_s = np.linalg.norm(res_s[:, :3], axis=1)
-                    sc_s = max(1.4826 * float(np.median(np.abs(nrm_s - np.median(nrm_s)))), 1e-4)
-                    r_s = nrm_s / (4.685 * sc_s)
-                    w_s = np.where(r_s < 1.0, (1.0 - r_s ** 2) ** 2, 1e-4)
-                Y_se3 = Y_se3 - E_shell @ B_shell
-            d_com = Y_se3[:, :3]
-            rv = Y_se3[:, 3:]
-            # 2) Intrinsic PE-axis projection and non-PE motion-gated B0/eddy attribution
-            t_par = d_com @ p_unit
-            T_perp = d_com - np.outer(t_par, p_unit)
-            t_norm = np.linspace(-1.0, 1.0, n_frames)
-            X_pe = np.c_[np.ones(n_frames), t_norm, t_norm ** 2, t_norm ** 3, T_perp, rv]
-            w_irls = np.ones(n_frames, dtype=np.float64)
-            beta_pe = np.zeros(X_pe.shape[1], dtype=np.float64)
-            for _ in range(3):
-                Xw = X_pe * np.sqrt(w_irls)[:, None]
-                yw = t_par * np.sqrt(w_irls)
-                beta_pe, *_ = np.linalg.lstsq(Xw, yw, rcond=None)
-                res_pe = t_par - X_pe @ beta_pe
-                s_pe = max(1.4826 * float(np.median(np.abs(res_pe - np.median(res_pe)))), 1e-4)
-                u_pe = res_pe / (4.685 * s_pe)
-                w_irls = np.where(np.abs(u_pe) < 1.0, (1.0 - u_pe ** 2) ** 2, 1e-4)
-            t_par_hat = X_pe @ beta_pe
-            dc_pe = float(np.median(t_par_hat))
-            r_par = t_par - t_par_hat
-            fd_rad = float(kwargs.get("fd_radius", 50.0))
-            fd_perp_rot = np.r_[0.0, np.sqrt((np.diff(T_perp, axis=0) ** 2).sum(axis=1) + (fd_rad ** 2) * (np.diff(rv, axis=0) ** 2).sum(axis=1))]
-            tau_perp = max(0.20, 3.0 * float(np.median(fd_perp_rot[1:])))
-            w_b0 = np.exp(-0.5 * (np.maximum(0.0, fd_perp_rot - tau_perp) / tau_perp) ** 2)
-            delta_pe_b0 = dc_pe + w_b0 * r_par
-            shift_mm_all = shift_mm_all + delta_pe_b0
-            d_com_clean = T_perp + np.outer(t_par - delta_pe_b0, p_unit)
-            R_clean = _Rot.from_rotvec(rv).as_matrix()
-            composed_rigid = []
-            for i in range(n_frames):
-                H_i = np.eye(4, dtype=np.float64)
-                H_i[:3, :3] = R_clean[i]
-                H_i[:3, 3] = d_com_clean[i] - (R_clean[i] - np.eye(3)) @ com
-                composed_rigid.append(H_i)
-            fd = jenkinson_framewise_displacement(composed_rigid, fd_rad, com)
         pe_affine = {"axis": [float(x) for x in p_unit], "coefficients_by_group": coef,
-                     "a": a_all, "jacobian": jac_all, "shift_mm": shift_mm_all}
+                     "a": a_all, "jacobian": jac_all, "shift_mm": a_all[:, 0].copy()}
     if nuisance_covariates is not None:
         if nuisance_axis is None:
             raise ValueError("nuisance_covariates needs nuisance_axis (physical unit vector the nuisance translation acts along)")
@@ -789,6 +808,7 @@ def motion_correct_grouped(
     out["masked_metric"] = mask_pass
     out["bias"] = [r.get("bias") for r in results]
     out["encoding_pose_bias_mm_rad"] = [r.get("encoding_pose_bias_mm_rad") for r in results]
+    out["cross_group_offset"] = cross_group_offset
     # convergence of the per-frame registrations (every stage of every frame ended on the pose-step test) and of each cross-shell
     # registration (the winning path's stages); False entries are frames/steps that were CAPPED, never silently final.
     frame_converged = np.ones(int(sum(len(i) for i in idx)), dtype=bool)
