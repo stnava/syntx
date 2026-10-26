@@ -171,9 +171,11 @@ def simulate_head_motion(
     nod_mm: float = 0.0,
     nod_deg: float = 0.0,
     nod_period_frames: float = 7.0,
+    alt_mm: float = 0.0,
 ) -> np.ndarray:
     """(T, 6) head trajectory ``[d (mm), rotvec (rad)]``: linear drift, step jumps ``(fraction_of_series, mm, deg)``
-    in a random direction, small random jitter, and optional sagittal nodding (z translation + pitch about x)."""
+    in a random direction, small random jitter, optional sagittal nodding (z translation + pitch about x) and an optional
+    REAL frame-to-frame alternation ``alt_mm * (-1)^t`` along a random direction (period-2 head jitter)."""
     rng = np.random.default_rng(seed)
     t = np.linspace(0.0, 1.0, n_frames)
     u = rng.normal(size=3)
@@ -197,6 +199,9 @@ def simulate_head_motion(
         ph = 2.0 * np.pi * np.arange(n_frames) / float(nod_period_frames)
         pose[:, 2] += nod_mm * np.sin(ph)
         pose[:, 3] += np.radians(nod_deg) * np.sin(ph)
+    if alt_mm:
+        w = np.random.default_rng(seed + 77).normal(size=3)
+        pose[:, :3] += float(alt_mm) * ((-1.0) ** np.arange(n_frames))[:, None] * (w / np.linalg.norm(w))[None, :]
     return pose
 
 
@@ -314,6 +319,45 @@ def simulate_dwi_series(n_dirs: int = 24, *, seed: int = 0, b: float = 1000.0, b
     C = np.array([[eddy_mm_per_unit, -0.6 * eddy_mm_per_unit, 0.3 * eddy_mm_per_unit],
                   [0.002 * eddy_mm_per_unit, 0, 0], [0, 0.002 * eddy_mm_per_unit, 0], [0, 0, -0.002 * eddy_mm_per_unit]])
     eddy = (bvecs * (bvals[:, None] / max(b, 1.0))) @ C.T
+    frames = [_render(ph, _dwi_signal(ph, bvals[t], bvecs[t]), pose[t], eddy[t], p, noise, rng) for t in range(T)]
+    return SimulatedSeries(image=_stack(ph, frames), head_pose=pose, phantom=ph, pe_axis=p, eddy=eddy,
+                           extra={"bvals": bvals, "bvecs": bvecs, "C": C})
+
+
+def simulate_multishell_dwi_series(n_dirs_per_shell: int = 12, *, seed: int = 0, shells=(1500.0, 3000.0),
+                                   b0_every: int = 16, noise: float = 0.01, eddy_mm_per_unit: float = 0.0,
+                                   pe_voxel_axis: int = 1, phantom: Optional[HeadPhantom] = None,
+                                   **motion) -> SimulatedSeries:
+    """Multi-shell DWI laid out like the FPA protocol: the shells alternate frame by frame (one direction each) with a b0
+    every ``b0_every`` frames. With ``eddy_mm_per_unit > 0`` each diffusion frame is REALLY displaced along phase encode
+    by an eddy affine linear in the gradient vector scaled by the gradient amplitude, ``a = C g sqrt(b / b_max)``."""
+    ph = phantom or make_head_phantom(seed=seed)
+    rng = np.random.default_rng(seed + 505)
+    shells = tuple(float(b) for b in shells)
+    dirs = {b: rng.normal(size=(n_dirs_per_shell, 3)) for b in shells}
+    for b in shells:
+        dirs[b] /= np.linalg.norm(dirs[b], axis=1, keepdims=True)
+    bvals, bvecs, used = [], [], {b: 0 for b in shells}
+    i = 0
+    while any(used[b] < n_dirs_per_shell for b in shells):
+        if len(bvals) % b0_every == 0:
+            bvals.append(0.0)
+            bvecs.append(np.zeros(3))
+            continue
+        b = shells[i % len(shells)]
+        i += 1
+        if used[b] >= n_dirs_per_shell:
+            continue
+        bvals.append(b)
+        bvecs.append(dirs[b][used[b]])
+        used[b] += 1
+    bvals, bvecs = np.asarray(bvals), np.asarray(bvecs)
+    T = len(bvals)
+    pose = simulate_head_motion(T, seed=seed, **motion)
+    p = _pe_vector(ph, pe_voxel_axis)
+    C = np.array([[eddy_mm_per_unit, -0.6 * eddy_mm_per_unit, 0.3 * eddy_mm_per_unit],
+                  [0.002 * eddy_mm_per_unit, 0, 0], [0, 0.002 * eddy_mm_per_unit, 0], [0, 0, -0.002 * eddy_mm_per_unit]])
+    eddy = (bvecs * np.sqrt(bvals / max(shells))[:, None]) @ C.T
     frames = [_render(ph, _dwi_signal(ph, bvals[t], bvecs[t]), pose[t], eddy[t], p, noise, rng) for t in range(T)]
     return SimulatedSeries(image=_stack(ph, frames), head_pose=pose, phantom=ph, pe_axis=p, eddy=eddy,
                            extra={"bvals": bvals, "bvecs": bvecs, "C": C})
