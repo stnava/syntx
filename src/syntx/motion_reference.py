@@ -349,6 +349,27 @@ def _group_offsets(H, groups, idx, com):
     return Y, {g: np.median(off[idx[g]], axis=0) for g in range(1, n_groups)}
 
 
+def _cross_link(fixed, moving, link, *, verbose, device, num_bins, convergence_tol_vox, max_extend_factor):
+    """Link of an adjacent pair of group means: ``"registration"`` (robust rigid registration of the corrected means) or
+    ``"identity"`` (groups interleaved in time: their raw means share the series' mean head position, so a cross-contrast
+    registration would only add its own contrast bias; the remaining offset is the cross-group debias' job)."""
+    import os
+
+    if link == "registration":
+        from .robust_affine import robust_affine
+
+        return robust_affine(fixed=fixed, moving=moving, dof="rigid", mode="auto", verbose=verbose, device=device,
+                             num_bins=num_bins, convergence_tol_vox=convergence_tol_vox, max_extend_factor=max_extend_factor)
+    if link != "identity":
+        raise ValueError(f"cross_link entries must be 'registration' or 'identity', got {link!r}")
+    import tempfile
+
+    tx = ants.create_ants_transform(transform_type="AffineTransform", precision="float", dimension=3)
+    path = os.path.join(tempfile.mkdtemp(prefix="syntx_identity_link_"), "identity.mat")
+    ants.write_transform(tx, path)
+    return {"fwdtransforms": [path], "convergence": [], "link": "identity"}
+
+
 def _pose_matrix(y, com):
     """4x4 rigid matrix of the pose ``y = [d_com, rotvec]`` about ``com``."""
     from scipy.spatial.transform import Rotation as _Rot
@@ -476,6 +497,7 @@ def motion_correct_grouped(
     cross_group_debias: bool = False,
     debias_pe_pseudomotion: bool = False,
     slice_axis=None,
+    cross_link="registration",
     **kwargs,
 ) -> GroupedMotionCorrectionResult:
     """Motion-correct a contrast-heterogeneous series (e.g. DWI: b0 and one group per b-shell) with same-contrast per-frame
@@ -565,6 +587,10 @@ def motion_correct_grouped(
         respiratory B0 pseudomotion. The transforms and the corrected series are unchanged; ``fd_before_pe_debias`` keeps
         the previous FD. Independent real jitter between volumes also alternates and is shrunk (audit: nodding jitter
         FD 0.94 -> 0.15 mm), so FD-based censoring after it under-counts real motion.
+    cross_link : str or sequence of str, default 'registration'
+        How each adjacent pair of group means is linked (one entry per pair, or one for all): ``'registration'`` (robust rigid
+        registration of the corrected means) or ``'identity'`` (groups interleaved in time share the series' mean head
+        position; pair it with ``cross_group_debias`` for the remaining contrast offset).
     slice_axis : int or str, optional
         Acquired slice axis for the ``debias_pe_pseudomotion`` frame (voxel index or BIDS ``i/j/k``); default: measured
         from the series with the group levels removed (``syntx.acquisition_axes.infer_slice_axis``); undecidable raises.
@@ -682,12 +708,15 @@ def motion_correct_grouped(
         reference_modes.append(mode_g)
         results.append(res_g)
 
-    # Corrected group means, then one careful registration per adjacent pair of contrasts.
+    # Corrected group means, then one link per adjacent pair of contrasts (registration, or identity for interleaved groups).
+    links = [cross_link] * (n_groups - 1) if isinstance(cross_link, str) else list(cross_link)
+    if len(links) != n_groups - 1:
+        raise ValueError(f"cross_link has {len(links)} entries for {n_groups - 1} adjacent group pairs")
     cmeans = [_mean_image([ants.slice_image(results[g].motion_corrected, axis=3, idx=i) for i in range(len(idx[g]))])
               for g in range(n_groups)]
-    cross = [robust_affine(fixed=cmeans[g - 1], moving=cmeans[g], dof="rigid", mode="auto", verbose=verbose,
-                           device=kwargs.get("device"), num_bins=cross_num_bins,
-                           convergence_tol_vox=kwargs.get("convergence_tol_vox", 0.05), max_extend_factor=kwargs.get("max_extend_factor", 4)) for g in range(1, n_groups)]
+    cross = [_cross_link(cmeans[g - 1], cmeans[g], links[g - 1], verbose=verbose, device=kwargs.get("device"),
+                         num_bins=cross_num_bins, convergence_tol_vox=kwargs.get("convergence_tol_vox", 0.05),
+                         max_extend_factor=kwargs.get("max_extend_factor", 4)) for g in range(1, n_groups)]
 
     # Second pass on the direction-dependent groups with the metric restricted to the caller's mask (anchor space ->
     # each group's mean space through the inverse cross chain); the cross registrations are then recomputed.
@@ -708,9 +737,9 @@ def motion_correct_grouped(
         mask_pass = True
         cmeans = [_mean_image([ants.slice_image(results[g].motion_corrected, axis=3, idx=i) for i in range(len(idx[g]))])
                   for g in range(n_groups)]
-        cross = [robust_affine(fixed=cmeans[g - 1], moving=cmeans[g], dof="rigid", mode="auto", verbose=verbose,
-                               device=kwargs.get("device"), num_bins=cross_num_bins,
-                           convergence_tol_vox=kwargs.get("convergence_tol_vox", 0.05), max_extend_factor=kwargs.get("max_extend_factor", 4)) for g in range(1, n_groups)]
+        cross = [_cross_link(cmeans[g - 1], cmeans[g], links[g - 1], verbose=verbose, device=kwargs.get("device"),
+                             num_bins=cross_num_bins, convergence_tol_vox=kwargs.get("convergence_tol_vox", 0.05),
+                             max_extend_factor=kwargs.get("max_extend_factor", 4)) for g in range(1, n_groups)]
 
     chains: list = [None] * n_frames
     for g in range(n_groups):
@@ -1048,6 +1077,7 @@ def motion_correct_grouped(
                 frame_converged[t] = bool(conv["frame_converged"][local_i])
     out["frame_converged"] = frame_converged
     out["cross_converged"] = [bool(all(rec["converged"] for rec in c.get("convergence", []) if rec.get("path") == c.get("init_candidate") and rec.get("level", 1) == 1)) for c in cross]
+    out["cross_link"] = list(links)
     out["fwdtransforms"] = chains
     out["group_results"] = results
     out["group_indices"] = idx
