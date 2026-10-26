@@ -611,9 +611,9 @@ def syn_only_reference_to_anatomy_rigid(
 
     moving = _apply_optional_mask(load_ants_image(ref_in), reference_mask)
     fixed = load_ants_image(anat_in)
-    assert_comparable_foreground_extent(fixed, moving, fixed_name="anatomy_rigid", moving_name="reference")
-
+    # arguments before data: an invalid restriction is reported as such, before the images are inspected
     restrict_tuple = _resolve_restrict_transformation(restrict_transformation, moving)
+    assert_comparable_foreground_extent(fixed, moving, fixed_name="anatomy_rigid", moving_name="reference")
 
     outprefix = _mk_outprefix(output_directory, "syn_dewarp_")
     fwd: list[str] = []

@@ -85,6 +85,8 @@ def background_floor(arr: np.ndarray, z: float = 4.0, bins: int = 200) -> dict:
       zero-filled image; or such blocks and no noise population among the positives; or scattered zeros with no tiny
       positive population): there is no noise to measure; the floor is 0 (every
       non-zero voxel is signal), with a ``UserWarning``.
+    * ``"constant"`` (no spread in the background sample: noise-free synthetic data): floor = that level, every voxel
+      above it is signal.
     * ``"no_background"`` (the object fills the field of view: the "noise" sample is more than 3x noisier than the
       image's own noise from neighbour differences, or its floor reaches the 98th percentile): nothing to exclude, floor 0.
     """
@@ -112,10 +114,14 @@ def background_floor(arr: np.ndarray, z: float = 4.0, bins: int = 200) -> dict:
     if pos.size < 2 * MIN_REGION_VOXELS_TINY:
         raise ValueError(f"{pos.size} positive voxels: no image to sample")
     p98 = float(np.percentile(pos, 98.0))
-    low = pos[pos <= np.percentile(pos, 50.0)]
-    h, e = np.histogram(low, bins=int(bins))
-    i = int(h.argmax())
-    mode = 0.5 * float(e[i] + e[i + 1])
+    low = pos[pos <= np.percentile(pos, 50.0)].astype(np.float64)
+    lo_v, hi_v = float(low.min()), float(low.max())
+    if hi_v - lo_v <= 1e-6 * max(abs(hi_v), 1e-30):
+        mode = float(np.median(low))                  # no spread to histogram (float32 cannot split it into bins)
+    else:
+        h, e = np.histogram(low, bins=int(bins), range=(lo_v, hi_v))
+        i = int(h.argmax())
+        mode = 0.5 * float(e[i] + e[i + 1])
     bg = pos[pos <= 3.0 * mode]
     rec = {"zero_fraction": float(zmask.mean()), "padding_zero_fraction": n_padding / a.size, "mode": mode, "z": float(z)}
     if n_padding >= 0.2 * a.size:
@@ -151,7 +157,11 @@ def background_floor(arr: np.ndarray, z: float = 4.0, bins: int = 200) -> dict:
         sd = 1.2533 * float(np.mean(np.abs(bg - mu)))
         rec["sd_estimator"] = "mean_abs_dev"
     if not sd > 0.0:
-        raise ValueError(f"background spread is zero (median {mu:.4g}): constant background; pass sample_mask")
+        # a CONSTANT background level (noise-free synthetic data): every voxel strictly above it is signal; an image that
+        # is that level everywhere has nothing separable (floor 0)
+        if float(np.max(pos)) > mu:
+            return {**rec, "background": "constant", "mu": mu, "sd": 0.0, "threshold": mu, "background_voxels": int(bg.size)}
+        return {**rec, "background": "no_background", "mu": None, "sd": 0.0, "threshold": 0.0, "background_voxels": 0}
     # the low half of the histogram is background only if the image HAS one: an object filling the field of view puts
     # dark tissue there. Check its spread against the image's own noise (neighbour differences, robust to edges): a
     # "background" more than 3x noisier than the image is tissue, and there is no background to exclude.
@@ -211,6 +221,10 @@ def gradient_magnitude_mm(img: ants.ANTsImage, sigma_mm: float) -> np.ndarray:
     from scipy.ndimage import gaussian_filter
 
     a = img.numpy().astype(np.float32)
+    if min(a.shape) >= 4:
+        # ITK GradientMagnitudeRecursiveGaussian (derivative of Gaussian, sigma in mm) where it is safe: the numpy path
+        # below changed the weights enough to bias the eddy PE-scale recovery (0.032 -> 0.021 for 0.03)
+        return ants.iMath(img, "Grad", float(sigma_mm)).numpy().astype(np.float32)
     sp = [float(x) for x in img.spacing]
     sm = gaussian_filter(a, sigma=[float(sigma_mm) / s_ if n > 1 else 0.0 for s_, n in zip(sp, a.shape)], mode="nearest")
     g2 = np.zeros_like(sm)

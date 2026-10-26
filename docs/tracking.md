@@ -1,12 +1,39 @@
 # Tracking Summary
-current phase: v6.21.0 release (grouped FD without per-group offsets for interleaved groups; short-series and lone-frame limits documented)
+current phase: v6.22.0 release (centralized metric sampling: syntx.sampling menu; dewarp foreground parity)
 next WP: Multi-modal deformable registration benchmarks and GPU memory optimization
 blockers: none
-active work: none (v6.21.0 released 2026-10-25)
+active work: none (v6.22.0 released 2026-10-25)
 device: Apple Silicon MPS / CPU (macOS arm64)
 last updated: 2026-10-25
 
 ---
+
+## R7 (Centralized Metric Sampling `syntx.sampling`, Merged Pilot Ideas, Independent Audits, v6.22.0, 2026-10-25)
+- New `src/syntx/sampling.py`: ONE implementation of metric sample-point selection, designed as a menu
+  (`SAMPLING_STRATEGIES`: `gradient_floor` default, `gradient`, `uniform`; `get_sampling_strategy`; unknown names raise).
+  Candidate region = above the reference's own noise floor (`background_floor`: noise / clipped_noise / zero-filled
+  (masked) / no_background, z = 4; zero padding told apart from clipping and from masking) and below the saturated top of
+  the foreground. One physical point pool shared by every pyramid scale; device-resident float32 draws (Gumbel top-k);
+  at most `MAX_EVAL_POINTS` = 20 000 points per metric evaluation. Design and evidence: `docs/METRIC_SAMPLING.md`.
+- Wired into the rigid motion pass, the group-bias pass, `robust_affine` (`fixed_fg` domain, weighted draws, candidate
+  scoring foreground) and the JAX MI (`regular_stride`, seeded `uniform_cube_points`; `syn_jax.fit(sample_seed=42)`).
+  `sample_fraction` = fraction of the region each evaluation sees (was the pool size).
+- Ground-truth motion phantoms (5 seeds, rotation error deg, former sampler -> default): ASL 0.181 -> 0.113, slow flow
+  no eddy 0.280 +- 0.138 (max 0.53) -> 0.166 +- 0.022, slow flow eddy 0.183 -> 0.135, DWI 0.672 -> 0.392, BOLD 0.192 ->
+  0.138; eddy PE scale 0.0322 for 0.03. Real DWI (FPA sub-BLAST079, MPS): 78 s / mean FD 0.125 mm (former 65 s / 0.163).
+  The former ~0.18 deg "phantom rotation floor" and much of the DWI rotation bias were sampling (MOTION_SYSTEMATIC_NOISE.md).
+- Merged `pilot/motion-sampling-and-epi-debias`: grouped DWI PE / non-linear-eddy debias of the reported trajectory and
+  the BOLD slice / pitch "Nyquist" extension, both OPT-IN (`motion_correct_grouped(debias_pe_pseudomotion=True)`,
+  `motion_correction(debias_sagittal_nyquist=True)`): an independent audit showed they remove real jitter from the
+  reported FD. The pilot's lever-arm `pe_scale` conditioning and its `> 0.01` / size-dependent pool were not adopted.
+- Two independent audits and two re-reviews; findings fixed (cap boundary, thin-slab ITK abort, integer data, padding vs
+  clipping vs masking, provenance, robust_affine fallbacks). Open, pre-existing: `_eval_low_res_mi` scores raw
+  intensities on a (0, 1) histogram range (changing it broke multi-start selection); known limits in METRIC_SAMPLING.md.
+- Dewarp: `_resolve_restrict_transformation` now runs before `assert_comparable_foreground_extent` (foreground-parity
+  guard from `bf21dbf`); pyramid-guard allowlist updated for `motion_batched.py` / `dewarp.py`.
+- Tests: full suite 2636 passed, 43 skipped, 0 failed (MPS, two processes with no other GPU job; a run concurrent with
+  an external MPS cohort job produced non-finite / uninitialised outputs in unrelated transform tests that passed on
+  rerun); `antsxqc.lint` 0 findings.
 
 ## R6 (`syntx.dewarp` Foreground-Extent Parity Guard, Reference Masks & Regularized Cross-Modal `SyNOnly`, 2026-10-25)
 - Deduplicated `assert_comparable_foreground_extent` into `src/syntx/dewarp.py` (exported in `syntx` and `syntx.dewarp`) and added `reference_mask` and `secondary_reference_mask` parameters to `rigid_align_anatomy_to_reference`, `syn_only_reference_to_anatomy_rigid`, and `dewarp_to_anatomical`.

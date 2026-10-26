@@ -346,3 +346,17 @@ def test_eval_points_never_exceed_the_cap_in_a_sparse_run():
     ps.pool()
     assert ps.eval_points(1.0, ps.n_pool) <= 1000                    # a stage asking for its whole pool
     assert ps.eval_points(0.2, ps.n_pool, minimum=5000) <= 1000      # a minimum above the cap
+
+
+def test_constant_background_and_tiny_range_do_not_raise():
+    """Noise-free synthetic data: a constant background level is the floor; a low half with no float32 spread does not
+    break the histogram (antsxdwi pipeline phantoms)."""
+    a = np.full((30, 30, 30), 500.0, dtype=np.float32)
+    a[10:20, 10:20, 10:20] = 1000.0
+    ps = PointSampler(ants.from_numpy(a))
+    b = ps.provenance()["background"]
+    assert 500.0 <= b["threshold"] < 1000.0                          # floor at or above the constant level
+    assert ps.region.sum() == 1000                                   # exactly the object
+    tiny = (1.0 + 1e-9 * np.random.default_rng(0).random((30, 30, 30))).astype(np.float32)
+    tiny[10:20, 10:20, 10:20] = 50.0
+    PointSampler(ants.from_numpy(tiny))                              # must not raise
