@@ -30,7 +30,7 @@ import math
 import os
 import tempfile
 import warnings
-from typing import List, NamedTuple, Optional, Tuple
+from typing import Any, List, NamedTuple, Optional, Tuple
 
 import ants
 import numpy as np
@@ -430,6 +430,8 @@ def separate_bold_pe_pseudomotion(
     fd_radius: float = 50.0,
     window_size: Optional[int] = None,
     sagittal_nyquist: bool = False,
+    slice_axis: Any = None,
+    sidecar: Any = None,
 ) -> Tuple[dict, Optional[dict]]:
     """Separate respiratory B0 phase-encode pseudomotion from the REPORTED rigid head motion of an EPI series.
 
@@ -442,9 +444,9 @@ def separate_bold_pe_pseudomotion(
     slice translation and pitch (thick-slice through-plane B0 gradients), gated on a negative lag-1 step autocorrelation
     (< -0.25). Caution: independent real jitter between frames also has a step autocorrelation near -0.5, so this can
     remove real motion from the reported trajectory (independent audit: real nodding jitter FD 0.94 -> 0.15 mm in the
-    grouped variant); use it only where the alternation is known to be pseudomotion. The slice axis is taken as voxel
-    axis 2 (orthogonalised against PE): after reorientation of a sagittal / coronal acquisition that is not the
-    acquired slice axis.
+    grouped variant); use it only where the alternation is known to be pseudomotion. The slice axis is ``slice_axis``
+    (BIDS i/j/k or voxel index), else the sidecar's ``SliceEncodingDirection`` / ``SliceTiming``, else measured from the
+    series (``syntx.acquisition_axes.infer_slice_axis``: voxel thickness, slice interleave); undecidable raises.
 
     The resampled series and the transforms keep the full registration pose (the B0 shift is a real displacement of
     the image), so after this step ``motion_parameters`` / ``fd`` differ from ``fwdtransforms`` by ``pe_b0_shift_mm``
@@ -483,33 +485,13 @@ def separate_bold_pe_pseudomotion(
     rv = Rot.from_matrix(R_all).as_rotvec()
     rv_mm = float(fd_radius) * rv
 
-    D = np.asarray(getattr(bold_image, "direction", np.eye(3)), dtype=np.float64)[:3, :3].copy()
-    for col in range(3):
-        nrm = float(np.linalg.norm(D[:, col]))
-        if nrm > 1e-8:
-            D[:, col] /= nrm
-
     if pe_axis is None:
         raise ValueError("separate_bold_pe_pseudomotion needs pe_axis (physical unit vector or voxel axis index 0/1/2)")
-    arr_pe = np.asarray(pe_axis, dtype=np.float64).reshape(-1)
-    if arr_pe.size == 1 and float(arr_pe[0]) in (0.0, 1.0, 2.0):
-        j_pe = int(arr_pe[0])
-        p_pe = D[:, j_pe].copy()
-    elif arr_pe.size == 3 and float(np.linalg.norm(arr_pe)) > 1e-8:
-        p_pe = arr_pe / float(np.linalg.norm(arr_pe))
-        j_pe = int(np.argmax(np.abs(D.T @ p_pe)))
-    else:
-        raise ValueError(f"pe_axis must be a voxel axis index (0, 1, 2) or a non-zero 3-vector, got {pe_axis!r}")
+    from .acquisition_axes import encoding_frame, infer_slice_axis
 
-    rem_axes = [a for a in range(3) if a != j_pe]
-    k_sl = 2 if 2 in rem_axes else rem_axes[-1]
-    p_sl_raw = D[:, k_sl] - float(np.dot(D[:, k_sl], p_pe)) * p_pe
-    if float(np.linalg.norm(p_sl_raw)) < 1e-6:
-        k_sl = rem_axes[0]
-        p_sl_raw = D[:, k_sl] - float(np.dot(D[:, k_sl], p_pe)) * p_pe
-    p_sl = p_sl_raw / max(float(np.linalg.norm(p_sl_raw)), 1e-12)
-    p_ro = np.cross(p_pe, p_sl)
-    p_ro = p_ro / max(float(np.linalg.norm(p_ro)), 1e-12)
+    # slice axis: stated (slice_axis / sidecar) or measured from the series (thickness, interleave); never assumed
+    sl_inf = infer_slice_axis(bold_image, slice_axis=slice_axis, sidecar=sidecar)
+    p_pe, p_sl, p_ro = encoding_frame(getattr(bold_image, "direction", np.eye(3)), pe_axis, sl_inf.voxel_axis)
 
     t_ro = t_all @ p_ro
     t_pe = t_all @ p_pe
@@ -666,6 +648,7 @@ def separate_bold_pe_pseudomotion(
         "pe_vector_lps": [float(x) for x in p_pe],
         "slice_vector_lps": [float(x) for x in p_sl],
         "readout_vector_lps": [float(x) for x in p_ro],
+        "slice_axis": {"voxel_axis": int(sl_inf.voxel_axis), "source": sl_inf.source},
         "sigma_ref_mm": sig_ref,
         "sigma_epi_mm": [float(s) for s in sigs],
         "lag1_step_autocorr": [float(a) for a in lag1_autocorrs],
@@ -910,6 +893,7 @@ def batched_rigid_register_pass(
     sample_fraction: float = 0.15,
     sampling: str = DEFAULT_SAMPLING,
     resample_points: bool = False,
+    sample_seed: int = 42,
     convergence_tol_vox: float = 0.05,
     max_extend_factor: int = 4,
     encoding_covariates: Optional[np.ndarray] = None,
@@ -974,7 +958,7 @@ def batched_rigid_register_pass(
             verbose=verbose, outprefix=outprefix,
             seed_mode=seed_mode, schedule_mode=schedule_mode, metric=metric, huber_delta=huber_delta, schedule=schedule,
             pe_affine_covariates=cov_all, pe_axis=pe_axis, sample_mask=sample_mask, bias_covariates=bias_covariates,
-            sample_fraction=sample_fraction, sampling=sampling, resample_points=resample_points,
+            sample_fraction=sample_fraction, sampling=sampling, resample_points=resample_points, sample_seed=sample_seed,
             convergence_tol_vox=convergence_tol_vox, max_extend_factor=max_extend_factor,
             encoding_covariates=enc_all, window_size=window_size, window_stride=window_stride,
             surround_weight=surround_weight, surround_delta_mm=surround_delta_mm,
@@ -1003,7 +987,7 @@ def batched_rigid_register_pass(
             pe_affine_covariates=None if cov_all is None else cov_all[start:start + chunk_size], pe_axis=pe_axis,
             sample_mask=sample_mask,
             bias_covariates=None if bias_covariates is None else np.asarray(bias_covariates)[start:start + chunk_size],
-            sample_fraction=sample_fraction, sampling=sampling, resample_points=resample_points,
+            sample_fraction=sample_fraction, sampling=sampling, resample_points=resample_points, sample_seed=sample_seed,
             convergence_tol_vox=convergence_tol_vox, max_extend_factor=max_extend_factor,
             encoding_covariates=None if enc_all is None else enc_all[start:start + chunk_size],
             window_size=window_size, window_stride=window_stride,
@@ -1066,6 +1050,7 @@ def _batched_rigid_register_pass_core(
     sample_fraction: float = 0.15,
     sampling: str = DEFAULT_SAMPLING,
     resample_points: bool = False,
+    sample_seed: int = 42,
     convergence_tol_vox: float = 0.05,
     max_extend_factor: int = 4,
     encoding_covariates: Optional[np.ndarray] = None,
@@ -1094,6 +1079,7 @@ def _batched_rigid_register_pass_core(
     ``"gradient_floor"``: candidates above the reference's noise floor and below its saturated top, drawn proportional
     to ``0.1 + |grad n| / max``; ``"uniform"`` / ``"gradient"`` are the other entries). ``resample_points``: re-draw each stage's
     subset at every convergence checkpoint (default False: one subset per stage).
+    ``sample_seed``: seed of the sample-point draws (default 42; changes only which points are drawn).
     ``sample_fraction``: the fraction of the strategy's candidate region (within ``sample_mask``) that EACH
     full-resolution metric evaluation sees. The stages draw ``_STAGE_SAMPLING`` (20 %) of a
     pool, so the pool holds ``sample_fraction / 0.2`` of the region (0.10 -> 50 %), at most ``MAX_EVAL_POINTS`` (20 000)
@@ -1364,7 +1350,7 @@ def _batched_rigid_register_pass_core(
     _ref_img = ants.from_numpy(np.ascontiguousarray(fixed_t.detach().cpu().numpy()), origin=reference_img.origin,
                                spacing=reference_img.spacing, direction=reference_img.direction)
     sampler = PointSampler(_ref_img, strategy=sampling, sample_mask=sample_mask, sample_fraction=sample_fraction,
-                           stage_sampling=_STAGE_SAMPLING, min_points=2000, seed=42, device=dev)
+                           stage_sampling=_STAGE_SAMPLING, min_points=2000, seed=int(sample_seed), device=dev)
     rng = sampler.generator
     _pool = sampler.pool()
     n_sample = sampler.n_pool
@@ -1887,7 +1873,7 @@ def _batched_rigid_register_pass_core(
     if pe_info is None:
         pe_info = {}
     pe_info["convergence"] = convergence_log
-    pe_info["sampling"] = {**sampler.provenance(), "resample_points": bool(resample_points),
+    pe_info["sampling"] = {**sampler.provenance(), "resample_points": bool(resample_points), "sample_seed": int(sample_seed),
                            "n_sample_full_resolution": int(n_sample)}
     fwd_transforms, inv_transforms = [], []
     for b in range(B):

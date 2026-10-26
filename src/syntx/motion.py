@@ -571,6 +571,7 @@ def motion_correction(
     window_size: Optional[int] = None,
     debias_pe_pseudomotion: bool = False,
     debias_sagittal_nyquist: bool = False,
+    slice_axis=None,
     **kwargs: Any,
 ) -> MotionCorrectionResult:
     """
@@ -662,6 +663,9 @@ def motion_correction(
     debias_sagittal_nyquist : bool, default False
         Opt-in extension of ``debias_pe_pseudomotion``: also shrink a TR-to-TR alternation of slice translation and pitch
         (see ``separate_bold_pe_pseudomotion(sagittal_nyquist=True)``; independent real jitter alternates too).
+    slice_axis : int or str, optional
+        Acquired slice axis for the PE debias frame (voxel index or BIDS ``i/j/k``); default: measured from the series
+        (``syntx.acquisition_axes.infer_slice_axis``: voxel thickness, slice interleave), raising when undecidable.
     **kwargs
         'ants': passed to ``ants.registration``; 'pytorch': passed to ``syntx.robust_affine``;
         'pytorch_batched': ``num_bins`` (default 32), ``seed_mode``, ``schedule_mode``, ``resolution_cap_mm``,
@@ -774,7 +778,7 @@ def motion_correction(
                          "Mattes mutual information)")
     _batched_allowed_kwargs = {"num_bins", "seed_mode", "schedule_mode", "resolution_cap_mm", "metric", "huber_delta",
                                "pe_affine_covariates", "pe_axis", "sample_mask", "bias_covariates", "sample_fraction",
-                               "sampling", "resample_points",
+                               "sampling", "resample_points", "sample_seed",
                                "convergence_tol_vox", "max_extend_factor", "encoding_covariates", "window_size",
                                "window_stride", "surround_weight", "surround_delta_mm"}
     if backend == "pytorch_batched" and set(kwargs) - _batched_allowed_kwargs:
@@ -972,7 +976,7 @@ def motion_correction(
                         bias_covariates=None if kwargs.get("bias_covariates") is None else np.asarray(kwargs["bias_covariates"])[list(batch_indices)],
                         sample_fraction=kwargs.get("sample_fraction", 0.15),
                         sampling=kwargs.get("sampling", DEFAULT_SAMPLING),
-                        resample_points=kwargs.get("resample_points", False),
+                        resample_points=kwargs.get("resample_points", False), sample_seed=int(kwargs.get("sample_seed", 42)),
                         convergence_tol_vox=kwargs.get("convergence_tol_vox", 0.05),
                         max_extend_factor=kwargs.get("max_extend_factor", 4),
                         encoding_covariates=None if enc_all is None else np.asarray(enc_all)[list(batch_indices)],
@@ -1244,6 +1248,7 @@ def motion_correction(
             fd_radius=fd_radius,
             window_size=kwargs.get("window_size"),
             sagittal_nyquist=bool(debias_sagittal_nyquist),
+            slice_axis=slice_axis,
         )
     return result
 

@@ -475,6 +475,7 @@ def motion_correct_grouped(
     window_size: Optional[int] = None,
     cross_group_debias: bool = False,
     debias_pe_pseudomotion: bool = False,
+    slice_axis=None,
     **kwargs,
 ) -> GroupedMotionCorrectionResult:
     """Motion-correct a contrast-heterogeneous series (e.g. DWI: b0 and one group per b-shell) with same-contrast per-frame
@@ -564,6 +565,9 @@ def motion_correct_grouped(
         respiratory B0 pseudomotion. The transforms and the corrected series are unchanged; ``fd_before_pe_debias`` keeps
         the previous FD. Independent real jitter between volumes also alternates and is shrunk (audit: nodding jitter
         FD 0.94 -> 0.15 mm), so FD-based censoring after it under-counts real motion.
+    slice_axis : int or str, optional
+        Acquired slice axis for the ``debias_pe_pseudomotion`` frame (voxel index or BIDS ``i/j/k``); default: measured
+        from the series with the group levels removed (``syntx.acquisition_axes.infer_slice_axis``); undecidable raises.
     cross_group_debias : bool, default False
         Opt-in: remove a contrast-driven bias of the cross-group (group mean -> group mean) registrations: when the groups
         are interleaved in time, the composed rigid trajectory is projected on the group indicators with the surround
@@ -845,27 +849,11 @@ def motion_correct_grouped(
         from .motion_batched import build_encoding_covariates
 
         fd_rad = float(kwargs.get("fd_radius", 50.0))
-        D_mat = np.asarray(getattr(means[0], "direction", np.eye(3)), dtype=np.float64)[:3, :3].copy()
-        for col in range(3):
-            nrm = float(np.linalg.norm(D_mat[:, col]))
-            if nrm > 1e-8:
-                D_mat[:, col] /= nrm
-        arr_pe = np.asarray(pe_axis, dtype=np.float64).reshape(-1)
-        if arr_pe.size == 1 and float(arr_pe[0]) in (0.0, 1.0, 2.0):
-            j_pe = int(arr_pe[0])
-            p_pe = D_mat[:, j_pe].copy()
-        else:
-            p_pe = arr_pe / max(float(np.linalg.norm(arr_pe)), 1e-12)
-            j_pe = int(np.argmax(np.abs(D_mat.T @ p_pe)))
-        rem_axes = [a for a in range(3) if a != j_pe]
-        k_sl = 2 if 2 in rem_axes else rem_axes[-1]
-        p_sl_raw = D_mat[:, k_sl] - float(np.dot(D_mat[:, k_sl], p_pe)) * p_pe
-        if float(np.linalg.norm(p_sl_raw)) < 1e-6:
-            k_sl = rem_axes[0]
-            p_sl_raw = D_mat[:, k_sl] - float(np.dot(D_mat[:, k_sl], p_pe)) * p_pe
-        p_sl = p_sl_raw / max(float(np.linalg.norm(p_sl_raw)), 1e-12)
-        p_ro = np.cross(p_pe, p_sl)
-        p_ro = p_ro / max(float(np.linalg.norm(p_ro)), 1e-12)
+        from .acquisition_axes import encoding_frame, infer_slice_axis
+
+        # slice axis stated or measured from the series (design levels removed); never assumed
+        sl_inf = infer_slice_axis(image, slice_axis=slice_axis, levels=groups)
+        p_pe, p_sl, p_ro = encoding_frame(getattr(means[0], "direction", np.eye(3)), pe_axis, sl_inf.voxel_axis)
 
         R_rig = np.array([H[:3, :3] for H in composed_rigid], dtype=np.float64)
         t_rig = np.array([H[:3, 3] + (H[:3, :3] - np.eye(3)) @ com for H in composed_rigid], dtype=np.float64)
@@ -1003,6 +991,7 @@ def motion_correct_grouped(
             pe_pseudomotion_debias = {
                 "method": "grouped_overlapping_window_wiener_tukey_epi",
                 "pe_vector_lps": [float(x) for x in p_pe],
+                "slice_axis": {"voxel_axis": int(sl_inf.voxel_axis), "source": sl_inf.source},
                 "sigma_ref_mm": sig_ref,
                 "sigma_pe_mm": sig_pe,
                 "wiener_shrinkage_eta": eta_pe,

@@ -107,7 +107,7 @@ def test_bold_respiratory_pe_shift_separated_without_touching_nodding():
     nodding (z translation + pitch) and every rotation are left exactly as registered."""
     sim = simulate_bold_series(48, seed=0, resp_mm=0.4, nod_mm=0.5, nod_deg=0.5)
     res0 = motion_correction(sim.image, preset="bold")
-    res1 = motion_correction(sim.image, preset="bold", pe_axis=sim.pe_axis, debias_pe_pseudomotion=True)
+    res1 = motion_correction(sim.image, preset="bold", pe_axis=sim.pe_axis, debias_pe_pseudomotion=True, slice_axis=2)
     mp0 = np.asarray(res0["motion_parameters"], dtype=float)
     mp1 = np.asarray(res1["motion_parameters"], dtype=float)
     true_pe = sim.head_pose[:, :3] @ sim.pe_axis

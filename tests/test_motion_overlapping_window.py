@@ -268,6 +268,7 @@ class TestOverlappingWindowBOLD:
             pe_axis=(0.0, 1.0, 0.0),
             window_size=6,
             debias_pe_pseudomotion=True,
+            slice_axis=2,
             verbose=False,
         )
         fd_clean = np.asarray(res_bold["fd"], dtype=np.float64)
@@ -295,7 +296,7 @@ class TestOverlappingWindowBOLD:
         res = motion_correction(template4d, preset="bold", pe_axis=(0.0, 1.0, 0.0), window_size=6, verbose=False)
         assert res.get("pe_pseudomotion_debias") is None and res.get("fd_raw") is None
         res_opt = motion_correction(template4d, preset="bold", pe_axis=(0.0, 1.0, 0.0), window_size=6,
-                                    debias_pe_pseudomotion=True, verbose=False)
+                                    debias_pe_pseudomotion=True, slice_axis=2, verbose=False)
         mp = np.asarray(res["motion_parameters"], dtype=np.float64)
         mp_opt = np.asarray(res_opt["motion_parameters"], dtype=np.float64)
         # tz (index 2) and the three rotations are identical; only ty (PE) may differ
@@ -327,7 +328,7 @@ class TestOverlappingWindowBOLD:
         )
         # default: the PE separation only; slice translation and pitch are never shrunk (real jitter alternates too)
         res_def = motion_correction(template4d, preset="bold", pe_axis=(0.0, 1.0, 0.0), window_size=8,
-                                    debias_pe_pseudomotion=True, verbose=False)
+                                    debias_pe_pseudomotion=True, slice_axis=2, verbose=False)
         meta_def = res_def["pe_pseudomotion_debias"]
         assert meta_def is None or meta_def["wiener_shrinkage_eta"][1:] == [0.0, 0.0]
         res_opt = motion_correction(
@@ -336,6 +337,7 @@ class TestOverlappingWindowBOLD:
             pe_axis=(0.0, 1.0, 0.0),
             window_size=8,
             debias_pe_pseudomotion=True,
+            slice_axis=2,
             debias_sagittal_nyquist=True,
             verbose=False,
         )
