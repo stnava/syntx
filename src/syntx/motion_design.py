@@ -2,9 +2,13 @@
 
 An acquisition design says which frames share a contrast (the design LEVELS: ASL control / label, DWI shells, slow-flow
 encoding states; BOLD has one level) and which per-frame columns can carry an acquisition-locked pose bias ``beta``
-(the encoding columns: ASL tag/control +-1, slow-flow state labels; DWI direction terms). Head motion and ``beta`` are
-estimated jointly: ``pose(t) = smooth head motion + D(t) beta + residual`` in overlapping Hann windows with Tukey
-weights (``motion_batched._project_encoding_surround_tukey_np``), with design-specific references.
+(DWI: the l = 2 direction terms and the eddy term per shell). Model: ``pose(t) = smooth head motion + D(t) beta +
+residual``. The ``unified`` engine registers every level to a reference of its own contrast with its own sample points,
+estimates the in-level design columns in the optimizer (overlapping Hann windows, Tukey weights), links the levels, and
+removes a per-level offset ``beta`` estimated from local (surround) differences of the composed trajectory with Tukey
+weights (``motion_reference._group_offsets``): smooth drift is in its nullspace, so it cannot absorb real head motion
+that is not locked to the design. Head motion that IS locked to the design (e.g. a period-2 jitter in an alternating
+design) is indistinguishable from ``beta`` and is removed with it.
 
 Menu (``DESIGNS``; ``make_design(name, ...)`` builds a :class:`Design` from the acquisition metadata):
 
@@ -16,7 +20,8 @@ Menu (``DESIGNS``; ``make_design(name, ...)`` builds a :class:`Design` from the 
 - ``encoding_states``  slow flow: integer encoding-state labels.
 - ``custom``           caller-supplied ``levels`` and ``encoding`` columns.
 
-``engine="dispatch"`` reproduces, for each design, the call each modality makes today (ASL: antsxfunctional
+``engine="unified"`` is the design-driven estimator; ``engine="dispatch"`` reproduces, for each design, the call each
+modality makes today (ASL: antsxfunctional
 ``syntx_motion_correction``; DWI: antsxdwi ``motion_correct``; slow flow: antsxslowflow ``preset="slowflow"``; BOLD:
 ``preset="bold"``), so the menu can replace those call sites without changing results.
 """
@@ -207,14 +212,6 @@ def level_layout(levels: np.ndarray) -> Dict[int, dict]:
     return out
 
 
-def _level_means(image, levels: np.ndarray) -> Dict[int, Any]:
-    import ants
-
-    a = image.numpy()
-    tmpl = ants.slice_image(image, axis=image.dimension - 1, idx=0)
-    return {int(k): ants.new_image_like(tmpl, a[..., levels == k].mean(-1).astype(np.float32)) for k in np.unique(levels)}
-
-
 def _knobs(design: Design) -> dict:
     """Registration settings per design (the modality presets; ``dwi``'s registration knobs without its grouped-only
     keys)."""
@@ -226,133 +223,16 @@ def _knobs(design: Design) -> dict:
     return cfg
 
 
-def _rigid_poses(chains) -> np.ndarray:
-    """(T, 6) ``[t (mm), rotvec (rad)]`` of each frame's composed rigid chain (eddy elements excluded)."""
-    import ants
-    from scipy.spatial.transform import Rotation
-
-    out = []
-    for chain in chains:
-        chain = [chain] if isinstance(chain, str) else list(chain)
-        h = np.eye(4)
-        for f in chain:
-            if str(f).endswith("_eddy.mat"):
-                continue
-            tx = ants.read_transform(str(f))
-            p = np.asarray(tx.parameters, dtype=np.float64)
-            c = np.asarray(tx.fixed_parameters, dtype=np.float64)[:3]
-            A = np.eye(4)
-            A[:3, :3] = p[:9].reshape(3, 3)
-            A[:3, 3] = p[9:12] + c - A[:3, :3] @ c
-            h = A @ h
-        U, _, Vt = np.linalg.svd(h[:3, :3])
-        out.append(np.r_[h[:3, 3], Rotation.from_matrix(U @ Vt).as_rotvec()])
-    return np.asarray(out)
-
-
-def _joint(image, design: Design, *, beta: str = "levels+design", iterations: int = 0, **kwargs) -> dict:
-    """Single joint pass (comparison engine): each frame is registered to the inclusive mean of its own design level
-    (design-specific reference) in ONE batched registration whose sample points come from the mean of all references;
-    interleaved levels share the series' mean head position and their residual offset is estimated in the
-    optimizer as a windowed pose term on the level indicators (``beta``), together with the design's own columns (DWI:
-    the l = 2 direction terms per shell); a blocked level's mean is linked to the anchor's by a rigid registration.
-    DWI: the eddy term along phase encode is tied to the gradient per shell. A one-level design is the plain registration
-    to the series mean (BOLD). ``beta``: ``"levels+design"`` (level indicators and the design's columns), ``"levels"``
-    or ``"none"``. A level indicator needs ``beta_estimable``; a level's design columns need ``FRAMES_PER_BETA_COLUMN``
-    frames per column (columns that cannot be estimated are left out and recorded). ``iterations``: passes rebuilding
-    each level's reference from its corrected frames (stops early when no frame moves by 0.01 mm / 0.01 deg)."""
+def _corrected_level_mean(frames, group_index=None, frame_indices=None):
+    """``reference_predictor`` for the reference iteration: every frame of the level gets the mean of the level's
+    corrected frames (sharper than the first-pass low-motion mean)."""
     import ants
 
-    from .motion import motion_correction
-    from .robust_affine import robust_affine
-    from .transforms import apply_transforms
-
-    levels = np.asarray(design.levels, dtype=int)
-    T = levels.size
-    knobs = _knobs(design)
-    backend = knobs.pop("backend")
-    kw = {**knobs, **kwargs}
-    if design.n_levels == 1:
-        if design.encoding is not None:
-            kw["encoding_covariates"] = design.encoding
-        r = motion_correction(image, reference="mean", type_of_transform="Rigid", backend=backend, **kw)
-        return _normalized(r, design, "joint", "motion_correction(reference='mean')")
-
-    layout = level_layout(levels)
-    means = _level_means(image, levels)
-    refs, links = dict(means), {}
-    for k, info in layout.items():
-        if k == 0 or info["interleaved"]:
-            continue
-        reg = robust_affine(fixed=means[0], moving=means[k], dof="rigid", num_bins=32, verbose=False)
-        refs[k] = apply_transforms(fixed=means[0], moving=means[k], transformlist=reg["fwdtransforms"])
-        links[k] = {"method": "robust_affine_rigid_to_anchor_mean"}
-
-    if beta not in ("levels+design", "levels", "none"):
-        raise ValueError(f"beta must be 'levels+design', 'levels' or 'none', got {beta!r}")
-    cols, names, dropped = [], [], []
-    if beta != "none":
-        for k in sorted(layout):
-            if k == 0 or not layout[k]["interleaved"]:
-                continue
-            if layout[k]["beta_estimable"]:
-                cols.append((levels == k).astype(np.float64))
-                names.append(f"level_{k}")
-            else:
-                dropped.append(f"level_{k} ({layout[k]['mixed']} mixed frames < {MIN_MIXED_FOR_BETA})")
-    if beta == "levels+design" and design.name == "shells" and design.bias_covariates is not None:
-        for k in sorted(layout):
-            blk = design.bias_covariates * (levels == k)[:, None]
-            live = [j for j in range(blk.shape[1]) if np.ptp(blk[:, j]) > 0]
-            if not live:
-                continue
-            if layout[k]["n"] < FRAMES_PER_BETA_COLUMN * len(live):
-                dropped.append(f"l2 terms of level {k} ({layout[k]['n']} frames < {FRAMES_PER_BETA_COLUMN} x {len(live)})")
-                continue
-            for j in live:
-                cols.append(blk[:, j])
-                names.append(f"l2_{j}_level_{k}")
-    if cols:
-        kw["encoding_covariates"] = np.stack(cols, axis=1)
-    if design.pe_affine_covariates is not None:
-        g = np.asarray(design.pe_affine_covariates, dtype=np.float64)
-        pe_cols = [g * (levels == k)[:, None] for k in sorted(layout) if np.any(np.abs(g[levels == k]) > 0)]
-        kw["pe_affine_covariates"] = np.concatenate(pe_cols, axis=1)
-        kw["pe_axis"] = design.pe_axis
-    r = motion_correction(image, reference=[refs[int(levels[t])] for t in range(T)], type_of_transform="Rigid",
-                          backend=backend, **kw)
-    # iteration of the design-specific references: each level's mean rebuilt from its CORRECTED frames (same space as the
-    # current references), then the raw series re-registered; stops when the poses and the references settle
-    passes = []
-    if iterations > 0:
-        mask = None
-        poses = _rigid_poses(r["fwdtransforms"])
-        for it in range(int(iterations)):
-            new_means = _level_means(r["motion_corrected"], levels)
-            if mask is None:
-                import ants as _ants
-                mask = _ants.get_mask(new_means[0]).numpy() > 0
-            ref_change = {k: float(np.sqrt(np.mean((new_means[k].numpy()[mask] - refs[k].numpy()[mask]) ** 2))
-                                   / max(float(np.mean(np.abs(refs[k].numpy()[mask]))), 1e-12)) for k in new_means}
-            refs = {k: new_means[k] for k in new_means}
-            r = motion_correction(image, reference=[refs[int(levels[t])] for t in range(T)], type_of_transform="Rigid",
-                                  backend=backend, **kw)
-            new_poses = _rigid_poses(r["fwdtransforms"])
-            d = (new_poses - new_poses.mean(0)) - (poses - poses.mean(0))
-            dt = float(np.sqrt((d[:, :3] ** 2).sum(1)).max())
-            dr = float(np.degrees(np.sqrt((d[:, 3:] ** 2).sum(1)).max()))
-            poses = new_poses
-            passes.append({"pass": it + 1, "relative_reference_change": ref_change, "max_pose_change_mm": dt,
-                           "max_pose_change_deg": dr})
-            if dt < 0.01 and dr < 0.01:
-                break
-    out = _normalized(r, design, "joint", "motion_correction(reference=per-level means)")
-    out["design"].update(layout=layout, links=links, beta=beta, beta_columns=names, beta_dropped=dropped,
-                         reference_passes=passes)
-    return out
+    m = ants.new_image_like(frames[0], np.mean([f.numpy() for f in frames], axis=0).astype(np.float32))
+    return [m] * len(frames)
 
 
-def _unified(image, design: Design, *, beta: str = "levels+design", **kwargs) -> dict:
+def _unified(image, design: Design, *, beta: str = "levels+design", iterations: int = 0, **kwargs) -> dict:
     """ONE path for every design. Each design level is registered in its own pass to its own reference, with its own
     sample points (``motion_correct_grouped``: the level's low-motion mean; a reference, and a sampling region, of the
     frame's own contrast); the design's in-level columns are estimated in the optimizer (DWI: the l = 2 direction terms
@@ -361,7 +241,8 @@ def _unified(image, design: Design, *, beta: str = "levels+design", **kwargs) ->
     the corrected means otherwise; the remaining per-level offset ``beta`` is the surround-Tukey projection of the
     composed trajectory on the level indicators, applied to the transforms (``cross_group_debias``). A one-level design is
     the plain registration to the series mean (BOLD). ``beta``: ``"levels+design"``, ``"levels"`` (no in-level design
-    columns) or ``"none"`` (no offset removal)."""
+    columns) or ``"none"`` (no offset removal). ``iterations``: passes re-registering each level to the mean of its
+    corrected frames (``motion_correct_grouped(reference_predictor=..., reference_iterations=...)``)."""
     from .motion import motion_correction
     from .motion_reference import motion_correct_grouped
 
@@ -406,16 +287,18 @@ def _unified(image, design: Design, *, beta: str = "levels+design", **kwargs) ->
                     kw["window_size"] = window_size
     else:
         kw.update(backend=backend, **knobs)
+    if iterations > 0:
+        kw.update(reference_predictor=_corrected_level_mean, reference_iterations=int(iterations))
     r = motion_correct_grouped(image, levels, cross_link=links, cross_group_debias=(beta != "none"), **kw)
     out = _normalized(r, design, "unified", "motion_correct_grouped(per-level references, links, cross_group_debias)")
     xo = r.get("cross_group_offset")
-    out["design"].update(layout=layout, links=links, beta=beta, beta_dropped=dropped,
+    out["design"].update(layout=layout, links=links, beta=beta, beta_dropped=dropped, iterations=int(iterations),
                          beta_levels=None if xo is None else {k: v for k, v in xo.items() if k != "correction_paths"},
                          beta_levels_estimable=xo is not None or beta == "none")
     return out
 
 
-ENGINES = {"dispatch": _dispatch, "unified": _unified, "joint": _joint}
+ENGINES = {"dispatch": _dispatch, "unified": _unified}
 
 
 def motion_correct_design(image, design: Design, *, engine: str = "dispatch", **kwargs) -> dict:

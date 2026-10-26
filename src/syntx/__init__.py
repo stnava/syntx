@@ -232,6 +232,8 @@ from .motion_reference import (
     motion_correct_grouped,
     shell_groups,
 )
+from .motion_design import DESIGNS, Design, make_design, motion_correct_design
+from .acquisition_axes import encoding_frame, infer_phase_encode_axis, infer_slice_axis
 from .temporal_denoise import (
     gaussian_temporal_average,
     smooth_all_frames,
@@ -546,6 +548,13 @@ __all__ = [
     "encoding_reference_predictor",
     "motion_correct_grouped",
     "shell_groups",
+    "DESIGNS",
+    "Design",
+    "make_design",
+    "motion_correct_design",
+    "encoding_frame",
+    "infer_phase_encode_axis",
+    "infer_slice_axis",
     "gaussian_temporal_average",
     "smooth_all_frames",
     "deformation_gradient",
