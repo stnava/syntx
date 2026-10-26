@@ -1,12 +1,37 @@
 # Tracking Summary
-current phase: v6.22.0 release (centralized metric sampling: syntx.sampling menu; dewarp foreground parity)
+current phase: v6.23.0 (design-driven motion correction: syntx.motion_correct_design; acquisition axes from the image)
 next WP: Multi-modal deformable registration benchmarks and GPU memory optimization
 blockers: none
-active work: none (v6.22.0 released 2026-10-25)
+active work: none (v6.23.0, 2026-10-26)
 device: Apple Silicon MPS / CPU (macOS arm64)
-last updated: 2026-10-25
+last updated: 2026-10-26
 
 ---
+
+## R8 (Design-Driven Motion Correction `syntx.motion_correct_design`, Acquisition Axes, robust_affine Multi-Start, v6.23.0, 2026-10-26)
+- New `src/syntx/motion_design.py`: one entry point `motion_correct_design(image, make_design(name, ...), engine=...)` with a
+  design menu (`DESIGNS`: `none` BOLD, `tag_control` ASL, `shells` DWI, `encoding_states` slow flow, `custom`). Engine
+  `unified`: each design level registered to its own reference with its own sample points, interleaved levels linked by
+  identity (blocked or lone levels by registering their means), the per-level pose offset removed by the surround-Tukey
+  projection on the level indicators. BOLD (one level) is identical to `preset="bold"`. `dispatch` reproduces the previous
+  per-modality calls. Results keep their type (attribute access). Design and evidence: `docs/MOTION_DESIGN.md`.
+- `motion_reference._group_offsets`: the offset is estimated for each level that is interleaved enough (>= 4 active surround
+  rows and >= 4 frames next to another level); a level that is not (a lone M0 frame) keeps its linked pose and is listed in
+  `cross_group_offset["not_identifiable_groups"]` instead of switching the offset off for every level.
+- New `src/syntx/acquisition_axes.py`: slice and phase-encode axes inferred from the image (sidecar, SliceTiming, voxel
+  thickness, slice interleave; Nyquist ghost cross-checked by the shift spread), raising when undecidable. Replaces the
+  hard-coded slice axis in the opt-in PE debias paths. Real data: 21 / 21 decided cases correct, 6 undecided.
+- `robust_affine(mode='ants', multi_start=True)`: rotation candidates no longer double-centred (`t_rot = t_w + C - R C` with
+  `fixed_params = C` added `(I - R) C`); candidates scored on images normalised to the (0, 1) histogram range
+  (`normalize_robust`, no auto-mask). Known-rotation head phantom (pitch 8 / yaw 12 deg, 2 origins, 3 seeds): the matching
+  candidate now wins and the final error is 0.5-1.8 mm (was 3.5-11.4 mm); each fix alone does not change the selection.
+- Phantom gate (5 seeds, rotation deg, previous call -> unified): ASL 0.117 -> 0.107, slow flow 0.164 -> 0.137, slow flow
+  + eddy 0.148 -> 0.132, single-shell DWI 0.359 -> 0.330 (translation 0.066 -> 0.035 mm). Real FPA sub-BLAST079: ASL and
+  DWI tie the previous calls, BOLD identical.
+- Downstream moved to the entry point: antsxfunctional (ASL, BOLD), antsxdwi (shells), antsxslowflow (encoding states).
+- Tests (targeted): motion_design / motion_reference / acquisition_axes 41 passed; affine set (robust_affine, affine,
+  dewarp, new `test_robust_affine_multistart_ants.py`) 95 passed, 1 skipped; standards 10 passed; `antsxqc.lint` 0.
+  The full suite was not run for this version.
 
 ## R7 (Centralized Metric Sampling `syntx.sampling`, Merged Pilot Ideas, Independent Audits, v6.22.0, 2026-10-25)
 - New `src/syntx/sampling.py`: ONE implementation of metric sample-point selection, designed as a menu

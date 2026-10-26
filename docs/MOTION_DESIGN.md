@@ -185,3 +185,20 @@ the voxel axes. The thresholds are provisional.
 - **`beta` acts on all six degrees of freedom.** No menu entry needs a narrower mask: the DWI eddy term is in the
   phase-encode affine.
 - **Multi-shell DWI phantoms with high b** are outside every engine's working range (see above).
+
+## Partially identifiable designs
+
+The level offset is estimated for each level that is interleaved enough: at least 4 active surround rows and at least 4
+frames next to another level. A level that is not, for example a lone ASL M0 frame, keeps the pose of its link (the
+registration of its mean) and is listed in `cross_group_offset["not_identifiable_groups"]`. The other levels are still
+corrected. Before this, a single lone frame switched the offset off for every level.
+
+## Downstream call sites
+
+| repo | call | design |
+|---|---|---|
+| antsxfunctional | `perfusion.pipeline.syntx_motion_correction` (ASL, rsfMRI, task fMRI) | `tag_control`, `none` |
+| antsxdwi | `motion.motion_correct` (with `bvals`) | `shells` |
+| antsxslowflow | `motion.api.motion_correct` (encoding states inferred from bval / bvec) | `encoding_states` |
+
+Each uses `engine="unified"`; antsxfunctional and antsxdwi expose `engine=` (`"dispatch"` gives the previous call).

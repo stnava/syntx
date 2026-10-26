@@ -327,26 +327,38 @@ def build_bilateral_window_references(
 def _group_offsets(H, groups, idx, com):
     """Per-group constant pose offset of composed rigid poses ``H`` (n, 4, 4) relative to the anchor group 0, from the
     surround Tukey projection on the group indicators. Returns ``(Y, offsets)`` with ``Y`` the (n, 6) poses
-    ``[d_com, rotvec]`` and ``offsets`` {group: (6,)}, or ``None`` when the groups are not interleaved enough to separate an
-    offset from head motion (fewer than 8 frames, or fewer than 4 active surround rows for some non-anchor group: a
-    blocked acquisition's group offset is indistinguishable from the head motion between the blocks)."""
+    ``[d_com, rotvec]`` and ``offsets`` {group: (6,)} for the groups interleaved enough to separate an offset from head
+    motion (at least 4 active surround rows and 4 frames next to another group), or ``None`` when no group is (fewer than 8 frames, or a blocked acquisition:
+    its group offset is indistinguishable from the head motion between the blocks). A group that is not (e.g. a lone M0
+    frame, linked by registering its mean) has no entry and is left out of the projection."""
     from scipy.spatial.transform import Rotation as _Rot
 
     from .motion_batched import _project_encoding_surround_tukey_np, build_encoding_covariates
 
+    groups = np.asarray(groups)
     n_frames, n_groups = len(H), len(idx)
     if n_frames < 8 or n_groups < 2:
         return None
     ind = np.column_stack([(groups == g).astype(np.float64) for g in range(1, n_groups)])
     surr = ind[1:-1] - 0.5 * (ind[:-2] + ind[2:])
-    if int(np.min(np.sum(np.abs(surr) > 0.1, axis=0))) < 4:
+    active = np.sum(np.abs(surr) > 0.1, axis=0)
+    # frames of the group with a neighbour of another group: a block has 2 whatever its surround rows (a blocked group's
+    # two boundaries alone give 4 active rows)
+    at_switch = (np.r_[groups[0], groups[:-1]] != groups) | (np.r_[groups[1:], groups[-1]] != groups)
+    mixed = [int(np.sum(at_switch & (groups == g))) for g in range(n_groups)]
+    est = [g for g in range(1, n_groups) if active[g - 1] >= 4 and mixed[g] >= 4]
+    if not est:
         return None
     H = np.asarray(H)
     Y = np.c_[np.einsum("nij,j->ni", H[:, :3, :3], com) + H[:, :3, 3] - com, _Rot.from_matrix(H[:, :3, :3]).as_rotvec()]
-    basis = build_encoding_covariates(state_labels=groups, num_frames=n_frames, window_size=n_frames)
-    _, dY, _ = _project_encoding_surround_tukey_np(Y, basis["E"], basis["psi"])
-    off = dY - np.median(dY[idx[0]], axis=0)          # relative to the anchor group (which stays put)
-    return Y, {g: np.median(off[idx[g]], axis=0) for g in range(1, n_groups)}
+    keep = np.flatnonzero(np.isin(groups, [0] + est))
+    if keep.size < 8:
+        return None
+    labels = np.searchsorted(np.array([0] + est), groups[keep])
+    basis = build_encoding_covariates(state_labels=labels, num_frames=keep.size, window_size=keep.size)
+    _, dY, _ = _project_encoding_surround_tukey_np(Y[keep], basis["E"], basis["psi"])
+    off = dY - np.median(dY[labels == 0], axis=0)          # relative to the anchor group (which stays put)
+    return Y, {g: np.median(off[labels == j + 1], axis=0) for j, g in enumerate(est)}
 
 
 def _cross_link(fixed, moving, link, *, verbose, device, num_bins, convergence_tol_vox, max_extend_factor):
@@ -383,8 +395,9 @@ def _pose_matrix(y, com):
 
 def _debias_cross_group_offsets(chains, groups, idx, results, cross, com, outprefix):
     """Per-frame rigid corrections removing the contrast-driven offset of each non-anchor group (see
-    ``motion_correct_grouped(cross_group_debias=True)``). Returns ``None`` when the groups are not interleaved enough to
-    separate an offset from head motion (fewer than 4 active surround rows per non-anchor group)."""
+    ``motion_correct_grouped(cross_group_debias=True)``). Returns ``None`` when no non-anchor group is interleaved
+    enough to separate an offset from head motion (fewer than 4 active surround rows); a group that is not keeps its
+    linked pose and is listed in ``not_identifiable_groups``."""
     import os
     import tempfile
 
@@ -410,7 +423,7 @@ def _debias_cross_group_offsets(chains, groups, idx, results, cross, com, outpre
     paths = {}
     for i in range(n_frames):
         g = int(groups[i])
-        if g == 0:
+        if g not in per_group:          # the anchor, and groups whose offset is not identifiable (left as linked)
             continue
         Hc = _pose_matrix(Y[i] - per_group[g], com)
         corr = np.linalg.inv(H[i]) @ Hc                  # H_new = H @ corr: corr acts on the anchor-space point first
@@ -425,6 +438,7 @@ def _debias_cross_group_offsets(chains, groups, idx, results, cross, com, outpre
         "offset_mm_rad_by_group": {int(g): v.tolist() for g, v in per_group.items()},
         "offset_mm_by_group": {int(g): float(np.linalg.norm(v[:3])) for g, v in per_group.items()},
         "offset_deg_by_group": {int(g): float(np.degrees(np.linalg.norm(v[3:]))) for g, v in per_group.items()},
+        "not_identifiable_groups": [g for g in range(1, len(idx)) if g not in per_group],
         "corrected_frames": sorted(paths),
         "correction_paths": paths,
     }
@@ -850,7 +864,7 @@ def motion_correct_grouped(
         est = _group_offsets(composed_rigid, groups, idx, com)
         if est is not None:
             Y_rigid, per_group = est
-            composed_rigid = [h if int(groups[i]) == 0 else _pose_matrix(Y_rigid[i] - per_group[int(groups[i])], com)
+            composed_rigid = [h if int(groups[i]) not in per_group else _pose_matrix(Y_rigid[i] - per_group[int(groups[i])], com)
                               for i, h in enumerate(composed_rigid)]
             group_offset_fd = {
                 "method": "surround_tukey_projection_on_group_indicators",

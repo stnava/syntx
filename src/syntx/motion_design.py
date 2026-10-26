@@ -141,7 +141,7 @@ def make_design(name: str, **metadata) -> Design:
 
 
 def _normalized(result: Any, design: Design, engine: str, call: str) -> dict:
-    out = dict(result)
+    out = type(result)(result)   # keeps MotionCorrectionResult / GroupedMotionCorrectionResult (attribute access)
     out["design"] = {"name": design.name, "engine": engine, "call": call, "n_levels": design.n_levels,
                      "levels": np.asarray(design.levels).tolist(), **design.detail}
     return out
@@ -169,12 +169,12 @@ def _dispatch(image, design: Design, **kwargs) -> dict:
         r = motion_correct_grouped(image, groups, encoding_covariates=design.encoding, **knobs, **kwargs)
         return _normalized(r, design, "dispatch", "motion_correct_grouped(asl knobs, encoding_covariates=s_tc)")
     if design.name == "shells":
-        kw = dict(preset="dwi", registration_direction="forward", metric_smoothing_mm=0.0)
+        kw = dict(preset="dwi", **_DWI_DEFAULTS)
         if design.pe_affine_covariates is not None:
             kw.update(pe_affine_covariates=design.pe_affine_covariates, pe_axis=design.pe_axis)
         if design.bias_covariates is not None:
             kw["bias_covariates"] = design.bias_covariates
-        r = motion_correct_grouped(image, design.levels, **kw, **kwargs)
+        r = motion_correct_grouped(image, design.levels, **{**kw, **kwargs})
         return _normalized(r, design, "dispatch", "motion_correct_grouped(preset='dwi')")
     if design.name == "encoding_states":
         r = motion_correction(image, reference="mean", preset="slowflow", encoding_covariates=design.encoding, **kwargs)
@@ -189,6 +189,9 @@ def _dispatch(image, design: Design, **kwargs) -> dict:
         return _normalized(r, design, "dispatch", "motion_correct_grouped")
     raise ValueError(f"no dispatch for design {design.name!r}")
 
+
+# antsxdwi's registration defaults for the shells (caller values win)
+_DWI_DEFAULTS = {"registration_direction": "forward", "metric_smoothing_mm": 0.0}
 
 MIN_MIXED_FOR_BETA = 4  # frames with a neighbour of another level needed to estimate a level's offset locally
 FRAMES_PER_BETA_COLUMN = 6  # a design column is estimated only with at least this many frames per column
@@ -271,7 +274,7 @@ def _unified(image, design: Design, *, beta: str = "levels+design", iterations: 
     kw = dict(kwargs)
     dropped = []
     if design.name == "shells":
-        kw.update(preset="dwi", registration_direction="forward", metric_smoothing_mm=0.0)
+        kw = {"preset": "dwi", **_DWI_DEFAULTS, **kw}
         if design.pe_affine_covariates is not None:
             kw.update(pe_affine_covariates=design.pe_affine_covariates, pe_axis=design.pe_axis)
         if beta == "levels+design" and design.bias_covariates is not None:

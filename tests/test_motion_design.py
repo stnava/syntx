@@ -115,6 +115,49 @@ def test_unified_asl_level_offset_removes_the_tag_control_bias():
     e1 = evaluate_motion_estimate(with_beta["fwdtransforms"], sim)["translation_rms_mm"]
     e0 = evaluate_motion_estimate(no_beta["fwdtransforms"], sim)["translation_rms_mm"]
     assert e1 < 0.5 * e0, (e1, e0)
+    assert with_beta.motion_corrected is with_beta["motion_corrected"]   # the result type (attribute access) is kept
+
+
+def test_unified_asl_with_lone_m0_still_removes_the_tag_control_bias():
+    """A lone M0 frame (not identifiable: linked by registering its mean) must not switch off the offset of the
+    interleaved label level."""
+    import ants
+
+    from syntx.motion_simulation import evaluate_motion_estimate, simulate_asl_series
+
+    sim = simulate_asl_series(n_frames=24, seed=2)
+    a = sim.image.numpy()
+    img = ants.from_numpy(np.concatenate([2.5 * a[..., :1], a], axis=-1), origin=sim.image.origin,
+                          spacing=sim.image.spacing, direction=sim.image.direction)
+    vt = ["m0scan"] + ["control" if s > 0 else "label" for s in sim.encoding_covariates]
+    d = make_design("tag_control", volume_types=vt)
+    r = motion_correct_design(img, d, engine="unified", device="cpu")
+    r0 = motion_correct_design(img, d, engine="unified", beta="none", device="cpu")
+    assert r["design"]["links"] == ["identity", "registration"]
+    xo = r["cross_group_offset"]
+    assert set(xo["offset_mm_by_group"]) == {1} and xo["not_identifiable_groups"] == [2]
+    e1 = evaluate_motion_estimate(r["fwdtransforms"][1:], sim)["translation_rms_mm"]
+    e0 = evaluate_motion_estimate(r0["fwdtransforms"][1:], sim)["translation_rms_mm"]
+    assert e1 < 0.5 * e0, (e1, e0)
+
+
+def test_group_offsets_skip_unidentifiable_groups_and_keep_the_others():
+    """Group 1 interleaved with a known offset, group 2 a lone frame: only group 1 gets an offset, and it is the
+    planted one (the pose of the lone frame does not enter the projection)."""
+    from syntx.motion_reference import _group_offsets, _pose_matrix
+
+    com = np.zeros(3)
+    groups = np.array([2] + [0, 1] * 8)
+    off1 = np.array([0.3, -0.2, 0.1, 0.0, 0.0, 0.01])
+    Y = np.zeros((groups.size, 6))
+    Y[:, 0] = np.linspace(0.0, 0.5, groups.size)          # smooth drift
+    Y[groups == 1] += off1
+    Y[groups == 2] += np.array([5.0, 0, 0, 0, 0, 0])     # lone frame far away
+    H = np.array([_pose_matrix(y, com) for y in Y])
+    idx = [np.flatnonzero(groups == g) for g in range(3)]
+    _, per_group = _group_offsets(H, groups, idx, com)
+    assert set(per_group) == {1}
+    np.testing.assert_allclose(per_group[1], off1, atol=0.02)
 
 
 def test_cross_link_values_are_checked():
