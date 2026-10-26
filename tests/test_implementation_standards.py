@@ -34,16 +34,16 @@ ALLOWED_REGISTRATION_EXCEPTIONS: dict[str, str] = {
     "motion.py:1059": (
         "Legacy mode='ants' C++ motion correction baseline comparator inside syntx.motion"
     ),
-    "robust_affine.py:2467": (
+    "robust_affine.py:2470": (
         "mode='ants_fast' explicit C++ affine backend inside syntx (the registration engine itself)"
     ),
-    "robust_affine.py:2476": (
+    "robust_affine.py:2479": (
         "mode='ants_fast' explicit C++ affine backend inside syntx (the registration engine itself)"
     ),
-    "robust_affine.py:2544": (
+    "robust_affine.py:2547": (
         "mode='ants_fast' explicit C++ affine backend inside syntx (the registration engine itself)"
     ),
-    "robust_affine.py:2636": (
+    "robust_affine.py:2639": (
         "mode='ants_fast' explicit C++ affine backend inside syntx (the registration engine itself)"
     ),
     "template.py:394": (

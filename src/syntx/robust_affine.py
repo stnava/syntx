@@ -247,7 +247,8 @@ def _scoring_foreground(fi_low: ants.ANTsImage) -> np.ndarray:
 
 def _eval_low_res_mi(fi_low: ants.ANTsImage, mi_low: ants.ANTsImage, tx_path: str = None, fg: np.ndarray = None) -> float:
     """Evaluates low-resolution Mattes Mutual Information score with foreground masking for candidate transform
-    (``fg``: ``_scoring_foreground(fi_low)``, computed once by the caller for all candidates)."""
+    (``fg``: ``_scoring_foreground(fi_low)``, computed once by the caller for all candidates). ``fi_low`` / ``mi_low``
+    are expected in [0, 1] (``syntx.sampling.normalize_robust``), the histogram range of the score."""
     if fg is None:
         fg = _scoring_foreground(fi_low)
     try:
@@ -262,10 +263,9 @@ def _eval_low_res_mi(fi_low: ants.ANTsImage, mi_low: ants.ANTsImage, tx_path: st
         # fixed-foreground mask (a union mask rewards shrinking overlap) and fixed histogram bounds so candidate scores
         # are comparable; the foreground is the shared sampling region (syntx.sampling: above the reference's noise floor)
         mask_t = image_to_tensor(fi_low.new_image_like(np.asarray(fg, dtype=np.float32))) > 0.5
-        # Known, pre-existing (independent re-review): fi_low / mi_low are raw intensities scored on the default (0, 1)
-        # histogram range. Passing fixed_range=None (bounds from the data) broke the multi-start selection across the
-        # affine / SyN / TVF / dewarp tests (singular / zero-determinant results), so the scoring is left as it was.
-        mi_score = mattes_mi_loss_nd(w_t, f_t, mask=mask_t, num_bins=32).item()
+        # fi_low / mi_low are [0, 1]-normalised once by the caller (normalize_robust), so the (0, 1) histogram range
+        # fits both; the fixed foreground is the whole selection (no |I| < 1 % auto-mask on the warped moving image)
+        mi_score = mattes_mi_loss_nd(w_t, f_t, mask=mask_t, num_bins=32, auto_mask=False).item()
         return mi_score
     except (RuntimeError, ValueError) as exc:
         # a candidate whose transform cannot be applied or scored ranks last, announced (never silently)
@@ -2415,9 +2415,9 @@ def robust_affine(
                         Rz = np.array([[np.cos(rz), -np.sin(rz), 0], [np.sin(rz), np.cos(rz), 0], [0, 0, 1]])
                         R = Rz @ Ry @ Rx
 
+                        # x -> R (x - C) + t_w + C about the fixed CoM C: maps C to C + t_w, as the CoM candidate
                         C = com_f_w
-                        t_rot = t_w + C - R @ C
-                        tx_r = create_ants_affine(R, t_rot, dim=3, fixed_params=C)
+                        tx_r = create_ants_affine(R, t_w, dim=3, fixed_params=C)
 
                         r_dir = tempfile.mkdtemp(prefix=f"robust_aff_rot_{r_idx}_{axis}_")
                         r_path = os.path.join(r_dir, "rot_translation.mat")
@@ -2430,8 +2430,7 @@ def robust_affine(
                     rad = np.radians(deg)
                     R2 = np.array([[np.cos(rad), -np.sin(rad)], [np.sin(rad), np.cos(rad)]])
                     C = com_f_w
-                    t_rot = t_w + C - R2 @ C
-                    tx_r = create_ants_affine(R2, t_rot, dim=2, fixed_params=C)
+                    tx_r = create_ants_affine(R2, t_w, dim=2, fixed_params=C)
 
                     r_dir = tempfile.mkdtemp(prefix=f"robust_aff_rot_2d_{r_idx}_")
                     r_path = os.path.join(r_dir, "rot_translation.mat")
@@ -2442,6 +2441,10 @@ def robust_affine(
             best_candidate_name = candidates[0][0]
             best_tx_path = candidates[0][1]
             fg_low = _scoring_foreground(fi_low)
+            # one [0, 1] scale per image (fixed: within its scoring foreground), the histogram range of the score
+            from .sampling import normalize_robust
+            fi_low = normalize_robust(fi_low, mask=fg_low)
+            mi_low = normalize_robust(mi_low)
             best_score = _eval_low_res_mi(fi_low, mi_low, best_tx_path, fg_low)
             if verbose:
                 print(f"  Candidate '{best_candidate_name}': Low-Res MI = {best_score:.4f}", flush=True)
