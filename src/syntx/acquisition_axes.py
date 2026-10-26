@@ -245,12 +245,59 @@ def infer_phase_encode_axis_detail(image: Any, *, slice_axis: Optional[int] = No
     return AxisInference(win, "nyquist_ghost", scores)
 
 
+def phase_encode_inference(
+    image: Any = None,
+    *,
+    levels: Optional[np.ndarray] = None,
+    slice_axis: Any = None,
+    sidecar: Any = None,
+    **kwargs,
+):
+    """Infer the in-plane phase-encode axis and return a :class:`PhaseEncode` object.
+
+    Contains exact voxel axis, physical unit vector (preserving oblique orientation),
+    physical axis index, alignment, and evidence scores.
+    """
+    from .phase_encode import PhaseEncode
+
+    img = image if image is not None else kwargs.get("image")
+    if img is None:
+        raise ValueError("phase_encode_inference requires an image")
+
+    sl_inf = infer_slice_axis(img, slice_axis=slice_axis, sidecar=sidecar, levels=levels)
+    pe_detail = infer_phase_encode_axis_detail(img, slice_axis=sl_inf.voxel_axis, levels=levels)
+    vax = int(pe_detail.voxel_axis)
+
+    # Calculate physical vector from direction matrix
+    d = np.asarray(getattr(img, "direction", np.eye(3)), dtype=np.float64)[:3, :3]
+    d = d / np.maximum(np.linalg.norm(d, axis=0, keepdims=True), 1e-12)
+    p_vec = d[:, vax]
+    phys_ax = int(np.argmax(np.abs(p_vec)))
+    alignment = float(np.abs(p_vec[phys_ax]))
+
+    evidence = dict(pe_detail.scores)
+    evidence["slice_axis_source"] = sl_inf.source
+    evidence["slice_axis_scores"] = sl_inf.scores
+
+    return PhaseEncode(
+        voxel_axis=vax,
+        sign=None,
+        physical_vector=tuple(float(x) for x in p_vec),
+        physical_axis=phys_ax,
+        alignment=alignment,
+        label=None,
+        anatomical=None,
+        source="inferred",
+        source_detail=f"acquisition_axes:{pe_detail.source}",
+        evidence=evidence,
+    )
+
+
 def infer_phase_encode_axis(image: Any) -> int:
     """``resolve_phase_encode(allow_inference=True, inference=infer_phase_encode_axis)`` callable: the PHYSICAL axis
     (0/1/2 = x/y/z) of the inferred in-plane phase-encode voxel axis."""
-    vax = infer_phase_encode_axis_detail(image).voxel_axis
-    d = np.asarray(image.direction, dtype=np.float64)[:3, :3]
-    return int(np.argmax(np.abs(d[:, vax])))
+    pe = phase_encode_inference(image)
+    return pe.physical_axis
 
 
 def encoding_frame(direction: Any, pe_axis: Any, slice_axis: int) -> tuple:

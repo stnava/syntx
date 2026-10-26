@@ -324,13 +324,122 @@ def build_bilateral_window_references(
     return [ants.new_image_like(frame_list[0], np.tensordot(W[t], stack, axes=(0, 0)).astype(ref_dtype)) for t in range(T)]
 
 
+def level_adjacency(levels: np.ndarray) -> np.ndarray:
+    """Symmetric level adjacency matrix A where A[u, v] counts adjacent transitions between levels u and v."""
+    lev = np.asarray(levels, dtype=int).reshape(-1)
+    if lev.size < 2:
+        n = int(np.max(lev) + 1) if lev.size == 1 else 0
+        return np.zeros((n, n), dtype=int)
+    n = int(np.max(lev) + 1)
+    adj = np.zeros((n, n), dtype=int)
+    u_seq = lev[:-1]
+    v_seq = lev[1:]
+    diff = u_seq != v_seq
+    u_diff = u_seq[diff]
+    v_diff = v_seq[diff]
+    for u, v in zip(u_diff, v_diff):
+        adj[u, v] += 1
+        adj[v, u] += 1
+    return adj
+
+
+def offset_identifiable(levels: np.ndarray, min_mixed: int = 4) -> tuple[dict, list]:
+    """Analyze level adjacency graph connected components and determine offset identifiability.
+
+    A connected component C requires at least 8 total frames.
+    Within each component C with root r(C) = min(C), a non-root level g in C has its offset
+    identifiable relative to r(C) iff it has at least 4 active surround rows on C's sub-timeline.
+
+    Returns:
+        info: dict[int, dict] mapping each level k to:
+            - 'identifiable': bool
+            - 'root': int (r(C))
+            - 'component': list[int]
+            - 'n': int (frame count of level k)
+            - 'active': int (active surround rows on C's sub-timeline)
+            - 'mixed': int (mixed transitions to other levels)
+            - 'interleaved': bool
+        components: list[list[int]] connected components sorted by root
+    """
+    lev = np.asarray(levels, dtype=int).reshape(-1)
+    T = lev.size
+    unique_levels = sorted(set(lev.tolist()))
+    if not unique_levels:
+        return {}, []
+
+    adj = level_adjacency(lev)
+
+    # Build adjacency graph with threshold min_mixed
+    adj_graph = {k: set() for k in unique_levels}
+    for u in unique_levels:
+        for v in unique_levels:
+            if u < v and adj[u, v] >= min_mixed:
+                adj_graph[u].add(v)
+                adj_graph[v].add(u)
+
+    # Find connected components via BFS
+    visited = set()
+    components = []
+    for k in unique_levels:
+        if k not in visited:
+            comp = []
+            queue = [k]
+            visited.add(k)
+            while queue:
+                curr = queue.pop(0)
+                comp.append(curr)
+                for neighbor in adj_graph[curr]:
+                    if neighbor not in visited:
+                        visited.add(neighbor)
+                        queue.append(neighbor)
+            components.append(sorted(comp))
+    components.sort(key=lambda c: c[0])
+
+    info = {}
+    for comp in components:
+        r = comp[0]  # root is min(comp)
+        comp_mask = np.isin(lev, comp)
+        n_comp_frames = int(np.sum(comp_mask))
+        comp_levels = lev[comp_mask]
+
+        for k in comp:
+            k_mask = (lev == k)
+            n_k = int(np.sum(k_mask))
+            idx_k = np.flatnonzero(k_mask)
+            mixed_k = int(sum(1 for t in idx_k if (t > 0 and lev[t - 1] != k) or (t < T - 1 and lev[t + 1] != k)))
+
+            # Active surround rows on comp's sub-timeline
+            if len(comp) > 1 and n_comp_frames >= 8:
+                ind_k = (comp_levels == k).astype(np.float64)
+                if ind_k.size >= 3:
+                    surr_k = ind_k[1:-1] - 0.5 * (ind_k[:-2] + ind_k[2:])
+                    active_k = int(np.sum(np.abs(surr_k) > 0.1))
+                else:
+                    active_k = 0
+            else:
+                active_k = 0
+
+            is_identifiable = bool(k != r and len(comp) > 1 and n_comp_frames >= 8 and active_k >= 4)
+            is_interleaved = bool(n_k >= 2 and mixed_k >= max(2, (n_k + 1) // 2) and (len(comp) > 1 and n_comp_frames >= 8))
+
+            info[k] = {
+                "identifiable": is_identifiable,
+                "root": r,
+                "component": comp,
+                "n": n_k,
+                "active": active_k,
+                "mixed": mixed_k,
+                "interleaved": is_interleaved,
+            }
+
+    return info, components
+
+
 def _group_offsets(H, groups, idx, com):
-    """Per-group constant pose offset of composed rigid poses ``H`` (n, 4, 4) relative to the anchor group 0, from the
-    surround Tukey projection on the group indicators. Returns ``(Y, offsets)`` with ``Y`` the (n, 6) poses
-    ``[d_com, rotvec]`` and ``offsets`` {group: (6,)} for the groups interleaved enough to separate an offset from head
-    motion (at least 4 active surround rows and 4 frames next to another group), or ``None`` when no group is (fewer than 8 frames, or a blocked acquisition:
-    its group offset is indistinguishable from the head motion between the blocks). A group that is not (e.g. a lone M0
-    frame, linked by registering its mean) has no entry and is left out of the projection."""
+    """Per-group constant pose offset of composed rigid poses ``H`` (n, 4, 4) relative to each component root,
+    from the surround Tukey projection on the group indicators evaluated on each connected component's sub-timeline.
+    Returns ``(Y, offsets)`` with ``Y`` the (n, 6) poses ``[d_com, rotvec]`` and ``offsets`` {group: (6,)} for
+    the identifiable non-root groups, or ``None`` when no group is identifiable."""
     from scipy.spatial.transform import Rotation as _Rot
 
     from .motion_batched import _project_encoding_surround_tukey_np, build_encoding_covariates
@@ -339,26 +448,35 @@ def _group_offsets(H, groups, idx, com):
     n_frames, n_groups = len(H), len(idx)
     if n_frames < 8 or n_groups < 2:
         return None
-    ind = np.column_stack([(groups == g).astype(np.float64) for g in range(1, n_groups)])
-    surr = ind[1:-1] - 0.5 * (ind[:-2] + ind[2:])
-    active = np.sum(np.abs(surr) > 0.1, axis=0)
-    # frames of the group with a neighbour of another group: a block has 2 whatever its surround rows (a blocked group's
-    # two boundaries alone give 4 active rows)
-    at_switch = (np.r_[groups[0], groups[:-1]] != groups) | (np.r_[groups[1:], groups[-1]] != groups)
-    mixed = [int(np.sum(at_switch & (groups == g))) for g in range(n_groups)]
-    est = [g for g in range(1, n_groups) if active[g - 1] >= 4 and mixed[g] >= 4]
-    if not est:
+
+    info, components = offset_identifiable(groups)
+    est_groups = [g for g, v in info.items() if v["identifiable"]]
+    if not est_groups:
         return None
+
     H = np.asarray(H)
     Y = np.c_[np.einsum("nij,j->ni", H[:, :3, :3], com) + H[:, :3, 3] - com, _Rot.from_matrix(H[:, :3, :3]).as_rotvec()]
-    keep = np.flatnonzero(np.isin(groups, [0] + est))
-    if keep.size < 8:
+
+    per_group = {}
+    for comp in components:
+        r = comp[0]
+        est_C = [g for g in comp if g != r and info[g]["identifiable"]]
+        if not est_C:
+            continue
+        keep = np.flatnonzero(np.isin(groups, comp))
+        if keep.size < 8:
+            continue
+        labels = np.searchsorted(np.array([r] + est_C), groups[keep])
+        basis = build_encoding_covariates(state_labels=labels, num_frames=keep.size, window_size=keep.size)
+        _, dY, _ = _project_encoding_surround_tukey_np(Y[keep], basis["E"], basis["psi"])
+        off = dY - np.median(dY[labels == 0], axis=0)  # relative to the component root (which stays put)
+        for j, g in enumerate(est_C):
+            per_group[g] = np.median(off[labels == j + 1], axis=0)
+
+    if not per_group:
         return None
-    labels = np.searchsorted(np.array([0] + est), groups[keep])
-    basis = build_encoding_covariates(state_labels=labels, num_frames=keep.size, window_size=keep.size)
-    _, dY, _ = _project_encoding_surround_tukey_np(Y[keep], basis["E"], basis["psi"])
-    off = dY - np.median(dY[labels == 0], axis=0)          # relative to the anchor group (which stays put)
-    return Y, {g: np.median(off[labels == j + 1], axis=0) for j, g in enumerate(est)}
+
+    return Y, per_group
 
 
 def _cross_link(fixed, moving, link, *, verbose, device, num_bins, convergence_tol_vox, max_extend_factor):
@@ -408,7 +526,9 @@ def _debias_cross_group_offsets(chains, groups, idx, results, cross, com, outpre
     H = []
     for i in range(n_frames):
         g = int(groups[i])
-        rigid_chain = chains[i][:sum(n_cross[:g])] + [chains[i][-1]]   # crosses + the frame's own rigid (no eddy)
+        li = int(np.where(idx[g] == i)[0][0])
+        n_own = len(results[g].fwdtransforms[li])
+        rigid_chain = chains[i][:-n_own] + [chains[i][-1]]   # crosses + the frame's own rigid (no eddy)
         h = np.eye(4)
         for f in rigid_chain:
             h = _extract_rigid_parameters(ants.read_transform(f), 3)[2] @ h
@@ -511,6 +631,7 @@ def motion_correct_grouped(
     cross_group_debias: bool = False,
     debias_pe_pseudomotion: bool = False,
     slice_axis=None,
+    sidecar=None,
     cross_link="registration",
     **kwargs,
 ) -> GroupedMotionCorrectionResult:
@@ -542,16 +663,10 @@ def motion_correct_grouped(
     cross_num_bins : int, default 32
         MI histogram bins of the cross registrations when no preset is given.
     nuisance_covariates : np.ndarray, shape (n_frames, k), optional
-        Per-frame covariates of a translation that is NOT head motion but is absorbed by the rigid fit, with
-        ``nuisance_axis`` the physical unit vector it acts along. DWI: the diffusion gradient vector (``bvecs``) and the
-        phase-encode axis -- eddy currents translate each volume along phase encode by an amount linear in the gradient
-        vector (sub-BLAST079, 3-shell AP/PA: the per-volume PE translation is linear in g with held-out R2 0.55-0.77,
-        flips sign between the AP and PA series and survives shape-only registration, so it is geometric, not a metric
-        effect). Within each group the displacement of the reference's centre of mass along the axis is regressed on
-        the covariates (``d = c + B @ cov``); ``B @ cov`` is the nuisance shift of that frame. The applied transforms keep
-        it (the registration did align the displaced content); ``fd`` is computed with it removed so it counts motion
-        only, ``fd_raw`` keeps the previous definition, and ``nuisance`` reports ``shift_mm`` per frame, ``coefficients``
-        and ``r2`` per group. A group whose covariates are all zero (b0) gets no fit.
+        Deprecated; use ``pe_affine_covariates``. Per-frame covariates of a translation that is NOT head motion but is
+        absorbed by the rigid fit, with ``nuisance_axis`` the physical unit vector it acts along.
+    nuisance_axis : Optional[np.ndarray], optional
+        Deprecated; use ``pe_axis``.
     pe_affine_covariates : np.ndarray, shape (n_frames, k), optional
         With ``pe_axis``: the eddy-current term estimated INSIDE each group's registration (``pytorch_batched`` backend,
         see ``motion_batched._batched_rigid_register_pass_core``): per frame a translation, two shears and a scale along
@@ -608,6 +723,8 @@ def motion_correct_grouped(
     slice_axis : int or str, optional
         Acquired slice axis for the ``debias_pe_pseudomotion`` frame (voxel index or BIDS ``i/j/k``); default: measured
         from the series with the group levels removed (``syntx.acquisition_axes.infer_slice_axis``); undecidable raises.
+    sidecar : dict or Path or str, optional
+        Optional BIDS sidecar dict or path for metadata-guided axis inference.
     cross_group_debias : bool, default False
         Opt-in: remove a contrast-driven bias of the cross-group (group mean -> group mean) registrations: when the groups
         are interleaved in time, the composed rigid trajectory is projected on the group indicators with the surround
@@ -623,6 +740,14 @@ def motion_correct_grouped(
     from .motion import _extract_rigid_parameters, motion_correction
     from .robust_affine import robust_affine
     from .transforms import apply_transforms as _apply_transforms
+
+    if nuisance_covariates is not None or nuisance_axis is not None:
+        warnings.warn(
+            "nuisance_covariates and nuisance_axis in motion_correct_grouped are deprecated and will be removed "
+            "in a future release; use pe_affine_covariates and pe_axis instead.",
+            FutureWarning,
+            stacklevel=2,
+        )
 
     groups = np.asarray(groups)
     if groups.dtype == bool:
@@ -711,12 +836,16 @@ def motion_correct_grouped(
                 refs = reference_predictor(frames_g, group_index=g, frame_indices=[int(i) for i in idx[g]])
                 if refs is None:
                     break
-                if len(refs) != len(idx[g]):
-                    raise ValueError(f"reference_predictor returned {len(refs)} references for {len(idx[g])} frames of group {g}")
+                if isinstance(refs, (list, tuple)):
+                    if len(refs) != len(idx[g]):
+                        raise ValueError(f"reference_predictor returned {len(refs)} references for {len(idx[g])} frames of group {g}")
+                    ref_input = list(refs)
+                else:
+                    ref_input = refs
                 kw_it = dict(kw)
                 if kw_it.get("outprefix") is not None:
                     kw_it["outprefix"] = f"{kw_it['outprefix']}it{it + 1}_"
-                res_g = motion_correction(img4d[g], reference=list(refs), backend=backend, verbose=verbose,
+                res_g = motion_correction(img4d[g], reference=ref_input, backend=backend, verbose=verbose,
                                           dvars_reference_intensity=ref_int_g, **kw_it)
                 mode_g = f"predicted (iteration {it + 1})"
         reference_modes.append(mode_g)
@@ -732,15 +861,27 @@ def motion_correct_grouped(
                          num_bins=cross_num_bins, convergence_tol_vox=kwargs.get("convergence_tol_vox", 0.05),
                          max_extend_factor=kwargs.get("max_extend_factor", 4)) for g in range(1, n_groups)]
 
+    info, components = offset_identifiable(groups)
+    root_prefix: dict[int, list] = {0: []}
+    for comp in components:
+        r = comp[0]
+        if r == 0:
+            continue
+        prev_root = info.get(r - 1, {}).get("root", 0)
+        root_prefix[r] = list(root_prefix.get(prev_root, [])) + list(cross[r - 1]["fwdtransforms"])
+
     # Second pass on the direction-dependent groups with the metric restricted to the caller's mask (anchor space ->
     # each group's mean space through the inverse cross chain); the cross registrations are then recomputed.
     mask_pass = False
     if sample_mask_fn is not None and n_groups > 1:
         mask_anchor = sample_mask_fn(cmeans[0])
         for g in range(1, n_groups):
-            chain_paths = [t for k in range(g) for t in cross[k]["fwdtransforms"]]
-            mask_g = ants.apply_transforms(fixed=cmeans[g], moving=mask_anchor, transformlist=chain_paths,
-                                           whichtoinvert=[True] * len(chain_paths), interpolator="nearestNeighbor")
+            chain_paths = list(root_prefix.get(info[g]["root"], []))
+            if not chain_paths:
+                mask_g = mask_anchor
+            else:
+                mask_g = ants.apply_transforms(fixed=cmeans[g], moving=mask_anchor, transformlist=chain_paths,
+                                               whichtoinvert=[True] * len(chain_paths), interpolator="nearestNeighbor")
             kw2 = dict(group_kw[g])
             kw2["sample_mask"] = mask_g
             if kw2.get("outprefix") is not None:
@@ -754,10 +895,17 @@ def motion_correct_grouped(
         cross = [_cross_link(cmeans[g - 1], cmeans[g], links[g - 1], verbose=verbose, device=kwargs.get("device"),
                              num_bins=cross_num_bins, convergence_tol_vox=kwargs.get("convergence_tol_vox", 0.05),
                              max_extend_factor=kwargs.get("max_extend_factor", 4)) for g in range(1, n_groups)]
+        root_prefix = {0: []}
+        for comp in components:
+            r = comp[0]
+            if r == 0:
+                continue
+            prev_root = info.get(r - 1, {}).get("root", 0)
+            root_prefix[r] = list(root_prefix.get(prev_root, [])) + list(cross[r - 1]["fwdtransforms"])
 
     chains: list = [None] * n_frames
     for g in range(n_groups):
-        pre = [t for k in range(g) for t in cross[k]["fwdtransforms"]]  # [cross_1, ..., cross_g]
+        pre = list(root_prefix.get(info[g]["root"], []))
         for li, gi in enumerate(idx[g]):
             chains[gi] = pre + list(results[g].fwdtransforms[li])
 
@@ -806,10 +954,11 @@ def motion_correct_grouped(
     composed_rigid = composed_all
     if any(r.get("pe_affine") is not None for r in results):
         # the eddy PE-affine is in the chain (and in fd_raw); FD counts the rigid part only: crosses + the frame's rigid
-        n_cross = [len(c["fwdtransforms"]) for c in cross]
-        n_corr = [0 if cross_group_offset is None or gi not in cross_group_offset["corrected_frames"] else 1 for gi in range(n_frames)]
-        mats_rigid = [ms[:n_corr[i] + sum(n_cross[:g])] + [ms[-1]]
-                      for i, (ms, g) in enumerate(zip(mats, [int(groups[i]) for i in range(n_frames)]))]
+        mats_rigid = []
+        for i, (ms, g) in enumerate(zip(mats, [int(groups[i]) for i in range(n_frames)])):
+            li = int(np.where(idx[g] == i)[0][0])
+            n_own = len(results[g].fwdtransforms[li])
+            mats_rigid.append(ms[:-n_own] + [ms[-1]])
         composed_rigid = _compose(mats_rigid)
         fd = jenkinson_framewise_displacement(composed_rigid, kwargs.get("fd_radius", 50.0), com)
         a_all = np.zeros((n_frames, 4)); jac_all = np.ones(n_frames); coef = []
@@ -888,140 +1037,21 @@ def motion_correct_grouped(
         warnings.warn(f"motion_correct_grouped: debias_pe_pseudomotion requested but skipped ({reason})", RuntimeWarning, stacklevel=2)
         pe_pseudomotion_debias = {"method": "skipped", "reason": reason}
     if debias_pe_pseudomotion and pe_axis is not None and n_frames >= 12:
-        from scipy.spatial.transform import Rotation as _Rot
-        from .motion_batched import build_encoding_covariates
-
-        fd_rad = float(kwargs.get("fd_radius", 50.0))
+        from .motion_batched import _shrink_pe_pseudomotion_core
         from .acquisition_axes import encoding_frame, infer_slice_axis
 
-        # slice axis stated or measured from the series (design levels removed); never assumed
-        sl_inf = infer_slice_axis(image, slice_axis=slice_axis, levels=groups)
+        fd_rad = float(kwargs.get("fd_radius", 50.0))
+        sl_inf = infer_slice_axis(image, slice_axis=slice_axis, sidecar=sidecar, levels=groups)
         p_pe, p_sl, p_ro = encoding_frame(getattr(means[0], "direction", np.eye(3)), pe_axis, sl_inf.voxel_axis)
 
         R_rig = np.array([H[:3, :3] for H in composed_rigid], dtype=np.float64)
         t_rig = np.array([H[:3, 3] + (H[:3, :3] - np.eye(3)) @ com for H in composed_rigid], dtype=np.float64)
-        rv_rig = _Rot.from_matrix(R_rig).as_rotvec()
-        rv_mm = fd_rad * rv_rig
 
-        t_ro = t_rig @ p_ro
-        t_pe = t_rig @ p_pe
-        t_sl = t_rig @ p_sl
-        r_ro = rv_mm @ p_ro
-        r_pe = rv_mm @ p_pe
-        r_sl = rv_mm @ p_sl
-
-        def _fit_tukey(Y_col: np.ndarray, win_sz: int) -> np.ndarray:
-            H_w = build_encoding_covariates(num_frames=n_frames, window_size=win_sz)["psi"]
-            gram_w = H_w.T @ H_w + 1e-4 * np.eye(H_w.shape[1], dtype=np.float64)
-            theta_w = np.linalg.solve(gram_w, H_w.T @ Y_col)
-            for _ in range(3):
-                res_w = Y_col - H_w @ theta_w
-                med_w = np.median(res_w, axis=0)
-                mad_w = np.maximum(1.4826 * np.median(np.abs(res_w - med_w), axis=0), 1e-6)
-                u_w = (res_w - med_w) / (4.685 * mad_w)
-                w_tk = np.where(np.abs(u_w) < 1.0, (1.0 - u_w ** 2) ** 2, 1e-4)
-                for col_i in range(Y_col.shape[1]):
-                    Hw_i = H_w * w_tk[:, col_i : col_i + 1]
-                    theta_w[:, col_i] = np.linalg.solve(
-                        Hw_i.T @ H_w + 1e-4 * np.eye(H_w.shape[1], dtype=np.float64),
-                        Hw_i.T @ Y_col[:, col_i],
-                    )
-            return Y_col - H_w @ theta_w
-
-        def _winsorized_ac1(series: np.ndarray) -> float:
-            ds = np.diff(series)
-            if ds.size < 4:
-                return 0.0
-            mu = float(np.mean(ds))
-            q75 = max(float(np.percentile(np.abs(ds - mu), 75)), 1e-12)
-            ds_c = np.clip(ds - mu, -3.0 * q75, 3.0 * q75)
-            ds0 = ds_c[:-1] - float(np.mean(ds_c[:-1]))
-            ds1 = ds_c[1:] - float(np.mean(ds_c[1:]))
-            denom = float(np.sqrt(np.sum(ds0 ** 2) * np.sum(ds1 ** 2)))
-            return float(np.sum(ds0 * ds1) / denom) if denom > 1e-12 else 0.0
-
-        w_pe = max(8, min(16, n_frames // 5))
-        w_nod = min(6, max(4, n_frames // 8))
-        r_pe_res = _fit_tukey(t_pe[:, None], w_pe)[:, 0]
-        raw_non_pe = np.column_stack([t_sl, r_ro, t_ro, r_pe, r_sl])
-        r_non_pe = _fit_tukey(raw_non_pe, w_nod)
-        r_epi = np.column_stack([r_pe_res, r_non_pe])
-
-        raw_all6 = np.column_stack([t_pe, raw_non_pe])
-        lag1_ac = [_winsorized_ac1(raw_all6[:, k]) for k in range(6)]
-        sigs = [float(np.median(np.abs(np.diff(r_epi[:, k])))) for k in range(6)]
-
-        etas_non_pe = [0.0] * 5
-        for idx_np in range(5):
-            k = idx_np + 1
-            ac1_k = lag1_ac[k]
-            sig_k_mm = 1.4826 * sigs[k]
-            if ac1_k < -0.38 and sig_k_mm > 0.052:
-                etas_non_pe[idx_np] = float(np.clip((-ac1_k - 0.20) / 0.45, 0.0, 0.85))
-
-        imm_clean = []
-        for k in (3, 4, 5):
-            eta_k = etas_non_pe[k - 1]
-            if eta_k > 0.0:
-                dr_k = np.zeros(n_frames, dtype=np.float64)
-                dr_k[1:] = np.abs(np.diff(r_epi[:, k]))
-                dr_local = np.maximum(dr_k, np.r_[dr_k[1:], 0.0])
-                scale_k = max(1.4826 * sigs[k], 0.02)
-                w_step_k = np.exp(-(np.maximum(0.0, dr_local - 3.5 * scale_k) / (2.5 * scale_k)) ** 2)
-                imm_clean.append(raw_all6[:, k] - eta_k * w_step_k * r_epi[:, k])
-            else:
-                imm_clean.append(raw_all6[:, k])
-
-        sig_ref = float(np.median([np.median(np.abs(np.diff(c))) for c in imm_clean]))
-        sag_min_sig = max(1.50 * sig_ref, 0.052 / 1.4826)
-        for idx_sag in (0, 1):
-            k = idx_sag + 1
-            if lag1_ac[k] < -0.38 and sigs[k] > sag_min_sig:
-                eta_wiener = max(0.0, 1.0 - (sig_ref / max(sigs[k], 1e-12)))
-                etas_non_pe[idx_sag] = max(etas_non_pe[idx_sag], eta_wiener)
-
-        sig_pe = sigs[0]
-        eta_pe = max(0.0, 1.0 - (sig_ref / max(sig_pe, 1e-12))) if sig_pe > 1.20 * sig_ref else 0.0
-        etas = [eta_pe] + etas_non_pe
-        pe_pseudomotion_debias = {"method": "grouped_overlapping_window_wiener_tukey_epi", "applied": False,
-                                  "wiener_shrinkage_eta_all6": [float(e) for e in etas],
-                                  "lag1_step_autocorr_all6": [float(a) for a in lag1_ac], "removed_pe_rms_mm": 0.0}
-        if max(etas) > 0.05:
-            d_ref_step = np.zeros(n_frames, dtype=np.float64)
-            d_ref_step[1:] = sum(np.abs(np.diff(c)) for c in imm_clean)
-            d_ref_local = np.maximum(d_ref_step, np.r_[d_ref_step[1:], 0.0])
-            tau_ref = max(0.25, 3.5 * float(np.median(d_ref_step[1:])))
-            w_b0 = np.exp(-np.maximum(0.0, (d_ref_local - tau_ref) / max(0.15, tau_ref)) ** 2)
-
-            deltas = np.zeros_like(r_epi)
-            for k in range(6):
-                if etas[k] <= 0.0:
-                    continue
-                dr_k = np.zeros(n_frames, dtype=np.float64)
-                dr_k[1:] = np.abs(np.diff(r_epi[:, k]))
-                dr_local = np.maximum(dr_k, np.r_[dr_k[1:], 0.0])
-                scale_k = max(1.4826 * sigs[k], 0.02)
-                u_step = np.maximum(0.0, dr_local - 3.5 * scale_k) / (2.5 * scale_k)
-                w_step_k = np.exp(-(u_step ** 2))
-                w_gate = w_b0 * w_step_k if k == 0 else w_step_k
-                deltas[:, k] = etas[k] * w_gate * r_epi[:, k]
-
-            t_clean = (
-                t_rig
-                - np.outer(deltas[:, 0], p_pe)
-                - np.outer(deltas[:, 1], p_sl)
-                - np.outer(deltas[:, 3], p_ro)
-            )
-            if max(etas[2], etas[4], etas[5]) > 0.0:
-                rv_clean = (
-                    rv_rig
-                    - np.outer(deltas[:, 2] / fd_rad, p_ro)
-                    - np.outer(deltas[:, 4] / fd_rad, p_pe)
-                    - np.outer(deltas[:, 5] / fd_rad, p_sl)
-                )
-                R_clean = _Rot.from_rotvec(rv_clean).as_matrix()
-            else:
-                R_clean = R_rig
+        R_clean, t_clean, deltas, pe_meta = _shrink_pe_pseudomotion_core(
+            R_rig, t_rig, com, p_pe, p_sl, p_ro, fd_radius=fd_rad, mode="grouped"
+        )
+        pe_pseudomotion_debias = pe_meta
+        if pe_meta is not None and pe_meta.get("applied"):
             composed_clean = []
             for i in range(n_frames):
                 H_c = np.eye(4, dtype=np.float64)
@@ -1031,23 +1061,12 @@ def motion_correct_grouped(
             fd_before_pe = np.asarray(fd, dtype=np.float64).copy()
             composed_rigid = composed_clean
             fd = jenkinson_framewise_displacement(composed_rigid, fd_rad, com)
-            pe_pseudomotion_debias = {
-                "method": "grouped_overlapping_window_wiener_tukey_epi",
-                "pe_vector_lps": [float(x) for x in p_pe],
+            pe_pseudomotion_debias.update({
                 "slice_axis": {"voxel_axis": int(sl_inf.voxel_axis), "source": sl_inf.source},
-                "sigma_ref_mm": sig_ref,
-                "sigma_pe_mm": sig_pe,
-                "wiener_shrinkage_eta": eta_pe,
-                "wiener_shrinkage_eta_all6": [float(e) for e in etas],
-                "lag1_step_autocorr_all6": [float(a) for a in lag1_ac],
-                "removed_pe_rms_mm": float(np.sqrt(np.mean(deltas[:, 0] ** 2))),
-                "removed_non_pe_rms_mm": float(np.sqrt(np.mean(np.sum(deltas[:, 1:] ** 2, axis=1)))),
-                "window_size": int(w_pe),
                 "fd_before_pe_debias_mean_mm": float(np.mean(fd_before_pe[1:])) if n_frames > 1 else 0.0,
                 "fd_before_pe_debias_max_mm": float(np.max(fd_before_pe[1:])) if n_frames > 1 else 0.0,
                 "fd_before_pe_debias": fd_before_pe,
-                "applied": True,
-            }
+            })
 
     # Extract composed 6-DOF rigid parameters in anchor space (centered at com), matching composed_rigid / fd
     translations_mm = np.zeros((n_frames, 3), dtype=np.float64)

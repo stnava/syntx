@@ -469,3 +469,67 @@ def test_group_offsets_interleaved_shells_recovered_and_blocked_refused():
 
     blocked = np.repeat([0, 1, 2], [10, 45, 45])
     assert _group_offsets(H, blocked, [np.flatnonzero(blocked == g) for g in range(3)], com) is None
+
+
+def test_bf7_connected_component_isolation():
+    """BF7: Planted 1.5 mm boundary jump in [0]*5 + [1, 2]*20 shows < 0.05 mm leakage into shell offsets."""
+    from syntx.motion_reference import _group_offsets, _pose_matrix
+
+    com = np.array([0.0, 0.0, 0.0])
+    groups = np.array([0] * 5 + [1, 2] * 20)
+    T = groups.size
+    head = np.zeros((T, 6))
+    head[5:, 0] = 1.5  # 1.5 mm jump right at the boundary between b0 and shells
+
+    # Imposed offset on shell 2 relative to shell 1
+    off2 = np.array([0.2, -0.15, 0.05, 0.0, 0.0, 0.0])
+    head[groups == 2] += off2
+
+    H = [_pose_matrix(head[i], com) for i in range(T)]
+    idx = [np.flatnonzero(groups == g) for g in range(3)]
+    est = _group_offsets(H, groups, idx, com)
+    assert est is not None
+    _, got = est
+    # Root of {1, 2} is 1, so offset of 2 is relative to root 1
+    assert 2 in got
+    np.testing.assert_allclose(got[2], off2, atol=0.04)
+
+
+def test_c1_level_layout_group_offsets_concordance():
+    """C1: 0 disagreements between level_layout and offset_identifiable across 1,500 random sequences."""
+    from syntx.motion_design import level_layout
+    from syntx.motion_reference import offset_identifiable
+
+    rng = np.random.default_rng(42)
+    disagreements = 0
+    for _ in range(1500):
+        T = rng.integers(20, 101)
+        k = rng.integers(2, 5)
+        # Random mix of blocked and alternating
+        if rng.random() < 0.5:
+            seq = rng.integers(0, k, size=T)
+        else:
+            blocks = rng.integers(1, 10, size=T // 5)
+            seq = np.repeat(rng.integers(0, k, size=len(blocks)), blocks)[:T]
+        # Ensure contiguous levels
+        u = np.unique(seq)
+        seq = np.searchsorted(u, seq)
+
+        layout = level_layout(seq)
+        info, _ = offset_identifiable(seq)
+        for g in info:
+            if layout[g]["beta_estimable"] != info[g]["identifiable"]:
+                disagreements += 1
+    assert disagreements == 0
+
+
+def test_f2_blocked_level_chain_isolation():
+    """F2: [0, 2]*10 with blocked level 1 ([1]*10) does not leak level 1's registration into level 2."""
+    from syntx.motion_reference import offset_identifiable
+
+    groups = np.array([0, 2] * 10 + [1] * 10)
+    info, components = offset_identifiable(groups)
+    assert info[0]["root"] == 0
+    assert info[2]["root"] == 0
+    assert info[1]["root"] == 1
+    assert components == [[0, 2], [1]]

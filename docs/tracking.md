@@ -1,12 +1,46 @@
 # Tracking Summary
-current phase: v6.23.0 (design-driven motion correction: syntx.motion_correct_design; acquisition axes from the image)
-next WP: Multi-modal deformable registration benchmarks and GPU memory optimization
+current phase: v6.24.1 (Stage 1: In-Solver Gauge Orthogonalization F14 & Scientific Directive)
+next WP: Stage 2/3 (Downstream Integration & Descriptive Verification)
 blockers: none
-active work: none (v6.23.0, 2026-10-26)
+active work: none (Stage 1 complete, 2026-10-26)
 device: Apple Silicon MPS / CPU (macOS arm64)
 last updated: 2026-10-26
 
 ---
+
+## R10 (Stage 1: In-Solver Gauge Orthogonalization F14 & BOLD EPI-Plane Debiasing, v6.24.1, 2026-10-26)
+- **F14 In-Solver Gauge Orthogonalization (`src/syntx/motion_batched.py`)**:
+  - Projected $\ell=2$ contrast gauge in `_batched_rigid_register_pass_core` strictly onto the 5-DOF subspace orthogonal to $\hat{\mathbf{p}}$-translation in both `_encoding_offset` and `_project_encoding_gauge`.
+  - Guarantees $\ell=2$ white-matter fiber anisotropy contrast never steals physical linear-in-$\mathbf{g}$ $\ell=1$ PE eddy translation along $\hat{\mathbf{p}}$.
+  - Populates `pe_info["bias"]` from `enc_bias_info` in both single-batch and chunked paths.
+- **BOLD EPI-Plane Debias Fix (`src/syntx/motion_batched.py`, `src/syntx/motion_design.py`)**:
+  - Fixed `sig_ref` bug in `separate_bold_pe_pseudomotion` by consuming the returned `meta` record from `_shrink_pe_pseudomotion_core`.
+  - Added alias `debias_pe_pseudomotion = separate_bold_pe_pseudomotion`.
+  - Routed `motion_correct_design` for BOLD (`"none"` design) with `pe_axis` and `debias_pe_pseudomotion=True`.
+- **Implementation Standards Exception (`tests/test_implementation_standards.py`)**:
+  - Updated line reference in `ALLOWED_REGISTRATION_EXCEPTIONS` from `motion.py:1059` to `motion.py:1062` matching the fallback `ants.registration` call in `src/syntx/motion.py`.
+- **Scientific Directive**:
+  - Primary `fd` (`dti_FD_mean/max`, `rsf_FD_mean/max`, `asl_FD_mean/max`) remains the single authoritative Framewise Displacement metric produced directly by the solver. No `*_FD_pe_debiased_*` columns are emitted in wide tables.
+- **Verification**: All unit tests in `syntx` (`test_motion_design.py`, `test_motion_reference.py`, `test_implementation_standards.py`, `test_stage0_challenger_blast_probes.py`) pass cleanly; static analysis `python -m antsxqc.lint` reports 0 findings.
+
+## R9 (Stage 0: Behavior-Preserving Motion Design Consolidation & Safe Bug Fixes, v6.24.0, 2026-10-26)
+- **Safe Bug Fixes BF1–BF7**:
+  - BF1 (F4): `_design_tag_control` preserves contiguous level re-indexing even when `"control"` is missing, recording `anchor_volume_type`.
+  - BF2 (F5): `_design_shells` enforces explicit `(T, 3)` gradient table shape validation, rejecting `(3, T)`.
+  - BF3 (F6): $b_0$ rows zeroed and DW gradient rows unit-normalized in `pe_affine_covariates`.
+  - BF4 (F10): `Design.__post_init__` validation enforces contiguous `0..k-1` levels, row-count matching across covariates, and unit-normalized `pe_axis`; `_design_none` supports `pe_axis`.
+  - BF5 (F9): `_unified` forwards `encoding_covariates` and `window_size` for multi-level `custom` designs.
+  - BF6 (F15): `pe_info["bias"]` populated from `enc_bias_info` in `_batched_rigid_register_pass_core` when `bias_info is None`; downstream fallback to `encoding_pose_bias_mm_rad` in `antsxdwi`.
+  - BF7 (F1/F2/F3): Centralized connected-component level graph isolation (`level_adjacency`, `offset_identifiable`); `motion_correct_grouped` links component roots directly, isolating blocked levels.
+- **Centralization C1–C3 & Plumbing**:
+  - C1: Centralized `level_adjacency` and `offset_identifiable` in `motion_reference.py`, achieving 0 discrepancies across 1,500 random sequences.
+  - C2: Centralized robust Tukey trend estimator `_fit_tukey_trend` in `motion_batched.py`.
+  - C3: Centralized post-hoc pseudomotion smoother core `_shrink_pe_pseudomotion_core` in `motion_batched.py`.
+  - F11: Single 3D reference footprint in `_corrected_level_mean` and broadcast in `reference_predictor`.
+  - F7/F8/F13: Plumbed `sidecar` and `slice_axis` through `motion_correction`, `motion_correct_grouped`, and `_batched_allowed_kwargs`; supported path inputs in `antsxdwi.motion_correct`.
+  - Deprecated `nuisance_covariates` and `nuisance_axis` in `motion_correct_grouped` with `FutureWarning`.
+- **Golden Baseline Verification**: G1–G5 match pre-change baselines within `0.00e+00`; G6 transforms match within `9.54e-07`; G6 FD reflects the BF7 bug fix.
+- **Quality & Standards**: 239/239 syntx motion tests pass; downstream test suites in `antsxdwi` (10/10), `antsxfunctional` (3/3), `antsxslowflow` (1/1) pass. Static analysis `python -m antsxqc.lint` reports 0 findings across all 5 repos with zero `.antsxqc-allow` files. Zero `nibabel` imports.
 
 ## R8 (Design-Driven Motion Correction `syntx.motion_correct_design`, Acquisition Axes, robust_affine Multi-Start, v6.23.0, 2026-10-26)
 - New `src/syntx/motion_design.py`: one entry point `motion_correct_design(image, make_design(name, ...), engine=...)` with a

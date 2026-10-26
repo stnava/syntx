@@ -572,6 +572,7 @@ def motion_correction(
     debias_pe_pseudomotion: bool = False,
     debias_sagittal_nyquist: bool = False,
     slice_axis=None,
+    sidecar=None,
     **kwargs: Any,
 ) -> MotionCorrectionResult:
     """
@@ -666,6 +667,8 @@ def motion_correction(
     slice_axis : int or str, optional
         Acquired slice axis for the PE debias frame (voxel index or BIDS ``i/j/k``); default: measured from the series
         (``syntx.acquisition_axes.infer_slice_axis``: voxel thickness, slice interleave), raising when undecidable.
+    sidecar : dict or Path or str, optional
+        Optional BIDS sidecar dict or path for metadata-guided axis inference.
     **kwargs
         'ants': passed to ``ants.registration``; 'pytorch': passed to ``syntx.robust_affine``;
         'pytorch_batched': ``num_bins`` (default 32), ``seed_mode``, ``schedule_mode``, ``resolution_cap_mm``,
@@ -780,7 +783,7 @@ def motion_correction(
                                "pe_affine_covariates", "pe_axis", "sample_mask", "bias_covariates", "sample_fraction",
                                "sampling", "resample_points", "sample_seed",
                                "convergence_tol_vox", "max_extend_factor", "encoding_covariates", "window_size",
-                               "window_stride", "surround_weight", "surround_delta_mm"}
+                               "window_stride", "surround_weight", "surround_delta_mm", "slice_axis", "sidecar"}
     if backend == "pytorch_batched" and set(kwargs) - _batched_allowed_kwargs:
         raise TypeError(f"backend='pytorch_batched' accepts only {sorted(_batched_allowed_kwargs)}; got "
                         f"{sorted(set(kwargs) - _batched_allowed_kwargs)}")
@@ -1249,6 +1252,7 @@ def motion_correction(
             window_size=kwargs.get("window_size"),
             sagittal_nyquist=bool(debias_sagittal_nyquist),
             slice_axis=slice_axis,
+            sidecar=sidecar,
         )
     return result
 

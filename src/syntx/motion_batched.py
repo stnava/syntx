@@ -423,6 +423,281 @@ def _project_encoding_surround_tukey_np(
     return delta_B, delta_Y, w_tukey
 
 
+def _fit_tukey_trend(Y: np.ndarray, window_size: int, n_iter: int = 3) -> np.ndarray:
+    """Robust windowed trend filtering using raised-cosine (Hann) basis and Tukey biweight IRLS.
+
+    Fits Y ~ Psi @ theta where Psi is the partition-of-unity basis with kernel radius window_size.
+    Returns high-pass residual Y - Psi @ theta.
+    Accepts 1D (T,) or 2D (T, K) arrays.
+    """
+    Y_arr = np.asarray(Y, dtype=np.float64)
+    is_1d = (Y_arr.ndim == 1)
+    Y_cols = Y_arr[:, None] if is_1d else Y_arr
+    T = Y_cols.shape[0]
+    H_loc = build_encoding_covariates(num_frames=T, window_size=int(window_size))["psi"]
+    gram_loc = H_loc.T @ H_loc + 1e-4 * np.eye(H_loc.shape[1], dtype=np.float64)
+    theta_loc = np.linalg.solve(gram_loc, H_loc.T @ Y_cols)
+    for _ in range(n_iter):
+        res_loc = Y_cols - H_loc @ theta_loc
+        med_loc = np.median(res_loc, axis=0)
+        mad_loc = np.maximum(1.4826 * np.median(np.abs(res_loc - med_loc), axis=0), 1e-6)
+        u_loc = (res_loc - med_loc) / (4.685 * mad_loc)
+        w_loc = np.where(np.abs(u_loc) < 1.0, (1.0 - u_loc ** 2) ** 2, 1e-4)
+        for c_idx in range(Y_cols.shape[1]):
+            Hw_loc = H_loc * w_loc[:, c_idx:c_idx + 1]
+            theta_loc[:, c_idx] = np.linalg.solve(
+                Hw_loc.T @ H_loc + 1e-4 * np.eye(H_loc.shape[1], dtype=np.float64),
+                Hw_loc.T @ Y_cols[:, c_idx],
+            )
+    res = Y_cols - H_loc @ theta_loc
+    return res[:, 0] if is_1d else res
+
+
+def _winsorized_step_ac1(series: np.ndarray) -> float:
+    """Winsorized lag-1 autocorrelation of step differences Delta x_t."""
+    ds = np.diff(series)
+    if ds.size < 4:
+        return 0.0
+    mu = float(np.mean(ds))
+    q75 = max(float(np.percentile(np.abs(ds - mu), 75)), 1e-12)
+    ds_c = np.clip(ds - mu, -3.0 * q75, 3.0 * q75)
+    ds0 = ds_c[:-1] - float(np.mean(ds_c[:-1]))
+    ds1 = ds_c[1:] - float(np.mean(ds_c[1:]))
+    denom = float(np.sqrt(np.sum(ds0 ** 2) * np.sum(ds1 ** 2)))
+    return float(np.sum(ds0 * ds1) / denom) if denom > 1e-12 else 0.0
+
+
+def _shrink_pe_pseudomotion_core(
+    R_all: np.ndarray,
+    t_all: np.ndarray,
+    com: np.ndarray,
+    p_pe: np.ndarray,
+    p_sl: np.ndarray,
+    p_ro: np.ndarray,
+    fd_radius: float = 50.0,
+    window_size: Optional[int] = None,
+    mode: str = "bold",
+    sagittal_nyquist: bool = False,
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray, Optional[dict]]:
+    """Centralized core for post-hoc respiratory phase-encode pseudomotion shrinkage.
+
+    Supports mode='bold' (3 DOFs: t_pe, t_sl, r_ro with gate < -0.25) and
+    mode='grouped' (6 DOFs with gate < -0.38).
+    Returns (R_clean, t_clean, deltas, meta).
+    """
+    from scipy.spatial.transform import Rotation as Rot
+
+    T = len(t_all)
+    rv = Rot.from_matrix(R_all).as_rotvec()
+    rv_mm = float(fd_radius) * rv
+
+    t_ro = t_all @ p_ro
+    t_pe = t_all @ p_pe
+    t_sl = t_all @ p_sl
+    r_ro = rv_mm @ p_ro
+    r_pe = rv_mm @ p_pe
+    r_sl = rv_mm @ p_sl
+
+    if mode == "bold":
+        w_size = int(window_size) if (window_size is not None and int(window_size) > 0) else max(8, min(24, T // 5))
+        r_pe_res = _fit_tukey_trend(t_pe, w_size)
+        w_nod = min(6, max(4, T // 8))
+        r_sag_res = _fit_tukey_trend(np.column_stack([t_sl, r_ro]), w_nod)
+        r_epi = np.column_stack([r_pe_res, r_sag_res])
+
+        raw_epi = np.column_stack([t_pe, t_sl, r_ro])
+        lag1_autocorrs = [_winsorized_step_ac1(raw_epi[:, k]) for k in range(3)]
+        sigs = [float(np.median(np.abs(np.diff(r_epi[:, k])))) for k in range(3)]
+
+        imm_floors = []
+        for imm_s in (t_ro, r_pe, r_sl):
+            sig_i = float(np.median(np.abs(np.diff(imm_s))))
+            ac1_i = _winsorized_step_ac1(imm_s)
+            eta_nyq_i = float(np.clip((-ac1_i - 0.20) / 0.45, 0.0, 0.75)) if (sagittal_nyquist and ac1_i < -0.25) else 0.0
+            imm_floors.append(sig_i * (1.0 - eta_nyq_i))
+        sig_ref = float(np.median(imm_floors))
+
+        sag_min_sig = max(1.35 * sig_ref, 0.025)
+        eta_pe = max(0.0, 1.0 - (sig_ref / max(sigs[0], 1e-12))) if sigs[0] > 1.10 * sig_ref else 0.0
+        eta_sl = (
+            max(0.0, 1.0 - (sig_ref / max(sigs[1], 1e-12)))
+            if (sigs[1] > sag_min_sig and lag1_autocorrs[1] < -0.25)
+            else 0.0
+        )
+        eta_r_ro = (
+            max(0.0, 1.0 - (sig_ref / max(sigs[2], 1e-12)))
+            if (sigs[2] > sag_min_sig and lag1_autocorrs[2] < -0.25)
+            else 0.0
+        )
+        if not sagittal_nyquist:
+            eta_sl = eta_r_ro = 0.0
+        etas = [eta_pe, eta_sl, eta_r_ro]
+        if max(etas) <= 0.05:
+            return R_all, t_all, np.zeros_like(r_epi), None
+
+        d_ref_step = np.zeros(T, dtype=np.float64)
+        d_ref_step[1:] = np.abs(np.diff(t_ro)) + np.abs(np.diff(r_pe)) + np.abs(np.diff(r_sl))
+        d_ref_local = np.maximum(d_ref_step, np.r_[d_ref_step[1:], 0.0])
+        tau_ref = max(0.25, 3.5 * float(np.median(d_ref_step[1:])))
+        w_b0 = np.exp(-np.maximum(0.0, (d_ref_local - tau_ref) / max(0.15, tau_ref)) ** 2)
+
+        deltas = np.zeros_like(r_epi)
+        for k in range(3):
+            if etas[k] <= 0.0:
+                continue
+            dr_k = np.zeros(T, dtype=np.float64)
+            dr_k[1:] = np.abs(np.diff(r_epi[:, k]))
+            dr_local = np.maximum(dr_k, np.r_[dr_k[1:], 0.0])
+            scale_k = max(1.4826 * sigs[k], 0.02)
+            u_step = np.maximum(0.0, dr_local - 3.5 * scale_k) / (2.5 * scale_k)
+            w_step_k = np.exp(-(u_step ** 2))
+            w_gate = w_b0 * w_step_k if k == 0 else w_step_k
+            deltas[:, k] = etas[k] * w_gate * r_epi[:, k]
+
+        t_clean = t_all - np.outer(deltas[:, 0], p_pe) - np.outer(deltas[:, 1], p_sl)
+        if etas[2] > 0.0:
+            rv_clean = rv - np.outer(deltas[:, 2] / float(fd_radius), p_ro)
+            R_clean = Rot.from_rotvec(rv_clean).as_matrix()
+        else:
+            R_clean = R_all
+
+        meta = {
+            "method": "overlapping_window_wiener_tukey_epi_plane",
+            "pe_vector_lps": [float(x) for x in p_pe],
+            "slice_vector_lps": [float(x) for x in p_sl],
+            "readout_vector_lps": [float(x) for x in p_ro],
+            "step_noise_floor_ref_mm": sig_ref,
+            "step_noise_floor_pe_mm": sigs[0],
+            "wiener_shrinkage_eta": float(eta_pe),
+            "pe_b0_shift_rms_mm": float(np.sqrt(np.mean(deltas[:, 0] ** 2))),
+            "pe_b0_shift_max_mm": float(np.max(np.abs(deltas[:, 0]))),
+            "pe_b0_shift_mm": [float(x) for x in deltas[:, 0]],
+            "window_size": int(w_size),
+            "step_lag1_autocorr_pe": float(lag1_autocorrs[0]),
+            "sagittal_nyquist": bool(sagittal_nyquist),
+        }
+        if sagittal_nyquist:
+            meta.update(
+                step_noise_floor_sl_mm=sigs[1],
+                step_noise_floor_r_ro_mm=sigs[2],
+                step_lag1_autocorr_sl=float(lag1_autocorrs[1]),
+                step_lag1_autocorr_r_ro=float(lag1_autocorrs[2]),
+                wiener_shrinkage_eta_sl=float(eta_sl),
+                wiener_shrinkage_eta_r_ro=float(eta_r_ro),
+                sl_shift_rms_mm=float(np.sqrt(np.mean(deltas[:, 1] ** 2))),
+                r_ro_shift_rms_mm=float(np.sqrt(np.mean(deltas[:, 2] ** 2))),
+            )
+        return R_clean, t_clean, deltas, meta
+
+    elif mode == "grouped":
+        w_pe = max(8, min(16, T // 5))
+        w_nod = min(6, max(4, T // 8))
+        r_pe_res = _fit_tukey_trend(t_pe, w_pe)
+        raw_non_pe = np.column_stack([t_sl, r_ro, t_ro, r_pe, r_sl])
+        r_non_pe = _fit_tukey_trend(raw_non_pe, w_nod)
+        r_epi = np.column_stack([r_pe_res, r_non_pe])
+
+        raw_all6 = np.column_stack([t_pe, raw_non_pe])
+        lag1_ac = [_winsorized_step_ac1(raw_all6[:, k]) for k in range(6)]
+        sigs = [float(np.median(np.abs(np.diff(r_epi[:, k])))) for k in range(6)]
+
+        etas_non_pe = [0.0] * 5
+        for idx_np in range(5):
+            k = idx_np + 1
+            ac1_k = lag1_ac[k]
+            sig_k_mm = 1.4826 * sigs[k]
+            if ac1_k < -0.38 and sig_k_mm > 0.052:
+                etas_non_pe[idx_np] = float(np.clip((-ac1_k - 0.20) / 0.45, 0.0, 0.85))
+
+        imm_clean = []
+        for k in (3, 4, 5):
+            eta_k = etas_non_pe[k - 1]
+            if eta_k > 0.0:
+                dr_k = np.zeros(T, dtype=np.float64)
+                dr_k[1:] = np.abs(np.diff(r_epi[:, k]))
+                dr_local = np.maximum(dr_k, np.r_[dr_k[1:], 0.0])
+                scale_k = max(1.4826 * sigs[k], 0.02)
+                w_step_k = np.exp(-(np.maximum(0.0, dr_local - 3.5 * scale_k) / (2.5 * scale_k)) ** 2)
+                imm_clean.append(raw_all6[:, k] - eta_k * w_step_k * r_epi[:, k])
+            else:
+                imm_clean.append(raw_all6[:, k])
+
+        sig_ref = float(np.median([np.median(np.abs(np.diff(c))) for c in imm_clean]))
+        sag_min_sig = max(1.50 * sig_ref, 0.052 / 1.4826)
+        for idx_sag in (0, 1):
+            k = idx_sag + 1
+            if lag1_ac[k] < -0.38 and sigs[k] > sag_min_sig:
+                eta_wiener = max(0.0, 1.0 - (sig_ref / max(sigs[k], 1e-12)))
+                etas_non_pe[idx_sag] = max(etas_non_pe[idx_sag], eta_wiener)
+
+        sig_pe = sigs[0]
+        eta_pe = max(0.0, 1.0 - (sig_ref / max(sig_pe, 1e-12))) if sig_pe > 1.20 * sig_ref else 0.0
+        etas = [eta_pe] + etas_non_pe
+        if max(etas) <= 0.05:
+            meta = {
+                "method": "grouped_overlapping_window_wiener_tukey_epi",
+                "applied": False,
+                "wiener_shrinkage_eta_all6": [float(e) for e in etas],
+                "lag1_step_autocorr_all6": [float(a) for a in lag1_ac],
+                "removed_pe_rms_mm": 0.0,
+            }
+            return R_all, t_all, np.zeros_like(r_epi), meta
+
+        d_ref_step = np.zeros(T, dtype=np.float64)
+        d_ref_step[1:] = sum(np.abs(np.diff(c)) for c in imm_clean)
+        d_ref_local = np.maximum(d_ref_step, np.r_[d_ref_step[1:], 0.0])
+        tau_ref = max(0.25, 3.5 * float(np.median(d_ref_step[1:])))
+        w_b0 = np.exp(-np.maximum(0.0, (d_ref_local - tau_ref) / max(0.15, tau_ref)) ** 2)
+
+        deltas = np.zeros_like(r_epi)
+        for k in range(6):
+            if etas[k] <= 0.0:
+                continue
+            dr_k = np.zeros(T, dtype=np.float64)
+            dr_k[1:] = np.abs(np.diff(r_epi[:, k]))
+            dr_local = np.maximum(dr_k, np.r_[dr_k[1:], 0.0])
+            scale_k = max(1.4826 * sigs[k], 0.02)
+            u_step = np.maximum(0.0, dr_local - 3.5 * scale_k) / (2.5 * scale_k)
+            w_step_k = np.exp(-(u_step ** 2))
+            w_gate = w_b0 * w_step_k if k == 0 else w_step_k
+            deltas[:, k] = etas[k] * w_gate * r_epi[:, k]
+
+        t_clean = (
+            t_all
+            - np.outer(deltas[:, 0], p_pe)
+            - np.outer(deltas[:, 1], p_sl)
+            - np.outer(deltas[:, 3], p_ro)
+        )
+        if max(etas[2], etas[4], etas[5]) > 0.0:
+            rv_clean = (
+                rv
+                - np.outer(deltas[:, 2] / float(fd_radius), p_ro)
+                - np.outer(deltas[:, 4] / float(fd_radius), p_pe)
+                - np.outer(deltas[:, 5] / float(fd_radius), p_sl)
+            )
+            R_clean = Rot.from_rotvec(rv_clean).as_matrix()
+        else:
+            R_clean = R_all
+
+        meta = {
+            "method": "grouped_overlapping_window_wiener_tukey_epi",
+            "pe_vector_lps": [float(x) for x in p_pe],
+            "sigma_ref_mm": sig_ref,
+            "sigma_pe_mm": sig_pe,
+            "wiener_shrinkage_eta": eta_pe,
+            "wiener_shrinkage_eta_all6": [float(e) for e in etas],
+            "lag1_step_autocorr_all6": [float(a) for a in lag1_ac],
+            "removed_pe_rms_mm": float(np.sqrt(np.mean(deltas[:, 0] ** 2))),
+            "removed_non_pe_rms_mm": float(np.sqrt(np.mean(np.sum(deltas[:, 1:] ** 2, axis=1)))),
+            "window_size": int(w_pe),
+            "applied": True,
+        }
+        return R_clean, t_clean, deltas, meta
+
+    else:
+        raise ValueError(f"unknown mode {mode!r}; expected 'bold' or 'grouped'")
+
+
 def separate_bold_pe_pseudomotion(
     bold_image: ants.ANTsImage,
     moco: dict,
@@ -493,113 +768,20 @@ def separate_bold_pe_pseudomotion(
     sl_inf = infer_slice_axis(bold_image, slice_axis=slice_axis, sidecar=sidecar)
     p_pe, p_sl, p_ro = encoding_frame(getattr(bold_image, "direction", np.eye(3)), pe_axis, sl_inf.voxel_axis)
 
-    t_ro = t_all @ p_ro
-    t_pe = t_all @ p_pe
-    t_sl = t_all @ p_sl
-
-    r_ro = rv_mm @ p_ro
-    r_pe = rv_mm @ p_pe
-    r_sl = rv_mm @ p_sl
-
-    def _fit_tukey_hann(Y_cols: np.ndarray, win_sz: int) -> np.ndarray:
-        H_loc = build_encoding_covariates(num_frames=T, window_size=win_sz)["psi"]
-        gram_loc = H_loc.T @ H_loc + 1e-4 * np.eye(H_loc.shape[1], dtype=np.float64)
-        theta_loc = np.linalg.solve(gram_loc, H_loc.T @ Y_cols)
-        for _ in range(3):
-            res_loc = Y_cols - H_loc @ theta_loc
-            for c_idx in range(Y_cols.shape[1]):
-                med_c = float(np.median(res_loc[:, c_idx]))
-                mad_c = max(1.4826 * float(np.median(np.abs(res_loc[:, c_idx] - med_c))), 1e-6)
-                u_c = (res_loc[:, c_idx] - med_c) / (4.685 * mad_c)
-                w_c = np.where(np.abs(u_c) < 1.0, (1.0 - u_c ** 2) ** 2, 1e-4)
-                Hw_loc = H_loc * w_c[:, None]
-                theta_loc[:, c_idx] = np.linalg.solve(
-                    Hw_loc.T @ H_loc + 1e-4 * np.eye(H_loc.shape[1], dtype=np.float64),
-                    Hw_loc.T @ Y_cols[:, c_idx],
-                )
-        return Y_cols - H_loc @ theta_loc
-
-    w_size = int(window_size) if (window_size is not None and int(window_size) > 0) else max(8, min(24, T // 5))
-    r_pe_res = _fit_tukey_hann(t_pe[:, None], w_size)[:, 0]
-
-    # Coupled sagittal-plane DOFs (t_SL, r_RO): thick-slice respiratory/cardiac through-slice B0 gradients induce
-    # Nyquist-like TR-to-TR oscillation (negative raw-step lag-1 autocorrelation < -0.25), whereas real head nodding
-    # (period > 4 frames, cos(2*pi/P) > 0) has positive lag-1 step autocorrelation and is preserved untouched.
-    w_nod = min(6, max(4, T // 8))
-    r_sag_res = _fit_tukey_hann(np.column_stack([t_sl, r_ro]), w_nod)
-    r_epi = np.column_stack([r_pe_res, r_sag_res[:, 0], r_sag_res[:, 1]])
-
-    def _winsorized_step_ac1(series: np.ndarray) -> float:
-        ds = np.diff(series)
-        if ds.size < 4:
-            return 0.0
-        mu = float(np.mean(ds))
-        q75 = max(float(np.percentile(np.abs(ds - mu), 75)), 1e-12)
-        ds_c = np.clip(ds - mu, -3.0 * q75, 3.0 * q75)
-        ds0 = ds_c[:-1] - float(np.mean(ds_c[:-1]))
-        ds1 = ds_c[1:] - float(np.mean(ds_c[1:]))
-        denom = float(np.sqrt(np.sum(ds0 ** 2) * np.sum(ds1 ** 2)))
-        return float(np.sum(ds0 * ds1) / denom) if denom > 1e-12 else 0.0
-
-    raw_epi = np.column_stack([t_pe, t_sl, r_ro])
-    lag1_autocorrs = [_winsorized_step_ac1(raw_epi[:, k]) for k in range(3)]
-    sigs = [float(np.median(np.abs(np.diff(r_epi[:, k])))) for k in range(3)]
-
-    # Reference step floor from the B0-immune DOFs (t_ro, r_pe, r_sl). The pilot's deflation of an alternating immune
-    # DOF ("Nyquist jitter") is used only with sagittal_nyquist: independent real jitter alternates too, and deflating
-    # the floor made the PE shrinkage remove real PE motion (re-review: 60 frames of 0.15 mm / 0.15 deg independent
-    # jitter, eta 0.43-0.65 in 4 of 4 seeds vs 1 of 4 with the plain floor).
-    imm_floors = []
-    for imm_s in (t_ro, r_pe, r_sl):
-        sig_i = float(np.median(np.abs(np.diff(imm_s))))
-        ac1_i = _winsorized_step_ac1(imm_s)
-        eta_nyq_i = float(np.clip((-ac1_i - 0.20) / 0.45, 0.0, 0.75)) if (sagittal_nyquist and ac1_i < -0.25) else 0.0
-        imm_floors.append(sig_i * (1.0 - eta_nyq_i))
-    sig_ref = float(np.median(imm_floors))
-
-    sag_min_sig = max(1.35 * sig_ref, 0.025)
-    eta_pe = max(0.0, 1.0 - (sig_ref / max(sigs[0], 1e-12))) if sigs[0] > 1.10 * sig_ref else 0.0
-    eta_sl = (
-        max(0.0, 1.0 - (sig_ref / max(sigs[1], 1e-12)))
-        if (sigs[1] > sag_min_sig and lag1_autocorrs[1] < -0.25)
-        else 0.0
+    R_clean, t_clean, deltas, meta = _shrink_pe_pseudomotion_core(
+        R_all,
+        t_all,
+        com,
+        p_pe,
+        p_sl,
+        p_ro,
+        fd_radius=fd_radius,
+        window_size=window_size,
+        mode="bold",
+        sagittal_nyquist=bool(sagittal_nyquist),
     )
-    eta_r_ro = (
-        max(0.0, 1.0 - (sig_ref / max(sigs[2], 1e-12)))
-        if (sigs[2] > sag_min_sig and lag1_autocorrs[2] < -0.25)
-        else 0.0
-    )
-    if not sagittal_nyquist:
-        eta_sl = eta_r_ro = 0.0
-    etas = [eta_pe, eta_sl, eta_r_ro]
-    if max(etas) <= 0.05:
+    if meta is None:
         return moco, None
-
-    d_ref_step = np.zeros(T, dtype=np.float64)
-    d_ref_step[1:] = np.abs(np.diff(t_ro)) + np.abs(np.diff(r_pe)) + np.abs(np.diff(r_sl))
-    d_ref_local = np.maximum(d_ref_step, np.r_[d_ref_step[1:], 0.0])
-    tau_ref = max(0.25, 3.5 * float(np.median(d_ref_step[1:])))
-    w_b0 = np.exp(-np.maximum(0.0, (d_ref_local - tau_ref) / max(0.15, tau_ref)) ** 2)
-
-    deltas = np.zeros_like(r_epi)
-    for k in range(3):
-        if etas[k] <= 0.0:
-            continue
-        dr_k = np.zeros(T, dtype=np.float64)
-        dr_k[1:] = np.abs(np.diff(r_epi[:, k]))
-        dr_local = np.maximum(dr_k, np.r_[dr_k[1:], 0.0])
-        scale_k = max(1.4826 * sigs[k], 0.02)
-        u_step = np.maximum(0.0, dr_local - 3.5 * scale_k) / (2.5 * scale_k)
-        w_step_k = np.exp(-(u_step ** 2))
-        w_gate = w_b0 * w_step_k if k == 0 else w_step_k
-        deltas[:, k] = etas[k] * w_gate * r_epi[:, k]
-
-    t_clean = t_all - np.outer(deltas[:, 0], p_pe) - np.outer(deltas[:, 1], p_sl)
-    if etas[2] > 0.0:
-        rv_clean = rv - np.outer(deltas[:, 2] / float(fd_radius), p_ro)
-        R_clean = Rot.from_rotvec(rv_clean).as_matrix()
-    else:
-        R_clean = R_all
 
     raw_params = np.zeros((T, 6), dtype=np.float64)
     homog_all = []
@@ -643,24 +825,27 @@ def separate_bold_pe_pseudomotion(
         summary["fd_max"] = float(np.max(fd_power))
         out["summary"] = summary
 
-    meta = {
-        "method": "overlapping_window_wiener_tukey_epi_plane",
-        "pe_vector_lps": [float(x) for x in p_pe],
-        "slice_vector_lps": [float(x) for x in p_sl],
-        "readout_vector_lps": [float(x) for x in p_ro],
-        "slice_axis": {"voxel_axis": int(sl_inf.voxel_axis), "source": sl_inf.source},
-        "sigma_ref_mm": sig_ref,
-        "sigma_epi_mm": [float(s) for s in sigs],
-        "lag1_step_autocorr": [float(a) for a in lag1_autocorrs],
-        "wiener_shrinkage_eta": [float(e) for e in etas],
-        "removed_pe_rms_mm": float(np.sqrt(np.mean(deltas[:, 0] ** 2))),
-        "removed_slice_rms_mm": float(np.sqrt(np.mean(deltas[:, 1] ** 2))),
-        "removed_pitch_rms_mm": float(np.sqrt(np.mean(deltas[:, 2] ** 2))),
-        "window_size": w_size,
-        "sagittal_window_size": w_nod,
-    }
+    meta = dict(meta)
+    meta["slice_axis"] = {"voxel_axis": int(sl_inf.voxel_axis), "source": sl_inf.source}
+    meta["sigma_ref_mm"] = meta.get("step_noise_floor_ref_mm")
+    sigs_list = [meta.get("step_noise_floor_pe_mm")]
+    ac1_list = [meta.get("step_lag1_autocorr_pe")]
+    eta_list = [meta.get("wiener_shrinkage_eta")]
+    if sagittal_nyquist:
+        sigs_list.extend([meta.get("step_noise_floor_sl_mm"), meta.get("step_noise_floor_r_ro_mm")])
+        ac1_list.extend([meta.get("step_lag1_autocorr_sl"), meta.get("step_lag1_autocorr_r_ro")])
+        eta_list.extend([meta.get("wiener_shrinkage_eta_sl"), meta.get("wiener_shrinkage_eta_r_ro")])
+    meta["sigma_epi_mm"] = sigs_list
+    meta["lag1_step_autocorr"] = ac1_list
+    meta["wiener_shrinkage_eta"] = eta_list
+    meta["removed_pe_rms_mm"] = float(np.sqrt(np.mean(deltas[:, 0] ** 2)))
+    meta["removed_slice_rms_mm"] = float(np.sqrt(np.mean(deltas[:, 1] ** 2)))
+    meta["removed_pitch_rms_mm"] = float(np.sqrt(np.mean(deltas[:, 2] ** 2)))
     out["pe_pseudomotion_debias"] = meta
     return out, meta
+
+
+debias_pe_pseudomotion = separate_bold_pe_pseudomotion
 
 
 
@@ -1017,6 +1202,8 @@ def batched_rigid_register_pass(
                 "removed_rms_mm": float(np.sqrt((dY[:, :3] ** 2).sum(axis=1).mean())),
                 "removed_rms_deg": float(np.degrees(np.sqrt((dY[:, 3:] ** 2).sum(axis=1).mean()))),
             }
+            if "bias" not in pe_info:
+                pe_info["bias"] = pe_info["encoding_pose_bias_mm_rad"]
         if "convergence" in first:
             pe_info["convergence"] = [pc["convergence"] for pc in pe_chunks if pc is not None]  # one stage list per chunk
         if any("a" in pc for pc in pe_chunks if pc is not None):
@@ -1572,7 +1759,14 @@ def _batched_rigid_register_pass_core(
 
     def _encoding_offset():
         """(B, 6) encoding-locked pose offset E_psi . B_win in (mm, rad)."""
-        return torch.einsum("bmk,mkd->bd", E_psi_t, B_win) * enc_unit
+        dY = torch.einsum("bmk,mkd->bd", E_psi_t, B_win) * enc_unit
+        if pe_on and pe_axis is not None:
+            # Enforce 5-DOF subspace orthogonal to p-translation:
+            # l=2 contrast gauge must never steal physical l=1 PE eddy translation along p_vec.
+            p_comp = (dY[:, :3] * p_vec).sum(dim=-1, keepdim=True)
+            dY_trans = dY[:, :3] - p_comp * p_vec
+            dY = torch.cat([dY_trans, dY[:, 3:]], dim=-1)
+        return dY
 
     def _total_pose():
         """Pose the image metric sees: head motion (t_param, omega) plus the encoding-locked offset."""
@@ -1604,7 +1798,24 @@ def _batched_rigid_register_pass_core(
             omega.add_(dY_old[:, 3:])
             B_win.zero_()
             Y_tot = np.c_[t_param.detach().cpu().numpy().astype(np.float64), omega.detach().cpu().numpy().astype(np.float64)]
-            B_np, dY_np, w_np = _project_encoding_surround_tukey_np(Y_tot, E_np, psi_np, fd_radius=50.0, surround_weight=0.0)
+            p_unit = None
+            if pe_on and pe_axis is not None:
+                p_arr = np.asarray(pe_axis, dtype=np.float64)
+                p_norm = np.linalg.norm(p_arr)
+                if p_norm > 1e-8:
+                    p_unit = p_arr / p_norm
+                    Y_fit = Y_tot.copy()
+                    Y_fit[:, :3] -= np.outer(Y_fit[:, :3] @ p_unit, p_unit)
+                else:
+                    Y_fit = Y_tot
+            else:
+                Y_fit = Y_tot
+            B_np, dY_np, w_np = _project_encoding_surround_tukey_np(Y_fit, E_np, psi_np, fd_radius=50.0, surround_weight=0.0)
+            if p_unit is not None:
+                comp_B = np.einsum("mkd,d->mk", B_np[:, :, :3], p_unit)
+                B_np[:, :, :3] -= comp_B[:, :, None] * p_unit[None, None, :]
+                comp_dY = dY_np[:, :3] @ p_unit
+                dY_np[:, :3] -= np.outer(comp_dY, p_unit)
             B_win.copy_(torch.tensor(B_np, **f32) / enc_unit)
             t_param.sub_(torch.tensor(dY_np[:, :3], **f32))
             omega.sub_(torch.tensor(dY_np[:, 3:], **f32))
@@ -1870,6 +2081,8 @@ def _batched_rigid_register_pass_core(
         if pe_info is None:
             pe_info = {}
         pe_info["encoding_pose_bias_mm_rad"] = enc_bias_info
+        if bias_info is None:
+            pe_info["bias"] = enc_bias_info
     if pe_info is None:
         pe_info = {}
     pe_info["convergence"] = convergence_log

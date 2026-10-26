@@ -45,6 +45,34 @@ class Design:
     pe_axis: Optional[np.ndarray] = None
     detail: Dict[str, Any] = field(default_factory=dict)
 
+    def __post_init__(self):
+        lev = np.asarray(self.levels)
+        if lev.ndim != 1:
+            raise ValueError(f"levels must be 1D, got ndim={lev.ndim}")
+        unique_levs = set(lev.tolist())
+        expected = set(range(len(unique_levs)))
+        if unique_levs != expected:
+            raise ValueError(f"levels must be contiguous integers 0..k-1; got {sorted(unique_levs)}")
+        T = len(lev)
+        if self.encoding is not None:
+            enc = np.asarray(self.encoding)
+            if enc.shape[0] != T:
+                raise ValueError(f"encoding rows ({enc.shape[0]}) must match levels length ({T})")
+        if self.pe_affine_covariates is not None:
+            pe_cov = np.asarray(self.pe_affine_covariates)
+            if pe_cov.shape[0] != T:
+                raise ValueError(f"pe_affine_covariates rows ({pe_cov.shape[0]}) must match levels length ({T})")
+        if self.bias_covariates is not None:
+            bias = np.asarray(self.bias_covariates)
+            if bias.shape[0] != T:
+                raise ValueError(f"bias_covariates rows ({bias.shape[0]}) must match levels length ({T})")
+        if self.pe_axis is not None:
+            p = np.asarray(self.pe_axis, dtype=np.float64).reshape(-1)
+            norm = float(np.linalg.norm(p))
+            if p.size != 3 or norm < 1e-8:
+                raise ValueError(f"pe_axis must be a non-zero 3-vector, got {self.pe_axis!r}")
+            object.__setattr__(self, "pe_axis", p / norm)
+
     @property
     def n_frames(self) -> int:
         return int(len(self.levels))
@@ -77,19 +105,33 @@ def _real_sh_l2(bvecs: np.ndarray, dw: np.ndarray) -> np.ndarray:
     return out
 
 
-def _design_none(n_frames: int) -> Design:
-    return Design("none", np.zeros(int(n_frames), dtype=int))
+def _design_none(n_frames: int, pe_axis=None) -> Design:
+    return Design("none", np.zeros(int(n_frames), dtype=int), pe_axis=pe_axis)
 
 
 def _design_tag_control(volume_types: Sequence[str]) -> Design:
     vt = [str(v).lower().replace("tag", "label") for v in volume_types]
     others = sorted(set(vt) - {"control", "label"})
-    levels = np.array([0 if v == "control" else (1 if v == "label" else 2 + others.index(v)) for v in vt], dtype=int)
+    seen = []
+    for v in vt:
+        if v not in seen:
+            seen.append(v)
+    if "control" in seen:
+        seen.remove("control")
+        seen.insert(0, "control")
+    if len(seen) > 1 and seen[0] == "control" and "label" in seen:
+        seen.remove("label")
+        seen.insert(1, "label")
+    type_to_level = {v: i for i, v in enumerate(seen)}
+    levels = np.array([type_to_level[v] for v in vt], dtype=int)
+    anchor_type = seen[0] if seen else "control"
+
     s_tc = np.array([1.0 if v == "control" else (-1.0 if v == "label" else 0.0) for v in vt])
     n_tc = int(np.sum(np.abs(s_tc) > 0))
     enc = s_tc if (n_tc >= 6 and {"control", "label"} <= set(vt)) else None
     return Design("tag_control", levels, encoding=enc,
-                  detail={"other_volume_types": others, "n_control_label": n_tc,
+                  detail={"other_volume_types": others, "anchor_volume_type": anchor_type,
+                          "n_control_label": n_tc,
                           "encoding": "tag_control_pm1" if enc is not None else
                           f"none ({n_tc} control/label volumes of types {sorted(set(vt))})"})
 
@@ -101,13 +143,24 @@ def _design_shells(bvals, bvecs=None, pe_axis=None, b0_threshold: float = 50.0) 
     levels = np.asarray(shell_groups(bv, b0_threshold=b0_threshold), dtype=int)
     pe_cov = bias = None
     if bvecs is not None:
-        g = np.asarray(bvecs, dtype=np.float64).reshape(len(bv), 3)
+        bvecs_arr = np.asarray(bvecs, dtype=np.float64)
+        if bvecs_arr.ndim != 2:
+            raise ValueError(f"bvecs must be 2-dimensional; received shape {bvecs_arr.shape}")
+        if bvecs_arr.shape == (3, len(bv)) and len(bv) != 3:
+            raise ValueError("bvecs must have shape (T, 3); received (3, T). Transpose before passing.")
+        if bvecs_arr.shape != (len(bv), 3):
+            raise ValueError(f"bvecs shape {bvecs_arr.shape} does not match bvals length ({len(bv)}, 3)")
+        g = bvecs_arr
         dw = (bv > b0_threshold) & (np.linalg.norm(g, axis=1) > 0)
         bias = _real_sh_l2(g, dw)
         if pe_axis is not None:
-            pe_cov = g
+            pe_cov = np.zeros_like(g)
+            if np.any(dw):
+                norms = np.linalg.norm(g[dw], axis=1, keepdims=True)
+                norms = np.where(norms == 0, 1.0, norms)
+                pe_cov[dw] = g[dw] / norms
     return Design("shells", levels, pe_affine_covariates=pe_cov, bias_covariates=bias,
-                  pe_axis=None if pe_axis is None else np.asarray(pe_axis, dtype=np.float64),
+                  pe_axis=pe_axis,
                   detail={"b0_threshold": float(b0_threshold), "n_per_level": np.bincount(levels).tolist()})
 
 
@@ -154,7 +207,10 @@ def _dispatch(image, design: Design, **kwargs) -> dict:
     from .motion_reference import motion_correct_grouped
 
     if design.name == "none":
-        r = motion_correction(image, reference="mean", type_of_transform="Rigid", preset="bold", **kwargs)
+        kw = dict(kwargs)
+        if design.pe_axis is not None:
+            kw.setdefault("pe_axis", design.pe_axis)
+        r = motion_correction(image, reference="mean", type_of_transform="Rigid", preset="bold", **kw)
         return _normalized(r, design, "dispatch", "motion_correction(preset='bold')")
     if design.name == "tag_control":
         if design.encoding is None:
@@ -202,16 +258,25 @@ def level_layout(levels: np.ndarray) -> Dict[int, dict]:
     through the series, so its mean shares the series' mean head position) when it has at least 2 frames and at least
     half of them are mixed; otherwise it is BLOCKED (its offset is not separable from drift). Its offset to the others is
     estimable locally (``beta_estimable``) with at least ``MIN_MIXED_FOR_BETA`` mixed frames."""
+    from .motion_reference import offset_identifiable
+
     lev = np.asarray(levels).reshape(-1)
     T = lev.size
+    info, _ = offset_identifiable(lev)
     out = {}
     for k in np.unique(lev):
+        k = int(k)
         idx = np.flatnonzero(lev == k)
-        mixed = sum(1 for t in idx if (t > 0 and lev[t - 1] != k) or (t < T - 1 and lev[t + 1] != k))
-        out[int(k)] = {"n": int(idx.size), "mixed": int(mixed),
-                       "interleaved": bool(idx.size >= 2 and mixed >= max(2, (idx.size + 1) // 2)),
-                       "beta_estimable": bool(mixed >= MIN_MIXED_FOR_BETA),
-                       "mean_time": float(idx.mean() / max(T - 1, 1))}
+        k_info = info.get(k, {})
+        out[k] = {
+            "n": int(idx.size),
+            "mixed": int(k_info.get("mixed", 0)),
+            "interleaved": bool(k_info.get("interleaved", False)),
+            "beta_estimable": bool(k_info.get("identifiable", False)),
+            "mean_time": float(idx.mean() / max(T - 1, 1)),
+            "root": int(k_info.get("root", k)),
+            "component": k_info.get("component", [k]),
+        }
     return out
 
 
@@ -227,12 +292,11 @@ def _knobs(design: Design) -> dict:
 
 
 def _corrected_level_mean(frames, group_index=None, frame_indices=None):
-    """``reference_predictor`` for the reference iteration: every frame of the level gets the mean of the level's
-    corrected frames (sharper than the first-pass low-motion mean)."""
+    """``reference_predictor`` for the reference iteration: returns the single mean 3D image of the level's
+    corrected frames (sharper than the first-pass low-motion mean), without stacking T copies in memory."""
     import ants
 
-    m = ants.new_image_like(frames[0], np.mean([f.numpy() for f in frames], axis=0).astype(np.float32))
-    return [m] * len(frames)
+    return ants.new_image_like(frames[0], np.mean([f.numpy() for f in frames], axis=0).astype(np.float32))
 
 
 def _unified(image, design: Design, *, beta: str = "levels+design", iterations: int = 0, **kwargs) -> dict:
@@ -257,6 +321,8 @@ def _unified(image, design: Design, *, beta: str = "levels+design", iterations: 
     window_size = knobs.pop("window_size", None)
     if design.n_levels == 1:
         kw = {**knobs, **kwargs}
+        if design.pe_axis is not None:
+            kw.setdefault("pe_axis", design.pe_axis)
         if design.encoding is not None:
             kw["encoding_covariates"] = design.encoding
             kw["window_size"] = window_size
@@ -265,11 +331,12 @@ def _unified(image, design: Design, *, beta: str = "levels+design", iterations: 
 
     layout = level_layout(levels)
     ks = sorted(layout)
-    # identity link where the level's offset is then measured locally (beta on, >= MIN_MIXED_FOR_BETA mixed frames: any
-    # mean-pose difference between the raw level means is part of that offset) or where both levels share the series'
-    # mean head position (interleaved); otherwise a rigid registration of the corrected means
-    links = ["identity" if ((beta != "none" and layout[ks[i]]["beta_estimable"])
-                            or (layout[ks[i - 1]]["interleaved"] and layout[ks[i]]["interleaved"])) else "registration"
+    # identity link where the levels belong to the same connected component and the level's offset is measured locally
+    # (beta on, identifiable) or where both levels share the series' mean head position (interleaved);
+    # otherwise a rigid registration of the corrected means
+    links = ["identity" if (layout[ks[i]]["root"] == layout[ks[i - 1]]["root"]
+                            and ((beta != "none" and layout[ks[i]]["beta_estimable"])
+                                 or (layout[ks[i - 1]]["interleaved"] and layout[ks[i]]["interleaved"]))) else "registration"
              for i in range(1, len(ks))]
     kw = dict(kwargs)
     dropped = []
@@ -290,6 +357,10 @@ def _unified(image, design: Design, *, beta: str = "levels+design", iterations: 
                     kw["window_size"] = window_size
     else:
         kw.update(backend=backend, **knobs)
+        if design.name == "custom" and design.encoding is not None:
+            kw["encoding_covariates"] = design.encoding
+            if window_size is not None:
+                kw["window_size"] = window_size
     if iterations > 0:
         kw.update(reference_predictor=_corrected_level_mean, reference_iterations=int(iterations))
     r = motion_correct_grouped(image, levels, cross_link=links, cross_group_debias=(beta != "none"), **kw)

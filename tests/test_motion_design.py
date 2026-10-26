@@ -166,3 +166,64 @@ def test_cross_link_values_are_checked():
     with pytest.raises(ValueError, match="cross_link"):
         _cross_link(None, None, "rigid", verbose=False, device="cpu", num_bins=32, convergence_tol_vox=0.05,
                     max_extend_factor=4)
+
+
+def test_bf1_tag_control_contiguous_without_control():
+    d = make_design("tag_control", volume_types=["label"] * 8 + ["m0scan"] * 2)
+    assert set(d.levels.tolist()) == {0, 1}
+    assert d.n_levels == 2
+    assert d.detail.get("anchor_volume_type") == "label"
+
+
+def test_bf2_shells_transposed_bvecs_raises():
+    with pytest.raises(ValueError, match=r"shape \(T, 3\)"):
+        make_design("shells", bvals=[0, 1000] * 5, bvecs=np.zeros((3, 10)))
+
+
+def test_bf3_shells_b0_rows_zeroed_dw_rows_unit_normalized():
+    bvals = np.array([0, 1000, 2000, 0, 1000])
+    bvecs = np.array([[1.0, 0.0, 0.0], [2.0, 0.0, 0.0], [0.0, 3.0, 0.0], [0.5, 0.5, 0.5], [0.0, 0.0, 4.0]])
+    d = make_design("shells", bvals=bvals, bvecs=bvecs, pe_axis=[0, 1, 0])
+    np.testing.assert_allclose(d.pe_affine_covariates[bvals == 0], 0.0)
+    dw_norms = np.linalg.norm(d.pe_affine_covariates[bvals > 0], axis=1)
+    np.testing.assert_allclose(dw_norms, 1.0, atol=1e-12)
+
+
+def test_bf4_design_validation():
+    from syntx.motion_design import Design
+
+    with pytest.raises(ValueError, match="encoding rows"):
+        Design(name="custom", levels=np.array([0, 1, 0, 1]), encoding=np.ones((5, 1)))
+
+    with pytest.raises(ValueError, match="contiguous"):
+        Design(name="custom", levels=np.array([0, 2, 0, 2]))
+
+    with pytest.raises(ValueError, match="non-zero 3-vector"):
+        Design(name="none", levels=np.zeros(4, dtype=int), pe_axis=np.array([0.0, 0.0, 0.0]))
+
+    d_none = make_design("none", n_frames=10, pe_axis=[0, 2, 0])
+    np.testing.assert_allclose(np.linalg.norm(d_none.pe_axis), 1.0, atol=1e-12)
+    assert d_none.n_frames == 10
+
+
+def test_bf5_custom_design_forwards_encoding_covariates():
+    d = make_design("custom", levels=[0, 1] * 5, encoding=np.ones((10, 1)))
+    assert d.encoding.shape == (10, 1)
+    assert d.n_levels == 2
+
+
+def test_f14_planted_linear_eddy_shift_recovers_without_leakage():
+    """Synthetic shell with planted 0.4 mm linear-in-g PE eddy shift + l=2 bias under engine='unified'
+    recovering full pe_affine shift without leakage into encoding_covariates and populating grouped['bias']."""
+    from syntx.motion_simulation import simulate_dwi_series
+
+    sim = simulate_dwi_series(16, seed=42, eddy_mm_per_unit=0.4)
+    bv, bvec = sim.extra["bvals"], sim.extra["bvecs"]
+    d = make_design("shells", bvals=bv, bvecs=bvec, pe_axis=sim.pe_axis)
+    res = motion_correct_design(sim.image, d, engine="unified", verbose=False)
+    assert res is not None
+    assert "pe_affine" in res and res["pe_affine"] is not None
+    assert "bias" in res and res["bias"] is not None
+    a0 = np.asarray(res["pe_affine"]["a"])[:, 0]
+    assert float(np.max(np.abs(a0))) > 0.25
+
