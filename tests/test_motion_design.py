@@ -227,3 +227,119 @@ def test_f14_planted_linear_eddy_shift_recovers_without_leakage():
     a0 = np.asarray(res["pe_affine"]["a"])[:, 0]
     assert float(np.max(np.abs(a0))) > 0.25
 
+
+
+# ---- engine="joint": one optimisation over the whole timeline (docs/MOTION_JOINT_OPTIMIZATION_PLAN.md) ----
+
+def test_joint_design_columns_levels_and_per_shell_blocks():
+    from syntx.motion_design import joint_design_columns, level_layout
+
+    bv = np.array([0.0] * 7 + [1500.0, 3000.0] * 32)
+    rng = np.random.default_rng(0)
+    g = rng.normal(size=(len(bv), 3)); g /= np.linalg.norm(g, axis=1, keepdims=True); g[bv == 0] = 0
+    d = make_design("shells", bvals=bv, bvecs=g, pe_axis=[0, 1, 0])
+    enc, pe_cov, dropped = joint_design_columns(d, level_layout(d.levels))
+    # shell 1 is the root of the interleaved component {1, 2}: its offset to the b0 block is not identifiable from the
+    # interleaving (it is the H0 registration link's); shell 2's offset to shell 1 is -> one level column + l2 per shell
+    assert enc.shape == (len(bv), 1 + 5 * 2) and len(dropped) == 1 and "level 1" in dropped[0]
+    assert np.all(enc[d.levels == 0] == 0)                                 # the anchor level carries no column
+    assert np.all(enc[d.levels == 1, 1:6] != 0) and np.all(enc[d.levels == 1, 6:] == 0)   # shell blocks are disjoint
+    # a blocked level (b0 block first, never interleaved) has no identifiable offset: its column is dropped and recorded
+    bv_blk = np.array([0.0] * 7 + [1500.0] * 40)
+    g_blk = np.r_[np.zeros((7, 3)), g[7:47]]
+    d_blk = make_design("shells", bvals=bv_blk, bvecs=g_blk, pe_axis=[0, 1, 0])
+    enc_blk, _, dropped_blk = joint_design_columns(d_blk, level_layout(d_blk.levels))
+    assert enc_blk.shape[1] == 5 and any("not identifiable" in x for x in dropped_blk)
+    assert pe_cov.shape == (len(bv), 6) and np.all(pe_cov[d.levels == 0] == 0)
+    assert np.allclose(np.linalg.norm(pe_cov[d.levels == 2, 3:], axis=1), 1.0) and np.all(pe_cov[d.levels == 2, :3] == 0)
+    bv_short = np.array([0.0] * 3 + [1000.0] * 12)
+    d2 = make_design("shells", bvals=bv_short, bvecs=np.r_[np.zeros((3, 3)), g[7:19]], pe_axis=[0, 1, 0])
+    enc2, _, dropped2 = joint_design_columns(d2, level_layout(d2.levels))
+    assert enc2 is None and len(dropped2) == 2     # blocked level: no offset column; l2 block dropped below 6 frames/column
+
+
+def test_refine_schedule_needs_an_initial_pose():
+    from syntx.motion_batched import batched_rigid_register_pass
+    from syntx.motion_simulation import simulate_asl_series
+    import ants
+
+    sim = simulate_asl_series(n_frames=6, seed=0)
+    frames = [ants.slice_image(sim.image, axis=3, idx=t) for t in range(6)]
+    with pytest.raises(ValueError, match="init_pose"):
+        batched_rigid_register_pass(frames[0], frames, schedule_mode="refine", device="cpu")
+
+
+def test_joint_asl_matches_or_beats_unified_and_keeps_the_true_fd():
+    """Total pose on the original frames from the H0 poses, the level column in the optimiser, the prior at the
+    precision knee: error at most that of ``unified`` and the mean FD within 15 % of the truth (no jitter shrinkage)."""
+    from scipy.spatial.transform import Rotation as Rot
+
+    from syntx.motion import jenkinson_framewise_displacement
+    from syntx.motion_simulation import evaluate_motion_estimate, simulate_asl_series
+
+    sim = simulate_asl_series(n_frames=24, seed=2)
+    d = make_design("tag_control", volume_types=["control" if s > 0 else "label" for s in sim.encoding_covariates])
+    rj = motion_correct_design(sim.image, d, engine="joint")
+    ru = motion_correct_design(sim.image, d, engine="unified")
+    ej = evaluate_motion_estimate(rj["fwdtransforms"], sim)
+    eu = evaluate_motion_estimate(ru["fwdtransforms"], sim)
+    assert ej["fd_error_mm"] <= 1.1 * eu["fd_error_mm"], (ej, eu)
+    H = []
+    for y in sim.head_pose:
+        R = Rot.from_rotvec(y[3:]).as_matrix(); h = np.eye(4); h[:3, :3] = R; h[:3, 3] = y[:3]; H.append(h)
+    fd_true = float(np.mean(jenkinson_framewise_displacement(np.asarray(H), 50.0, np.zeros(3))))
+    assert abs(float(np.mean(rj["fd"])) - fd_true) < 0.15 * fd_true, (np.mean(rj["fd"]), fd_true)
+    rec = rj["design"]
+    assert rec["engine"] == "joint" and rec["columns"] == ["level1"] and rec["beta_levels"] is not None
+    assert rec["surround_delta_mm"] == 0.05 and rj["group_indices"][0].shape == (24,)
+    assert rj.motion_corrected.shape == sim.image.shape
+
+
+def test_joint_dwi_eddy_applied_and_fd_closer_to_truth_than_unified():
+    """Single-shell DWI with a planted 0.4 mm linear-in-g eddy shift: the joint pass keeps the eddy term applied (chain
+    ``[eddy, rigid]``), the head FD error is below ``unified``'s, and the odd-only gauge projection leaves the eddy
+    translation to the applied term."""
+    from syntx.motion_simulation import evaluate_motion_estimate, simulate_dwi_series
+
+    sim = simulate_dwi_series(16, seed=42, eddy_mm_per_unit=0.4)
+    bv, bvec = sim.extra["bvals"], sim.extra["bvecs"]
+    d = make_design("shells", bvals=bv, bvecs=bvec, pe_axis=sim.pe_axis)
+    rj = motion_correct_design(sim.image, d, engine="joint")
+    ru = motion_correct_design(sim.image, d, engine="unified")
+    ej = evaluate_motion_estimate(rj["fwdtransforms"], sim)
+    eu = evaluate_motion_estimate(ru["fwdtransforms"], sim)
+    assert ej["fd_error_mm"] < eu["fd_error_mm"], (ej, eu)
+    dw = bv > 50
+    assert all(len(c) == 2 and c[0].endswith("_eddy.mat") for c, isdw in zip(rj["fwdtransforms"], dw) if isdw)
+    assert all(len(c) == 1 for c, isdw in zip(rj["fwdtransforms"], dw) if not isdw)
+    a0 = np.asarray(rj["pe_affine"]["a"])[:, 0]
+    assert float(np.max(np.abs(a0))) > 0.25
+    assert np.all(np.asarray(rj["fd_raw"]) >= 0) and len(rj["fd"]) == len(bv)
+
+
+def test_odd_only_projection_keeps_even_in_g_translation_out_of_the_pose():
+    """A translation along phase encode that is EVEN in g is a contrast term: with the eddy covariates on, the gauge may
+    carry it (the old projection removed every p-translation from the gauge and sent it to the pose)."""
+    import ants
+    from syntx.motion import motion_correction
+    from syntx.motion_simulation import simulate_dwi_series
+
+    sim = simulate_dwi_series(16, seed=3, eddy_mm_per_unit=0.0, drift_mm=0.0, drift_deg=0.0, jumps=(), jitter_mm=0.0)
+    bv, bvec = sim.extra["bvals"], sim.extra["bvecs"]
+    p = np.asarray(sim.pe_axis, dtype=float)
+    dw = bv > 50
+    g_dot_p = np.where(dw, bvec @ p, 0.0)
+    even = 0.6 * (g_dot_p ** 2 - np.mean(g_dot_p[dw] ** 2)) * dw                 # even in g, zero mean over DW frames
+    frames = []
+    for t in range(len(bv)):
+        f = ants.slice_image(sim.image, axis=3, idx=t)
+        tx = ants.create_ants_transform(transform_type="AffineTransform", precision="float", dimension=3)
+        tx.set_parameters(np.concatenate([np.eye(3).ravel(), even[t] * p]))
+        frames.append(tx.apply_to_image(f, reference=f))
+    img = ants.list_to_ndimage(sim.image, frames)
+    enc = np.c_[(bv > 50).astype(float), np.where(dw[:, None], g_dot_p[:, None] ** 2, 0.0)]
+    r = motion_correction(img, reference="mean", type_of_transform="Rigid", backend="pytorch_batched", seed_mode="narrow",
+                          encoding_covariates=enc, pe_affine_covariates=np.where(dw[:, None], bvec, 0.0), pe_axis=p, device="cpu")
+    t_p = np.asarray(r.motion_parameters.translations) @ p
+    leak = float(np.std(t_p[dw] - np.mean(t_p[dw])))
+    assert leak < 0.5 * float(np.std(even[dw])), (leak, float(np.std(even[dw])))

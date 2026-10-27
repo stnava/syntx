@@ -73,6 +73,83 @@ Options:
 - `beta="levels+design" | "levels" | "none"`.
 - `iterations=k`: re-register each level to the mean of its corrected frames, k times.
 
+### `engine="joint"`, one optimisation over the whole timeline (v6.25)
+
+Design and evidence: `docs/MOTION_JOINT_OPTIMIZATION_PLAN.md`; review that motivated it: `docs/MOTION_COMPLETE_MODEL_REVIEW.md`.
+
+The `unified` engine solves each level separately and estimates `beta` afterwards from local differences of the
+composed trajectory, so any acquisition effect those local differences cannot isolate is left in the pose. The `joint`
+engine makes the split part of one objective over all `T` frames:
+
+```
+J(m, beta, C) = sum_t L_t(I_t o T(m_t + D_t beta) o A(C g_t), R_t) + lambda sum_t rho(W Delta^2 m_t)
+```
+
+- **H0.** `motion_correct_grouped(cross_link="registration")`: every level to its own mean, the level means linked
+  by an explicit rigid registration of the corrected means (the DW-to-b0 link is a measurement, not an inference).
+- **H1.** One `motion_correction` call over the ORIGINAL frames, each against the corrected mean of its own level in
+  the anchor space (`reference=<list>`), started from the H0 poses (`init_pose`, `schedule_mode="refine"`: L-BFGS then
+  Newton at full resolution; the coarse Adam stages would walk a good pose away), with every design column of the
+  timeline in the optimiser (`joint_design_columns`: one indicator per non-anchor level, the five l = 2 terms per
+  shell in their own block, the eddy covariates per shell), the intensity range of each frame taken from its own
+  reference, and (opt-in, `surround_weight`) the Charbonnier prior on the second differences of the head trajectory
+  with its knee at the registration precision floor (`surround_delta_mm = 0.05`). With the prior off the split between
+  motion and the design columns is made by the robust re-split after every stage.
+- **Gauge.** The encoding offset may carry a translation along phase encode only in the complement of the eddy
+  covariates' span over frames (odd in `g` belongs to the applied eddy term, even in `g` is contrast and stays out of
+  the pose); the previous unconditional projection sent the even part to motion.
+- Written transforms: `[eddy, rigid]` per frame, `fd` from the rigid part; `design.beta_levels` holds the per-level
+  column offsets; `group_results = [the joint result]`, `group_indices = [all frames]`, so antsxdwi's consumers are
+  unchanged.
+
+Phantoms with known motion (`simulate_dwi_series` seeds 42 / 7, `simulate_asl_series` seed 2; true mean FD
+0.156 / 0.155 / 0.160 mm), FD error in mm:
+
+| engine | DWI s42 | DWI s7 | ASL | mean FD reported (DWI s42 / ASL; truth 0.156 / 0.160) |
+|---|---|---|---|---|
+| unified | 0.438 | 0.398 | 0.089 | 0.301 / 0.180 |
+| joint, lambda 0 (default) | 0.208 | 0.259 | 0.059 | 0.220 / 0.169 |
+| joint, lambda 0.02 | 0.113 | 0.203 | 0.050 | 0.184 / 0.154 |
+| joint, lambda 0.05 | 0.106 | 0.169 | 0.070 | 0.178 / 0.149 |
+
+`unified` reports twice the true DWI motion; the joint pass with per-reference intensity scaling removes most of
+that at `lambda = 0`. The prior at 0.02 takes more on these structured phantoms, but its weight is absolute: its force
+(`lambda x delta` per mm) competes with the image term's curvature, and on a featureless Gaussian-blob phantom with no
+motion (antsxfunctional `test_asl_tag_control_motion_debias`) 0.02 displaced frames by 0.1 mm where 0 gives exactly
+zero. The prior is therefore off by default; a curvature-normalised prior is the next work package.
+Per-level point weights (`level_weights=True`: each frame weights the shared pool by its own level's edges) were
+neutral or slightly worse on these phantoms and are off by default. Real-data gate: `benchmarks/motion_cohort_gate.py`
+(section "motion_cohort gate" below).
+
+### motion_cohort gate (real data, 2026-10-27)
+
+`benchmarks/motion_cohort_gate.py` on the curated `motion_cohort` archive (report:
+`docs/reports/motion_cohort_gate_2026-10-27.html`). No truth exists; the columns are physical signatures: mean FD,
+the robust frame-to-frame step along phase encode / slice / readout (the readout step is immune to B0 and eddy
+effects and must not shrink), and the median relative temporal SD of the corrected series in the foreground
+(alignment). `joint` at the default (prior off); 0.02, 0.05 and `level_weights=True` are in the report of the same
+day (`docs/reports/motion_cohort_gate_2026-10-27.html`).
+
+| series | T | FD unified -> joint | step t_pe | step t_sl | step t_ro | tsd_rel |
+|---|---|---|---|---|---|---|
+| ASL ExpArt EAS009 | 25 | 0.367 -> 0.365 | 0.077 -> 0.069 | 0.205 -> 0.200 | 0.055 -> 0.053 | 0.232 -> 0.232 |
+| ASL ExpArt EAS020 | 25 | 0.499 -> 0.494 | 0.093 -> 0.103 | 0.206 -> 0.182 | 0.055 -> 0.054 | 0.228 -> 0.228 |
+| ASL FPA BLAST031 | 16 | 0.044 -> 0.041 | 0.016 -> 0.016 | 0.029 -> 0.029 | 0.020 -> 0.020 | 0.014 -> 0.014 |
+| ASL FPA BLAST071 | 16 | 0.794 -> 0.790 | 0.044 -> 0.044 | 0.481 -> 0.481 | 0.253 -> 0.253 | 0.043 -> 0.043 |
+| DWI FPA BLAST031 AP | 100 | 0.606 -> 0.564 | 0.696 -> 0.560 | 0.125 -> 0.100 | 0.057 -> 0.080 | 0.683 -> 0.681 |
+| DWI FPA BLAST066 AP | 100 | 0.540 -> 0.452 | 0.601 -> 0.438 | 0.134 -> 0.152 | 0.097 -> 0.072 | 0.684 -> 0.686 |
+| DWI breacher 4667 | 36 | 0.150 -> 0.142 | 0.074 -> 0.088 | 0.115 -> 0.105 | 0.029 -> 0.023 | 0.574 -> 0.574 |
+| DWI breacher 6223 | 36 | 0.256 -> 0.257 | 0.127 -> 0.145 | 0.136 -> 0.121 | 0.027 -> 0.034 | 0.525 -> 0.525 |
+
+Reading (`docs/reports/motion_cohort_gate_2026-10-27_default.html`; the 0.02 / 0.05 / `level_weights` variants are in
+`motion_cohort_gate_2026-10-27.html`): alignment is identical (tsd_rel), so the engines differ in attribution, not in
+registration quality. FD falls 1-7 % on ASL and 0-16 % on DWI; on the two FPA DWI series the phase-encode step falls by
+0.14-0.16 mm while the readout step moves by at most 0.025 mm in either direction (on DWI the unified readout step also
+carries the cross-contrast link bias at every b0 switch, so part of that is not jitter). The ASL readout steps change by
+at most 0.002 mm; the large-motion series (BLAST071, FD 0.79) is untouched. With the prior at 0.02 the DWI FD fell a
+further 2-5 % and the ASL FD 3-5 %, at the cost described above. Every frame converged. Cost: 1.2-1.5x the unified time
+(the H0 pass plus one full-resolution refinement).
+
 ### `engine="dispatch"`, today's calls
 
 Reproduces today's calls unchanged:

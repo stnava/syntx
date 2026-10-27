@@ -447,6 +447,29 @@ class PointSampler:
             self._weights_cache[key] = self._at_pool(field_np)
         return self._weights_cache[key]
 
+    def weights_of(self, reference: ants.ANTsImage, sigma_mm: Optional[float] = None, use_sample_mask: bool = True) -> torch.Tensor:
+        """(n_pool,) weights of ANOTHER reference on the same grid at this sampler's pool points: the strategy's candidate
+        region and weights of ``reference`` (its own noise floor and gradients), evaluated where this pool's points are.
+        For a series whose frames have different contrasts (DWI shells), each frame then weights the shared pool by the
+        edges of its OWN level's reference, so a high-b frame is not scored on the CSF edges that only the b0 mean has."""
+        if self.vox_xyz is None:
+            raise RuntimeError("PointSampler.weights_of before pool()")
+        if tuple(reference.shape) != tuple(self.reference.shape):
+            raise ValueError(f"weights_of: reference grid {tuple(reference.shape)} differs from the pool's {tuple(self.reference.shape)}")
+        sig = self.sigma_mm if sigma_mm is None else float(sigma_mm)
+        strat = get_sampling_strategy(self.strategy.name, **self.strategy.params())   # a fresh instance: no shared state
+        normalized = normalize_robust(reference)
+        region = strat.region(reference, normalized, None)
+        if getattr(strat, "normalized", None) is not None:
+            normalized = strat.normalized
+        if use_sample_mask and self.mask is not None:
+            region = region & self.mask
+        w = strat.weights(normalized, region, sig)
+        field_np = region.astype(np.float32) if w is None else w.astype(np.float32)
+        if use_sample_mask and self.mask is not None:
+            field_np = field_np * self.mask
+        return self._at_pool(field_np)
+
     def _at_pool(self, field_np: np.ndarray) -> torch.Tensor:
         """The field's value in each pool point's OWN voxel (nearest; the jitter keeps a point within +-0.5 voxel of its
         voxel centre). Bilinear interpolation would mix in the zeros of neighbouring voxels outside the region and

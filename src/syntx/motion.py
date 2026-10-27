@@ -783,7 +783,8 @@ def motion_correction(
                                "pe_affine_covariates", "pe_axis", "sample_mask", "bias_covariates", "sample_fraction",
                                "sampling", "resample_points", "sample_seed",
                                "convergence_tol_vox", "max_extend_factor", "encoding_covariates", "window_size",
-                               "window_stride", "surround_weight", "surround_delta_mm", "slice_axis", "sidecar"}
+                               "window_stride", "surround_weight", "surround_delta_mm", "slice_axis", "sidecar",
+                               "frame_levels", "init_pose", "schedule"}
     if backend == "pytorch_batched" and set(kwargs) - _batched_allowed_kwargs:
         raise TypeError(f"backend='pytorch_batched' accepts only {sorted(_batched_allowed_kwargs)}; got "
                         f"{sorted(set(kwargs) - _batched_allowed_kwargs)}")
@@ -970,6 +971,7 @@ def motion_correction(
                         device=motion_device,
                         seed_mode=kwargs.get("seed_mode", "wide"),
                         schedule_mode=kwargs.get("schedule_mode", "default"),
+                        schedule=kwargs.get("schedule"),
                         metric=kwargs.get("metric", "mattes"),
                         huber_delta=kwargs.get("huber_delta", 0.1),
                         pe_affine_covariates=None if cov_all is None else np.asarray(cov_all)[list(batch_indices)],
@@ -987,6 +989,9 @@ def motion_correction(
                         window_stride=kwargs.get("window_stride"),
                         surround_weight=kwargs.get("surround_weight"),
                         surround_delta_mm=kwargs.get("surround_delta_mm", 0.25),
+                        frame_levels=None if kwargs.get("frame_levels") is None else np.asarray(kwargs["frame_levels"])[list(batch_indices)],
+                        init_pose=None if kwargs.get("init_pose") is None else (np.asarray(kwargs["init_pose"][0])[list(batch_indices)],
+                                                                                 np.asarray(kwargs["init_pose"][1])[list(batch_indices)]),
                     )
                     if pe_batch is not None:
                         if "sampling" in pe_batch:

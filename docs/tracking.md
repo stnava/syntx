@@ -1,10 +1,34 @@
 # Tracking Summary
-current phase: v6.24.1 (Stage 1: In-Solver Gauge Orthogonalization F14 & Scientific Directive)
-next WP: Stage 2/3 (Downstream Integration & Descriptive Verification)
+current phase: v6.25.0 (joint motion engine: one optimisation over the whole series)
+next WP: plan sections 8 (BOLD respiratory field term) and 9 (motion-specific metric), docs/MOTION_JOINT_OPTIMIZATION_PLAN.md
 blockers: none
-active work: none (Stage 1 complete, 2026-10-27)
+active work: none (joint engine released, 2026-10-27)
 device: Apple Silicon MPS / CPU (macOS arm64)
 last updated: 2026-10-27
+
+---
+
+## R11 (joint motion engine, v6.25.0, 2026-10-27)
+- **Review and plan** (`docs/MOTION_COMPLETE_MODEL_REVIEW.md`, `docs/MOTION_JOINT_OPTIMIZATION_PLAN.md`): the `unified` engine
+  solved each level separately and gave the free motion term everything the local-difference estimators could not isolate;
+  measured on the `motion_cohort` archive, 34-48 % of raw DWI FD is explainable by acquisition columns, ASL 1-11 %, BOLD 0 %
+  (respiration is not in the metadata).
+- **`engine="joint"`** (`src/syntx/motion_design.py`): H0 per-level means linked by explicit registration, H1 one batched
+  pass over all frames (per-frame references, `init_pose`, `schedule_mode="refine"`, all design columns of the timeline,
+  Charbonnier prior knee 0.05 mm, off by default). Solver (`motion_batched.py`, `motion.py`, `sampling.py`): `init_pose`,
+  `refine` schedule, per-reference intensity range, `frame_levels` point weights (`PointSampler.weights_of`), odd-only
+  phase-encode projection of the encoding gauge.
+- **Evidence**: phantoms (`docs/MOTION_DESIGN.md`, section joint): FD error DWI 0.438 -> 0.208, ASL 0.089 -> 0.059, slow flow
+  0.133 -> 0.068 mm; reported mean FD 0.301 -> 0.220 for a truth of 0.156. The prior (0.02) took more on structured
+  phantoms but displaced a featureless no-motion phantom by 0.1 mm (absolute weight vs image curvature): off by default,
+  curvature-normalised prior = next WP. Cohort (`benchmarks/motion_cohort_gate.py`,
+  `docs/reports/motion_cohort_gate_2026-10-27_default.html`): FD -1-7 % ASL, 0-16 % DWI, alignment identical, readout step
+  within 0.025 mm, all frames converged.
+- **GLM (antsxslowflow 2.10)**: motion nuisance columns orthogonalised to the harmonic columns (raw poses with a 0.6 mm
+  respiration-locked PE shift: amplitude 1.66 for a truth of 1.0; orthogonalised 1.00).
+- **Tests**: `tests/test_motion_design.py` +5 (joint columns, refine guard, ASL and DWI joint vs unified, odd-only
+  projection); motion / sampling / standards suites green except the pre-existing BOLD Nyquist test; `antsxqc.lint` 0.
+- Downstream: antsxdwi 0.31.0, antsxfunctional 0.20.0, antsxslowflow 2.10.0 (`engine="joint"` default, `syntx>=6.25.0`).
 
 ---
 

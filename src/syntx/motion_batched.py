@@ -1086,6 +1086,8 @@ def batched_rigid_register_pass(
     window_stride: Optional[int] = None,
     surround_weight: Optional[float] = None,
     surround_delta_mm: float = 0.25,
+    frame_levels: Optional[np.ndarray] = None,
+    init_pose: Optional[Tuple[np.ndarray, np.ndarray]] = None,
 ):
     """Rigidly register every frame in ``moving_imgs`` to the same ``reference_img``, in one
     or more batched optimisations, optionally with a per-frame eddy-current (phase-encode affine) term whose
@@ -1146,7 +1148,8 @@ def batched_rigid_register_pass(
             sample_fraction=sample_fraction, sampling=sampling, resample_points=resample_points, sample_seed=sample_seed,
             convergence_tol_vox=convergence_tol_vox, max_extend_factor=max_extend_factor,
             encoding_covariates=enc_all, window_size=window_size, window_stride=window_stride,
-            surround_weight=surround_weight, surround_delta_mm=surround_delta_mm,
+            surround_weight=surround_weight, surround_delta_mm=surround_delta_mm, frame_levels=frame_levels,
+            init_pose=init_pose,
         )
         return out if return_pe_affine else out[:3]
 
@@ -1177,6 +1180,9 @@ def batched_rigid_register_pass(
             encoding_covariates=None if enc_all is None else enc_all[start:start + chunk_size],
             window_size=window_size, window_stride=window_stride,
             surround_weight=surround_weight, surround_delta_mm=surround_delta_mm,
+            frame_levels=None if frame_levels is None else np.asarray(frame_levels)[start:start + chunk_size],
+            init_pose=None if init_pose is None else (np.asarray(init_pose[0])[start:start + chunk_size],
+                                                      np.asarray(init_pose[1])[start:start + chunk_size]),
         )
         fwd_all.extend(fwd_c)
         inv_all.extend(inv_c)
@@ -1245,6 +1251,8 @@ def _batched_rigid_register_pass_core(
     window_stride: Optional[int] = None,
     surround_weight: Optional[float] = None,
     surround_delta_mm: float = 0.25,
+    frame_levels: Optional[np.ndarray] = None,
+    init_pose: Optional[Tuple[np.ndarray, np.ndarray]] = None,
 ) -> Tuple[List[List[str]], List[List[str]], float, Optional[dict]]:
     """
     Rigidly register every frame in ``moving_imgs`` to the same ``reference_img`` in one
@@ -1461,6 +1469,13 @@ def _batched_rigid_register_pass_core(
             # from t_final after optimisation so it does not create a translation gauge nullspace with t_param.
             pe_scale = torch.tensor([0.0, 0.01, 0.01, 0.01], **f32).unsqueeze(1)
             Ccoef = torch.zeros(4, cov_t.shape[1], device=dev, requires_grad=True)
+            # Projector on the span of the eddy covariates over frames (the ODD-in-g part of a per-frame scalar): the
+            # encoding gauge may carry a translation along p only in the complement, so it can never take the linear
+            # eddy translation (that is the applied term, attributed from the head translations after the fit), while a
+            # translation along p that is EVEN in g (direction contrast) stays a contrast term and never becomes motion.
+            _XtX = cov_np.T @ cov_np
+            P_odd_np = cov_np @ np.linalg.solve(_XtX + 1e-8 * np.trace(_XtX) / max(cov_np.shape[1], 1) * np.eye(cov_np.shape[1]), cov_np.T)
+            P_odd_t = torch.tensor(P_odd_np, **f32)
 
     # Overlapping-window encoding-induced pose bias B_win (M, K_eff, 6) jointly optimised with pure head motion (t_param, omega)
     enc_on = False
@@ -1552,7 +1567,49 @@ def _batched_rigid_register_pass_core(
     vox_idx, phys_X = _pool["vox_xyz"], _pool["phys"]
     fixed_vals = _interp_fixed(fixed_stack_zyx if per_frame_ref else fixed_t_zyx, vox_idx, shape_xyz)
 
-    lo, hi = 0.0, float((fixed_stack_zyx if per_frame_ref else fixed_t).max())
+    # Per-level point weights: with ``frame_levels`` (and per-frame references) each frame weights the shared pool by the
+    # strategy's weights of ITS OWN level's reference, so a level whose edges the mean reference does not show (high-b
+    # shells: CSF dark) is scored where its own contrast has edges. The stage draw uses the max over levels (every level's
+    # edges can be drawn); the per-frame weight is the importance ratio level / shared (<= 1).
+    lvl_of_frame = None
+    _lvl_ref_img: dict = {}
+    if frame_levels is not None:
+        if not per_frame_ref:
+            raise ValueError("frame_levels needs one reference per frame (reference_img as a list)")
+        lvl_of_frame = np.asarray(frame_levels, dtype=int).reshape(-1)
+        if lvl_of_frame.size != B:
+            raise ValueError(f"frame_levels has {lvl_of_frame.size} entries for {B} frames")
+        for k in np.unique(lvl_of_frame):
+            _lvl_ref_img[int(k)] = ref_list[int(np.flatnonzero(lvl_of_frame == k)[0])]
+    _lvl_w_cache: dict = {}
+
+    def level_point_weights(sigma_mm, use_sample_mask):
+        """(shared draw weights (S,), per-frame weights (B, S)) at a scale, or (None, None) without frame_levels."""
+        if lvl_of_frame is None:
+            return None, None
+        key = (round(float(sigma_mm), 6), bool(use_sample_mask))
+        if key not in _lvl_w_cache:
+            w_k = {k: sampler.weights_of(img_k, sigma_mm, use_sample_mask) for k, img_k in _lvl_ref_img.items()}
+            w_shared = torch.stack(list(w_k.values()), dim=0).max(dim=0).values
+            w_frame = torch.stack([w_k[int(k)] for k in lvl_of_frame], dim=0) / w_shared.clamp_min(1e-12).unsqueeze(0)
+            _lvl_w_cache[key] = (w_shared, w_frame)
+        return _lvl_w_cache[key]
+
+    lo = 0.0
+    if per_frame_ref:
+        # one intensity range PER REFERENCE: frames of a dark contrast (high-b shells) keep the full histogram range of
+        # their own reference instead of being compressed into the low bins of the brightest reference (b0)
+        hi_b = fixed_stack_zyx.reshape(B, -1).amax(dim=1).clamp_min(1e-8)          # (B,)
+        hi = float(hi_b.max())
+    else:
+        hi = float(fixed_t.max())
+        hi_b = None
+
+    def _scale(vals, per_frame_rows):
+        """[-1, 1] intensity scaling; ``vals`` (B, S) per frame or (S,) shared; the per-frame range when available."""
+        if hi_b is not None and per_frame_rows:
+            return (vals - lo) / (hi_b.unsqueeze(1) - lo + 1e-8) * 2.0 - 1.0
+        return (vals - lo) / (hi - lo + 1e-8) * 2.0 - 1.0
 
     _warp_cache = {}
 
@@ -1595,6 +1652,7 @@ def _batched_rigid_register_pass_core(
             fixed_vals_all, moving_lvl, shape_lvl = fixed_vals, moving_stack, shape_xyz
             # the caller's sample_mask restricts the full-resolution stages only
             w_all = sampler.weights(sp_min, use_sample_mask=True)
+            w_shared_lvl, w_frame_lvl = level_point_weights(sp_min, True)
         else:
             fixed_src = fixed_stack_zyx.unsqueeze(1) if per_frame_ref else fixed_t_zyx.unsqueeze(0).unsqueeze(0)
             if _level_builder is not None:
@@ -1622,12 +1680,16 @@ def _batched_rigid_register_pass_core(
             # bias it removes is a fine-scale effect, while the coarse stages provide the capture range for real motion
             # and need the whole head (masking them cost 0.2 mm of relative-pose error under 1 mm / 1 deg motion)
             w_all = sampler.weights(sp_min * float(level), use_sample_mask=False)
+            w_shared_lvl, w_frame_lvl = level_point_weights(sp_min * float(level), False)
             # every eligible pool point (stages draw their share of these with the level's weights). Thinning a coarse
             # level to its voxel count left the capture stages and the seed search a few hundred edge-concentrated points:
             # DWI phantom rotation error 0.83 deg (one seed 1.83) vs 0.36 deg with the whole pool (5 seeds, gradient_floor)
+        if w_shared_lvl is not None:
+            w_all = w_shared_lvl
         sel = torch.nonzero(w_all > 0, as_tuple=False).squeeze(1)
         entry = dict(X=phys_X[sel], w_y=None, moving=moving_lvl, shape=shape_lvl, fixed_vals=_sub(fixed_vals_all, sel),
-                     fixed_tensor=fixed_tensor_lvl, w=w_all[sel])
+                     fixed_tensor=fixed_tensor_lvl, w=w_all[sel],
+                     w_frame=None if w_frame_lvl is None else w_frame_lvl[:, sel])
         _pyramid_cache[level] = entry
         return entry
 
@@ -1738,15 +1800,22 @@ def _batched_rigid_register_pass_core(
     else:
         raise ValueError(f"seed_mode must be 'wide' or 'narrow', got {seed_mode!r}")
 
-    fit_results = []
-    for t_cand in all_t_candidates:
-        for seed in rot_seeds:
-            fit_results.append(fit_pair(t_cand, seed))
-    all_scores = np.stack([s for _, _, s in fit_results], axis=0)
-    best_combo = all_scores.argmin(axis=0)
-    t_init = np.stack([fit_results[best_combo[b]][0][b] for b in range(B)], axis=0).astype(np.float32)
-    omega_init = np.stack([fit_results[best_combo[b]][1][b] for b in range(B)], axis=0).astype(np.float32)
-    if verbose:
+    if init_pose is not None:
+        # a known starting pose per frame (``[d_com (mm), rotvec (rad)]`` about the reference's centre of mass, e.g. the
+        # composed chain of a previous pass): no seed search, the schedule refines from here
+        t_init = np.asarray(init_pose[0], dtype=np.float32).reshape(B, 3)
+        omega_init = np.asarray(init_pose[1], dtype=np.float32).reshape(B, 3)
+        fit_results = []
+    else:
+        fit_results = []
+        for t_cand in all_t_candidates:
+            for seed in rot_seeds:
+                fit_results.append(fit_pair(t_cand, seed))
+        all_scores = np.stack([s for _, _, s in fit_results], axis=0)
+        best_combo = all_scores.argmin(axis=0)
+        t_init = np.stack([fit_results[best_combo[b]][0][b] for b in range(B)], axis=0).astype(np.float32)
+        omega_init = np.stack([fit_results[best_combo[b]][1][b] for b in range(B)], axis=0).astype(np.float32)
+    if verbose and fit_results:
         print(f"[motion_batched] translation+rotation init ({seed_mode}): searched "
               f"{len(all_t_candidates)} translation candidates x {len(rot_seeds)} rotation "
               f"seeds = {len(fit_results)} combos/frame")
@@ -1761,10 +1830,10 @@ def _batched_rigid_register_pass_core(
         """(B, 6) encoding-locked pose offset E_psi . B_win in (mm, rad)."""
         dY = torch.einsum("bmk,mkd->bd", E_psi_t, B_win) * enc_unit
         if pe_on and pe_axis is not None:
-            # Enforce 5-DOF subspace orthogonal to p-translation:
-            # l=2 contrast gauge must never steal physical l=1 PE eddy translation along p_vec.
-            p_comp = (dY[:, :3] * p_vec).sum(dim=-1, keepdim=True)
-            dY_trans = dY[:, :3] - p_comp * p_vec
+            # the gauge keeps no translation along p in the span of the eddy covariates (odd in g); the even part stays
+            p_comp = (dY[:, :3] * p_vec).sum(dim=-1)
+            odd = P_odd_t @ p_comp
+            dY_trans = dY[:, :3] - odd.unsqueeze(1) * p_vec
             dY = torch.cat([dY_trans, dY[:, 3:]], dim=-1)
         return dY
 
@@ -1798,27 +1867,19 @@ def _batched_rigid_register_pass_core(
             omega.add_(dY_old[:, 3:])
             B_win.zero_()
             Y_tot = np.c_[t_param.detach().cpu().numpy().astype(np.float64), omega.detach().cpu().numpy().astype(np.float64)]
-            p_unit = None
+            Y_fit = Y_tot
             if pe_on and pe_axis is not None:
                 p_arr = np.asarray(pe_axis, dtype=np.float64)
                 p_norm = np.linalg.norm(p_arr)
                 if p_norm > 1e-8:
                     p_unit = p_arr / p_norm
-                    Y_fit = Y_tot.copy()
-                    Y_fit[:, :3] -= np.outer(Y_fit[:, :3] @ p_unit, p_unit)
-                else:
-                    Y_fit = Y_tot
-            else:
-                Y_fit = Y_tot
-            B_np, dY_np, w_np = _project_encoding_surround_tukey_np(Y_fit, E_np, psi_np, fd_radius=50.0, surround_weight=0.0)
-            if p_unit is not None:
-                comp_B = np.einsum("mkd,d->mk", B_np[:, :, :3], p_unit)
-                B_np[:, :, :3] -= comp_B[:, :, None] * p_unit[None, None, :]
-                comp_dY = dY_np[:, :3] @ p_unit
-                dY_np[:, :3] -= np.outer(comp_dY, p_unit)
+                    Y_fit = Y_tot.copy()   # the odd-in-g translation along p is the eddy term's, not the gauge's
+                    Y_fit[:, :3] -= np.outer(P_odd_np @ (Y_fit[:, :3] @ p_unit), p_unit)
+            B_np, _, w_np = _project_encoding_surround_tukey_np(Y_fit, E_np, psi_np, fd_radius=50.0, surround_weight=0.0)
             B_win.copy_(torch.tensor(B_np, **f32) / enc_unit)
-            t_param.sub_(torch.tensor(dY_np[:, :3], **f32))
-            omega.sub_(torch.tensor(dY_np[:, 3:], **f32))
+            dY_new = _encoding_offset()            # applies the odd-only projection to the new gauge
+            t_param.sub_(dY_new[:, :3])
+            omega.sub_(dY_new[:, 3:])
         return w_np
 
     # Coarse-to-fine schedule: Adam at real avg_pool3d-downsampled levels (broad, cheap
@@ -1859,11 +1920,22 @@ def _batched_rigid_register_pass_core(
                 ]
             ),
         ]
+    elif schedule_mode == "refine":
+        # From a known pose (``init_pose``): no capture stages. Adam's first steps are learning-rate sized whatever the
+        # gradient, so coarse Adam stages walk a good pose away before converging back to the coarse level's own
+        # (biased) optimum. L-BFGS at full resolution first (the shared design terms and the head prior enter here), then
+        # the Newton finisher on the per-frame rigid poses.
+        if init_pose is None:
+            raise ValueError("schedule_mode='refine' needs init_pose")
+        schedule = [
+            dict(optimizer="lbfgs", iters=15, sampling=0.2, level=1),
+            dict(optimizer="newton", iters=15, sampling=0.2, level=1, freeze_pe=True, confirm_vox=min(0.02, float(convergence_tol_vox))),
+        ]
     else:
-        raise ValueError(f"schedule_mode must be 'default' or 'fast', got {schedule_mode!r}")
+        raise ValueError(f"schedule_mode must be 'default', 'medium', 'fast' or 'refine', got {schedule_mode!r}")
 
     def compute_loss(X_stage, w_y_stage, moving_tensor, shape_stage, level_stage=1,
-                      fixed_vals_stage=None, corr_weight=0.0, fixed_tensor=None):
+                      fixed_vals_stage=None, corr_weight=0.0, fixed_tensor=None, w_pts=None):
         t_eff, om_eff = _total_pose()
         R = _batched_rodrigues(om_eff)
         Xc = X_stage - C_phys
@@ -1879,13 +1951,22 @@ def _batched_rigid_register_pass_core(
                                  precomputed_grad_I=get_grad_I(moving_tensor)).reshape(B, -1)
         if pe_on:
             warped = warped * jac_pe.unsqueeze(1)
-        w_scaled = (warped - lo) / (hi - lo + 1e-8) * 2.0 - 1.0
+        w_scaled = _scale(warped, True)
         if metric == "huber":
-            fixed_scaled_stage = (fixed_vals_stage - lo) / (hi - lo + 1e-8) * 2.0 - 1.0
+            fixed_scaled_stage = _scale(fixed_vals_stage, fixed_vals_stage.dim() == 2)
             target = fixed_scaled_stage if fixed_scaled_stage.dim() == 2 else fixed_scaled_stage.unsqueeze(0).expand_as(w_scaled)
-            per_frame_loss = huber_loss_nd(w_scaled, target, delta=huber_delta, reduction="none").mean(dim=1)
+            elem = huber_loss_nd(w_scaled, target, delta=huber_delta, reduction="none")
+            if w_pts is None:
+                per_frame_loss = elem.mean(dim=1)
+            else:
+                per_frame_loss = (elem * w_pts).sum(dim=1) / w_pts.sum(dim=1).clamp_min(1e-8)
         else:
             w_x = parzen_weights(w_scaled.reshape(-1), num_bins=num_bins).reshape(*w_scaled.shape, num_bins)
+            if w_pts is not None:
+                # weighted joint histogram: each point enters with its frame's weight (sqrt on each factor)
+                sw = torch.sqrt(w_pts).unsqueeze(-1)
+                w_x = w_x * sw
+                w_y_stage = (w_y_stage if w_y_stage.dim() == 3 else w_y_stage.unsqueeze(0).expand(B, -1, -1)) * sw
             per_frame_loss = batched_mattes_mi_from_weights(w_x, w_y_stage)
         if corr_weight > 0.0 and fixed_vals_stage is not None:
             per_frame_loss = per_frame_loss + corr_weight * pearson_correlation_loss(warped, fixed_vals_stage)
@@ -1913,8 +1994,10 @@ def _batched_rigid_register_pass_core(
             fv = lvl_data["fixed_vals"] if sub is None else _sub(lvl_data["fixed_vals"], sub)
             cur["X"] = lvl_data["X"] if sub is None else lvl_data["X"][sub]
             cur["fixed_vals"] = fv
+            wf = lvl_data.get("w_frame")
+            cur["w_pts"] = None if wf is None else (wf if sub is None else wf[:, sub])
             if lvl_data["w_y"] is None:
-                cur["w_y"] = _parzen((fv - lo) / (hi - lo + 1e-8) * 2.0 - 1.0)
+                cur["w_y"] = _parzen(_scale(fv, fv.dim() == 2))
             else:
                 cur["w_y"] = lvl_data["w_y"] if sub is None else _sub(lvl_data["w_y"], sub)
 
@@ -1973,7 +2056,7 @@ def _batched_rigid_register_pass_core(
             optimizer=stage.get("optimizer", "adam"), params=opt_params, per_frame_params=per_frame_params,
             loss_fn=lambda: compute_loss(cur["X"], cur["w_y"], moving_tensor, shape_stage, level_stage=level,
                                          fixed_vals_stage=cur["fixed_vals"], corr_weight=corr_weight,
-                                         fixed_tensor=lvl_data["fixed_tensor"]),
+                                         fixed_tensor=lvl_data["fixed_tensor"], w_pts=cur["w_pts"]),
             resample_fn=resample_fn,
             points_fn=stage_points, iters=int(stage["iters"]), B=B, dev=dev,
             tol=float(convergence_tol_vox) * stage_voxel, max_extend=int(max_extend_factor),
@@ -1981,7 +2064,7 @@ def _batched_rigid_register_pass_core(
             lr_r=stage.get("step_r_vox", 0.0) * ref_min_sp / rot_scale_mean, point_radius=rot_scale_mean,
             probe_fn=lambda: probe_manifold(lambda: compute_loss(cur["X"], cur["w_y"], moving_tensor, shape_stage, level_stage=level,
                                                                  fixed_vals_stage=cur["fixed_vals"], corr_weight=corr_weight,
-                                                                 fixed_tensor=lvl_data["fixed_tensor"]),
+                                                                 fixed_tensor=lvl_data["fixed_tensor"], w_pts=cur["w_pts"]),
                                             probe_axes, stage_voxel, probe_vox=0.5),
             confirm_vox=float(stage.get("confirm_vox", _CONFIRM_FACTOR * float(convergence_tol_vox))), axes=probe_axes, stage_voxel=stage_voxel,
             label=f"{stage.get('optimizer', 'adam')}@L{level}" + (f"/{freeze}" if freeze else ""), level=level,

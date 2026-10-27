@@ -372,7 +372,213 @@ def _unified(image, design: Design, *, beta: str = "levels+design", iterations: 
     return out
 
 
-ENGINES = {"dispatch": _dispatch, "unified": _unified}
+
+# Charbonnier knee of the head-motion prior in the joint engine: the registration's own precision floor (0.05 mm), so
+# unexplained frame-to-frame jitter stays in the pose at nearly full amplitude and only a design column can lower it.
+JOINT_SURROUND_DELTA_MM = 0.05
+# Weight of that prior: OFF by default. Phantoms with known motion (simulate_dwi_series seeds 42 / 7, simulate_asl_series
+# seed 2; true FD 0.156 / 0.155 / 0.160 mm): FD error 0.21 / 0.26 / 0.06 mm at 0, 0.11 / 0.20 / 0.05 at 0.02, 0.11 / 0.17 /
+# 0.07 at 0.05 (where ASL's mean FD falls below the truth: jitter shrunk). But the weight is absolute: its force
+# (lambda x delta per mm) competes with the image term's curvature, which depends on the image. On a featureless
+# Gaussian-blob phantom with NO motion (antsxfunctional test_asl_tag_control_motion_debias) 0.02 displaced frames by
+# 0.1 mm (1e-6 and 0: exact zero). A curvature-normalised prior is the next work package; until then the split between
+# motion and the design columns is made by the robust re-split after every stage (lambda = 0), which already gives
+# most of the gain above. Real-data gate: benchmarks/motion_cohort_gate.py.
+JOINT_SURROUND_WEIGHT = 0.0
+
+
+def joint_design_columns(design: Design, layout: Dict[int, dict]) -> tuple:
+    """The acquisition columns ``D_t`` of the joint pass over the whole timeline, and the eddy covariates per shell.
+
+    Returns ``(encoding (T, K) or None, pe_affine (T, 3 * n_shells) or None, dropped: list)``. Columns: one indicator per
+    non-anchor level (the constant level offset), and for ``shells`` the five l = 2 direction terms of each shell in its
+    own block (zero on the other frames), each block kept only with ``FRAMES_PER_BETA_COLUMN`` frames per column. The
+    eddy covariates are the unit gradients in one block per shell, so the tied eddy matrix is per shell as in the
+    grouped call (the eddy amplitude depends on b)."""
+    levels = np.asarray(design.levels, dtype=int)
+    T = levels.size
+    ks = sorted(layout)
+    cols, dropped = [], []
+    for k in ks[1:]:
+        if not layout[k]["beta_estimable"]:
+            # a constant offset of a level that never alternates with another cannot be told from head motion between
+            # the blocks (offset_identifiable); the level keeps the pose of its link
+            dropped.append(f"offset of level {k} (not identifiable: {layout[k]['mixed']} mixed frames)")
+            continue
+        cols.append((levels == k).astype(np.float64)[:, None])
+    pe_cov = None
+    if design.name == "shells":
+        if design.bias_covariates is not None:
+            l2 = np.asarray(design.bias_covariates, dtype=np.float64)
+            for k in ks[1:]:
+                blk = np.zeros_like(l2)
+                blk[levels == k] = l2[levels == k]
+                live = int(np.sum(np.ptp(blk[levels == k], axis=0) > 0)) if np.any(levels == k) else 0
+                if live == 0:
+                    continue
+                if layout[k]["n"] < FRAMES_PER_BETA_COLUMN * live:
+                    dropped.append(f"l2 terms of level {k} ({layout[k]['n']} frames < {FRAMES_PER_BETA_COLUMN} x {live})")
+                    continue
+                cols.append(blk)
+        if design.pe_affine_covariates is not None:
+            g = np.asarray(design.pe_affine_covariates, dtype=np.float64)
+            blocks = []
+            for k in ks[1:]:
+                blk = np.zeros_like(g)
+                blk[levels == k] = g[levels == k]
+                if np.any(blk != 0):
+                    blocks.append(blk)
+            pe_cov = np.hstack(blocks) if blocks else None
+    enc = np.hstack(cols) if cols else None
+    return enc, pe_cov, dropped
+
+
+def _joint(image, design: Design, *, init: str = "levels", surround_weight: Optional[float] = None,
+           surround_delta_mm: float = JOINT_SURROUND_DELTA_MM, window_size: Optional[int] = None,
+           sample_mask_fn=None, level_weights: bool = False, schedule_mode: str = "refine", **kwargs) -> dict:
+    """ONE optimisation over the whole acquisition timeline (docs/MOTION_JOINT_OPTIMIZATION_PLAN.md).
+
+    H0: every level registered to its own mean and the level means linked by an explicit rigid registration of the
+    corrected means (``motion_correct_grouped(cross_link="registration")``, no design columns): the DW-to-b0 link is a
+    measurement. H1: all T frames in one batched pass against the per-frame reference of their own level (the corrected
+    level means, all in the anchor space), each frame weighting the shared sample pool by its own level's edges
+    (``frame_levels``), with every design column of the timeline in the optimiser (``joint_design_columns``: level
+    offsets and the l = 2 terms per shell as contrast gauge, removed from the pose, never applied; the eddy affine per
+    shell, applied) and the Charbonnier prior on the second differences of the head trajectory (knee
+    ``surround_delta_mm``). The joint pass estimates the residual pose of the H0-corrected frames; the written chain is
+    ``[eddy, residual rigid] + H0 chain`` and every frame is resampled ONCE from the original. A one-level design
+    (BOLD) is the plain registration to the mean (no column: nothing the prior could trade against)."""
+    import ants
+
+    from .motion import jenkinson_framewise_displacement, motion_correction, _extract_rigid_parameters
+    from .motion_reference import GroupedMotionCorrectionResult, _mean_image, motion_correct_grouped
+
+    levels = np.asarray(design.levels, dtype=int)
+    T = int(levels.size)
+    knobs = _knobs(design)
+    backend = knobs.pop("backend")
+    knobs.pop("window_size", None)
+    if design.n_levels == 1:
+        kw = {**knobs, **kwargs}
+        if design.pe_axis is not None:
+            kw.setdefault("pe_axis", design.pe_axis)
+        r = motion_correction(image, reference="mean", type_of_transform="Rigid", backend=backend, **kw)
+        out = _normalized(r, design, "joint", "motion_correction(reference='mean')")
+        out["design"].update(columns=[], surround_weight=0.0, surround_delta_mm=float(surround_delta_mm))
+        return out
+    if init != "levels":
+        raise ValueError(f"init must be 'levels', got {init!r}")
+    layout = level_layout(levels)
+    enc, pe_cov, dropped = joint_design_columns(design, layout)
+    lam = JOINT_SURROUND_WEIGHT if surround_weight is None else float(surround_weight)
+
+    # H0: per-level references, no design columns. Links as in ``unified``: identity where the level's offset is
+    # identifiable from its interleaving (its mean shares the series' head position, the column takes the offset),
+    # a rigid registration of the corrected means otherwise (a blocked level, DWI's b0 block: an explicit measurement)
+    ks = sorted(layout)
+    links = ["identity" if (layout[ks[i]]["root"] == layout[ks[i - 1]]["root"]
+                            and (layout[ks[i]]["beta_estimable"]
+                                 or (layout[ks[i - 1]]["interleaved"] and layout[ks[i]]["interleaved"]))) else "registration"
+             for i in range(1, len(ks))]
+    kw0 = dict(kwargs)
+    kw0.pop("sample_mask", None)
+    if design.name == "shells":
+        kw0 = {"preset": "dwi", **_DWI_DEFAULTS, **kw0}
+    else:
+        kw0.update(backend=backend, **knobs)
+    if kw0.get("outprefix") is not None:
+        kw0["outprefix"] = f"{kw0['outprefix']}h0_"
+    h0 = motion_correct_grouped(image, levels, cross_link=links, cross_group_debias=False, **kw0)
+    corrected0 = h0["motion_corrected"]
+    frames0 = [ants.slice_image(corrected0, axis=3, idx=t) for t in range(T)]
+    ref_level = {int(k): _mean_image([frames0[t] for t in np.flatnonzero(levels == k)]) for k in np.unique(levels)}
+    refs = [ref_level[int(levels[t])] for t in range(T)]
+
+    # H1: the joint pass on the ORIGINAL frames against their level's reference in the anchor space, started from the
+    # H0 poses (the composed chain): the TOTAL pose is solved, so the design columns see the whole trajectory
+    anchor = h0["group_means"][0]
+    com = np.asarray(anchor.get_center_of_mass(), dtype=np.float64)
+    from scipy.spatial.transform import Rotation as _Rot
+
+    def _compose(paths):
+        h = np.eye(4)
+        for f in paths:
+            h = _extract_rigid_parameters(ants.read_transform(f), 3)[2] @ h
+        return h
+    H0 = [_compose(h0["fwdtransforms"][t]) for t in range(T)]
+    t_init = np.array([H[:3, 3] + (H[:3, :3] - np.eye(3)) @ com for H in H0])
+    om_init = np.array([_Rot.from_matrix(H[:3, :3]).as_rotvec() for H in H0])
+    kw1 = dict(kwargs)
+    kw1.update(backend=backend, **{k: v for k, v in knobs.items() if k != "schedule_mode"})
+    if design.name == "shells":
+        kw1 = {k: v for k, v in kw1.items() if k not in ("registration_direction", "metric_smoothing_mm", "cross_num_bins")}
+    if kw1.get("outprefix") is not None:
+        kw1["outprefix"] = f"{kw1['outprefix']}h1_"
+    if enc is not None:
+        kw1["encoding_covariates"] = enc
+        if window_size is not None:
+            kw1["window_size"] = int(window_size)
+    if pe_cov is not None:
+        kw1.update(pe_affine_covariates=pe_cov, pe_axis=design.pe_axis)
+    if sample_mask_fn is not None:
+        kw1["sample_mask"] = sample_mask_fn(ref_level[0])
+    kw1.update(surround_weight=lam, surround_delta_mm=float(surround_delta_mm), init_pose=(t_init, om_init), schedule_mode=schedule_mode)
+    if level_weights:
+        kw1["frame_levels"] = levels
+    kw1 = {k: v for k, v in kw1.items() if k not in ("preset",)}
+    r1 = motion_correction(image, reference=refs, type_of_transform="Rigid", **kw1)
+
+    chains = [list(r1.fwdtransforms[t]) for t in range(T)]
+    motion_corrected = r1["motion_corrected"]
+    pe1 = r1.get("pe_affine")
+    jac = np.ones(T) if pe1 is None else np.asarray(pe1["jacobian"], dtype=float)
+    composed_all = [_compose(c) for c in chains]
+    composed_rigid = [_compose(c[-1:]) for c in chains]
+    fd_radius = float(kwargs.get("fd_radius", 50.0))
+    fd_raw = jenkinson_framewise_displacement(composed_all, fd_radius, com)
+    fd = jenkinson_framewise_displacement(composed_rigid, fd_radius, com)
+    translations_mm = np.zeros((T, 3)); rotations_deg = np.zeros((T, 3))
+    for i, H in enumerate(composed_rigid):
+        R_i = H[:3, :3]
+        translations_mm[i] = H[:3, 3] + (R_i - np.eye(3)) @ com
+        rotations_deg[i] = np.degrees(_Rot.from_matrix(R_i).as_euler("xyz"))
+
+    enc_info = r1.get("encoding_pose_bias_mm_rad")
+    beta_levels = None
+    est_levels = [k for k in ks[1:] if layout[k]["beta_estimable"]]
+    if enc_info is not None and est_levels:
+        dY = np.asarray(enc_info["delta_Y_mm_rad"], dtype=float)
+        by = {int(k): np.mean(dY[levels == k], axis=0) - np.mean(dY[levels == 0], axis=0) for k in est_levels}
+        beta_levels = {"method": "joint_in_optimizer_level_columns",
+                       "offset_mm_rad_by_group": {k: v.tolist() for k, v in by.items()},
+                       "offset_mm_by_group": {k: float(np.linalg.norm(v[:3])) for k, v in by.items()},
+                       "offset_deg_by_group": {k: float(np.degrees(np.linalg.norm(v[3:]))) for k, v in by.items()},
+                       "not_identifiable_groups": [k for k in ks[1:] if k not in est_levels]}
+    pe_affine = None
+    if pe1 is not None:
+        p_unit = np.asarray(design.pe_axis, dtype=np.float64) / np.linalg.norm(design.pe_axis)
+        a_all = np.asarray(pe1["a"], dtype=float)
+        pe_affine = {"axis": [float(x) for x in p_unit], "coefficients_by_group": [pe1.get("coefficients")],
+                     "a": a_all, "jacobian": jac, "shift_mm": a_all[:, 0].copy()}
+
+    out = GroupedMotionCorrectionResult()
+    out.update(motion_corrected=motion_corrected, fd=fd, fd_raw=fd_raw, translations_mm=translations_mm, rotations_deg=rotations_deg,
+               nuisance=None, pe_affine=pe_affine, reference_modes=["joint: corrected level means"],
+               masked_metric=sample_mask_fn is not None, bias=[r1.get("bias")], encoding_pose_bias_mm_rad=[enc_info],
+               cross_group_offset=beta_levels, group_offset_fd=None, pe_pseudomotion_debias=None,
+               frame_converged=(np.asarray(r1["convergence"]["frame_converged"], dtype=bool) if r1.get("convergence") else np.ones(T, dtype=bool)),
+               cross_converged=list(h0.get("cross_converged") or []), cross_link=list(h0.get("cross_link") or []),
+               fwdtransforms=chains, group_results=[r1], group_indices=[np.arange(T)], group_means=[ref_level[int(k)] for k in sorted(ref_level)],
+               cross_registrations=h0.get("cross_registrations"), preset=kw0.get("preset"), h0=h0)
+    out = _normalized(out, design, "joint", "motion_correct_grouped(H0 links) + motion_correction(per-frame refs, D_t, prior)")
+    out["design"].update(layout=layout, links=list(h0.get("cross_link") or []), beta="columns", beta_dropped=dropped,
+                         columns=([f"level{k}" for k in est_levels] + ([f"l2 x {design.n_levels - 1} shells"] if (enc is not None and design.name == "shells" and enc.shape[1] > len(est_levels)) else [])),
+                         n_columns=0 if enc is None else int(enc.shape[1]), surround_weight=lam, surround_delta_mm=float(surround_delta_mm),
+                         beta_levels=beta_levels, beta_levels_estimable=beta_levels is not None)
+    return out
+
+
+ENGINES = {"dispatch": _dispatch, "unified": _unified, "joint": _joint}
 
 
 def motion_correct_design(image, design: Design, *, engine: str = "dispatch", **kwargs) -> dict:
