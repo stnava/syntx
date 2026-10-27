@@ -175,6 +175,9 @@ def infer_slice_axis(image: Any, *, slice_axis: Any = None, sidecar: Any = None,
         hits = [a for a in range(3) if shape[a] == len(st)]
         if len(hits) == 1:
             return AxisInference(hits[0], "slice_timing", {"n_slice_timing": len(st), "shape": shape})
+    if meta.get("dcmmeta_slice_dim") in (0, 1, 2):
+        sd = int(meta["dcmmeta_slice_dim"])
+        return AxisInference(sd, "dcmmeta_slice_dim", {"dcmmeta_slice_dim": sd, "shape": shape})
     spacing = np.asarray(image.spacing[:3], dtype=np.float64)
     thick = [float(spacing[a] / np.median(np.delete(spacing, a))) for a in range(3)]
     scores: dict = {"thickness_ratio": thick, "shape": shape}
@@ -211,6 +214,9 @@ def infer_slice_axis(image: Any, *, slice_axis: Any = None, sidecar: Any = None,
     scores["interleave_margin"] = float(margin)
     if margin >= INTERLEAVE_MARGIN and all(h[0] == k and h[1] > 0 for h in hk):
         return AxisInference(k, "interleave", scores)
+    other_dims = [shape[a] for a in range(3) if a != k]
+    if margin > 0 and all(h[0] == k and h[1] > 0 for h in hk) and other_dims[0] == other_dims[1] and shape[k] < other_dims[0]:
+        return AxisInference(k, "interleave_and_slab_shape", scores)
     raise AcquisitionAxisUndecidable(
         f"slice axis: interleave test not decisive (lead {'ijk'[k]}, margin {margin:.3f} < {INTERLEAVE_MARGIN} or "
         f"halves disagree: {hk}); pass slice_axis or the sidecar")

@@ -2,21 +2,22 @@
 current phase: v6.24.1 (Stage 1: In-Solver Gauge Orthogonalization F14 & Scientific Directive)
 next WP: Stage 2/3 (Downstream Integration & Descriptive Verification)
 blockers: none
-active work: none (Stage 1 complete, 2026-10-26)
+active work: none (Stage 1 complete, 2026-10-27)
 device: Apple Silicon MPS / CPU (macOS arm64)
-last updated: 2026-10-26
+last updated: 2026-10-27
 
 ---
 
-## R10 (Stage 1: In-Solver Gauge Orthogonalization F14 & BOLD EPI-Plane Debiasing, v6.24.1, 2026-10-26)
+## R10 (Stage 1: In-Solver Gauge Orthogonalization F14, BOLD EPI-Plane Debiasing & Slice-Axis Inference, v6.24.1, 2026-10-27)
 - **F14 In-Solver Gauge Orthogonalization (`src/syntx/motion_batched.py`)**:
   - Projected $\ell=2$ contrast gauge in `_batched_rigid_register_pass_core` strictly onto the 5-DOF subspace orthogonal to $\hat{\mathbf{p}}$-translation in both `_encoding_offset` and `_project_encoding_gauge`.
   - Guarantees $\ell=2$ white-matter fiber anisotropy contrast never steals physical linear-in-$\mathbf{g}$ $\ell=1$ PE eddy translation along $\hat{\mathbf{p}}$.
   - Populates `pe_info["bias"]` from `enc_bias_info` in both single-batch and chunked paths.
-- **BOLD EPI-Plane Debias Fix (`src/syntx/motion_batched.py`, `src/syntx/motion_design.py`)**:
+- **BOLD EPI-Plane Debias Fix & Slice-Axis Inference (`src/syntx/motion_batched.py`, `src/syntx/motion_design.py`, `src/syntx/acquisition_axes.py`)**:
   - Fixed `sig_ref` bug in `separate_bold_pe_pseudomotion` by consuming the returned `meta` record from `_shrink_pe_pseudomotion_core`.
   - Added alias `debias_pe_pseudomotion = separate_bold_pe_pseudomotion`.
   - Routed `motion_correct_design` for BOLD (`"none"` design) with `pe_axis` and `debias_pe_pseudomotion=True`.
+  - Enhanced `infer_slice_axis` (`src/syntx/acquisition_axes.py`) to resolve `dcmmeta_slice_dim` from BIDS sidecars and `interleave_and_slab_shape` when both half-series interleave checks agree on the smaller slab axis of a square-in-plane 2D EPI volume.
 - **Implementation Standards Exception (`tests/test_implementation_standards.py`)**:
   - Updated line reference in `ALLOWED_REGISTRATION_EXCEPTIONS` from `motion.py:1059` to `motion.py:1062` matching the fallback `ants.registration` call in `src/syntx/motion.py`.
 - **Scientific Directive**:
