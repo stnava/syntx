@@ -405,6 +405,9 @@ def jenkinson_framewise_displacement(
     return fd
 
 
+MIN_FRAMES_FOR_BAND = 32   # below this no band is sought: a 16-frame ASL series has eight spectral bins and no physiology to resolve
+
+
 def band_limited_fd(
     translations_mm: np.ndarray,
     rotations_deg: np.ndarray,
@@ -413,8 +416,15 @@ def band_limited_fd(
     radius: float = 50.0,
     min_hz: float = 0.1,
     min_prominence: float = 1.5,
+    fd_method: str = "power",
+    center_of_mass: Optional[np.ndarray] = None,
 ) -> Dict[str, Any]:
     """Framewise displacement with the near-Nyquist physiological alternation removed from the pose series.
+
+    ``fd_method`` is the definition of the returned FD series: ``'power'`` (sum of absolute steps, rotations at
+    ``radius``) or ``'jenkinson'`` (RMS displacement over the sphere, as ``motion_correct_grouped`` and the design engines
+    report), so ``fd_bandlimited`` is comparable with the result's own ``fd``. Rotations are Euler xyz degrees as stored
+    in ``rotations_deg``; ``center_of_mass`` is the point the translations are expressed about.
 
     A sub-voxel oscillation faster than the sampling (respiration aliased at a long TR, cardiac pulsation at a short one)
     is a real frame-to-frame displacement of the image content that the registration corrects well, but a per-step sum
@@ -462,14 +472,26 @@ def band_limited_fd(
         raise ValueError(f"band_limited_fd needs a positive repetition time, got {tr_s!r}")
     nyq = 0.5 / tr_s
 
+    if fd_method not in ("power", "jenkinson"):
+        raise ValueError(f"fd_method must be 'power' or 'jenkinson', got {fd_method!r}")
+
     def _fd(Y):
-        return np.r_[0.0, np.abs(np.diff(Y, axis=0)).sum(axis=1)]
+        if fd_method == "power":
+            return np.r_[0.0, np.abs(np.diff(Y, axis=0)).sum(axis=1)]
+        from scipy.spatial.transform import Rotation as _Rot
+        com = np.zeros(3) if center_of_mass is None else np.asarray(center_of_mass, dtype=np.float64)
+        Hs = []
+        for k in range(Y.shape[0]):
+            R = _Rot.from_euler("xyz", Y[k, 3:] / float(radius), degrees=False).as_matrix()
+            H = np.eye(4); H[:3, :3] = R; H[:3, 3] = Y[k, :3] - (R - np.eye(3)) @ com
+            Hs.append(H)
+        return np.asarray(jenkinson_framewise_displacement(Hs, float(radius), com), dtype=np.float64)
 
     fd_raw = _fd(X)
     out: Dict[str, Any] = {"fd_raw_power": fd_raw, "tr_s": tr_s, "nyquist_hz": float(nyq), "band_hz": None,
                            "band_source": "none", "alternation_hz": None, "alternation_amplitude_mm": 0.0,
                            "band_prominence": 0.0, "band_power_fraction": 0.0}
-    if T < 8 or nyq <= float(min_hz):
+    if T < MIN_FRAMES_FOR_BAND or nyq <= float(min_hz):   # a band needs spectral resolution: 32 frames gives 16 bins
         out.update(fd_bandlimited=fd_raw, fd_bandlimited_mean=float(np.mean(fd_raw[1:])) if T > 1 else 0.0,
                    fd_bandlimited_max=float(fd_raw.max()))
         return out
@@ -527,7 +549,8 @@ def band_limited_fd(
 
 
 def attach_band_limited_fd(result: Dict[str, Any], image: Optional[ants.ANTsImage], translations_mm: np.ndarray,
-                           rotations_deg: np.ndarray, tr_s: Optional[float] = None, radius: float = 50.0) -> None:
+                           rotations_deg: np.ndarray, tr_s: Optional[float] = None, radius: float = 50.0,
+                           fd_method: str = "power", center_of_mass: Optional[np.ndarray] = None) -> None:
     """Write the ``band_limited_fd`` keys into a motion result in place (``fd_bandlimited``, ``fd_band`` dict and, when the
     result has a ``summary``, ``fd_bandlimited_mean`` / ``fd_bandlimited_max`` / ``fd_band_hz`` / ``fd_band_source`` /
     ``fd_alternation_hz`` / ``fd_alternation_amplitude_mm``). The repetition time is ``tr_s`` or the time spacing of a
@@ -541,7 +564,7 @@ def attach_band_limited_fd(result: Dict[str, Any], image: Optional[ants.ANTsImag
             result["summary"].update(fd_bandlimited_mean=None, fd_bandlimited_max=None, fd_band_hz=None, fd_band_source="no_tr",
                                      fd_alternation_hz=None, fd_alternation_amplitude_mm=None)
         return
-    b = band_limited_fd(translations_mm, rotations_deg, tr_s, radius=radius)
+    b = band_limited_fd(translations_mm, rotations_deg, tr_s, radius=radius, fd_method=fd_method, center_of_mass=center_of_mass)
     result["fd_bandlimited"] = b["fd_bandlimited"]
     result["fd_band"] = {k: b[k] for k in ("band_hz", "band_source", "alternation_hz", "alternation_amplitude_mm", "band_prominence", "band_power_fraction", "nyquist_hz", "tr_s")}
     if isinstance(result.get("summary"), dict):
@@ -930,7 +953,7 @@ def motion_correction(
                                "convergence_tol_vox", "max_extend_factor", "encoding_covariates", "window_size",
                                "window_stride", "surround_weight", "surround_delta_mm", "slice_axis", "sidecar",
                                "frame_levels", "init_pose", "schedule", "design_matrix", "design_point_scale",
-                               "design_levels", "design_model_live", "tr"}
+                               "design_levels", "design_model_live", "tr", "surround_scale"}
     if backend == "pytorch_batched" and set(kwargs) - _batched_allowed_kwargs:
         raise TypeError(f"backend='pytorch_batched' accepts only {sorted(_batched_allowed_kwargs)}; got "
                         f"{sorted(set(kwargs) - _batched_allowed_kwargs)}")
@@ -1142,12 +1165,15 @@ def motion_correction(
                         design_levels=None if kwargs.get("design_levels") is None else np.asarray(kwargs["design_levels"])[list(batch_indices)],
                         design_point_scale=bool(kwargs.get("design_point_scale", True)),
                         design_model_live=bool(kwargs.get("design_model_live", False)),
+                        surround_scale=str(kwargs.get("surround_scale", "raw")),
                     )
                     if pe_batch is not None:
                         if "sampling" in pe_batch:
                             pe_frames["sampling"] = pe_batch["sampling"]
                         if "design_model" in pe_batch:
                             pe_frames["design_model"] = pe_batch["design_model"]
+                        if "prior" in pe_batch:
+                            pe_frames["prior"] = pe_batch["prior"]
                         if "bias" in pe_batch:
                             pe_frames["bias"] = pe_batch["bias"]
                         if pe_batch.get("encoding_pose_bias_mm_rad") is not None:
@@ -1387,6 +1413,7 @@ def motion_correction(
         "encoding_pose_bias_mm_rad": pe_frames["encoding_pose_bias_mm_rad"],
         "sampling": pe_frames["sampling"],
         "design_model": pe_frames.get("design_model"),
+        "prior": pe_frames.get("prior"),
         "convergence": None if not pe_frames["stages"] else {
             "tol_vox": float(kwargs.get("convergence_tol_vox", 0.05)), "max_extend_factor": int(kwargs.get("max_extend_factor", 4)),
             "frame_converged": [bool(pe_frames["frame_converged"].get(t, True)) for t in range(num_frames)],
@@ -1394,7 +1421,8 @@ def motion_correction(
         },
     })
     attach_band_limited_fd(result, image if isinstance(image, ants.ANTsImage) else None, motion_params.translations,
-                           motion_params.rotations_deg, tr_s=kwargs.get("tr"), radius=fd_radius)
+                           motion_params.rotations_deg, tr_s=kwargs.get("tr"), radius=fd_radius,
+                           fd_method=("jenkinson" if fd_method.lower() == "jenkinson" else "power"), center_of_mass=center_of_sphere)
     if debias_pe_pseudomotion:
         if spatial_dim != 3:
             raise ValueError("debias_pe_pseudomotion needs a 3-D (+ time) series")

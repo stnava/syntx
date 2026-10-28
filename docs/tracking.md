@@ -8,6 +8,24 @@ last updated: 2026-10-28
 
 ---
 
+## R13 (ISMRM abstract, decomposition module, FD consistency, 2026-10-28; uncommitted solver work)
+- **Abstract** (`docs/abstracts/ISMRM_2027_motion_solver.md`, 747-word body): one solver, four series (breacher 3315 resting BOLD,
+  ExpArt EAS020 ASL, FPA BLAST031 AP and SOCOM Blast-11 PA multi-shell DWI), every number from `benchmarks/ismrm_cases.py`
+  (`docs/reports/ismrm_cases_2026-10-28.{html,json,_figure.png}`), joint engine on MPS.
+- **`syntx.motion_decomposition`** (new): `pose_step_decomposition` (head / applied / removed shares per acquisition axis),
+  `image_variance_decomposition` (sequential sums of squares: design blocks, motion after the design, residual; residual-FD
+  correlation), `design_blocks`, `real_even_sh`; `tests/test_motion_decomposition.py` (3).
+- **Band-limited FD consistency** (`motion.py`): `band_limited_fd(fd_method=, center_of_mass=)` so the band-limited series uses the
+  result's own FD definition (Jenkinson in the grouped and design engines, Power in `motion_correction`; without a band the two
+  series agree to 1e-14); `MIN_FRAMES_FOR_BAND = 32` (a 16-frame ASL series has no spectral resolution for a band).
+- **Prior in likelihood units and coupled Newton** (`motion_batched.py`, from earlier today, uncommitted): `surround_scale="likelihood"`
+  (nats per mm, scaled by sigma^2 / S measured per stage), `surround_prior_hessian_full` (block-tridiagonal, autograd-checked),
+  one global line search; `benchmarks/prior_units_case_study.py`, `docs/reports/prior_units_case_BLAST031_2026-10-28.html`: a
+  strong prior bends pitch, the readout jitter of the projected engine is data-supported.
+- Plan: `docs/MOTION_NEXT_STEPS_PLAN_2026-10-28.md` (steps 2 to 7 pending). ANTsTorch's working tree was briefly mid-edit by another agent (import broken); two reruns stubbed `antstorch`
+  in-process; once it imported again the SOCOM DWI case was rerun without the stub and every reported cell was identical
+  (the motion modules never reference antstorch), the ASL and BLAST031 cases were then rerun without it and every reported cell matched the committed values; the figure, HTML and JSON are from these unstubbed runs. Author block: sole author (co-authors are the user's to add). Independent check: the antsxdwi script written this morning (`antsxdwi/benchmarks/motion_variance_report.py`, its own mask, voxel sample and SH code, run on the WRITTEN corrected NIfTI and confounds of SOCOM Blast-11 PA) reproduces the syntx module's decomposition within sampling noise (intercepts 92.2 vs 91.8 %, l=2 2.6 vs 2.6, l=4 0.9 vs 1.0, motion 0.8 vs 0.9, residual 3.5 vs 3.7 %; r -0.12 both) and the pose shares exactly (readout 61/45 %, PE eddy 71 %). The BOLD and ASL rows were likewise recomputed from written outputs with a separate plain least-squares routine, a raw-mean mask and a different 40 000-voxel sample (seed 7): BOLD motion 34.7/23.5 vs 35.0/23.6 %, residual 65.3/76.5 vs 65.0/76.4 %, r 0.62; ASL design 97.1/98.4, motion 0.33/0.17, residual 2.6/1.4 %, r 0.59; FD, band-limited FD and censored fractions identical. Every row of the table is thus checked by an independent implementation.
+
 ## R12 (prior in every stage, band-limited FD, resting-BOLD pilot, projected engine, v6.26.0, 2026-10-28)
 - **Plan** (`docs/MOTION_JOINT_V2_AND_CENSORING_PLAN.md`): the v2 model (design `D` profiled out of the metric per point, levels
   differ in contrast never in pose, prior inside one objective), six syntx WPs, nine cross-repo censoring WPs, six gates, four

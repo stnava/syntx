@@ -600,6 +600,7 @@ def _joint(image, design: Design, *, init: str = "levels", surround_weight: Opti
         gauge_ok = [k for k in ks[1:] if layout[k]["beta_estimable"] and layout[k]["n"] >= GAUGE_MIN_FRAMES and layout[ks[0]]["n"] >= GAUGE_MIN_FRAMES]
         gauge_levels = np.where(np.isin(levels, gauge_ok), levels, ks[0])
         kw1.update(design_matrix=D_metric, metric="huber", design_levels=gauge_levels)
+        kw1.setdefault("surround_scale", "likelihood")   # surround_weight in nats per mm (a log-prior in the likelihood's units)
     if pe_cov is not None:
         kw1.update(pe_affine_covariates=pe_cov, pe_axis=design.pe_axis)
     if sample_mask_fn is not None:
@@ -652,12 +653,13 @@ def _joint(image, design: Design, *, init: str = "levels", surround_weight: Opti
                cross_converged=list(h0.get("cross_converged") or []), cross_link=list(h0.get("cross_link") or []),
                fwdtransforms=chains, group_results=[r1], group_indices=[np.arange(T)], group_means=[ref_level[int(k)] for k in sorted(ref_level)],
                cross_registrations=h0.get("cross_registrations"), preset=kw0.get("preset"), h0=h0)
-    attach_band_limited_fd(out, image, translations_mm, rotations_deg, tr_s=kwargs.get("tr"), radius=fd_radius)
+    attach_band_limited_fd(out, image, translations_mm, rotations_deg, tr_s=kwargs.get("tr"), radius=fd_radius, fd_method="jenkinson", center_of_mass=com)
     out = _normalized(out, design, engine_name, ("motion_correct_grouped(identity links) + motion_correction(design in the metric, prior)" if projected
                                                  else "motion_correct_grouped(H0 links) + motion_correction(per-frame refs, D_t, prior)"))
     if projected:
         out["design_model"] = (r1.get("convergence") or {}).get("design_model") if isinstance(r1.get("convergence"), dict) else None
         out["design_model"] = out["design_model"] or r1.get("design_model")
+        out["prior"] = r1.get("prior")
     out["design"].update(layout=layout, links=list(h0.get("cross_link") or []), beta=("metric" if projected else "columns"), beta_dropped=dropped,
                          columns=(([f"intercept x {design.n_levels}"] + ([f"l2 x shells ({D_metric.shape[1] - design.n_levels} cols)"] if D_metric.shape[1] > design.n_levels else [])) if projected
                                   else [f"level{k}" for k in est_levels] + ([f"l2 x {design.n_levels - 1} shells"] if (enc is not None and design.name == "shells" and enc.shape[1] > len(est_levels)) else [])),

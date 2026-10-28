@@ -882,10 +882,37 @@ def surround_prior_hessian(t_param: torch.Tensor, omega: torch.Tensor, weight: f
     return Hb
 
 
+def surround_prior_hessian_full(t_param: torch.Tensor, omega: torch.Tensor, weight: float, delta_mm: float,
+                                rot_radius_mm: float = 50.0) -> torch.Tensor:
+    """The FULL Hessian (B, 6, B, 6) of the surround prior in parameter units: the diagonal blocks of
+    ``surround_prior_hessian`` plus the couplings between the frames of each term (frame t with t +- 1, coefficient
+    1 x -0.5; t - 1 with t + 1, coefficient 0.25). The Newton stage solves the coupled system with it: a per-frame
+    step judged frame by frame is a Jacobi iteration on a strongly coupled chain and stalls."""
+    B = int(t_param.shape[0])
+    f32 = dict(dtype=t_param.dtype, device=t_param.device)
+    H = torch.zeros((B, 6, B, 6), **f32)
+    if B < 3 or float(weight) <= 0.0:
+        return H
+    with torch.no_grad():
+        u = torch.cat([t_param[1:-1] - 0.5 * (t_param[:-2] + t_param[2:]),
+                       rot_radius_mm * (omega[1:-1] - 0.5 * (omega[:-2] + omega[2:]))], dim=1)
+        s2 = float(delta_mm) ** 2 + (u * u).sum(dim=1, keepdim=True)
+        Hu = float(weight) * float(delta_mm) * (s2.unsqueeze(-1) * torch.eye(6, **f32) - u.unsqueeze(2) * u.unsqueeze(1)) / s2.pow(1.5).unsqueeze(-1)
+        unit = torch.tensor([1.0, 1.0, 1.0, rot_radius_mm, rot_radius_mm, rot_radius_mm], **f32)
+        Hu = Hu * unit.view(1, 6, 1) * unit.view(1, 1, 6)
+        coef = {-1: -0.5, 0: 1.0, 1: -0.5}
+        for j in range(B - 2):
+            t = j + 1
+            for a, ca in coef.items():
+                for b, cb in coef.items():
+                    H[t + a, :, t + b, :] += ca * cb * Hu[j]
+    return H
+
+
 def _run_converging_stage(*, optimizer, params, per_frame_params, loss_fn, points_fn, iters, B, dev, tol, max_extend,
                           lr_groups=None, lr_t=None, lr_r=0.0, point_radius=0.0, probe_fn=None, confirm_vox=None, axes=None, stage_voxel=None,
                           max_step_vox=1.0, label="", level=1, shared_params=None, reg_loss_fn=None, resample_fn=None,
-                          reg_hess_fn=None, reg_frame_fn=None):
+                          reg_hess_fn=None, reg_frame_fn=None, reg_hess_full_fn=None):
     """One optimiser stage that ends when every frame has CONVERGED, not when an iteration count is spent.
 
     ``loss_fn()`` returns the (B,) per-frame loss; ``points_fn()`` the (B, S, 3) physical positions of a fixed subset of the
@@ -1015,7 +1042,24 @@ def _run_converging_stage(*, optimizer, params, per_frame_params, loss_fn, point
             ev, Q = (t.to(dev) for t in torch.linalg.eigh(Hv.detach().cpu()))   # B x 6 x 6: eigh is not implemented on MPS, and is tiny
             floor = 1e-3 * ev.abs().max(dim=1, keepdim=True).values.clamp_min(1e-12)
             inv = 1.0 / (torch.maximum(ev.abs(), floor) + lam.unsqueeze(1))
-            dv = -(Q @ (inv * (Q.transpose(1, 2) @ Gv.unsqueeze(-1)).squeeze(-1)).unsqueeze(-1)).squeeze(-1)   # (B, P) voxels
+            if reg_hess_full_fn is None:
+                dv = -(Q @ (inv * (Q.transpose(1, 2) @ Gv.unsqueeze(-1)).squeeze(-1)).unsqueeze(-1)).squeeze(-1)   # (B, P) voxels
+            else:
+                # coupled Newton step: the image Hessian per frame (saddle-free, damped) on the block diagonal, the prior's
+                # full block-tridiagonal Hessian between frames; solved over the ACTIVE frames (frozen ones fixed)
+                Hv_img = Q @ torch.diag_embed(torch.maximum(ev.abs(), floor) + lam.unsqueeze(1)) @ Q.transpose(1, 2)
+                Hp = reg_hess_full_fn() * to_vox.view(1, P, 1, 1) * to_vox.view(1, 1, 1, P)       # (B,P,B,P) voxel units
+                Hp_diag = torch.stack([Hp[b, :, b, :] for b in range(B)])
+                Hfull = Hp.clone()
+                for b in range(B):
+                    Hfull[b, :, b, :] = Hfull[b, :, b, :] - Hp_diag[b] + Hv_img[b] + Hp_diag[b]
+                act = torch.nonzero(tracker.active).flatten()
+                dv = torch.zeros(B, P, device=dev)
+                if act.numel() > 0:
+                    Ha = Hfull[act][:, :, act, :].reshape(act.numel() * P, act.numel() * P).cpu().double()
+                    ga = Gv[act].reshape(-1).cpu().double()
+                    sol = torch.linalg.solve(Ha + 1e-9 * torch.eye(Ha.shape[0], dtype=Ha.dtype), -ga).float().view(act.numel(), P)
+                    dv[act] = sol.to(dev)
             remaining = dv.abs().max(dim=1).values
             tracker.last_step = torch.where(tracker.active, remaining * vox, tracker.last_step)
             done_now = tracker.active & (remaining <= confirm_vox)
@@ -1030,13 +1074,24 @@ def _run_converging_stage(*, optimizer, params, per_frame_params, loss_fn, point
                 _f_frame = (lambda: loss_fn().detach() + reg_frame_fn()) if reg_frame_fn is not None else (lambda: loss_fn().detach())
                 f0 = _f_frame()
                 best_f, best_a = f0.clone(), torch.zeros(B, device=dev)
+                coupled = reg_hess_full_fn is not None
+                tot0 = float(loss_fn().detach()[tracker.active].sum() + reg_loss_fn().detach()) if coupled else None
+                best_tot, best_alpha = tot0, 0.0
                 for alpha in (1.0, 0.5, 0.25, 0.1):
                     for k, ax in enumerate(axes):
                         ax.tensor[ax.index] = base[k] + alpha * dv[:, k] / to_vox[k]
+                    if coupled:
+                        # one objective, one line search: the frames' steps are a joint step of the coupled system
+                        tot = float(loss_fn().detach()[tracker.active].sum() + reg_loss_fn().detach())
+                        if tot < best_tot:
+                            best_tot, best_alpha = tot, alpha
+                        continue
                     f = _f_frame()
                     better = tracker.active & (f < best_f)
                     best_f = torch.where(better, f, best_f)
                     best_a = torch.where(better, torch.full_like(best_a, alpha), best_a)
+                if coupled:
+                    best_a = torch.where(tracker.active, torch.full_like(best_a, best_alpha), best_a)
                 for k, ax in enumerate(axes):
                     ax.tensor[ax.index] = base[k] + best_a * dv[:, k] / to_vox[k]
             moved = best_a > 0
@@ -1137,6 +1192,7 @@ def batched_rigid_register_pass(
     design_point_scale: bool = True,
     design_levels: Optional[np.ndarray] = None,
     design_model_live: bool = False,
+    surround_scale: str = "raw",
 ):
     """Rigidly register every frame in ``moving_imgs`` to the same ``reference_img``, in one
     or more batched optimisations, optionally with a per-frame eddy-current (phase-encode affine) term whose
@@ -1199,7 +1255,7 @@ def batched_rigid_register_pass(
             encoding_covariates=enc_all, window_size=window_size, window_stride=window_stride,
             surround_weight=surround_weight, surround_delta_mm=surround_delta_mm, frame_levels=frame_levels,
             init_pose=init_pose, design_matrix=design_matrix, design_point_scale=design_point_scale,
-            design_levels=design_levels, design_model_live=design_model_live,
+            design_levels=design_levels, design_model_live=design_model_live, surround_scale=surround_scale,
         )
         return out if return_pe_affine else out[:3]
 
@@ -1237,7 +1293,7 @@ def batched_rigid_register_pass(
             design_matrix=None if design_matrix is None else np.asarray(design_matrix)[start:start + chunk_size],
             design_point_scale=design_point_scale,
             design_levels=None if design_levels is None else np.asarray(design_levels)[start:start + chunk_size],
-            design_model_live=design_model_live,
+            design_model_live=design_model_live, surround_scale=surround_scale,
         )
         fwd_all.extend(fwd_c)
         inv_all.extend(inv_c)
@@ -1312,6 +1368,7 @@ def _batched_rigid_register_pass_core(
     design_point_scale: bool = True,
     design_levels: Optional[np.ndarray] = None,
     design_model_live: bool = False,
+    surround_scale: str = "raw",
 ) -> Tuple[List[List[str]], List[List[str]], float, Optional[dict]]:
     """
     Rigidly register every frame in ``moving_imgs`` to the same ``reference_img`` in one
@@ -1568,6 +1625,15 @@ def _batched_rigid_register_pass_core(
     # 0.003 / 0.012 / 0.019 mm, rotation 0.108 / 0.133 / 0.157 deg at weights 0 / 0.02 / 0.05), so the default is 0.
     surr_w = 0.0 if surround_weight is None else float(surround_weight)
     surr_delta = max(float(surround_delta_mm), 1e-4)
+    if surround_scale not in ("raw", "likelihood"):
+        raise ValueError(f"surround_scale must be 'raw' or 'likelihood', got {surround_scale!r}")
+    # ``surround_scale='likelihood'``: ``surround_weight`` is in nats per mm of second difference beyond the knee, i.e. a
+    # log-prior in the units of the image log-likelihood. The image term per frame is a MEAN over the S sample points of
+    # the Huber loss on scaled intensities, which is the log-likelihood divided by S / sigma^2 (sigma: the residual noise
+    # in scaled units), so the prior enters the loss multiplied by sigma^2 / S. Both are measured at every stage start
+    # on the stage's own points (``_prior_scale``). With ``'raw'`` the multiplier is 1 (the 6.25 behaviour).
+    surr_scale = [1.0]
+    prior_scale_log: list = []
 
     def pe_terms():
         """Per-frame eddy coefficients a (B, 4) and Jacobian (B,)."""
@@ -1909,7 +1975,21 @@ def _batched_rigid_register_pass_core(
         u_t = t_param[1:-1] - 0.5 * (t_param[:-2] + t_param[2:])
         u_w = 50.0 * (omega[1:-1] - 0.5 * (omega[:-2] + omega[2:]))
         u_sq = (u_t * u_t).sum(dim=-1) + (u_w * u_w).sum(dim=-1)
-        return surr_w * (surr_delta ** 2) * (torch.sqrt(1.0 + u_sq / (surr_delta ** 2)) - 1.0).sum()
+        return surr_scale[0] * surr_w * (surr_delta ** 2) * (torch.sqrt(1.0 + u_sq / (surr_delta ** 2)) - 1.0).sum()
+
+    def _prior_scale(cur, moving_tensor, shape_stage, level_stage):
+        """sigma^2 / S of this stage's points at the current pose (``surround_scale='likelihood'``)."""
+        if surround_scale != "likelihood" or surr_w <= 0.0:
+            return
+        with torch.no_grad():
+            E = _warped_values(cur["X"], moving_tensor, shape_stage, level_stage)
+            fv = cur["fixed_vals"]
+            r = _scale(E, True) - (_scale(fv, True) if fv.dim() == 2 else _scale(fv, False).unsqueeze(0))
+            mad = 1.4826 * (r - r.median(dim=1, keepdim=True).values).abs().median(dim=1).values   # (B,) per frame
+            sigma2 = float(mad.median() ** 2)
+            S = int(cur["X"].shape[0])
+            surr_scale[0] = max(sigma2, 1e-12) / max(S, 1)
+            prior_scale_log.append({"sigma_scaled": float(np.sqrt(sigma2)), "points": S, "scale": surr_scale[0]})
 
     def _surround_frame_terms():
         """The prior's per-term values (B-2,), one per second difference, attributed to its centre frame for the per-frame
@@ -1918,7 +1998,7 @@ def _batched_rigid_register_pass_core(
             u_t = t_param[1:-1] - 0.5 * (t_param[:-2] + t_param[2:])
             u_w = 50.0 * (omega[1:-1] - 0.5 * (omega[:-2] + omega[2:]))
             u_sq = (u_t * u_t).sum(dim=-1) + (u_w * u_w).sum(dim=-1)
-            terms = surr_w * (surr_delta ** 2) * (torch.sqrt(1.0 + u_sq / (surr_delta ** 2)) - 1.0)
+            terms = surr_scale[0] * surr_w * (surr_delta ** 2) * (torch.sqrt(1.0 + u_sq / (surr_delta ** 2)) - 1.0)
             out = torch.zeros(B, **f32)
             out[1:-1] = terms
         return out
@@ -1926,7 +2006,7 @@ def _batched_rigid_register_pass_core(
     def _surround_reg_hess(axes):
         """Per-frame Hessian block (B, P, P) of the surround prior in the order of ``axes`` (``surround_prior_hessian``)."""
         cols = [(3 if ax.tensor is omega else 0) + int(ax.index[1]) for ax in axes]
-        return surround_prior_hessian(t_param.detach(), omega.detach(), surr_w, surr_delta)[:, cols][:, :, cols]
+        return surround_prior_hessian(t_param.detach(), omega.detach(), surr_scale[0] * surr_w, surr_delta)[:, cols][:, :, cols]
 
     # Level gauge of the ``projected`` engine: a constant pose offset of one level against the anchor is a nullspace of a
     # within-level metric (its model moves with its frames), and physics says levels differ in contrast, not in pose. The
@@ -1958,6 +2038,12 @@ def _batched_rigid_register_pass_core(
             level_gauge_log.append({"removed_rms_mm": float(np.sqrt((dY[:, :3] ** 2).sum(1).mean())),
                                     "removed_rms_deg": float(np.degrees(np.sqrt((dY[:, 3:] ** 2).sum(1).mean())))})
         return w_np
+
+    def _surround_reg_hess_full(axes):
+        """Full coupled Hessian (B, P, B, P) of the surround prior in the order of ``axes``."""
+        cols = [(3 if ax.tensor is omega else 0) + int(ax.index[1]) for ax in axes]
+        H = surround_prior_hessian_full(t_param.detach(), omega.detach(), surr_scale[0] * surr_w, surr_delta)
+        return H[:, cols][:, :, :, cols]
 
     def _project_encoding_gauge():
         """Re-split the total pose into head motion and encoding offset with the closed-form Tukey surround projection.
@@ -2159,6 +2245,7 @@ def _batched_rigid_register_pass_core(
                 cur["w_y"] = lvl_data["w_y"] if sub is None else _sub(lvl_data["w_y"], sub)
             if design_model is not None:
                 _design_model_refs(cur, moving_tensor, shape_stage, level)
+            _prior_scale(cur, moving_tensor, shape_stage, level)
 
         if design_model is not None:
             design_model["live"] = bool(design_model_live) and stage.get("optimizer", "adam") != "newton"
@@ -2235,6 +2322,7 @@ def _batched_rigid_register_pass_core(
             shared_params=shared_stage_params if shared_stage_params else None,
             reg_loss_fn=_surround_reg_loss if prior_stage else None,
             reg_hess_fn=(lambda: _surround_reg_hess(probe_axes)) if prior_stage else None,
+            reg_hess_full_fn=(lambda: _surround_reg_hess_full(probe_axes)) if prior_stage else None,
             reg_frame_fn=_surround_frame_terms if prior_stage else None)
         _project_encoding_gauge()
         _project_level_gauge()
@@ -2336,6 +2424,8 @@ def _batched_rigid_register_pass_core(
     if pe_info is None:
         pe_info = {}
     pe_info["convergence"] = convergence_log
+    pe_info["prior"] = {"surround_weight": float(surr_w), "surround_delta_mm": float(surr_delta), "surround_scale": surround_scale,
+                        "scale_log": prior_scale_log}
     if design_model is not None:
         pe_info["design_model"] = {k: v for k, v in design_model.items() if k not in ("P", "live")}
         pe_info["design_model"]["level_gauge"] = level_gauge_log

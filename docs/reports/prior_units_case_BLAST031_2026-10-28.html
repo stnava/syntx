@@ -1,0 +1,11 @@
+<!doctype html><html><head><meta charset="utf-8"><title>Prior in likelihood units: one DWI case</title>
+<style>body{font-family:sans-serif;margin:2em;max-width:1100px} table{border-collapse:collapse} td,th{border:1px solid #999;padding:3px 6px;font-size:13px} th{background:#eee}</style></head>
+<body><h1>Head prior in likelihood units: one real multi-shell DWI series</h1>
+<p>The prior weight is in nats per mm of second difference beyond the 0.05 mm knee, entering the loss multiplied by the measured
+sigma^2 / S of the stage's points (<code>surround_scale='likelihood'</code>). Step MAD: robust frame-to-frame step per axis
+(mm; pitch at 50 mm). The readout step is the B0-immune floor: real jitter the prior must not shrink below what unified and joint
+report; the phase-encode step carries eddy and contrast effects. design_locked: period-2 pose amplitude along PE relative to the
+anchor level. tsd_rel: alignment (lower is better).</p>
+<table><tr><th>engine</th><th>FD mean</th><th>FD max</th><th>step readout</th><th>step PE</th><th>step slice</th><th>step pitch</th>
+<th>locked PE</th><th>tsd_rel</th><th>converged</th><th>s</th></tr><tr><td>unified</td><td>0.606</td><td>2.32</td><td>0.057</td><td>0.696</td><td>0.125</td><td>0.090</td><td>0.008</td><td>0.6825</td><td>1.00</td><td>84</td></tr><tr><td>joint</td><td>0.564</td><td>2.53</td><td>0.080</td><td>0.560</td><td>0.100</td><td>0.088</td><td>0.040</td><td>0.6812</td><td>1.00</td><td>97</td></tr><tr><td>projected, prior 0 nats/mm</td><td>0.719</td><td>2.20</td><td>0.146</td><td>0.634</td><td>0.255</td><td>0.130</td><td>0.026</td><td>0.6804</td><td>1.00</td><td>80</td></tr><tr><td>projected, prior 2000 nats/mm</td><td>0.714</td><td>2.20</td><td>0.145</td><td>0.635</td><td>0.260</td><td>0.131</td><td>0.027</td><td>0.6805</td><td>1.00</td><td>79</td></tr><tr><td>projected, prior 100000 nats/mm</td><td>0.685</td><td>2.17</td><td>0.144</td><td>0.650</td><td>0.258</td><td>0.048</td><td>0.025</td><td>0.6817</td><td>0.91</td><td>137</td></tr></table>
+<h3>Pose along the acquisition axes</h3><img src="prior_units_case_BLAST031_2026-10-28_traces.png" style="max-width:100%"></body></html>

@@ -1100,7 +1100,7 @@ def motion_correct_grouped(
     out["cross_group_offset"] = cross_group_offset
     out["group_offset_fd"] = group_offset_fd
     out["pe_pseudomotion_debias"] = pe_pseudomotion_debias
-    attach_band_limited_fd(out, image, translations_mm, rotations_deg, tr_s=kwargs.get("tr"), radius=float(kwargs.get("fd_radius", 50.0)))
+    attach_band_limited_fd(out, image, translations_mm, rotations_deg, tr_s=kwargs.get("tr"), radius=float(kwargs.get("fd_radius", 50.0)), fd_method="jenkinson", center_of_mass=com)
     # convergence of the per-frame registrations (every stage of every frame ended on the pose-step test) and of each cross-shell
     # registration (the winning path's stages); False entries are frames/steps that were CAPPED, never silently final.
     frame_converged = np.ones(int(sum(len(i) for i in idx)), dtype=bool)
