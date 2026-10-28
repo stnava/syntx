@@ -12,7 +12,7 @@ calls displacements (the eddy-current affine along phase encode, its Jacobian) a
 physics calls contrast or design-locked pose offsets are removed from the reported motion and never applied. The
 head trajectory carries a prior on its second differences whose form is re-descending (Cauchy): the pull peaks at a
 knee of 0.05 mm and fades for larger steps, so drift and real motion pass through. The prior's weight (0.03 in
-curvature units) was chosen by a gate on three phantoms with known motion and five clinical series. The result
+curvature units for multi-level designs, 0.05 for one-level designs such as BOLD, since syntx 6.29.0) was chosen by a gate on three phantoms with known motion and five clinical series. The result
 reports, per acquisition axis and per voxel, the share of variance held by head motion, by applied acquisition
 terms and by removed design-locked terms.
 
@@ -27,10 +27,37 @@ terms and by removed design-locked terms.
   ASL +87 %, slow flow +55 %; Charbonnier 0.1: +70 %, +51 %. Cohort under cauchy 0.03: readout step within 0.011 mm,
   alignment unchanged, FD −0.9 to +1.8 %, every frame converged (81 to 85 % without), BOLD 206 s to 32 s.
   Run-to-run noise of the solver on repeated series: below 0.001 mm.
+- Independent downstream evaluation by another agent (task fMRI, OpenNeuro ds007693 sub-07, four 340-volume runs, syntx 6.27.0,
+  prior cauchy 0.05 vs none): `/Users/stnava/.gemini/antigravity-cli/brain/3693d91f-687f-42f4-9e12-aeda8e15cc5c/scratch/ds007693_sub07_rerun/ds007693_sub07_3way_motion_comparison.json`
+  and the write-up `/tmp/taskgood.md`. Usable numbers: mean FD 0.2016 -> 0.1987 mm (lower on 4/4 runs), censored volumes 12/1360
+  in both, voxelwise GLM beta correlation 0.9937 to 0.9989 against no prior, end-to-end wall clock 2606 -> 600 s for the four runs (4.3x; the per-run motion-only 6x figure in the write-up is not in the
+  JSON, do not quote it). Note the weight there is 0.05, not the 0.03 default; say so if you quote it.
 - `docs/MOTION_NEXT_STEPS_PLAN_2026-10-28.md`, sections "Shipping the default solver" and "6.28.0: the form of the
   surround prior": the decisions and their reasoning.
 - `docs/MOTION_DESIGN.md`: the model as implemented. Equations in the abstract must match
   `src/syntx/motion_batched.py` (`_warped_values`, `apply_pe`, `surround_rho`, `surround_prior_hessian`).
+
+## Files and build
+
+- The LaTeX file `docs/abstracts/ISMRM_2027_motion_solver.tex` is the source of record. Edit it, not the markdown: the
+  markdown `ISMRM_2027_motion_solver.md` is regenerated from the tex with
+  `pandoc ISMRM_2027_motion_solver.tex -t gfm --wrap=none` (keep its header note, replace everything from `## Synopsis`).
+- Build the PDF from `docs/abstracts/` with `pdflatex -interaction=nonstopmode ISMRM_2027_motion_solver.tex` run twice
+  (MacTeX, `/Library/TeX/texbin/pdflatex`); delete the `.aux`, `.log`, `.out` files afterwards. The PDF is not committed.
+  To look at the pages without a PDF viewer: `gs -q -dNOPAUSE -dBATCH -sDEVICE=png16m -r80 -sOutputFile=p%d.png <pdf>`.
+- Table 1 rows sit between `%% TABLE-START` and `%% TABLE-END` and are produced by
+  `python benchmarks/ismrm_table.py docs/reports/ismrm_cases_6_28_2026-10-28.json --latex` (markdown rows without
+  `--latex`). Never edit a row by hand; regenerate it.
+- Figures 1 and 2 are produced by `python benchmarks/ismrm_figures.py <gate dir> docs/abstracts/figures` (the gate dir holds
+  `phantoms.json` and `cohort.json`; the committed copies are under `docs/reports/prior_form_gate_2026-10-28_*.json`).
+  Figure 3 is `docs/reports/ismrm_cases_6_28_2026-10-28_figure.png` from `benchmarks/ismrm_cases.py`. `\graphicspath` in the
+  tex points at `figures/` and `../reports/`.
+- Word counts: count the body from `\section*{Introduction}` to `\section*{References}` with equations removed; the
+  synopsis must not exceed 100 words, the body 850. The current build is 99 / 850.
+- Equations use `amsmath` display math with `\label{eq:model}` and `\label{eq:prior}`; captions use `caption` with
+  `\captionsetup{font=small,labelfont=bf}`; the table is in `pdflscape` landscape at `\scriptsize`.
+- After any edit: rebuild, regenerate the markdown, and re-run the number check (the list of strings in the session's
+  verification script, or redo it: every number in the text must be found in the JSON sources above).
 
 ## Hard constraints
 
@@ -54,7 +81,7 @@ terms and by removed design-locked terms.
   (so "sub-knee jitter is measurement noise" has no phantom gate yet); the 60-volume ASL image-domain account is not
   interpreted; censoring thresholds are not tied to a downstream outcome; the design-in-metric engine over-reports
   readout jitter on real DWI and is not default.
-- Software versions: syntx 6.28.0, antsxdwi 0.33.x, antsxfunctional 0.23.x, antsxslowflow 2.12.x. Earlier versions
+- Software versions: syntx 6.29.0 (6.28.0 set the 0.03 default; 6.29.0 added 0.05 for one-level designs), antsxdwi 0.33.x, antsxfunctional 0.23.x, antsxslowflow 2.12.x. Earlier versions
   (6.24 to 6.26) had a Newton unit bug and a chain-order bug; numbers from them are superseded and must not appear.
 
 ## Style (the author's own rules)

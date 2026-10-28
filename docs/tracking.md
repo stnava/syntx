@@ -1,12 +1,35 @@
 # Tracking Summary
-current phase: v6.28.0 (default head prior: re-descending cauchy surround penalty at 0.03 curvature units, decided by the prior-form gate)
-next WP: a phantom whose jitter is in the images, not the trajectory (the gate the measurement-noise claim needs); audit notes 4 to 6; plan steps 3 to 5 (docs/MOTION_NEXT_STEPS_PLAN_2026-10-28.md); the ISMRM abstract rewrite from the fixed-solver numbers
+current phase: v6.29.0 (per-modality default prior: cauchy 0.05 for one-level designs, 0.03 for multi-level; ISMRM abstract rebuilt and verified)
+next WP: a phantom whose jitter is in the images, not the trajectory; per-axis curvature scaling (plateau transient on featureless phantoms); audit notes 4 to 6; plan steps 3 to 5 (docs/MOTION_NEXT_STEPS_PLAN_2026-10-28.md)
 blockers: none
-active work: R15 below
+active work: R16 below
 device: Apple Silicon MPS / CPU (macOS arm64)
 last updated: 2026-10-28
 
 ---
+
+## R16 (one-level default prior 0.05; ISMRM abstract verified; v6.29.0, 2026-10-28)
+- **`JOINT_SURROUND_WEIGHT_ONE_LEVEL = 0.05`** (`motion_design._joint`, one-level path): the readout-floor rule that rejected 0.05 is a
+  DWI rule; on the cohort BOLD series 0.03 and 0.05 behaved the same (readout step within 0.002 mm, alignment unchanged, FD +1.7 /
+  +1.3 %), and an independent task-fMRI evaluation (OpenNeuro ds007693 sub-07, four 340-volume runs; another agent's
+  `ds007693_sub07_3way_motion_comparison.json`) at 0.05 lowered FD on every run (0.202 -> 0.199 mm), left the censored volumes
+  unchanged (12 of 1360), preserved the first-level GLM maps (voxelwise beta correlation 0.994 to 0.999 against no prior) and ran
+  4.3x faster end to end. Multi-level designs keep 0.03. Consumers call `motion_correct_design` with no prior arguments, so the
+  default reaches antsxfunctional (BOLD, ASL), antsxdwi and antsxslowflow without a code change.
+- **ISMRM abstract** (`docs/abstracts/ISMRM_2027_motion_solver.{tex,md}`, PDF built with pdflatex, not committed; figures
+  `docs/abstracts/figures/`; `benchmarks/ismrm_figures.py`, `benchmarks/ismrm_table.py`; `LLM_PROMPT_ISMRM_2027.md` for an external
+  editor): rebuilt from the 6.28.0 five-case run (`docs/reports/ismrm_cases_6_28_2026-10-28.*`), every number checked against its
+  JSON source by script and by two independent reviewers (equations against the code, captions against the panels, table header
+  against rows); synopsis 99 words, body within 850. The tex is being edited further by another agent from the prompt; its
+  state at this release is not committed here.
+- **`transforms.resample_series` applies the motion chain's affine Jacobian** (`chain_linear_jacobian`: det of the composed linear
+  part, `1 + a . p` for the eddy affine, 1 for a rigid): the single-interpolation path antsxdwi uses for its final DWI volumes
+  (`two_pe` / `single_pe` through `syntx.transforms.resample_series`) carried the eddy displacement but not its intensity
+  modulation, unlike the solver's own `motion_corrected`; on the three code paths (batched affine, per-volume torch, ANTs).
+  `tests/test_resample_series_eddy_jacobian.py`. `_joint` docstring corrected: the chain is `[rigid, eddy]` with the total pose.
+- Comment correction in `motion_design.py`: the no-prior convergence range is 56 to 87 % (four series 56 to 85 %, the 60-volume ASL
+  87 %), not 81 to 85 %.
+- Tests (targeted): see the release commit. `antsxqc.lint src/syntx` 0.
 
 ## R15 (surround prior forms and the 6.28.0 default: cauchy 0.03; fd_unfiltered; v6.28.0, 2026-10-28)
 - **`motion_batched.surround_rho`** (`surround_form` kwarg through `motion_correction`, `motion_correct_design`, `_joint`): three forms

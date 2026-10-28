@@ -68,7 +68,7 @@ def figure1(out):
         (3, "reference of the\nframe's level $\\bar I_{\\ell(k)}(x)$\n(contrast lives here)", "#dfe9f3"),
         (21, "design-locked pose offset\n$D_k\\,\\beta$ (per level; $l=2$ terms)\nremoved from FD, never applied", "#e6f2df"),
         (39, "head pose $m_k$: $x \\mapsto R_k x + t_k$\n6 free parameters per frame;\nframe pose $= m_k + D_k\\beta$", "#fbe3d6"),
-        (57, "eddy affine along $p$\n$y \\mapsto y + p\\,(a_{k0} + a_k^{\\top}(y-c))$\n$a_k = C\\,g_k$, Jacobian $1 + a_k^{\\top}p$", "#f3e3f3"),
+        (57, "eddy affine along $p$\n$y \\mapsto y + p\\,(a_{k0} + \\tilde a_k^{\\top}(y-c))$\n$(a_{k0}, \\tilde a_k) = C\\,g_k$, Jacobian $1 + \\tilde a_k^{\\top}p$", "#f3e3f3"),
         (75, "gain $\\gamma_k$\n(scanner drift,\nspatially uniform)", "#f6f0d6"),
         (91, "observed\nframe $I_k$", "#e8e8e8"),
     ]

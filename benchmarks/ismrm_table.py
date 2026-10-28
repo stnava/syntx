@@ -39,6 +39,7 @@ def latex_rows(d):
     out = []
     for r in rows(d):
         cells = [c.strip() for c in r.strip("|").split("|")]
+        cells[3] = cells[3].replace(" %", "")          # the header carries the unit
         out.append(" & ".join(c.replace("%", "\\%") for c in cells) + " \\\\")
     return out
 

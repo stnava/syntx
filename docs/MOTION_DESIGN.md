@@ -98,7 +98,8 @@ J(m, beta, C) = sum_t L_t(I_t o T(m_t + D_t beta) o A(C g_t), R_t) + lambda sum_
 - **Gauge.** The encoding offset may carry a translation along phase encode only in the complement of the eddy
   covariates' span over frames (odd in `g` belongs to the applied eddy term, even in `g` is contrast and stays out of
   the pose); the previous unconditional projection sent the even part to motion.
-- Head prior (6.28.0): the re-descending `cauchy` surround penalty at 0.03 in curvature units is the joint engine's default
+- Head prior (6.28.0, 6.29.0): the re-descending `cauchy` surround penalty is the joint engine's default, at 0.03 in curvature
+  units for multi-level designs and 0.05 for one-level designs (BOLD; 6.29.0, task-fMRI evidence ds007693)
   (`motion_batched.surround_rho`; gate `docs/reports/prior_form_gate_2026-10-28.html`): phantoms -3 to -17 % FD error, cohort
   readout floor and alignment held, every frame converged. `pose_shrinkage` stays off.
 - Written transforms: `[rigid, eddy]` per frame (a transform list acts on the reference-space point first-listed first, so

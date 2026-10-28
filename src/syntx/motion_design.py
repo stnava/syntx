@@ -390,7 +390,8 @@ JOINT_SURROUND_DELTA_MM = 0.05
 # 6.28.0 default (gate of 2026-10-28, docs/reports/prior_form_gate_2026-10-28.html): the re-descending ``cauchy`` form at
 # 0.03 in curvature units. It was the only setting that passed BOTH gates: on the three drifting phantoms FD error -14 % (ASL),
 # -17 % (DWI eddy), -3 % (slow-flow trajectory) against no prior; on the five real series the B0-immune readout step within
-# 0.011 mm, alignment unchanged, FD within 2 %, every frame converged (81 to 85 % without the prior) and BOLD 6x faster. The
+# 0.011 mm, alignment unchanged, FD within 2 %, every frame converged on four series (56 to 85 % without the prior; the 60-volume
+# ASL series stayed at 78 %) and BOLD 6x faster. The
 # forms that drive small second differences to zero (``sparse``, Charbonnier at 0.1 and above, shrinkage at any weight) removed
 # the phantoms' true jitter; ``cauchy`` at 0.05 lowered BLAST031's readout step by 0.043 mm (run-to-run noise of the no-prior
 # solver is below 0.001 mm), so it fails the readout-floor rule. Set 0 to recover the 6.27 behaviour.
@@ -399,6 +400,13 @@ JOINT_SURROUND_WEIGHT = 0.03
 # at zero: sub-knee jitter driven to zero, drift and jumps free) or ``cauchy`` (re-descending: the pull peaks at the knee and
 # fades for larger second differences, so real steps pass through).
 JOINT_SURROUND_FORM = "cauchy"
+# One-level designs (BOLD, any series without an acquisition design) take 0.05 (6.29.0): the readout-floor rule that
+# rejected 0.05 is a DWI rule (BLAST031's B0-immune readout step fell 0.043 mm), and on one-level data the two weights
+# behaved the same on the cohort BOLD series (readout step within 0.002 mm, alignment unchanged, FD +1.3 vs +1.7 %), while an
+# independent task-fMRI evaluation (OpenNeuro ds007693 sub-07, four 340-volume runs) at 0.05 lowered FD on every run
+# (0.202 -> 0.199 mm), left the censored volumes unchanged (12 of 1360), preserved the first-level GLM maps (voxelwise beta
+# correlation 0.994 to 0.999 against no prior) and ran 4.3x faster end to end. Multi-level designs keep 0.03.
+JOINT_SURROUND_WEIGHT_ONE_LEVEL = 0.05
 # The ``projected`` engine's head prior is OFF until its weight is in the image term's units: the image loss is a MEAN over
 # sample points, so its gradient is small, while the prior with the 50 mm rotation lever is comparable to it at 0.02 and
 # stops L-BFGS from correcting a smooth rotation error (plain phantom, no jitter: rotation RMS 0.065 deg with the prior
@@ -536,8 +544,8 @@ def _joint(image, design: Design, *, init: str = "levels", surround_weight: Opti
     (``frame_levels``), with every design column of the timeline in the optimiser (``joint_design_columns``: level
     offsets and the l = 2 terms per shell as contrast gauge, removed from the pose, never applied; the eddy affine per
     shell, applied) and the Charbonnier prior on the second differences of the head trajectory (knee
-    ``surround_delta_mm``). The joint pass estimates the residual pose of the H0-corrected frames; the written chain is
-    ``[eddy, residual rigid] + H0 chain`` and every frame is resampled ONCE from the original. A one-level design
+    ``surround_delta_mm``). The joint pass solves the TOTAL pose (started from the composed H0 chain); the written chain is
+    ``[rigid, eddy]`` per frame (the rigid is the total pose) and every frame is resampled ONCE from the original. A one-level design
     (BOLD) is the plain registration to the mean (no column: nothing the prior could trade against).
 
     ``mode="projected"`` (``engine="projected"``, v2): the design is profiled out of the METRIC at every point
@@ -568,7 +576,7 @@ def _joint(image, design: Design, *, init: str = "levels", surround_weight: Opti
         kw.update(frame_gain=bool(frame_gain))
         if pose_shrinkage > 0.0:
             kw.update(pose_shrinkage=float(pose_shrinkage)); kw.setdefault("surround_scale", "curvature")
-        lam1 = JOINT_SURROUND_WEIGHT if surround_weight is None else float(surround_weight)   # the default prior applies here too (6.28.0)
+        lam1 = JOINT_SURROUND_WEIGHT_ONE_LEVEL if surround_weight is None else float(surround_weight)   # one-level default (6.29.0)
         if lam1 > 0.0:
             kw.update(surround_weight=lam1, surround_delta_mm=float(surround_delta_mm), surround_form=str(surround_form))
             kw.setdefault("surround_scale", "curvature")

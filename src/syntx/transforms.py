@@ -1787,6 +1787,18 @@ def jacobian_modulation(field_path_or_image: Any, reference: Any) -> Any:
     return reference.new_image_like(np.clip(det, *JACOBIAN_CLIP).astype(np.float32))
 
 
+def chain_linear_jacobian(chain: "TransformChain | None") -> float:
+    """Determinant of the composed linear part of a chain (displacement fields contribute 1): the intensity factor that
+    conserves signal under the chain's affine volume change. A rigid contributes 1; the motion solver's eddy affine along
+    phase encode ``p`` with shears/scale ``a`` has ``det(I + p a^T) = 1 + a . p``, the Jacobian the solver applies to its own
+    ``motion_corrected`` (``_batched_rigid_register_pass_core``). ``resample_series`` applies it so the single-interpolation
+    path and the solver's output agree (gap found 2026-10-28: the final DWI volumes carried the eddy displacement but not its
+    intensity modulation)."""
+    if chain is None or len(chain) == 0:
+        return 1.0
+    return float(np.linalg.det(chain.linear_part()))
+
+
 def resample_series(
     img4d: Any,
     motion_chains: Sequence[TransformChain | None],
@@ -1803,6 +1815,8 @@ def resample_series(
     if len(motion_chains) != nvol:
         raise ValueError(f"len(motion_chains)={len(motion_chains)} != number of volumes {nvol}")
     jac = jacobian_modulation(field_path, reference).numpy() if jacobian else None
+    # per-volume intensity factor of the motion chain's affine part (the eddy Jacobian; 1 for a rigid-only chain)
+    jac_motion = np.array([chain_linear_jacobian(ch) for ch in motion_chains], dtype=np.float64) if jacobian else np.ones(nvol)
 
     interp_lower = interpolator.lower()
     if interp_lower in ("linear", "bilinear", "trilinear"):
@@ -1823,6 +1837,7 @@ def resample_series(
         field_chain = TransformChain.from_paths([str(field_path)])
         pts_after_field = _map_points_to_moving_tensor(pts_fixed, field_chain, dev)
         jac_t = torch.as_tensor(jac.reshape(-1), dtype=torch.float32, device=dev) if jac is not None else None
+        jac_motion_t = torch.as_tensor(jac_motion, dtype=torch.float32, device=dev)
 
         arr4d = np.ascontiguousarray(img4d.numpy(), dtype=np.float32)
         vol_origin = tuple(float(x) for x in img4d.origin[:3])
@@ -1904,6 +1919,7 @@ def resample_series(
                     del inside
                     if jac_t is not None:
                         sampled = sampled * jac_t.unsqueeze(0)
+                    sampled = sampled * jac_motion_t[s_idx:e_idx].to(sampled.device).unsqueeze(1)
                     out4d[..., s_idx:e_idx] = (
                         sampled.view(b_len, *ref_shape).permute(1, 2, 3, 0).contiguous().detach().cpu().numpy()
                     )
@@ -1959,6 +1975,7 @@ def resample_series(
                 sampled = _sample_field_itk(field_vol, pts_k, mode=mode)
                 if jac_t is not None:
                     sampled = sampled * jac_t
+                sampled = sampled * float(jac_motion[k])
                 out4d[..., k] = sampled.reshape(ref_shape).detach().cpu().numpy()
 
         spacing = list(reference.spacing) + [float(img4d.spacing[3])]
@@ -1978,6 +1995,8 @@ def resample_series(
         )
         if jac is not None:
             w = w.new_image_like(w.numpy() * jac)
+        if jac_motion[k] != 1.0:
+            w = w.new_image_like(w.numpy() * float(jac_motion[k]))
         out.append(w)
     res = ants.list_to_ndimage(img4d, out)
     spacing = list(reference.spacing) + [float(img4d.spacing[3])]
@@ -2016,6 +2035,7 @@ __all__ = [
     "signed_jacobian_determinant",
     "jacobian_modulation",
     "resample_series",
+    "chain_linear_jacobian",
     "_sample_field_itk",
     "_reference_grid_points_lps",
     "_read_itk_affine",
