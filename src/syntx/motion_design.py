@@ -387,7 +387,18 @@ JOINT_SURROUND_DELTA_MM = 0.05
 # 0.1 mm (1e-6 and 0: exact zero). A curvature-normalised prior is the next work package; until then the split between
 # motion and the design columns is made by the robust re-split after every stage (lambda = 0), which already gives
 # most of the gain above. Real-data gate: benchmarks/motion_cohort_gate.py.
-JOINT_SURROUND_WEIGHT = 0.0
+# 6.28.0 default (gate of 2026-10-28, docs/reports/prior_form_gate_2026-10-28.html): the re-descending ``cauchy`` form at
+# 0.03 in curvature units. It was the only setting that passed BOTH gates: on the three drifting phantoms FD error -14 % (ASL),
+# -17 % (DWI eddy), -3 % (slow-flow trajectory) against no prior; on the five real series the B0-immune readout step within
+# 0.011 mm, alignment unchanged, FD within 2 %, every frame converged (81 to 85 % without the prior) and BOLD 6x faster. The
+# forms that drive small second differences to zero (``sparse``, Charbonnier at 0.1 and above, shrinkage at any weight) removed
+# the phantoms' true jitter; ``cauchy`` at 0.05 lowered BLAST031's readout step by 0.043 mm (run-to-run noise of the no-prior
+# solver is below 0.001 mm), so it fails the readout-floor rule. Set 0 to recover the 6.27 behaviour.
+JOINT_SURROUND_WEIGHT = 0.03
+# Form of the surround penalty (``motion_batched.surround_rho``): ``charbonnier`` (quadratic below the knee), ``sparse`` (steep
+# at zero: sub-knee jitter driven to zero, drift and jumps free) or ``cauchy`` (re-descending: the pull peaks at the knee and
+# fades for larger second differences, so real steps pass through).
+JOINT_SURROUND_FORM = "cauchy"
 # The ``projected`` engine's head prior is OFF until its weight is in the image term's units: the image loss is a MEAN over
 # sample points, so its gradient is small, while the prior with the 50 mm rotation lever is comparable to it at 0.02 and
 # stops L-BFGS from correcting a smooth rotation error (plain phantom, no jitter: rotation RMS 0.065 deg with the prior
@@ -515,7 +526,7 @@ def _joint(image, design: Design, *, init: str = "levels", surround_weight: Opti
            surround_delta_mm: float = JOINT_SURROUND_DELTA_MM, window_size: Optional[int] = None,
            sample_mask_fn=None, level_weights: bool = False, schedule_mode: str = "refine", mode: str = "columns",
            lmax_high_b: int = PROJECTED_LMAX_HIGH_B, full_gauge: bool = True, pose_shrinkage: float = JOINT_POSE_SHRINKAGE,
-           level_gauge: bool = True, frame_gain: bool = True, **kwargs) -> dict:
+           level_gauge: bool = True, frame_gain: bool = True, surround_form: str = JOINT_SURROUND_FORM, **kwargs) -> dict:
     """ONE optimisation over the whole acquisition timeline (docs/MOTION_JOINT_OPTIMIZATION_PLAN.md).
 
     H0: every level registered to its own mean and the level means linked by an explicit rigid registration of the
@@ -557,11 +568,13 @@ def _joint(image, design: Design, *, init: str = "levels", surround_weight: Opti
         kw.update(frame_gain=bool(frame_gain))
         if pose_shrinkage > 0.0:
             kw.update(pose_shrinkage=float(pose_shrinkage)); kw.setdefault("surround_scale", "curvature")
-        if surround_weight is not None:
-            kw.update(surround_weight=float(surround_weight), surround_delta_mm=float(surround_delta_mm))
+        lam1 = JOINT_SURROUND_WEIGHT if surround_weight is None else float(surround_weight)   # the default prior applies here too (6.28.0)
+        if lam1 > 0.0:
+            kw.update(surround_weight=lam1, surround_delta_mm=float(surround_delta_mm), surround_form=str(surround_form))
+            kw.setdefault("surround_scale", "curvature")
         r = motion_correction(image, reference="mean", type_of_transform="Rigid", backend=backend, **kw)
         out = _normalized(r, design, "joint", "motion_correction(reference='mean')")
-        out["design"].update(columns=[], surround_weight=0.0, surround_delta_mm=float(surround_delta_mm))
+        out["design"].update(columns=[], surround_weight=lam1, surround_delta_mm=float(surround_delta_mm), surround_form=str(surround_form))
         return out
     if init != "levels":
         raise ValueError(f"init must be 'levels', got {init!r}")
@@ -662,7 +675,8 @@ def _joint(image, design: Design, *, init: str = "levels", surround_weight: Opti
         kw1.update(pe_affine_covariates=pe_cov, pe_axis=design.pe_axis)
     if sample_mask_fn is not None:
         kw1["sample_mask"] = sample_mask_fn(ref_level[0])
-    kw1.update(surround_weight=lam, surround_delta_mm=float(surround_delta_mm), init_pose=(t_init, om_init), schedule_mode=schedule_mode)
+    kw1.update(surround_weight=lam, surround_delta_mm=float(surround_delta_mm), surround_form=str(surround_form), init_pose=(t_init, om_init),
+               schedule_mode=schedule_mode)
     if pose_shrinkage > 0.0:
         kw1.update(pose_shrinkage=float(pose_shrinkage))
         kw1.setdefault("surround_scale", "curvature")
@@ -720,12 +734,13 @@ def _joint(image, design: Design, *, init: str = "levels", surround_weight: Opti
     if projected:
         out["design_model"] = (r1.get("convergence") or {}).get("design_model") if isinstance(r1.get("convergence"), dict) else None
         out["design_model"] = out["design_model"] or r1.get("design_model")
-        out["prior"] = r1.get("prior")
+    out["prior"] = r1.get("prior")   # the prior record (weight, form, scale log) for both engines
     out["frame_gain"] = r1.get("frame_gain")
     out["design"].update(layout=layout, links=list(h0.get("cross_link") or []), beta=("metric" if projected else "columns"), beta_dropped=dropped,
                          columns=(([f"intercept x {design.n_levels}"] + ([f"l2 x shells ({D_metric.shape[1] - design.n_levels} cols)"] if D_metric.shape[1] > design.n_levels else [])) if projected
                                   else [f"level{k}" for k in est_levels] + ([f"l2 x {design.n_levels - 1} shells"] if (enc is not None and design.name == "shells" and enc.shape[1] > len(est_levels)) else [])),
                          n_columns=0 if enc is None else int(enc.shape[1]), surround_weight=lam, surround_delta_mm=float(surround_delta_mm),
+                         surround_form=str(surround_form),
                          beta_levels=beta_levels, beta_levels_estimable=beta_levels is not None)
     return out
 

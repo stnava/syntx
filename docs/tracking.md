@@ -1,12 +1,39 @@
 # Tracking Summary
-current phase: v6.27.0 (motion solver correctness release: Newton step units, prior Hessian once, chain order `[rigid, eddy]`, `linear_part` order; priors available, off by default)
-next WP: default prior decision for 6.28 behind the bias-aware gate (three phantoms within 10 % of no prior AND cohort readout floor / alignment held); audit notes 4 to 7; plan steps 3 to 5 (docs/MOTION_NEXT_STEPS_PLAN_2026-10-28.md)
+current phase: v6.28.0 (default head prior: re-descending cauchy surround penalty at 0.03 curvature units, decided by the prior-form gate)
+next WP: a phantom whose jitter is in the images, not the trajectory (the gate the measurement-noise claim needs); audit notes 4 to 6; plan steps 3 to 5 (docs/MOTION_NEXT_STEPS_PLAN_2026-10-28.md); the ISMRM abstract rewrite from the fixed-solver numbers
 blockers: none
-active work: R14 below
+active work: R15 below
 device: Apple Silicon MPS / CPU (macOS arm64)
 last updated: 2026-10-28
 
 ---
+
+## R15 (surround prior forms and the 6.28.0 default: cauchy 0.03; fd_unfiltered; v6.28.0, 2026-10-28)
+- **`motion_batched.surround_rho`** (`surround_form` kwarg through `motion_correction`, `motion_correct_design`, `_joint`): three forms
+  of the second-difference penalty sharing the knee (0.05 mm) and the curvature-unit scale: `charbonnier` (6.27 form, gradient
+  vanishes at zero), `sparse` (gradient ten times steeper at zero; a Charbonnier with knee d/10 and weight w d / e), `cauchy`
+  (re-descending; Newton uses the IRLS majoriser omega I since its exact Hessian is indefinite beyond the knee).
+  `surround_prior_hessian(_full)(form=)`; `pe_info["prior"]["surround_form"]`. Tests: Hessian vs autograd per form, PSD; a 1-D
+  denoising test of the claim (sparse removes 71 % of sub-knee jitter energy at weight 1 vs charbonnier 54 %; drift within 2 %).
+- **Gate** (`benchmarks/prior_form_gate.py`: pre-flight, three drifting phantoms, five-series cohort, HTML report
+  `docs/reports/prior_form_gate_2026-10-28.html`). The author's hypothesis (shrink small second differences harder) is refuted on
+  the phantoms: `sparse` and Charbonnier at 0.1 and above remove the phantoms' TRUE jitter (ASL +70 to +172 % FD error). Only
+  `cauchy` at low weight improves all three phantoms; 0.05 lowers BLAST031's B0-immune readout step by 0.043 mm (run-to-run
+  noise below 0.001 mm), so **0.03 is the default** (`JOINT_SURROUND_FORM = "cauchy"`, `JOINT_SURROUND_WEIGHT = 0.03`): phantoms
+  -14 / -17 / -3 %, cohort readout step within 0.011 mm, alignment unchanged, FD within 2 % (rule relaxed from "not higher" by
+  the author), every frame converged (81 to 85 % without), BOLD 206 s -> 32 s (the no-prior stage oscillates on plateau
+  directions until its block cap).
+- `band_limited_fd` returns `fd_unfiltered` and `fd_method` (was `fd_raw_power`, misnamed under Jenkinson; audit note 7).
+- `test_projected_dwi_beats_joint_and_unified_on_the_phantom` holds the prior off on both engines (its claim is about the metrics).
+- The one-level design path (plain BOLD through `motion_correct_design`) now applies the default prior too (it ignored
+  `JOINT_SURROUND_WEIGHT` before: the cohort gate passed the weight explicitly, the ISMRM rerun exposed the gap); the joint
+  engine's result carries `prior` (weight, form, scale log). antsxfunctional's zero-motion ASL phantom gained the smooth texture
+  of syntx's own (author's decision): on three featureless blobs any surround prior drifts the unconstrained rotation plateau
+  (0.03 to 0.04 mm FD at 0.03), with texture 0.006 mm.
+- ISMRM abstract rewritten from the 6.28.0 five-case run (`docs/reports/ismrm_cases_6_28_2026-10-28.*`; table by
+  `benchmarks/ismrm_table.py`, figures by `benchmarks/ismrm_figures.py`; `docs/abstracts/ISMRM_2027_motion_solver.{md,tex}`,
+  PDF built with pdflatex, not committed; `LLM_PROMPT_ISMRM_2027.md` for an external editor).
+- Tests (targeted): see the release commit. `antsxqc.lint src/syntx`: 0 findings.
 
 ## R14 (solver correctness: Newton units, prior Hessian, chain order; curvature-unit priors, shrinkage, frame gain; v6.27.0, 2026-10-28)
 - **Newton step unit conversion** (`motion_batched._run_converging_stage`): the parameter step was `dv / to_vox` instead of

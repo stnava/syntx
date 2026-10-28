@@ -849,18 +849,63 @@ debias_pe_pseudomotion = separate_bold_pe_pseudomotion
 
 
 
+SURROUND_FORMS = ("charbonnier", "sparse", "cauchy")
+SPARSE_KNEE_FRACTION = 0.1   # the ``sparse`` form's smoothing knee as a fraction of ``delta_mm``
+
+
+def surround_rho(u_sq: torch.Tensor, weight: float, delta_mm: float, form: str = "charbonnier"):
+    """The surround prior's penalty per second difference and the two coefficients of its Newton Hessian model.
+
+    ``u_sq`` (n,) is ``|u|^2`` in mm^2 (rotations times the lever arm). Returns ``(rho, omega, kappa)``, each (n,): the
+    penalty ``rho(|u|)``, the IRLS weight ``omega = rho'(|u|) / |u|`` (gradient ``omega u``) and the coefficient ``kappa`` of
+    ``u u^T`` in the Hessian model ``omega I + kappa u u^T``. With ``d = delta_mm`` (the knee: second differences below it are
+    measurement noise) and ``w = weight``:
+
+    - ``charbonnier``: ``rho = w d^2 (sqrt(1 + |u|^2/d^2) - 1)``: quadratic below the knee (gradient -> 0 at 0, so sub-knee
+      jitter is shrunk least), linear above with slope ``w d``. Exact Hessian ``w d (s^2 I - u u^T) / s^3``, PSD.
+    - ``sparse``: ``rho = w d (sqrt(|u|^2 + e^2) - e)``, ``e = SPARSE_KNEE_FRACTION d``: the same asymptotic slope ``w d``, but the
+      gradient is ``w d |u| / e`` near zero (ten times steeper), so sub-knee jitter is driven to (near) zero while a smooth
+      drift (``u ~ 0``) and a real jump (one large ``u``, linear cost) are left alone. Algebraically a Charbonnier with knee
+      ``e`` and weight ``w d / e``; exact PSD Hessian of the same form.
+    - ``cauchy``: ``rho = (w d^2 / 2) log(1 + |u|^2/d^2)``: gradient ``w |u|`` near zero, concave beyond the knee (a jump
+      costs less and less). Its exact Hessian is indefinite for ``|u| > d``, so the Newton model uses the IRLS majoriser
+      ``omega I`` (``kappa = 0``), the standard choice for re-descending penalties.
+    """
+    if form not in SURROUND_FORMS:
+        raise ValueError(f"surround_form must be one of {SURROUND_FORMS}, got {form!r}")
+    w, d = float(weight), float(delta_mm)
+    if form == "charbonnier":
+        s = torch.sqrt(d * d + u_sq)
+        return w * d * (s - d), w * d / s, -w * d / s.pow(3)
+    if form == "sparse":
+        e = SPARSE_KNEE_FRACTION * d
+        s = torch.sqrt(e * e + u_sq)
+        return w * d * (s - e), w * d / s, -w * d / s.pow(3)
+    s2 = d * d + u_sq
+    return 0.5 * w * d * d * torch.log1p(u_sq / (d * d)), w * d * d / s2, torch.zeros_like(u_sq)
+
+
+def _surround_hessian_terms(t_param, omega, weight, delta_mm, rot_radius_mm, form):
+    """(B-2, 6, 6) Hessian model of every second-difference term in mm units (``surround_rho``)."""
+    u = torch.cat([t_param[1:-1] - 0.5 * (t_param[:-2] + t_param[2:]),
+                   rot_radius_mm * (omega[1:-1] - 0.5 * (omega[:-2] + omega[2:]))], dim=1)        # (B-2, 6) mm
+    _, om, kap = surround_rho((u * u).sum(dim=1), weight, delta_mm, form)
+    eye6 = torch.eye(6, dtype=t_param.dtype, device=t_param.device)
+    return om.view(-1, 1, 1) * eye6 + kap.view(-1, 1, 1) * (u.unsqueeze(2) * u.unsqueeze(1))
+
+
 def surround_prior_hessian(t_param: torch.Tensor, omega: torch.Tensor, weight: float, delta_mm: float,
-                           rot_radius_mm: float = 50.0, shrinkage: float = 0.0) -> torch.Tensor:
+                           rot_radius_mm: float = 50.0, shrinkage: float = 0.0, form: str = "charbonnier") -> torch.Tensor:
     """Analytic per-frame Hessian blocks (B, 6, 6) of the surround (second-difference) head prior, in parameter units
     (mm, rad), columns ordered (t_x, t_y, t_z, omega_x, omega_y, omega_z).
 
-    The prior is ``sum_t phi(u_t)`` with ``u_t = m_t - 0.5 (m_{t-1} + m_{t+1})`` in mm (rotations times ``rot_radius_mm``) and
-    ``phi(u) = w d^2 (sqrt(1 + |u|^2 / d^2) - 1) = w d (s - d)``, ``s = sqrt(d^2 + |u|^2)``, whose Hessian is
-    ``w d (s^2 I - u u^T) / s^3``. Frame k enters its own term with coefficient 1 and its neighbours' terms with 0.5, so its
-    diagonal block is the sum of those terms' Hessians times the squared coefficients. The Newton stage adds this block to
-    the image Hessian: a central difference that shifts one axis of every frame together cannot see a second-difference
-    prior (its gradient is invariant to a uniform shift). Checked against ``torch.autograd`` in
-    ``tests/test_motion_design.py``.
+    The prior is ``sum_t rho(u_t)`` with ``u_t = m_t - 0.5 (m_{t-1} + m_{t+1})`` in mm (rotations times ``rot_radius_mm``) and
+    ``rho`` one of the ``surround_rho`` forms (``form``); each term's Hessian model is ``omega I + kappa u u^T`` (exact for
+    ``charbonnier`` and ``sparse``, the IRLS majoriser for ``cauchy``). Frame k enters its own term with coefficient 1 and its
+    neighbours' terms with 0.5, so its diagonal block is the sum of those terms' Hessians times the squared coefficients.
+    The Newton stage adds this block to the image Hessian: a central difference that shifts one axis of every frame
+    together cannot see a second-difference prior (its gradient is invariant to a uniform shift). Checked against
+    ``torch.autograd`` in ``tests/test_motion_design.py``.
     """
     B = int(t_param.shape[0])
     f32 = dict(dtype=t_param.dtype, device=t_param.device)
@@ -872,12 +917,7 @@ def surround_prior_hessian(t_param: torch.Tensor, omega: torch.Tensor, weight: f
     if B < 3 or float(weight) <= 0.0:
         return Hb
     with torch.no_grad():
-        u = torch.cat([t_param[1:-1] - 0.5 * (t_param[:-2] + t_param[2:]),
-                       rot_radius_mm * (omega[1:-1] - 0.5 * (omega[:-2] + omega[2:]))], dim=1)        # (B-2, 6) mm
-        s2 = float(delta_mm) ** 2 + (u * u).sum(dim=1, keepdim=True)
-        s3 = s2.pow(1.5)
-        eye6 = torch.eye(6, **f32)
-        Hu = float(weight) * float(delta_mm) * (s2.unsqueeze(-1) * eye6 - u.unsqueeze(2) * u.unsqueeze(1)) / s3.unsqueeze(-1)
+        Hu = _surround_hessian_terms(t_param, omega, weight, delta_mm, rot_radius_mm, form)
         Hs = torch.zeros((B, 6, 6), **f32)
         Hs[1:-1] += Hu                                  # own term, coefficient 1
         Hs[:-2] += 0.25 * Hu                            # as frame k-1 of the term centred on k, coefficient 0.5
@@ -887,7 +927,7 @@ def surround_prior_hessian(t_param: torch.Tensor, omega: torch.Tensor, weight: f
 
 
 def surround_prior_hessian_full(t_param: torch.Tensor, omega: torch.Tensor, weight: float, delta_mm: float,
-                                rot_radius_mm: float = 50.0, shrinkage: float = 0.0) -> torch.Tensor:
+                                rot_radius_mm: float = 50.0, shrinkage: float = 0.0, form: str = "charbonnier") -> torch.Tensor:
     """The FULL Hessian (B, 6, B, 6) of the surround prior in parameter units: the diagonal blocks of
     ``surround_prior_hessian`` plus the couplings between the frames of each term (frame t with t +- 1, coefficient
     1 x -0.5; t - 1 with t + 1, coefficient 0.25). The Newton stage solves the coupled system with it: a per-frame
@@ -902,10 +942,7 @@ def surround_prior_hessian_full(t_param: torch.Tensor, omega: torch.Tensor, weig
     if B < 3 or float(weight) <= 0.0:
         return H
     with torch.no_grad():
-        u = torch.cat([t_param[1:-1] - 0.5 * (t_param[:-2] + t_param[2:]),
-                       rot_radius_mm * (omega[1:-1] - 0.5 * (omega[:-2] + omega[2:]))], dim=1)
-        s2 = float(delta_mm) ** 2 + (u * u).sum(dim=1, keepdim=True)
-        Hu = float(weight) * float(delta_mm) * (s2.unsqueeze(-1) * torch.eye(6, **f32) - u.unsqueeze(2) * u.unsqueeze(1)) / s2.pow(1.5).unsqueeze(-1)
+        Hu = _surround_hessian_terms(t_param, omega, weight, delta_mm, rot_radius_mm, form)
         unit = torch.tensor([1.0, 1.0, 1.0, rot_radius_mm, rot_radius_mm, rot_radius_mm], **f32)
         Hu = Hu * unit.view(1, 6, 1) * unit.view(1, 1, 6)
         coef = {-1: -0.5, 0: 1.0, 1: -0.5}
@@ -1210,6 +1247,7 @@ def batched_rigid_register_pass(
     design_levels: Optional[np.ndarray] = None,
     design_model_live: bool = False,
     surround_scale: str = "raw",
+    surround_form: str = "charbonnier",
     design_gauge: Optional[np.ndarray] = None,
     pose_shrinkage: float = 0.0,
     frame_gain: bool = False,
@@ -1275,8 +1313,8 @@ def batched_rigid_register_pass(
             encoding_covariates=enc_all, window_size=window_size, window_stride=window_stride,
             surround_weight=surround_weight, surround_delta_mm=surround_delta_mm, frame_levels=frame_levels,
             init_pose=init_pose, design_matrix=design_matrix, design_point_scale=design_point_scale,
-            design_levels=design_levels, design_model_live=design_model_live, surround_scale=surround_scale, design_gauge=design_gauge,
-            pose_shrinkage=pose_shrinkage, frame_gain=frame_gain,
+            design_levels=design_levels, design_model_live=design_model_live, surround_scale=surround_scale, surround_form=surround_form,
+            design_gauge=design_gauge, pose_shrinkage=pose_shrinkage, frame_gain=frame_gain,
         )
         return out if return_pe_affine else out[:3]
 
@@ -1314,7 +1352,7 @@ def batched_rigid_register_pass(
             design_matrix=None if design_matrix is None else np.asarray(design_matrix)[start:start + chunk_size],
             design_point_scale=design_point_scale,
             design_levels=None if design_levels is None else np.asarray(design_levels)[start:start + chunk_size],
-            design_model_live=design_model_live, surround_scale=surround_scale,
+            design_model_live=design_model_live, surround_scale=surround_scale, surround_form=surround_form,
             design_gauge=None if design_gauge is None else np.asarray(design_gauge)[start:start + chunk_size],
             pose_shrinkage=pose_shrinkage, frame_gain=frame_gain,
         )
@@ -1392,6 +1430,7 @@ def _batched_rigid_register_pass_core(
     design_levels: Optional[np.ndarray] = None,
     design_model_live: bool = False,
     surround_scale: str = "raw",
+    surround_form: str = "charbonnier",
     design_gauge: Optional[np.ndarray] = None,
     pose_shrinkage: float = 0.0,
     frame_gain: bool = False,
@@ -1657,6 +1696,8 @@ def _batched_rigid_register_pass_core(
     shrink_w = max(0.0, float(pose_shrinkage))   # shrinkage toward identity, same units and scale as the surround prior
     if surround_scale not in ("raw", "likelihood", "curvature"):
         raise ValueError(f"surround_scale must be 'raw', 'likelihood' or 'curvature', got {surround_scale!r}")
+    if surround_form not in SURROUND_FORMS:
+        raise ValueError(f"surround_form must be one of {SURROUND_FORMS}, got {surround_form!r}")
     # ``surround_scale='curvature'`` (metric-independent): the prior terms are multiplied by the measured curvature of the
     # image term, the median over frames and translation axes of the second derivative of the per-frame loss with respect
     # to a displacement (loss per mm^2, from ``probe_manifold`` at every stage start). A weight of 1 then means a prior
@@ -2004,12 +2045,13 @@ def _batched_rigid_register_pass_core(
         return t_param + dY[:, :3], omega + dY[:, 3:]
 
     def _surround_reg_loss():
-        """Charbonnier penalty on the second-order surround of the HEAD trajectory only (mm; rotations x 50 mm). Smooth
-        drift is in its nullspace; a real jump costs ~linearly (not quadratically), so it is not pulled toward its neighbours."""
+        """Penalty (``surround_rho``, form ``surround_form``) on the second-order surround of the HEAD trajectory only (mm;
+        rotations x 50 mm). Smooth drift is in its nullspace; a real jump costs ~linearly (not quadratically), so it is not
+        pulled toward its neighbours; the ``sparse`` form drives sub-knee jitter to zero."""
         u_t = t_param[1:-1] - 0.5 * (t_param[:-2] + t_param[2:])
         u_w = 50.0 * (omega[1:-1] - 0.5 * (omega[:-2] + omega[2:]))
         u_sq = (u_t * u_t).sum(dim=-1) + (u_w * u_w).sum(dim=-1)
-        rough = surr_w * (surr_delta ** 2) * (torch.sqrt(1.0 + u_sq / (surr_delta ** 2)) - 1.0).sum()
+        rough = surround_rho(u_sq, surr_w, surr_delta, surround_form)[0].sum()
         shrink = shrink_w * ((t_param * t_param).sum() + 2500.0 * (omega * omega).sum())
         return surr_scale[0] * (rough + shrink)
 
@@ -2051,7 +2093,7 @@ def _batched_rigid_register_pass_core(
             u_t = t_param[1:-1] - 0.5 * (t_param[:-2] + t_param[2:])
             u_w = 50.0 * (omega[1:-1] - 0.5 * (omega[:-2] + omega[2:]))
             u_sq = (u_t * u_t).sum(dim=-1) + (u_w * u_w).sum(dim=-1)
-            terms = surr_scale[0] * surr_w * (surr_delta ** 2) * (torch.sqrt(1.0 + u_sq / (surr_delta ** 2)) - 1.0)
+            terms = surr_scale[0] * surround_rho(u_sq, surr_w, surr_delta, surround_form)[0]
             out = torch.zeros(B, **f32)
             out[1:-1] = terms
             out = out + surr_scale[0] * shrink_w * ((t_param * t_param).sum(dim=1) + 2500.0 * (omega * omega).sum(dim=1))
@@ -2060,7 +2102,8 @@ def _batched_rigid_register_pass_core(
     def _surround_reg_hess(axes):
         """Per-frame Hessian block (B, P, P) of the surround prior in the order of ``axes`` (``surround_prior_hessian``)."""
         cols = [(3 if ax.tensor is omega else 0) + int(ax.index[1]) for ax in axes]
-        return surround_prior_hessian(t_param.detach(), omega.detach(), surr_scale[0] * surr_w, surr_delta, shrinkage=surr_scale[0] * shrink_w)[:, cols][:, :, cols]
+        return surround_prior_hessian(t_param.detach(), omega.detach(), surr_scale[0] * surr_w, surr_delta, shrinkage=surr_scale[0] * shrink_w,
+                                      form=surround_form)[:, cols][:, :, cols]
 
     # Level gauge of the ``projected`` engine: a constant pose offset of one level against the anchor is a nullspace of a
     # within-level metric (its model moves with its frames), and physics says levels differ in contrast, not in pose. The
@@ -2106,7 +2149,8 @@ def _batched_rigid_register_pass_core(
     def _surround_reg_hess_full(axes):
         """Full coupled Hessian (B, P, B, P) of the surround prior in the order of ``axes``."""
         cols = [(3 if ax.tensor is omega else 0) + int(ax.index[1]) for ax in axes]
-        H = surround_prior_hessian_full(t_param.detach(), omega.detach(), surr_scale[0] * surr_w, surr_delta, shrinkage=surr_scale[0] * shrink_w)
+        H = surround_prior_hessian_full(t_param.detach(), omega.detach(), surr_scale[0] * surr_w, surr_delta, shrinkage=surr_scale[0] * shrink_w,
+                                        form=surround_form)
         return H[:, cols][:, :, :, cols]
 
     def _project_encoding_gauge():
@@ -2521,6 +2565,7 @@ def _batched_rigid_register_pass_core(
     pe_info["convergence"] = convergence_log
     pe_info["frame_gain"] = gain_t.detach().cpu().numpy().astype(float).tolist() if frame_gain else None
     pe_info["prior"] = {"surround_weight": float(surr_w), "surround_delta_mm": float(surr_delta), "surround_scale": surround_scale,
+                        "surround_form": surround_form,
                         "pose_shrinkage": float(shrink_w),
                         "scale_log": prior_scale_log}
     if design_model is not None:

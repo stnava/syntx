@@ -22,7 +22,7 @@ def test_known_oscillation_is_found_within_one_bin_and_removed():
     assert r["band_source"] == "auto"
     assert abs(r["alternation_hz"] - 0.3) <= 1.0 / (T * tr) + 1e-9      # one spectral bin
     assert r["band_hz"][0] < 0.3 < r["band_hz"][1]
-    assert r["fd_bandlimited_mean"] < 0.3 * np.mean(r["fd_raw_power"][1:])
+    assert r["fd_bandlimited_mean"] < 0.3 * np.mean(r["fd_unfiltered"][1:])
     assert 0.18 <= r["alternation_amplitude_mm"] <= 0.26                 # RMS of a 0.3 mm sine is 0.21
     assert len(r["fd_bandlimited"]) == T and r["fd_bandlimited"][0] == 0.0
 
@@ -33,14 +33,14 @@ def test_white_jitter_and_real_motion_are_left_alone():
     white = 0.05 * rng.standard_normal((T, 3))
     r = band_limited_fd(white, _rot(T, rng), tr)
     assert r["band_source"] == "none" and r["band_hz"] is None
-    assert np.allclose(r["fd_bandlimited"], r["fd_raw_power"])
+    assert np.allclose(r["fd_bandlimited"], r["fd_unfiltered"])
     t = np.zeros((T, 3))
     t[:, 0] = np.linspace(0, 1, T)            # slow drift
     t[200:, 2] += 0.8                         # one real jump
     t += 0.01 * rng.standard_normal((T, 3))
     r = band_limited_fd(t, _rot(T, rng), tr)
     assert r["band_source"] == "none"
-    assert np.allclose(r["fd_bandlimited"], r["fd_raw_power"])
+    assert np.allclose(r["fd_bandlimited"], r["fd_unfiltered"])
     assert r["fd_bandlimited"][200] > 0.7     # the jump is kept
 
 
@@ -50,7 +50,7 @@ def test_given_band_is_applied_and_recorded():
     t = 0.05 * rng.standard_normal((T, 3))
     r = band_limited_fd(t, _rot(T, rng), tr, band_hz=(0.2, 0.4))
     assert r["band_source"] == "given" and r["band_hz"] == (0.2, 0.4)
-    assert r["fd_bandlimited_mean"] < np.mean(r["fd_raw_power"][1:])
+    assert r["fd_bandlimited_mean"] < np.mean(r["fd_unfiltered"][1:])
 
 
 def test_short_series_and_bad_tr():

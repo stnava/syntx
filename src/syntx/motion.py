@@ -458,7 +458,8 @@ def band_limited_fd(
 
     Returns
     -------
-    dict with ``fd_bandlimited`` (T,), ``fd_bandlimited_mean``, ``fd_bandlimited_max``, ``fd_raw_power`` (T,),
+    dict with ``fd_bandlimited`` (T,), ``fd_bandlimited_mean``, ``fd_bandlimited_max``, ``fd_unfiltered`` (T,; the same FD
+    definition as ``fd_bandlimited``, named by ``fd_method``, without the band removed),
     ``band_hz`` ((lo, hi) or None), ``band_source`` ('given' | 'auto' | 'none'), ``alternation_hz`` (spectral peak),
     ``alternation_amplitude_mm`` (RMS pose displacement inside the band at ``radius``), ``band_prominence``,
     ``nyquist_hz`` and ``tr_s``.
@@ -488,7 +489,7 @@ def band_limited_fd(
         return np.asarray(jenkinson_framewise_displacement(Hs, float(radius), com), dtype=np.float64)
 
     fd_raw = _fd(X)
-    out: Dict[str, Any] = {"fd_raw_power": fd_raw, "tr_s": tr_s, "nyquist_hz": float(nyq), "band_hz": None,
+    out: Dict[str, Any] = {"fd_unfiltered": fd_raw, "fd_method": str(fd_method), "tr_s": tr_s, "nyquist_hz": float(nyq), "band_hz": None,
                            "band_source": "none", "alternation_hz": None, "alternation_amplitude_mm": 0.0,
                            "band_prominence": 0.0, "band_power_fraction": 0.0}
     if T < MIN_FRAMES_FOR_BAND or nyq <= float(min_hz):   # a band needs spectral resolution: 32 frames gives 16 bins
@@ -953,7 +954,7 @@ def motion_correction(
                                "convergence_tol_vox", "max_extend_factor", "encoding_covariates", "window_size",
                                "window_stride", "surround_weight", "surround_delta_mm", "slice_axis", "sidecar",
                                "frame_levels", "init_pose", "schedule", "design_matrix", "design_point_scale",
-                               "design_levels", "design_model_live", "tr", "surround_scale", "design_gauge", "pose_shrinkage", "frame_gain"}
+                               "design_levels", "design_model_live", "tr", "surround_scale", "surround_form", "design_gauge", "pose_shrinkage", "frame_gain"}
     if backend == "pytorch_batched" and set(kwargs) - _batched_allowed_kwargs:
         raise TypeError(f"backend='pytorch_batched' accepts only {sorted(_batched_allowed_kwargs)}; got "
                         f"{sorted(set(kwargs) - _batched_allowed_kwargs)}")
@@ -1166,6 +1167,7 @@ def motion_correction(
                         design_point_scale=bool(kwargs.get("design_point_scale", True)),
                         design_model_live=bool(kwargs.get("design_model_live", False)),
                         surround_scale=str(kwargs.get("surround_scale", "raw")),
+                        surround_form=str(kwargs.get("surround_form", "charbonnier")),
                         design_gauge=None if kwargs.get("design_gauge") is None else np.asarray(kwargs["design_gauge"])[list(batch_indices)],
                         pose_shrinkage=float(kwargs.get("pose_shrinkage", 0.0)),
                         frame_gain=bool(kwargs.get("frame_gain", False)),

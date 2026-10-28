@@ -98,6 +98,9 @@ J(m, beta, C) = sum_t L_t(I_t o T(m_t + D_t beta) o A(C g_t), R_t) + lambda sum_
 - **Gauge.** The encoding offset may carry a translation along phase encode only in the complement of the eddy
   covariates' span over frames (odd in `g` belongs to the applied eddy term, even in `g` is contrast and stays out of
   the pose); the previous unconditional projection sent the even part to motion.
+- Head prior (6.28.0): the re-descending `cauchy` surround penalty at 0.03 in curvature units is the joint engine's default
+  (`motion_batched.surround_rho`; gate `docs/reports/prior_form_gate_2026-10-28.html`): phantoms -3 to -17 % FD error, cohort
+  readout floor and alignment held, every frame converged. `pose_shrinkage` stays off.
 - Written transforms: `[rigid, eddy]` per frame (a transform list acts on the reference-space point first-listed first, so
   the chain reproduces the fitted `eddy(rigid(x))`; order corrected 2026-10-28, readers select the rigid by name through
   `syntx.motion_batched.rigid_transform_of`), `fd` from the rigid part; `design.beta_levels` holds the per-level

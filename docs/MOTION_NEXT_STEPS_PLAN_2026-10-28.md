@@ -162,6 +162,61 @@ shrinkage-default phantom tests fail; `test_motion_overlapping_window.py::TestOv
 fails identically at HEAD b90cb1a in a clean worktree (`wiener_shrinkage_eta` list is empty), so it predates this work and is
 not a release blocker for the motion fix; it needs its own ticket.
 
+## 6.28.0: the form of the surround prior (2026-10-28, night; plan `~/.claude/plans/kind-pondering-bentley.md`, approved)
+
+**Hypothesis (author):** the shrinkage should act more strongly on small parameters. **Decision:** apply it to the second
+differences of the trajectory, not to the pose amplitude (a demeaned drift crosses zero mid-series and a concave amplitude
+penalty would flatten its middle). Implemented as `surround_form` in `motion_batched.surround_rho` with three forms sharing
+the knee `delta = 0.05` mm and the curvature-unit scale: `charbonnier` (6.27 form; quadratic below the knee, gradient
+vanishes at zero), `sparse` (`w d (sqrt(u^2 + e^2) - e)`, `e = d / 10`: gradient ten times steeper at zero; algebraically a
+Charbonnier with knee `e` and weight `w d / e`), `cauchy` (`(w d^2 / 2) log(1 + u^2 / d^2)`, re-descending; Newton uses the
+IRLS majoriser `omega I` because its exact Hessian is indefinite beyond the knee). `pose_shrinkage` is untouched (off).
+Tests: `test_surround_prior_hessian_matches_autograd[form]` (gradient and Hessian vs autograd, PSD), and a 1-D denoising
+test of the claim (`test_sparse_surround_removes_sub_knee_jitter_and_spares_drift_and_jumps`): against a unit-curvature
+quadratic image term at weight 1, `sparse` removes 71 % of sub-knee jitter energy (ceiling 78 % at weight 10: a
+second-difference prior cannot remove the part of white jitter in the smooth subspace), `charbonnier` 54 %; drift within
+2 %, jumps within 0.1 %.
+
+**Pre-flight (24-frame BLAST031 excerpt):** every form moves the poses against no prior and against each other at weight
+0.3 (0.06 to 0.42 mm), so the gate measured a real parameter.
+
+**Phantom gate** (`benchmarks/prior_form_gate.py --phase phantoms`; FD error change against no prior, ASL drift / DWI eddy
+/ slow-flow trajectory; pass = no phantom loses more than 10 % and DWI gains):
+
+| setting | ASL | DWI | slow flow | gate |
+|---|---|---|---|---|
+| sparse 0.1 | +87 % | -30 % | +55 % | fail |
+| sparse 0.3 | +172 % | -24 % | +121 % | fail |
+| charbonnier 0.1 | +70 % | -34 % | +51 % | fail |
+| cauchy 0.1 | +18 % | -40 % | +6 % | fail |
+| cauchy 0.05 | -7 % | -27 % | +3 % | PASS |
+| cauchy 0.03 | -14 % | -17 % | -3 % | PASS |
+
+The hypothesis is refuted on the phantoms: the form that drives small second differences to zero is the one that hurts
+the drifting phantoms most, because their sub-knee jitter is TRUE motion (the simulators plant it), and a jitter-killing
+prior removes it. On real data the sub-knee jitter is judged measurement noise, which these phantoms cannot represent; a
+phantom whose jitter is in the measurement (noise in the images, not in the trajectory) is the missing gate and is the
+next work package. The re-descending `cauchy` form at a low weight is the only setting that improves all three phantoms:
+it damps small second differences gently and lets any real step through.
+
+**Cohort gate** (five series; pass = B0-immune readout step within 0.02 mm of no prior, alignment within 1 %, FD mean within
+max(2 %, twice the run-to-run noise); the author relaxed "FD not higher" to this). Run-to-run noise of the no-prior solver,
+measured by repeating BOLD and BLAST031: below 0.001 mm on FD and the readout step (the solver is reproducible on MPS).
+
+| setting | BOLD | ASL 25 | ASL 60 | BLAST031 | SOCOM | gate |
+|---|---|---|---|---|---|---|
+| cauchy 0.03: readout step / FD | -0.001 mm / +1.7 % | +0.005 / +1.8 % | -0.001 / -0.2 % | -0.002 / -0.4 % | -0.011 / -0.9 % | PASS |
+| cauchy 0.05: readout step / FD | -0.002 / +1.3 % | -0.005 / +0.3 % | -0.001 / -0.3 % | **-0.043** / -7.1 % | -0.011 / -1.9 % | fail (BLAST031 readout) |
+
+Alignment (tsd_rel) unchanged on every series for both; every frame converged with either prior against 81 to 85 % without
+(the no-prior stage oscillates on the plateau directions until its block cap; BOLD 206 s -> 32 s). At 0.05 the BLAST031
+readout trace is visibly smoothed (per-frame FD differences to 0.2 mm) on a series whose second differences all sit above
+the knee: that is removed jitter on the B0-immune axis, which the readout-floor rule forbids. **Decision: 6.28.0 default
+`JOINT_SURROUND_FORM = "cauchy"`, `JOINT_SURROUND_WEIGHT = 0.03`** (`docs/reports/prior_form_gate_2026-10-28.html`). The
+engine-comparison test `test_projected_dwi_beats_joint_and_unified_on_the_phantom` now holds the prior off on both engines
+(its claim is about the metrics; joint with the prior reached 0.142 and broke the 1.3x ratio). Open: a phantom whose jitter
+is in the images rather than the trajectory, the gate the "sub-knee jitter is measurement noise" claim actually needs.
+
 ## Engineering rules that hold for every step
 
 Measurements in library modules with unit tests, `benchmarks/` scripts as thin CLIs writing HTML plus JSON under
