@@ -1,10 +1,49 @@
 # Tracking Summary
-current phase: v6.25.0 (joint motion engine: one optimisation over the whole series)
-next WP: plan sections 8 (BOLD respiratory field term) and 9 (motion-specific metric), docs/MOTION_JOINT_OPTIMIZATION_PLAN.md
+current phase: v6.26.0 (motion model v2 and censoring repair, docs/MOTION_JOINT_V2_AND_CENSORING_PLAN.md: S1, S3 done; S2 engine="projected" shipped as available, not default)
+next WP: S2 `engine="projected"` (design projected out of the metric, identity level links from the prior, no re-split), gated on the DWI phantom (G1)
 blockers: none
-active work: none (joint engine released, 2026-10-27)
+active work: R12 below
 device: Apple Silicon MPS / CPU (macOS arm64)
-last updated: 2026-10-27
+last updated: 2026-10-28
+
+---
+
+## R12 (prior in every stage, band-limited FD, resting-BOLD pilot, projected engine, v6.26.0, 2026-10-28)
+- **Plan** (`docs/MOTION_JOINT_V2_AND_CENSORING_PLAN.md`): the v2 model (design `D` profiled out of the metric per point, levels
+  differ in contrast never in pose, prior inside one objective), six syntx WPs, nine cross-repo censoring WPs, six gates, four
+  decisions taken (engine `projected`, 0.5 mm on band-limited FD, automatic band with a recorded trace overriding, field term dropped).
+- **Resting-BOLD pilot** (`benchmarks/pilot_bold_resting_joint.py`, `docs/reports/pilot_bold_resting_joint_2026-10-27.html`): one
+  L-BFGS objective over all frames (Huber residual about the robust temporal mean at a gradient-weighted point set, per-point scale,
+  per-slice-group PE field term, Charbonnier head prior) on breacher sub-6223 (TR 2.5) and sub-3315 (TR 1.0). Edge temporal SD
+  0.0323 vs 0.0340 and 0.0515 vs 0.0524 against the `bold` preset while reporting MORE FD (0.48 / 0.87 vs 0.42 / 0.62 mm):
+  the near-Nyquist alternation is a real displacement (notching it before resampling raises edge SD 15-20 % and kills the
+  DVARS-FD correlation). Field term 0.04-0.06 mm, per-point scale no effect: both dropped from v2.
+- **S1, prior in the Newton stage (`motion_batched.py`)**: `_run_converging_stage(reg_hess_fn, reg_frame_fn)`; the Newton gradient
+  includes the prior by autograd, its per-frame Hessian block comes from `surround_prior_hessian` (analytic, `w d (s^2 I - u u^T)/s^3`
+  summed over the three terms a frame enters, checked against autograd to 1e-15), the line search sees the prior's per-frame
+  attribution. Isolation of the "invented motion" on the antsxfunctional zero-motion blob phantom: a near-linear rotation drift
+  about the blob centres, i.e. the prior's nullspace crossed with the image plateau of three Gaussian blobs (0.17 mm at the 16 mm
+  extent with every frame reporting converged); a smooth texture on the same phantom gives 0.01 mm. G4 re-specified accordingly.
+- **S3, band-limited FD (`motion.py`: `band_limited_fd`, `attach_band_limited_fd`; exported as `syntx.band_limited_fd`)**: the pose
+  spectrum's peak above 0.1 Hz, widened to a quarter of the hump's height over the white floor and at least a quarter of the
+  Nyquist frequency each side, applied only when its power is 1.5x what its width would hold (`band_source` auto | given | none);
+  attached to every `motion_correction`, `motion_correct_grouped` and `motion_correct_design` result (`fd_bandlimited`, `fd_band`,
+  summary keys) with the TR from the 4-D spacing or `tr=`. Breacher: 0.426 -> 0.246 and 0.622 -> 0.328 mm; frames above 0.5 mm
+  27 -> 10 % and 48 -> 16 %. Documented in `docs/MOTION_BOLD.md`.
+- **Tests**: `tests/test_band_limited_fd.py` (5), `tests/test_motion_design.py` +2 (Hessian vs autograd; textured zero-motion phantom
+  with the prior on), 25 passed; standards allowlist line moved (`motion.py:1212`); `antsxqc.lint` 0. Pre-existing BOLD Nyquist
+  window test still fails (unchanged).
+- **S2, `engine="projected"` (shipped, not default)**: the design profiled out of the metric at every point (`design_matrix` in
+  the batched core, `projected_design_matrix`: intercept per level plus the l = 2 block per shell; design-model references
+  refreshed per stage, redraw and Newton iteration; per-point residual scale), identity links and a robust level gauge for
+  interleaved levels with `GAUGE_MIN_FRAMES` frames, registration links for blocked levels, eddy applied, the prior in every
+  L-BFGS / Newton stage and never in Adam. Phantoms (CPU, head FD error): DWI 0.176 vs joint 0.210 vs unified 0.319; ASL 0.065
+  vs 0.055. Prior OFF by default: its weight is not in the image term's units (the loss is a mean over points): at 0.02 it
+  stops L-BFGS from correcting a smooth rotation error (plain phantom 0.065 -> 0.208 deg) and on the real DWI cohort it
+  doubled the B0-immune readout step with identical alignment (`docs/reports/motion_cohort_gate_projected_2026-10-27.html`);
+  the prior-off gate rerun is pending. Tests: `tests/test_motion_design.py` +4 (29 passed).
+- Downstream (same release train): antsxqc 0.4.0 catalog and lint rule; antsxfunctional censors on `fd_bandlimited`; antsxdwi,
+  antsxslowflow, antsxmm import the one threshold; antsxslowflow's local motion verdict replaced by `antsxqc.grade`.
 
 ---
 

@@ -82,3 +82,32 @@ motion by this method.
 * The effect on downstream rsfMRI results (censoring with `fd_censor_threshold_mm`, connectivity) was not measured: a
   quiet run read 0.15-0.2 mm under the old backend, near typical censoring thresholds, so frames may have been dropped
   spuriously. Not quantified.
+
+## Band-limited FD for censoring (v6.26, `syntx.band_limited_fd`)
+
+A sub-voxel physiological oscillation faster than the sampling (respiration aliased at a long TR, cardiac pulsation at a
+short one) is a real frame-to-frame displacement of the image content. On the `breacher` resting series (TR 2.5 and 1.0 s)
+a joint group-wise objective aligned the frames slightly better than the `bold` preset while reporting more FD, and
+removing the oscillation from the poses before resampling made tissue edges 15 to 20 % worse
+(`benchmarks/pilot_bold_resting_joint.py`, `docs/reports/pilot_bold_resting_joint_2026-10-27.html`). The oscillation must
+be applied as a correction. What it must not do is count as motion for censoring: a per-step sum counts it twice per cycle
+and inflates mean FD three to four fold.
+
+`band_limited_fd(translations_mm, rotations_deg, tr_s, band_hz=None)` removes one band from the pose series and
+recomputes Power FD. The band is given (a recorded respiratory trace is the right source) or found from the pose
+spectrum: the peak above 0.1 Hz, widened to the contiguous region above a quarter of the hump's height over the white
+floor and to at least a quarter of the Nyquist frequency on either side. It is applied only when the band holds at
+least 1.5 times the power its width alone would hold; otherwise `band_source` is `'none'` and the series is the plain
+FD (white jitter and drift-plus-jump series are untouched, `tests/test_band_limited_fd.py`). Every result of
+`motion_correction`, `motion_correct_grouped` and `motion_correct_design` carries `fd_bandlimited` and `fd_band`
+(`band_hz`, `band_source`, `alternation_hz`, `alternation_amplitude_mm`, `band_prominence`, `band_power_fraction`), the
+TR taken from the 4-D time spacing or the `tr` keyword.
+
+| series | FD raw | FD band-limited | band (Hz) | frames above 0.5 mm raw | band-limited |
+|---|---|---|---|---|---|
+| breacher sub-6223, TR 2.5 | 0.426 | 0.246 | 0.146 to 0.200 | 27 % | 10 % |
+| breacher sub-3315, TR 1.0 | 0.622 | 0.328 | 0.355 to 0.500 | 48 % | 16 % |
+
+The consumers censor on `fd_bandlimited` and keep the full poses as the correction and as nuisance regressors
+(`docs/MOTION_JOINT_V2_AND_CENSORING_PLAN.md`, section 4). Precedent: Power et al. 2019, Fair et al. 2020, Gratton et al.
+2020.

@@ -215,6 +215,7 @@ from .motion import (
     TransformCollection,
     MotionCorrectionResult,
     calculate_framewise_displacement,
+    band_limited_fd,
     calculate_dvars,
 )
 from .motion_batched import (
@@ -340,7 +341,7 @@ from .liouville import liouville_determinant, determinant_summary
 syngs = syngs_registration
 affine_benchmark = evaluate_affine_benchmark
 
-__version__ = "6.25.0"
+__version__ = "6.26.0"
 
 
 
@@ -536,6 +537,7 @@ __all__ = [
     "TransformCollection",
     "MotionCorrectionResult",
     "calculate_framewise_displacement",
+    "band_limited_fd",
     "calculate_dvars",
     "batched_rigid_register_pass",
     "batched_rigid_register_pass_temporal",

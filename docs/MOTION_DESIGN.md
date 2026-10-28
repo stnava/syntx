@@ -279,3 +279,31 @@ corrected. Before this, a single lone frame switched the offset off for every le
 | antsxslowflow | `motion.api.motion_correct` (encoding states inferred from bval / bvec) | `encoding_states` |
 
 Each uses `engine="unified"`; antsxfunctional and antsxdwi expose `engine=` (`"dispatch"` gives the previous call).
+
+## engine="projected" (v6.26, the design in the metric)
+
+`motion_correct_design(image, design, engine="projected")` is the v2 engine of
+`docs/MOTION_JOINT_V2_AND_CENSORING_PLAN.md`: the acquisition design `D` (one intercept per level, the l = 2 direction
+terms per shell with enough frames; `projected_design_matrix`) is profiled out of the metric at every sample point
+instead of entering the pose. Each frame's reference is the design's prediction fitted across frames to the current
+warped values, `P_D e(x)`, refreshed at every stage start, point redraw and Newton iteration (`design_matrix` in the
+batched core). Design-locked contrast is in the reference, so moving the head cannot lower it; the eddy affine stays
+applied; the Charbonnier head prior (`PROJECTED_SURROUND_WEIGHT` 0.02, knee 0.05 mm) is inside every stage, the Newton
+stage included (`surround_prior_hessian`). H0 is the per-level registration with the same links as `joint`; a level
+whose offset its interleaving identifies and that has `GAUGE_MIN_FRAMES` frames gets its level gauge fixed after every
+stage (a constant per-level pose offset is a nullspace of a within-level metric and is contrast, not motion; the robust
+surround estimator on the level indicator columns removes it); a blocked level keeps the explicit registration of the
+corrected means. A one-level design runs the same engine with an intercept-only model (group-wise registration).
+
+Phantoms with known motion (`tests/test_motion_design.py`, CPU; head FD error, mm):
+
+| phantom | unified | joint | projected | projected, prior off |
+|---|---|---|---|---|
+| DWI, 16 frames, eddy 0.4 mm | 0.319 | 0.210 | 0.110 | 0.176 |
+| ASL, 24 frames alternating | 0.092 | 0.055 | 0.111 | 0.065 |
+
+The DWI gain needs the prior (noise jitter of low-SNR frames is estimator variance, which only the prior removes); on
+the ASL phantom the same prior shrinks the large planted jitter and costs 0.05 mm. The real-data gate
+(`benchmarks/motion_cohort_gate.py --projected`) decides with the B0-immune readout step. Measured and rejected on the
+way: fitting the model inside the L-BFGS loss (`design_model_live=True`) lets the level offset wander (ASL 0.39 mm);
+the level gauge on a 4-frame b0 level injects its own estimation error (DWI 0.11 to 0.18 mm), hence `GAUGE_MIN_FRAMES`.

@@ -343,3 +343,133 @@ def test_odd_only_projection_keeps_even_in_g_translation_out_of_the_pose():
     t_p = np.asarray(r.motion_parameters.translations) @ p
     leak = float(np.std(t_p[dw] - np.mean(t_p[dw])))
     assert leak < 0.5 * float(np.std(even[dw])), (leak, float(np.std(even[dw])))
+
+
+def test_surround_prior_hessian_matches_autograd():
+    """The analytic per-frame Hessian block of the head prior (what the Newton stage adds to the image Hessian) equals the
+    diagonal blocks of the autograd Hessian of the same prior, including the rotation scaling."""
+    import torch
+    from syntx.motion_batched import surround_prior_hessian
+
+    torch.manual_seed(0)
+    B, w, d = 7, 0.02, 0.05
+    t = torch.randn(B, 3, dtype=torch.float64) * 0.1
+    om = torch.randn(B, 3, dtype=torch.float64) * 0.002
+
+    def prior(x):
+        tt, oo = x.view(B, 6)[:, :3], x.view(B, 6)[:, 3:]
+        u_t = tt[1:-1] - 0.5 * (tt[:-2] + tt[2:])
+        u_w = 50.0 * (oo[1:-1] - 0.5 * (oo[:-2] + oo[2:]))
+        return w * d * d * (torch.sqrt(1 + ((u_t * u_t).sum(-1) + (u_w * u_w).sum(-1)) / d / d) - 1).sum()
+
+    x = torch.cat([t, om], 1).reshape(-1).clone()
+    H = torch.autograd.functional.hessian(prior, x).view(B, 6, B, 6)
+    blocks = torch.stack([H[k, :, k, :] for k in range(B)])
+    Hb = surround_prior_hessian(t, om, w, d)
+    assert float((Hb - blocks).abs().max()) < 1e-10 * float(blocks.abs().max())
+    assert float(surround_prior_hessian(t, om, 0.0, d).abs().max()) == 0.0
+
+
+def test_prior_in_every_stage_keeps_a_zero_motion_phantom_within_tolerance():
+    """Static phantom with tag/control contrast only and NO motion, the head prior ON, refine schedule (L-BFGS then
+    Newton; the prior is part of the objective in both): no point of the phantom moves by more than the Newton confirm
+    tolerance. The phantom is the antsxfunctional three-blob zero-motion phantom plus a smooth texture: three Gaussian
+    blobs alone leave rotation about their centres almost unconstrained, and on that plateau the prior's transient
+    (the image term asks for an alternating pose, the prior refuses it, the encoding offset absorbs it) drifts the pose
+    by 0.17 mm at the blobs' 16 mm extent while every frame reports converged (plateau, not optimum). With texture the
+    same run gives 0.01 mm. FD at a 50 mm radius is not the criterion here: the blobs lie within 16 mm of the centre."""
+    import ants
+    from scipy.ndimage import gaussian_filter
+
+    N = 32
+    gx, gy, gz = np.ogrid[-N // 2:N // 2, -N // 2:N // 2, -N // 2:N // 2]
+    b1 = np.exp(-(gx ** 2 + gy ** 2 + gz ** 2) / (2 * 5.0 ** 2))
+    b2 = np.exp(-((gx - 6) ** 2 + (gy + 4) ** 2 + (gz - 3) ** 2) / (2 * 3.5 ** 2))
+    b3 = np.exp(-((gx + 5) ** 2 + (gy - 5) ** 2 + (gz + 4) ** 2) / (2 * 3.0 ** 2))
+    rng = np.random.default_rng(0)
+    tex = gaussian_filter(rng.standard_normal((N, N, N)), 1.5)
+    tex = 12.0 * tex / tex.std() * np.exp(-(gx ** 2 + gy ** 2 + gz ** 2) / (2 * 9.0 ** 2))
+    w = {"control": (0.85, 0.60), "label": (0.55, 0.80)}
+    vt = ["control" if t % 2 == 0 else "label" for t in range(8)]
+    frames = [(100.0 * b1 + 80.0 * w[v][0] * b2 + 70.0 * w[v][1] * b3 + tex).astype(np.float32) for v in vt]
+    img = ants.from_numpy(np.stack(frames, axis=-1), spacing=(2.0, 2.0, 2.0, 1.0))
+    design = make_design("tag_control", volume_types=vt)
+    r = motion_correct_design(img, design, engine="joint", surround_weight=0.02, device="cpu", verbose=False)
+    rot = np.radians(np.asarray(r["rotations_deg"], float))
+    t = np.asarray(r["translations_mm"], float)
+    extent_mm = 16.0                     # farthest blob centre from the phantom centre (8 voxels x 2 mm)
+    step = np.abs(np.diff(t, axis=0)).sum(1) + extent_mm * np.abs(np.diff(rot, axis=0)).sum(1)
+    assert float(step.max()) <= 0.05, step   # Newton confirm tolerance 0.02 voxels = 0.04 mm, plus rounding
+
+
+def test_projected_design_matrix_intercepts_and_l2_blocks():
+    """Intercept per level (anchor included) plus the l = 2 block of each shell with enough frames; constant columns pruned."""
+    from syntx.motion_design import level_layout, projected_design_matrix
+
+    bv = np.r_[[0] * 10, [1000] * 40, [2000] * 40]
+    rng = np.random.default_rng(0)
+    g = rng.standard_normal((90, 3)); g /= np.linalg.norm(g, axis=1, keepdims=True); g[bv == 0] = 0
+    d = make_design("shells", bvals=bv, bvecs=g, pe_axis=np.array([0.0, 1.0, 0.0]))
+    D, dropped = projected_design_matrix(d, level_layout(np.asarray(d.levels)))
+    assert D.shape[0] == 90 and D.shape[1] == 3 + 2 * 5, (D.shape, dropped)
+    assert np.allclose(D[:, :3].sum(axis=1), 1.0)                       # one intercept per frame
+    assert np.linalg.matrix_rank(D) == D.shape[1]
+    vt = ["control" if t % 2 == 0 else "label" for t in range(10)]
+    D2, dropped2 = projected_design_matrix(make_design("tag_control", volume_types=vt), level_layout(np.arange(10) % 2))
+    assert D2.shape == (10, 2) and dropped2 == []
+
+
+def test_projected_dwi_beats_joint_and_unified_on_the_phantom():
+    """G1 of docs/MOTION_JOINT_V2_AND_CENSORING_PLAN.md: single-shell DWI phantom with a planted eddy shift, the design in the
+    metric (``projected``) lowers the joint engine's head FD error (0.176 vs 0.210 vs unified 0.319 measured, prior off), keeps the eddy
+    term applied, and fixes no level gauge for the 4-frame b0 level (below GAUGE_MIN_FRAMES: its link is the measurement)."""
+    from syntx.motion_simulation import evaluate_motion_estimate, simulate_dwi_series
+
+    sim = simulate_dwi_series(16, seed=42, eddy_mm_per_unit=0.4)
+    bv, bvec = sim.extra["bvals"], sim.extra["bvecs"]
+    d = make_design("shells", bvals=bv, bvecs=bvec, pe_axis=sim.pe_axis)
+    rp = motion_correct_design(sim.image, d, engine="projected", device="cpu")
+    rj = motion_correct_design(sim.image, d, engine="joint", device="cpu")
+    ep = evaluate_motion_estimate(rp["fwdtransforms"], sim)
+    ej = evaluate_motion_estimate(rj["fwdtransforms"], sim)
+    assert ep["fd_error_mm"] < ej["fd_error_mm"], (ep, ej)              # CPU, prior off: 0.176 vs 0.210 (0.110 with the prior on)
+    assert ep["fd_error_mm"] <= 0.19, ep
+    dw = bv > 50
+    assert all(len(c) == 2 and c[0].endswith("_eddy.mat") for c, isdw in zip(rp["fwdtransforms"], dw) if isdw)
+    assert rp["design"]["engine"] == "projected" and rp["design"]["beta"] == "metric"
+    assert rp["design_model"]["rank"] == 2 and rp["design_model"]["level_gauge"] == []
+    assert len(rp["fd_bandlimited"]) == len(bv)
+
+
+def test_projected_asl_fixes_the_level_gauge_and_tracks_the_truth():
+    """Alternating control/label: a constant per-level pose offset is a nullspace of the within-level metric; the level
+    gauge removes it (without it the pose alternated by 0.3 mm). The head FD error stays within 2.5x the joint engine's
+    (prior off by default: 0.065 vs 0.055)."""
+    from syntx.motion_simulation import evaluate_motion_estimate, simulate_asl_series
+
+    sim = simulate_asl_series(n_frames=24, seed=1)
+    vt = ["control" if i % 2 == 0 else "label" for i in range(24)]
+    d = make_design("tag_control", volume_types=vt)
+    rp = motion_correct_design(sim.image, d, engine="projected", device="cpu")
+    rj = motion_correct_design(sim.image, d, engine="joint", device="cpu")
+    ep = evaluate_motion_estimate(rp["fwdtransforms"], sim)
+    ej = evaluate_motion_estimate(rj["fwdtransforms"], sim)
+    true = np.asarray(sim.head_pose)[:, :3]
+    step_err = np.abs(np.diff(np.asarray(rp["translations_mm"]) - true, axis=0)).mean()
+    assert step_err < 0.05, step_err                                   # no alternation left
+    assert rp["design_model"]["level_gauge"][0]["removed_rms_mm"] > 0.05
+    assert ep["fd_error_mm"] < 2.5 * ej["fd_error_mm"] and ep["fd_error_mm"] < 0.15, (ep, ej)
+    r0 = motion_correct_design(sim.image, d, engine="projected", surround_weight=0.0, device="cpu")
+    e0 = evaluate_motion_estimate(r0["fwdtransforms"], sim)
+    assert e0["fd_error_mm"] < 1.5 * ej["fd_error_mm"], (e0, ej)        # 0.065 vs 0.055 on CPU
+
+
+def test_projected_one_level_design_is_groupwise_registration():
+    """A design without levels (resting BOLD) runs the same engine with an intercept-only model."""
+    from syntx.motion_simulation import simulate_asl_series
+
+    sim = simulate_asl_series(n_frames=10, seed=2)
+    d = make_design("none", n_frames=10)
+    r = motion_correct_design(sim.image, d, engine="projected", device="cpu")
+    assert r["design"]["engine"] == "projected" and r["design_model"]["rank"] == 1
+    assert len(r["fd"]) == 10 and np.all(np.asarray(r["frame_converged"]).shape == (10,))

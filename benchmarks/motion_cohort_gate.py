@@ -94,6 +94,7 @@ def main(argv=None):
     ap.add_argument("--only", default="asl,dwi,bold")
     ap.add_argument("--device", default="auto")
     ap.add_argument("--report-only", action="store_true", help="rebuild the HTML from <out>/gate.json")
+    ap.add_argument("--projected", action="store_true", help="unified vs joint vs projected at their defaults (plan v2, G2)")
     args = ap.parse_args(argv)
     if args.report_only:
         results = json.load(open(os.path.join(args.out, "gate.json")))
@@ -118,14 +119,18 @@ def main(argv=None):
             design = syntx.make_design("none", n_frames=img.shape[-1])
         levels = np.asarray(design.levels)
         variants = [("unified", {})] + [("joint", {"surround_weight": lam}) for lam in lams]
-        if kind == "dwi":
-            variants.append(("joint", {"surround_weight": lams[0], "level_weights": True}))
+        if args.projected:
+            variants = [("unified", {}), ("joint", {}), ("projected", {})]
         rec = {}
         for eng, extra in variants:
             label = eng if not extra else eng + ":" + ",".join(f"{k}={v}" for k, v in extra.items())
             t0 = time.time()
             r = syntx.motion_correct_design(img, design, engine=eng, device=args.device, verbose=False, **extra)
+            if kind == "bold":
+                sig_bl = {"fd_bandlimited_mean": float(np.mean(r["fd_bandlimited"][1:])), "fd_band": r["fd_band"]}
             sig = _signatures(r, img, levels)
+            if kind == "bold":
+                sig.update(sig_bl)
             sig["seconds"] = time.time() - t0
             rec[label] = sig
             print(name, label, json.dumps({k: (round(v, 3) if isinstance(v, float) else v) for k, v in sig.items() if k in ("fd_mean", "seconds", "tsd_rel")}), flush=True)

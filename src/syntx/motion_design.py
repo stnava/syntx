@@ -385,6 +385,13 @@ JOINT_SURROUND_DELTA_MM = 0.05
 # motion and the design columns is made by the robust re-split after every stage (lambda = 0), which already gives
 # most of the gain above. Real-data gate: benchmarks/motion_cohort_gate.py.
 JOINT_SURROUND_WEIGHT = 0.0
+# The ``projected`` engine's head prior is OFF until its weight is in the image term's units: the image loss is a MEAN over
+# sample points, so its gradient is small, while the prior with the 50 mm rotation lever is comparable to it at 0.02 and
+# stops L-BFGS from correcting a smooth rotation error (plain phantom, no jitter: rotation RMS 0.065 deg with the prior
+# off, 0.208 with it on). In the resting-BOLD pilot, where the image term was a sum over points in noise units, the same
+# prior was negligible except in nullspaces, which is the intended relation (plan S2, remaining work).
+PROJECTED_SURROUND_WEIGHT = 0.0
+GAUGE_MIN_FRAMES = 8               # frames per level (and in the anchor) before the projected engine fixes the level gauge   # the ``projected`` engine: the prior is inside every stage (Newton included) since 6.26
 
 
 def joint_design_columns(design: Design, layout: Dict[int, dict]) -> tuple:
@@ -433,9 +440,47 @@ def joint_design_columns(design: Design, layout: Dict[int, dict]) -> tuple:
     return enc, pe_cov, dropped
 
 
+def projected_design_matrix(design: Design, layout: Dict[int, dict]) -> tuple:
+    """The acquisition design ``D`` (T, K) that the ``projected`` engine profiles out of the metric at every point, and
+    the list of columns dropped.
+
+    Columns: one intercept per level (every level, the anchor included: the level mean is the reference, so no level
+    offset is ever a pose), and for ``shells`` the five l = 2 direction terms of each shell in its own block, kept only
+    with ``FRAMES_PER_BETA_COLUMN`` frames per column. Levels differ in contrast, never in pose: there is no level-offset
+    pose column and no cross-contrast link; the prior resolves the per-level pose nullspace to zero
+    (docs/MOTION_JOINT_V2_AND_CENSORING_PLAN.md section 2)."""
+    levels = np.asarray(design.levels, dtype=int)
+    ks = sorted(layout)
+    cols, dropped = [], []
+    for k in ks:
+        cols.append((levels == k).astype(np.float64)[:, None])
+    if design.name == "shells" and design.bias_covariates is not None:
+        l2 = np.asarray(design.bias_covariates, dtype=np.float64)
+        for k in ks:
+            blk = np.zeros_like(l2)
+            blk[levels == k] = l2[levels == k]
+            live = int(np.sum(np.ptp(blk[levels == k], axis=0) > 0)) if np.any(levels == k) else 0
+            if live == 0:
+                continue
+            if layout[k]["n"] < FRAMES_PER_BETA_COLUMN * live:
+                dropped.append(f"l2 terms of level {k} ({layout[k]['n']} frames < {FRAMES_PER_BETA_COLUMN} x {live})")
+                continue
+            cols.append(blk)
+    D = np.hstack(cols)
+    keep = np.ptp(D, axis=0) > 0
+    keep[: len(ks)] = True
+    return D[:, keep], dropped
+
+
+def _projected(image, design: Design, **kwargs) -> dict:
+    """``engine="projected"``: the design in the metric, not in the pose (``_joint(mode="projected")``)."""
+    return _joint(image, design, mode="projected", **kwargs)
+
+
 def _joint(image, design: Design, *, init: str = "levels", surround_weight: Optional[float] = None,
            surround_delta_mm: float = JOINT_SURROUND_DELTA_MM, window_size: Optional[int] = None,
-           sample_mask_fn=None, level_weights: bool = False, schedule_mode: str = "refine", **kwargs) -> dict:
+           sample_mask_fn=None, level_weights: bool = False, schedule_mode: str = "refine", mode: str = "columns",
+           **kwargs) -> dict:
     """ONE optimisation over the whole acquisition timeline (docs/MOTION_JOINT_OPTIMIZATION_PLAN.md).
 
     H0: every level registered to its own mean and the level means linked by an explicit rigid registration of the
@@ -447,18 +492,29 @@ def _joint(image, design: Design, *, init: str = "levels", surround_weight: Opti
     shell, applied) and the Charbonnier prior on the second differences of the head trajectory (knee
     ``surround_delta_mm``). The joint pass estimates the residual pose of the H0-corrected frames; the written chain is
     ``[eddy, residual rigid] + H0 chain`` and every frame is resampled ONCE from the original. A one-level design
-    (BOLD) is the plain registration to the mean (no column: nothing the prior could trade against)."""
+    (BOLD) is the plain registration to the mean (no column: nothing the prior could trade against).
+
+    ``mode="projected"`` (``engine="projected"``, v2): the design is profiled out of the METRIC at every point
+    (``projected_design_matrix``, ``design_matrix`` in the batched core) instead of entering the pose; the level links
+    of H0 are all identity (levels differ in contrast, never in pose); no encoding columns, no gauge re-split; the
+    Charbonnier prior (default ``PROJECTED_SURROUND_WEIGHT``) is inside every stage and resolves the per-level pose
+    nullspace to zero; the eddy affine stays applied. A one-level design runs the same engine with an intercept-only
+    design, i.e. group-wise registration to the series model."""
     import ants
 
-    from .motion import jenkinson_framewise_displacement, motion_correction, _extract_rigid_parameters
+    from .motion import jenkinson_framewise_displacement, motion_correction, _extract_rigid_parameters, attach_band_limited_fd
     from .motion_reference import GroupedMotionCorrectionResult, _mean_image, motion_correct_grouped
 
     levels = np.asarray(design.levels, dtype=int)
     T = int(levels.size)
+    if mode not in ("columns", "projected"):
+        raise ValueError(f"mode must be 'columns' or 'projected', got {mode!r}")
+    projected = mode == "projected"
+    engine_name = "projected" if projected else "joint"
     knobs = _knobs(design)
     backend = knobs.pop("backend")
     knobs.pop("window_size", None)
-    if design.n_levels == 1:
+    if design.n_levels == 1 and not projected:
         kw = {**knobs, **kwargs}
         if design.pe_axis is not None:
             kw.setdefault("pe_axis", design.pe_axis)
@@ -470,12 +526,19 @@ def _joint(image, design: Design, *, init: str = "levels", surround_weight: Opti
         raise ValueError(f"init must be 'levels', got {init!r}")
     layout = level_layout(levels)
     enc, pe_cov, dropped = joint_design_columns(design, layout)
-    lam = JOINT_SURROUND_WEIGHT if surround_weight is None else float(surround_weight)
+    D_metric = None
+    if projected:
+        D_metric, dropped = projected_design_matrix(design, layout)
+        enc = None
+    lam = (PROJECTED_SURROUND_WEIGHT if projected else JOINT_SURROUND_WEIGHT) if surround_weight is None else float(surround_weight)
 
     # H0: per-level references, no design columns. Links as in ``unified``: identity where the level's offset is
     # identifiable from its interleaving (its mean shares the series' head position, the column takes the offset),
     # a rigid registration of the corrected means otherwise (a blocked level, DWI's b0 block: an explicit measurement)
     ks = sorted(layout)
+    # (``projected`` keeps the same rule: a level whose offset its interleaving identifies gets the identity link and the
+    # level gauge below; a blocked level, DWI's b0 block, keeps the explicit registration of the corrected means, because
+    # its offset against the anchor is a measurement no within-level metric can make)
     links = ["identity" if (layout[ks[i]]["root"] == layout[ks[i - 1]]["root"]
                             and (layout[ks[i]]["beta_estimable"]
                                  or (layout[ks[i - 1]]["interleaved"] and layout[ks[i]]["interleaved"]))) else "registration"
@@ -488,7 +551,17 @@ def _joint(image, design: Design, *, init: str = "levels", surround_weight: Opti
         kw0.update(backend=backend, **knobs)
     if kw0.get("outprefix") is not None:
         kw0["outprefix"] = f"{kw0['outprefix']}h0_"
-    h0 = motion_correct_grouped(image, levels, cross_link=links, cross_group_debias=False, **kw0)
+    if design.n_levels == 1:
+        # projected, one level: H0 is the plain registration to the mean, then the group-wise pass with an intercept model
+        kw00 = {k: v for k, v in kw0.items() if k not in ("preset", "backend")}
+        if design.pe_axis is not None:
+            kw00.setdefault("pe_axis", design.pe_axis)
+        r0 = motion_correction(image, reference="mean", type_of_transform="Rigid", backend=backend, **kw00)
+        h0 = {"motion_corrected": r0["motion_corrected"], "fwdtransforms": [list(c) for c in r0.fwdtransforms],
+              "group_means": [_mean_image([ants.slice_image(r0["motion_corrected"], axis=3, idx=t) for t in range(T)])],
+              "cross_link": [], "cross_converged": [], "cross_registrations": None}
+    else:
+        h0 = motion_correct_grouped(image, levels, cross_link=links, cross_group_debias=False, **kw0)
     corrected0 = h0["motion_corrected"]
     frames0 = [ants.slice_image(corrected0, axis=3, idx=t) for t in range(T)]
     ref_level = {int(k): _mean_image([frames0[t] for t in np.flatnonzero(levels == k)]) for k in np.unique(levels)}
@@ -518,6 +591,15 @@ def _joint(image, design: Design, *, init: str = "levels", surround_weight: Opti
         kw1["encoding_covariates"] = enc
         if window_size is not None:
             kw1["window_size"] = int(window_size)
+    if projected:
+        # the level gauge (a level-locked pose offset is contrast, not motion) only for levels whose offset is identifiable
+        # from their interleaving; the others are mapped to the anchor so no gauge column is built for them
+        # ... and only with enough frames on both sides: the gauge is a robust mean difference, its error is the jitter
+        # over sqrt(n); below GAUGE_MIN_FRAMES frames the level keeps the pose of its link (the DWI phantom's few b0s:
+        # removing their 0.12 mm estimate raised the FD error from 0.11 to 0.18 mm)
+        gauge_ok = [k for k in ks[1:] if layout[k]["beta_estimable"] and layout[k]["n"] >= GAUGE_MIN_FRAMES and layout[ks[0]]["n"] >= GAUGE_MIN_FRAMES]
+        gauge_levels = np.where(np.isin(levels, gauge_ok), levels, ks[0])
+        kw1.update(design_matrix=D_metric, metric="huber", design_levels=gauge_levels)
     if pe_cov is not None:
         kw1.update(pe_affine_covariates=pe_cov, pe_axis=design.pe_axis)
     if sample_mask_fn is not None:
@@ -570,15 +652,21 @@ def _joint(image, design: Design, *, init: str = "levels", surround_weight: Opti
                cross_converged=list(h0.get("cross_converged") or []), cross_link=list(h0.get("cross_link") or []),
                fwdtransforms=chains, group_results=[r1], group_indices=[np.arange(T)], group_means=[ref_level[int(k)] for k in sorted(ref_level)],
                cross_registrations=h0.get("cross_registrations"), preset=kw0.get("preset"), h0=h0)
-    out = _normalized(out, design, "joint", "motion_correct_grouped(H0 links) + motion_correction(per-frame refs, D_t, prior)")
-    out["design"].update(layout=layout, links=list(h0.get("cross_link") or []), beta="columns", beta_dropped=dropped,
-                         columns=([f"level{k}" for k in est_levels] + ([f"l2 x {design.n_levels - 1} shells"] if (enc is not None and design.name == "shells" and enc.shape[1] > len(est_levels)) else [])),
+    attach_band_limited_fd(out, image, translations_mm, rotations_deg, tr_s=kwargs.get("tr"), radius=fd_radius)
+    out = _normalized(out, design, engine_name, ("motion_correct_grouped(identity links) + motion_correction(design in the metric, prior)" if projected
+                                                 else "motion_correct_grouped(H0 links) + motion_correction(per-frame refs, D_t, prior)"))
+    if projected:
+        out["design_model"] = (r1.get("convergence") or {}).get("design_model") if isinstance(r1.get("convergence"), dict) else None
+        out["design_model"] = out["design_model"] or r1.get("design_model")
+    out["design"].update(layout=layout, links=list(h0.get("cross_link") or []), beta=("metric" if projected else "columns"), beta_dropped=dropped,
+                         columns=(([f"intercept x {design.n_levels}"] + ([f"l2 x shells ({D_metric.shape[1] - design.n_levels} cols)"] if D_metric.shape[1] > design.n_levels else [])) if projected
+                                  else [f"level{k}" for k in est_levels] + ([f"l2 x {design.n_levels - 1} shells"] if (enc is not None and design.name == "shells" and enc.shape[1] > len(est_levels)) else [])),
                          n_columns=0 if enc is None else int(enc.shape[1]), surround_weight=lam, surround_delta_mm=float(surround_delta_mm),
                          beta_levels=beta_levels, beta_levels_estimable=beta_levels is not None)
     return out
 
 
-ENGINES = {"dispatch": _dispatch, "unified": _unified, "joint": _joint}
+ENGINES = {"dispatch": _dispatch, "unified": _unified, "joint": _joint, "projected": _projected}
 
 
 def motion_correct_design(image, design: Design, *, engine: str = "dispatch", **kwargs) -> dict:

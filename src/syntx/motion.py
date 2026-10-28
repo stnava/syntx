@@ -405,6 +405,151 @@ def jenkinson_framewise_displacement(
     return fd
 
 
+def band_limited_fd(
+    translations_mm: np.ndarray,
+    rotations_deg: np.ndarray,
+    tr_s: float,
+    band_hz: Optional[Tuple[float, float]] = None,
+    radius: float = 50.0,
+    min_hz: float = 0.1,
+    min_prominence: float = 1.5,
+) -> Dict[str, Any]:
+    """Framewise displacement with the near-Nyquist physiological alternation removed from the pose series.
+
+    A sub-voxel oscillation faster than the sampling (respiration aliased at a long TR, cardiac pulsation at a short one)
+    is a real frame-to-frame displacement of the image content that the registration corrects well, but a per-step sum
+    like FD counts it twice per cycle and inflates the mean three to four fold (breacher resting series: 0.42 and 0.62 mm
+    raw, 0.14 and 0.19 mm after the band is removed; Power et al. 2019, Fair et al. 2020, Gratton et al. 2020). Censoring
+    should use this series; the full poses stay the correction and the nuisance regressors.
+
+    The band is ``band_hz`` when given (a recorded respiratory trace is the right source) or found automatically: the peak
+    of the pose power spectrum (translations plus rotations at ``radius``, summed over the six degrees of freedom) above
+    ``min_hz``, widened to the contiguous region where the smoothed spectrum stays above a quarter of the hump's height
+    over the white floor (the median smoothed power above ``min_hz``) and to at least a quarter of the Nyquist frequency
+    on either side, clipped to [``min_hz``, Nyquist]. The band is applied
+    only when its power is at least ``min_prominence`` times what its width alone would hold (otherwise there is no
+    oscillation and removing the band would merely understate white jitter); then ``band_source`` is ``'none'`` and the
+    returned series is the plain Power FD. Every decision is in the returned dict; nothing is silent.
+
+    Parameters
+    ----------
+    translations_mm, rotations_deg : (T, 3) arrays
+        Rigid pose per frame about the reference centre of mass.
+    tr_s : float
+        Repetition time in seconds.
+    band_hz : (lo, hi), optional
+        Band to remove; None selects it from the pose spectrum.
+    radius : float, default 50.0
+        Sphere radius (mm) for the rotation lever, as for Power FD.
+    min_hz : float, default 0.1
+        Lowest frequency considered physiological (below it lies drift and real head motion).
+    min_prominence : float, default 1.5
+        Required ratio of the band's power fraction to its width fraction for the band to be applied.
+
+    Returns
+    -------
+    dict with ``fd_bandlimited`` (T,), ``fd_bandlimited_mean``, ``fd_bandlimited_max``, ``fd_raw_power`` (T,),
+    ``band_hz`` ((lo, hi) or None), ``band_source`` ('given' | 'auto' | 'none'), ``alternation_hz`` (spectral peak),
+    ``alternation_amplitude_mm`` (RMS pose displacement inside the band at ``radius``), ``band_prominence``,
+    ``nyquist_hz`` and ``tr_s``.
+    """
+    t = np.asarray(translations_mm, dtype=np.float64).reshape(-1, 3)
+    rot = np.radians(np.asarray(rotations_deg, dtype=np.float64).reshape(-1, 3)) * float(radius)
+    X = np.c_[t, rot]
+    T = X.shape[0]
+    tr_s = float(tr_s)
+    if not np.isfinite(tr_s) or tr_s <= 0:
+        raise ValueError(f"band_limited_fd needs a positive repetition time, got {tr_s!r}")
+    nyq = 0.5 / tr_s
+
+    def _fd(Y):
+        return np.r_[0.0, np.abs(np.diff(Y, axis=0)).sum(axis=1)]
+
+    fd_raw = _fd(X)
+    out: Dict[str, Any] = {"fd_raw_power": fd_raw, "tr_s": tr_s, "nyquist_hz": float(nyq), "band_hz": None,
+                           "band_source": "none", "alternation_hz": None, "alternation_amplitude_mm": 0.0,
+                           "band_prominence": 0.0, "band_power_fraction": 0.0}
+    if T < 8 or nyq <= float(min_hz):
+        out.update(fd_bandlimited=fd_raw, fd_bandlimited_mean=float(np.mean(fd_raw[1:])) if T > 1 else 0.0,
+                   fd_bandlimited_max=float(fd_raw.max()))
+        return out
+    Xc = X - X.mean(axis=0)
+    F = np.fft.rfft(Xc, axis=0)
+    freqs = np.fft.rfftfreq(T, d=tr_s)
+    power = (np.abs(F) ** 2).sum(axis=1)
+    total = float(power[1:].sum())
+    phys = (freqs >= float(min_hz)) & (freqs <= nyq) & (freqs > 0)
+    if band_hz is not None:
+        lo, hi = float(band_hz[0]), float(band_hz[1])
+        source = "given"
+    else:
+        peak = int(np.flatnonzero(phys)[np.argmax(power[phys])]) if bool(phys.any()) else None
+        if peak is None:
+            out.update(fd_bandlimited=fd_raw, fd_bandlimited_mean=float(np.mean(fd_raw[1:])), fd_bandlimited_max=float(fd_raw.max()))
+            return out
+        f_peak = float(freqs[peak])
+        # the band is the half-power width of the hump around the peak on the smoothed spectrum (a broad respiratory hump
+        # at a long TR spans most of the upper half of the spectrum; a cardiac alias is narrow), never narrower than a
+        # quarter of the Nyquist frequency on either side
+        k = max(3, int(round(T / 64)) | 1)
+        sm = np.convolve(power, np.ones(k) / k, mode="same")
+        floor = float(np.median(sm[phys]))                      # the white jitter level above min_hz
+        thresh = floor + 0.25 * (float(sm[peak]) - floor)       # quarter height of the hump above that floor
+        lo_i = peak
+        while lo_i - 1 > 0 and sm[lo_i - 1] >= thresh and freqs[lo_i - 1] >= float(min_hz):
+            lo_i -= 1
+        hi_i = peak
+        while hi_i + 1 < len(freqs) and sm[hi_i + 1] >= thresh:
+            hi_i += 1
+        lo = max(float(min_hz), min(float(freqs[lo_i]), f_peak - 0.25 * nyq))
+        hi = min(float(nyq), max(float(freqs[hi_i]), f_peak + 0.25 * nyq))
+        source = "auto"
+        out["alternation_hz"] = f_peak
+    sel = (freqs >= lo) & (freqs <= hi) & (freqs > 0)
+    band_power = float(power[sel].sum())
+    width_frac = max((hi - lo) / nyq, 1e-9)
+    prominence = (band_power / max(total, 1e-12)) / width_frac
+    out["band_prominence"] = float(prominence)
+    out["band_power_fraction"] = float(band_power / max(total, 1e-12))
+    out["alternation_amplitude_mm"] = float(np.sqrt(2.0 * band_power / (T * T)))   # RMS amplitude of the band-limited pose
+    if source == "auto" and prominence < float(min_prominence):
+        out.update(fd_bandlimited=fd_raw, fd_bandlimited_mean=float(np.mean(fd_raw[1:])), fd_bandlimited_max=float(fd_raw.max()))
+        return out
+    Fn = F.copy()
+    Fn[sel] = 0.0
+    Xn = np.fft.irfft(Fn, n=T, axis=0) + X.mean(axis=0)
+    fd_n = _fd(Xn)
+    if source == "auto":
+        out["alternation_hz"] = float(freqs[sel][np.argmax(power[sel])])
+    out.update(fd_bandlimited=fd_n, fd_bandlimited_mean=float(np.mean(fd_n[1:])), fd_bandlimited_max=float(fd_n.max()),
+               band_hz=(float(lo), float(hi)), band_source=source)
+    return out
+
+
+def attach_band_limited_fd(result: Dict[str, Any], image: Optional[ants.ANTsImage], translations_mm: np.ndarray,
+                           rotations_deg: np.ndarray, tr_s: Optional[float] = None, radius: float = 50.0) -> None:
+    """Write the ``band_limited_fd`` keys into a motion result in place (``fd_bandlimited``, ``fd_band`` dict and, when the
+    result has a ``summary``, ``fd_bandlimited_mean`` / ``fd_bandlimited_max`` / ``fd_band_hz`` / ``fd_band_source`` /
+    ``fd_alternation_hz`` / ``fd_alternation_amplitude_mm``). The repetition time is ``tr_s`` or the time spacing of a
+    4-D ``image``; with neither, the keys record ``band_source='no_tr'`` and ``fd_bandlimited`` is None."""
+    if tr_s is None and image is not None and image.dimension == 4 and len(image.spacing) == 4 and float(image.spacing[3]) > 0:
+        tr_s = float(image.spacing[3])
+    if tr_s is None or not np.isfinite(tr_s) or tr_s <= 0:
+        result["fd_bandlimited"] = None
+        result["fd_band"] = {"band_source": "no_tr", "band_hz": None, "tr_s": None}
+        if isinstance(result.get("summary"), dict):
+            result["summary"].update(fd_bandlimited_mean=None, fd_bandlimited_max=None, fd_band_hz=None, fd_band_source="no_tr",
+                                     fd_alternation_hz=None, fd_alternation_amplitude_mm=None)
+        return
+    b = band_limited_fd(translations_mm, rotations_deg, tr_s, radius=radius)
+    result["fd_bandlimited"] = b["fd_bandlimited"]
+    result["fd_band"] = {k: b[k] for k in ("band_hz", "band_source", "alternation_hz", "alternation_amplitude_mm", "band_prominence", "band_power_fraction", "nyquist_hz", "tr_s")}
+    if isinstance(result.get("summary"), dict):
+        result["summary"].update(fd_bandlimited_mean=b["fd_bandlimited_mean"], fd_bandlimited_max=b["fd_bandlimited_max"],
+                                 fd_band_hz=b["band_hz"], fd_band_source=b["band_source"], fd_alternation_hz=b["alternation_hz"],
+                                 fd_alternation_amplitude_mm=b["alternation_amplitude_mm"])
+
+
 def calculate_framewise_displacement(
     motion_parameters: MotionParameters,
     homogeneous_matrices: List[np.ndarray],
@@ -784,7 +929,8 @@ def motion_correction(
                                "sampling", "resample_points", "sample_seed",
                                "convergence_tol_vox", "max_extend_factor", "encoding_covariates", "window_size",
                                "window_stride", "surround_weight", "surround_delta_mm", "slice_axis", "sidecar",
-                               "frame_levels", "init_pose", "schedule"}
+                               "frame_levels", "init_pose", "schedule", "design_matrix", "design_point_scale",
+                               "design_levels", "design_model_live", "tr"}
     if backend == "pytorch_batched" and set(kwargs) - _batched_allowed_kwargs:
         raise TypeError(f"backend='pytorch_batched' accepts only {sorted(_batched_allowed_kwargs)}; got "
                         f"{sorted(set(kwargs) - _batched_allowed_kwargs)}")
@@ -992,10 +1138,16 @@ def motion_correction(
                         frame_levels=None if kwargs.get("frame_levels") is None else np.asarray(kwargs["frame_levels"])[list(batch_indices)],
                         init_pose=None if kwargs.get("init_pose") is None else (np.asarray(kwargs["init_pose"][0])[list(batch_indices)],
                                                                                  np.asarray(kwargs["init_pose"][1])[list(batch_indices)]),
+                        design_matrix=None if kwargs.get("design_matrix") is None else np.asarray(kwargs["design_matrix"])[list(batch_indices)],
+                        design_levels=None if kwargs.get("design_levels") is None else np.asarray(kwargs["design_levels"])[list(batch_indices)],
+                        design_point_scale=bool(kwargs.get("design_point_scale", True)),
+                        design_model_live=bool(kwargs.get("design_model_live", False)),
                     )
                     if pe_batch is not None:
                         if "sampling" in pe_batch:
                             pe_frames["sampling"] = pe_batch["sampling"]
+                        if "design_model" in pe_batch:
+                            pe_frames["design_model"] = pe_batch["design_model"]
                         if "bias" in pe_batch:
                             pe_frames["bias"] = pe_batch["bias"]
                         if pe_batch.get("encoding_pose_bias_mm_rad") is not None:
@@ -1234,12 +1386,15 @@ def motion_correction(
         "bias": pe_frames["bias"],
         "encoding_pose_bias_mm_rad": pe_frames["encoding_pose_bias_mm_rad"],
         "sampling": pe_frames["sampling"],
+        "design_model": pe_frames.get("design_model"),
         "convergence": None if not pe_frames["stages"] else {
             "tol_vox": float(kwargs.get("convergence_tol_vox", 0.05)), "max_extend_factor": int(kwargs.get("max_extend_factor", 4)),
             "frame_converged": [bool(pe_frames["frame_converged"].get(t, True)) for t in range(num_frames)],
             "stages": pe_frames["stages"],
         },
     })
+    attach_band_limited_fd(result, image if isinstance(image, ants.ANTsImage) else None, motion_params.translations,
+                           motion_params.rotations_deg, tr_s=kwargs.get("tr"), radius=fd_radius)
     if debias_pe_pseudomotion:
         if spatial_dim != 3:
             raise ValueError("debias_pe_pseudomotion needs a 3-D (+ time) series")
