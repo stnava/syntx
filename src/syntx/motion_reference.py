@@ -37,7 +37,7 @@ import warnings
 
 import numpy as np
 
-from .motion_batched import batched_rigid_register_pass, estimate_coarse_fd
+from .motion_batched import batched_rigid_register_pass, estimate_coarse_fd, is_eddy_transform, rigid_transform_of
 
 
 def _mean_image(imgs: Sequence[ants.ANTsImage]) -> ants.ANTsImage:
@@ -77,29 +77,19 @@ def _register_group_backward(img4d_g, mean_img, kw, backend, verbose, ref_intens
     mov4d = ants.list_to_ndimage(img4d_g, [mean_m] * n)
     res_b = motion_correction(mov4d, reference=refs, backend=backend, verbose=verbose,
                               dvars_reference_intensity=ref_intensity, **kw)
-    # backward chain per frame: [eddy_b, rigid_b] maps frame points -> mean points (rigid applied first). The forward
-    # map is R_b^-1 o E_b^-1 = E' o R_b^-1 with E' = R_b^-1 E_b^-1 R_b, kept in the pipeline's [eddy, rigid] order.
+    # backward chain per frame: [rigid_b, eddy_b] maps frame points -> mean points as E_b o R_b (a transform list acts
+    # first-listed first). The forward map is its inverse R_b^-1 o E_b^-1: the inverted eddy file first, then the
+    # inverted rigid; the rigid stays identifiable by name (``rigid_transform_of``), the eddy inverse as ``*_eddy_fwd.mat``.
     fwd, params, homogs, jac_f = [], [], [], []
     pe_b = res_b.get("pe_affine")
     for li in range(n):
         chain_b = list(res_b.fwdtransforms[li])
-        rigid_b = chain_b[-1]
+        rigid_b = rigid_transform_of(chain_b)
         rigid_f = _invert_affine_file(rigid_b, rigid_b.replace(".mat", "_fwd.mat"))
         chain_f = [rigid_f]
-        if len(chain_b) == 2:  # an eddy affine precedes the rigid
-            tb = ants.read_transform(rigid_b)
-            eb = ants.read_transform(chain_b[0])
-            Rb = _extract_rigid_parameters(tb, 3)[2]
-            Mb = np.array(eb.parameters[:9], dtype=np.float64).reshape(3, 3)
-            tbv = np.array(eb.parameters[9:12], dtype=np.float64)
-            c = np.array(eb.fixed_parameters, dtype=np.float64)
-            Hb_e = np.eye(4); Hb_e[:3, :3] = Mb; Hb_e[:3, 3] = tbv + c - Mb @ c  # y = M (x - c) + c + t
-            Hp = np.linalg.inv(Rb) @ np.linalg.inv(Hb_e) @ Rb  # E' (affine)
-            te = ants.create_ants_transform(transform_type="AffineTransform", precision="float", dimension=3)
-            te.set_parameters(np.concatenate([Hp[:3, :3].flatten(), Hp[:3, 3] - c + Hp[:3, :3] @ c]))
-            te.set_fixed_parameters(c)
-            e_path = chain_b[0].replace(".mat", "_fwd.mat")
-            ants.write_transform(te, e_path)
+        eddy_b = [f for f in chain_b if is_eddy_transform(f)]
+        if eddy_b:
+            e_path = _invert_affine_file(eddy_b[0], eddy_b[0].replace(".mat", "_fwd.mat"))
             chain_f = [e_path, rigid_f]
         fwd.append(chain_f)
         tr_, rot_, T_h = _extract_rigid_parameters(ants.read_transform(rigid_f), 3)
@@ -528,7 +518,7 @@ def _debias_cross_group_offsets(chains, groups, idx, results, cross, com, outpre
         g = int(groups[i])
         li = int(np.where(idx[g] == i)[0][0])
         n_own = len(results[g].fwdtransforms[li])
-        rigid_chain = chains[i][:-n_own] + [chains[i][-1]]   # crosses + the frame's own rigid (no eddy)
+        rigid_chain = chains[i][:-n_own] + [rigid_transform_of(chains[i][-n_own:])]   # crosses + the frame's own rigid (no eddy)
         h = np.eye(4)
         for f in rigid_chain:
             h = _extract_rigid_parameters(ants.read_transform(f), 3)[2] @ h
@@ -945,6 +935,12 @@ def motion_correct_grouped(
     motion_corrected = ants.list_to_ndimage(_make_4d_template_from_3d(frames_out[0], n_frames, tr=tr), frames_out)
 
     mats = [[_extract_rigid_parameters(ants.read_transform(f), 3)[2] for f in chain] for chain in chains]
+    # index of the frame's own rigid within its chain (by name: the own part is [rigid] or [rigid, eddy])
+    own_rigid_idx = []
+    for i in range(n_frames):
+        g = int(groups[i]); li = int(np.where(idx[g] == i)[0][0]); n_own = len(results[g].fwdtransforms[li])
+        own = chains[i][-n_own:]
+        own_rigid_idx.append(len(chains[i]) - n_own + own.index(rigid_transform_of(own)))
 
     composed_all = _compose(mats)
     fd_raw = jenkinson_framewise_displacement(composed_all, kwargs.get("fd_radius", 50.0), com)
@@ -958,7 +954,7 @@ def motion_correct_grouped(
         for i, (ms, g) in enumerate(zip(mats, [int(groups[i]) for i in range(n_frames)])):
             li = int(np.where(idx[g] == i)[0][0])
             n_own = len(results[g].fwdtransforms[li])
-            mats_rigid.append(ms[:-n_own] + [ms[-1]])
+            mats_rigid.append(ms[:-n_own] + [ms[own_rigid_idx[i]]])
         composed_rigid = _compose(mats_rigid)
         fd = jenkinson_framewise_displacement(composed_rigid, kwargs.get("fd_radius", 50.0), com)
         a_all = np.zeros((n_frames, 4)); jac_all = np.ones(n_frames); coef = []
@@ -981,7 +977,7 @@ def motion_correct_grouped(
         coefficients, r2 = [], []
         for g in range(n_groups):
             ig = np.asarray(idx[g])
-            own = np.array([mats[i][-1] for i in ig])  # the frame's own transform (last in its chain)
+            own = np.array([mats[i][own_rigid_idx[i]] for i in ig])  # the frame's own rigid (by name, not position)
             d = np.einsum("nij,j->ni", own[:, :3, :3] - np.eye(3), com) + own[:, :3, 3]
             d = d @ axis  # displacement of the reference centre of mass along the axis, per frame
             X = np.c_[np.ones(len(ig)), cov[ig]]
@@ -997,9 +993,9 @@ def motion_correct_grouped(
             coefficients.append([float(b) for b in beta[1:]])
         mats_motion = []
         for i, ms in enumerate(mats):
-            own = ms[-1].copy()
+            own = ms[own_rigid_idx[i]].copy()
             own[:3, 3] = own[:3, 3] - shift[i] * axis
-            mats_motion.append(ms[:-1] + [own])
+            mats_motion.append([own if j == own_rigid_idx[i] else m for j, m in enumerate(ms) if not is_eddy_transform(chains[i][j])])
         composed_rigid = _compose(mats_motion)
         fd = jenkinson_framewise_displacement(composed_rigid, kwargs.get("fd_radius", 50.0), com)
         nuisance = {"axis": [float(a) for a in axis], "shift_mm": shift, "coefficients": coefficients, "r2": r2}

@@ -268,10 +268,13 @@ class TransformChain:
     def linear_part(self) -> np.ndarray:
         """Composed 3x3 matrix of the rigid/affine elements only. Displacement fields contribute identity.
 
-        Composition follows application order: the last element in the list is applied first.
+        Composition follows the application order of ``apply`` / ``_map_points_to_moving_tensor`` (and of
+        ``ants.apply_transforms``): the FIRST element in the list acts first on the reference-space point, so the
+        composed matrix is ``A_n ... A_2 A_1``. Until 2026-10-28 this composed in the reverse order, which disagreed
+        with the resampling for every chain with more than one non-commuting linear element.
         """
         m = np.eye(3)
-        for e in reversed(self.linear_elements()):
+        for e in self.linear_elements():
             a, _ = _read_itk_affine(e.path, invert=e.invert)
             m = a @ m
         return m

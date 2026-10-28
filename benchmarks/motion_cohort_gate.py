@@ -62,8 +62,12 @@ def _pe_axis(path: str, img) -> np.ndarray:
 def _signatures(r, img, levels):
     from scipy.spatial.transform import Rotation as Rot
 
-    t = np.asarray(r["translations_mm"], float)
-    rot = np.radians(np.asarray(r["rotations_deg"], float))
+    if "translations_mm" in r:
+        t = np.asarray(r["translations_mm"], float)
+        rot = np.radians(np.asarray(r["rotations_deg"], float))
+    else:   # a one-level design returns the plain MotionCorrectionResult
+        mp = r["motion_parameters"]
+        t = np.asarray(mp.translations, float); rot = np.radians(np.asarray(mp.rotations_deg, float))
     rot_mm = 50.0 * Rot.from_euler("xyz", np.degrees(rot), degrees=True).as_rotvec()
     D = np.asarray(img.direction)[:3, :3]
     proj = {"t_pe": t @ D[:, 1], "t_sl": t @ D[:, 2], "t_ro": t @ D[:, 0], "pitch": rot_mm @ D[:, 0]}
@@ -83,7 +87,8 @@ def _signatures(r, img, levels):
     tsd = float(np.median(np.std(arr[fg], axis=-1) / (np.mean(arr[fg], axis=-1) + 1e-6)))
     return {"fd_mean": float(np.mean(r["fd"])), "fd_max": float(np.max(r["fd"])), "step_mad_mm": step,
             "design_locked_mm": locked, "tsd_rel": tsd,
-            "frame_converged_frac": float(np.mean(np.asarray(r.get("frame_converged", [True]), bool)))}
+            "frame_converged_frac": float(np.mean(np.asarray(r.get("frame_converged") if r.get("frame_converged") is not None
+                                                             else (r.get("convergence") or {}).get("frame_converged", [True]), bool)))}
 
 
 def main(argv=None):

@@ -32,6 +32,8 @@ from typing import Any, Callable, Dict, Optional, Sequence
 
 import numpy as np
 
+from .motion_batched import rigid_transform_of
+
 
 @dataclass(frozen=True)
 class Design:
@@ -161,7 +163,8 @@ def _design_shells(bvals, bvecs=None, pe_axis=None, b0_threshold: float = 50.0) 
                 pe_cov[dw] = g[dw] / norms
     return Design("shells", levels, pe_affine_covariates=pe_cov, bias_covariates=bias,
                   pe_axis=pe_axis,
-                  detail={"b0_threshold": float(b0_threshold), "n_per_level": np.bincount(levels).tolist()})
+                  detail={"b0_threshold": float(b0_threshold), "n_per_level": np.bincount(levels).tolist(),
+                          "bvals": bv.tolist(), "bvecs": None if bvecs is None else np.asarray(bvecs, dtype=np.float64).tolist()})
 
 
 def _design_encoding_states(state_labels) -> Design:
@@ -391,7 +394,16 @@ JOINT_SURROUND_WEIGHT = 0.0
 # off, 0.208 with it on). In the resting-BOLD pilot, where the image term was a sum over points in noise units, the same
 # prior was negligible except in nullspaces, which is the intended relation (plan S2, remaining work).
 PROJECTED_SURROUND_WEIGHT = 0.0
-GAUGE_MIN_FRAMES = 8               # frames per level (and in the anchor) before the projected engine fixes the level gauge   # the ``projected`` engine: the prior is inside every stage (Newton included) since 6.26
+# Shrinkage of the pose toward identity, in curvature units (1 = prior curvature equal to the measured image curvature). OFF
+# by default (decision 2026-10-28 evening): the cohort scan (docs/reports/cohort_shrinkage_report_2026-10-28.html) lowered FD
+# 11 to 41 % at 0.1 with the readout floor held, but on the fixed solver the drifting phantoms show the mechanism: shrinkage at
+# any weight pulls a drifting trajectory toward identity (ASL FD error 0.042 -> 0.129 mm, rotation 0.058 -> 0.362 deg at 0.1;
+# 0.100 mm at 0.03; the antsxslowflow trajectory test fails at 0.060 against 0.05), and the real-data rule cannot tell
+# suppressed jitter from suppressed drift. Per-call option for series judged drift-free; the default prior is decided in
+# 6.28 behind a gate the three phantoms and the cohort both pass (docs/MOTION_NEXT_STEPS_PLAN_2026-10-28.md).
+JOINT_POSE_SHRINKAGE = 0.0
+GAUGE_MIN_FRAMES = 8               # frames per level (and in the anchor) before the projected engine fixes the level gauge
+GAUGE_FRAMES_PER_COLUMN = 8        # frames per direction column in a shell before its block joins the gauge   # the ``projected`` engine: the prior is inside every stage (Newton included) since 6.26
 
 
 def joint_design_columns(design: Design, layout: Dict[int, dict]) -> tuple:
@@ -440,32 +452,54 @@ def joint_design_columns(design: Design, layout: Dict[int, dict]) -> tuple:
     return enc, pe_cov, dropped
 
 
-def projected_design_matrix(design: Design, layout: Dict[int, dict]) -> tuple:
+METRIC_FRAMES_PER_COLUMN = 8   # a direction block enters the projected engine's metric only when its shell has this many frames per
+                               # column, which is also what its gauge needs (GAUGE_FRAMES_PER_COLUMN): a design column in the metric
+                               # without a gauge is a nullspace the pose drifts into (16-frame phantom: l = 2 in the metric ungauged
+                               # raised the FD error from 0.176 to 0.284 mm)
+PROJECTED_LMAX_HIGH_B = 4      # direction terms up to l = 4 on shells at or above PROJECTED_HIGH_B (plan step 2)
+PROJECTED_HIGH_B = 2500.0
+
+
+def projected_design_matrix(design: Design, layout: Dict[int, dict], lmax_high_b: int = PROJECTED_LMAX_HIGH_B,
+                            high_b: float = PROJECTED_HIGH_B, min_frames_per_column: int = METRIC_FRAMES_PER_COLUMN) -> tuple:
     """The acquisition design ``D`` (T, K) that the ``projected`` engine profiles out of the metric at every point, and
     the list of columns dropped.
 
     Columns: one intercept per level (every level, the anchor included: the level mean is the reference, so no level
-    offset is ever a pose), and for ``shells`` the five l = 2 direction terms of each shell in its own block, kept only
-    with ``FRAMES_PER_BETA_COLUMN`` frames per column. Levels differ in contrast, never in pose: there is no level-offset
+    offset is ever a pose), and for ``shells`` the five l = 2 direction terms of each shell in its own block, plus the
+    nine l = 4 terms on shells whose b is at least ``high_b`` (``lmax_high_b`` >= 4; the real symmetric harmonics of
+    ``motion_decomposition.real_even_sh``), each block kept only with ``min_frames_per_column`` frames per column. Levels differ in contrast, never in pose: there is no level-offset
     pose column and no cross-contrast link; the prior resolves the per-level pose nullspace to zero
     (docs/MOTION_JOINT_V2_AND_CENSORING_PLAN.md section 2)."""
     levels = np.asarray(design.levels, dtype=int)
+    T = int(levels.size)
     ks = sorted(layout)
     cols, dropped = [], []
     for k in ks:
         cols.append((levels == k).astype(np.float64)[:, None])
     if design.name == "shells" and design.bias_covariates is not None:
+        from .motion_decomposition import real_even_sh
+
         l2 = np.asarray(design.bias_covariates, dtype=np.float64)
+        bv = np.asarray(design.detail.get("bvals", np.zeros(T)), dtype=np.float64)
+        g = design.detail.get("bvecs")
+        l4 = real_even_sh(np.asarray(g, dtype=np.float64), 4)[:, 5:] if (g is not None and int(lmax_high_b) >= 4) else None
         for k in ks:
-            blk = np.zeros_like(l2)
-            blk[levels == k] = l2[levels == k]
-            live = int(np.sum(np.ptp(blk[levels == k], axis=0) > 0)) if np.any(levels == k) else 0
-            if live == 0:
-                continue
-            if layout[k]["n"] < FRAMES_PER_BETA_COLUMN * live:
-                dropped.append(f"l2 terms of level {k} ({layout[k]['n']} frames < {FRAMES_PER_BETA_COLUMN} x {live})")
-                continue
-            cols.append(blk)
+            m = levels == k
+            for lab, Y in (("l2", l2), ("l4", l4)):
+                if Y is None:
+                    continue
+                if lab == "l4" and (not np.any(m) or float(np.mean(bv[m])) < float(high_b)):
+                    continue
+                blk = np.zeros_like(Y)
+                blk[m] = Y[m]
+                live = int(np.sum(np.ptp(blk[m], axis=0) > 0)) if np.any(m) else 0
+                if live == 0:
+                    continue
+                if layout[k]["n"] < int(min_frames_per_column) * live:
+                    dropped.append(f"{lab} terms of level {k} ({layout[k]['n']} frames < {min_frames_per_column} x {live})")
+                    continue
+                cols.append(blk)
     D = np.hstack(cols)
     keep = np.ptp(D, axis=0) > 0
     keep[: len(ks)] = True
@@ -480,7 +514,8 @@ def _projected(image, design: Design, **kwargs) -> dict:
 def _joint(image, design: Design, *, init: str = "levels", surround_weight: Optional[float] = None,
            surround_delta_mm: float = JOINT_SURROUND_DELTA_MM, window_size: Optional[int] = None,
            sample_mask_fn=None, level_weights: bool = False, schedule_mode: str = "refine", mode: str = "columns",
-           **kwargs) -> dict:
+           lmax_high_b: int = PROJECTED_LMAX_HIGH_B, full_gauge: bool = True, pose_shrinkage: float = JOINT_POSE_SHRINKAGE,
+           level_gauge: bool = True, frame_gain: bool = True, **kwargs) -> dict:
     """ONE optimisation over the whole acquisition timeline (docs/MOTION_JOINT_OPTIMIZATION_PLAN.md).
 
     H0: every level registered to its own mean and the level means linked by an explicit rigid registration of the
@@ -518,6 +553,12 @@ def _joint(image, design: Design, *, init: str = "levels", surround_weight: Opti
         kw = {**knobs, **kwargs}
         if design.pe_axis is not None:
             kw.setdefault("pe_axis", design.pe_axis)
+        # the one-level path carries the same solver terms as the multi-level one (drift gain, shrinkage, prior units)
+        kw.update(frame_gain=bool(frame_gain))
+        if pose_shrinkage > 0.0:
+            kw.update(pose_shrinkage=float(pose_shrinkage)); kw.setdefault("surround_scale", "curvature")
+        if surround_weight is not None:
+            kw.update(surround_weight=float(surround_weight), surround_delta_mm=float(surround_delta_mm))
         r = motion_correction(image, reference="mean", type_of_transform="Rigid", backend=backend, **kw)
         out = _normalized(r, design, "joint", "motion_correction(reference='mean')")
         out["design"].update(columns=[], surround_weight=0.0, surround_delta_mm=float(surround_delta_mm))
@@ -528,7 +569,7 @@ def _joint(image, design: Design, *, init: str = "levels", surround_weight: Opti
     enc, pe_cov, dropped = joint_design_columns(design, layout)
     D_metric = None
     if projected:
-        D_metric, dropped = projected_design_matrix(design, layout)
+        D_metric, dropped = projected_design_matrix(design, layout, lmax_high_b=int(lmax_high_b))
         enc = None
     lam = (PROJECTED_SURROUND_WEIGHT if projected else JOINT_SURROUND_WEIGHT) if surround_weight is None else float(surround_weight)
 
@@ -598,14 +639,34 @@ def _joint(image, design: Design, *, init: str = "levels", surround_weight: Opti
         # over sqrt(n); below GAUGE_MIN_FRAMES frames the level keeps the pose of its link (the DWI phantom's few b0s:
         # removing their 0.12 mm estimate raised the FD error from 0.11 to 0.18 mm)
         gauge_ok = [k for k in ks[1:] if layout[k]["beta_estimable"] and layout[k]["n"] >= GAUGE_MIN_FRAMES and layout[ks[0]]["n"] >= GAUGE_MIN_FRAMES]
-        gauge_levels = np.where(np.isin(levels, gauge_ok), levels, ks[0])
+        gauge_levels = np.where(np.isin(levels, gauge_ok), levels, ks[0]) if level_gauge else np.full_like(levels, ks[0])
         kw1.update(design_matrix=D_metric, metric="huber", design_levels=gauge_levels)
-        kw1.setdefault("surround_scale", "likelihood")   # surround_weight in nats per mm (a log-prior in the likelihood's units)
+        if full_gauge:
+            # every design column is gauged out of the pose when the gauge can be estimated: identifiable level intercepts
+            # (gauge_ok) and direction blocks whose shell has GAUGE_FRAMES_PER_COLUMN frames per column (the robust surround
+            # estimate of a 5-column block from 12 frames removed 0.34 mm of REAL motion on the 16-frame phantom)
+            cols = []
+            for i in range(D_metric.shape[1]):
+                nz = np.flatnonzero(D_metric[:, i] != 0)
+                if i < design.n_levels:
+                    if nz.size and np.isin(levels[nz[0]], gauge_ok):
+                        cols.append(i)
+                    continue
+                shell = levels[nz[0]] if nz.size else None
+                n_block = int(sum(1 for jj in range(design.n_levels, D_metric.shape[1]) if np.any(D_metric[:, jj] != 0) and levels[np.flatnonzero(D_metric[:, jj] != 0)[0]] == shell))
+                if shell is not None and layout[int(shell)]["n"] >= GAUGE_FRAMES_PER_COLUMN * n_block:
+                    cols.append(i)
+            kw1["design_gauge"] = D_metric[:, cols] if cols else None
+        kw1.setdefault("surround_scale", "curvature")    # prior weights relative to the measured image curvature (metric-independent)
     if pe_cov is not None:
         kw1.update(pe_affine_covariates=pe_cov, pe_axis=design.pe_axis)
     if sample_mask_fn is not None:
         kw1["sample_mask"] = sample_mask_fn(ref_level[0])
     kw1.update(surround_weight=lam, surround_delta_mm=float(surround_delta_mm), init_pose=(t_init, om_init), schedule_mode=schedule_mode)
+    if pose_shrinkage > 0.0:
+        kw1.update(pose_shrinkage=float(pose_shrinkage))
+        kw1.setdefault("surround_scale", "curvature")
+    kw1.update(frame_gain=bool(frame_gain))   # scanner drift as a per-frame global gain inside the solver (decision 2026-10-28)
     if level_weights:
         kw1["frame_levels"] = levels
     kw1 = {k: v for k, v in kw1.items() if k not in ("preset",)}
@@ -616,7 +677,7 @@ def _joint(image, design: Design, *, init: str = "levels", surround_weight: Opti
     pe1 = r1.get("pe_affine")
     jac = np.ones(T) if pe1 is None else np.asarray(pe1["jacobian"], dtype=float)
     composed_all = [_compose(c) for c in chains]
-    composed_rigid = [_compose(c[-1:]) for c in chains]
+    composed_rigid = [_compose([rigid_transform_of(c)]) for c in chains]
     fd_radius = float(kwargs.get("fd_radius", 50.0))
     fd_raw = jenkinson_framewise_displacement(composed_all, fd_radius, com)
     fd = jenkinson_framewise_displacement(composed_rigid, fd_radius, com)
@@ -660,6 +721,7 @@ def _joint(image, design: Design, *, init: str = "levels", surround_weight: Opti
         out["design_model"] = (r1.get("convergence") or {}).get("design_model") if isinstance(r1.get("convergence"), dict) else None
         out["design_model"] = out["design_model"] or r1.get("design_model")
         out["prior"] = r1.get("prior")
+    out["frame_gain"] = r1.get("frame_gain")
     out["design"].update(layout=layout, links=list(h0.get("cross_link") or []), beta=("metric" if projected else "columns"), beta_dropped=dropped,
                          columns=(([f"intercept x {design.n_levels}"] + ([f"l2 x shells ({D_metric.shape[1] - design.n_levels} cols)"] if D_metric.shape[1] > design.n_levels else [])) if projected
                                   else [f"level{k}" for k in est_levels] + ([f"l2 x {design.n_levels - 1} shells"] if (enc is not None and design.name == "shells" and enc.shape[1] > len(est_levels)) else [])),

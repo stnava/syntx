@@ -1,12 +1,56 @@
 # Tracking Summary
-current phase: v6.26.0 (motion model v2 and censoring repair, docs/MOTION_JOINT_V2_AND_CENSORING_PLAN.md: S1, S3 done; S2 engine="projected" shipped as available, not default)
-next WP: S2 `engine="projected"` (design projected out of the metric, identity level links from the prior, no re-split), gated on the DWI phantom (G1)
+current phase: v6.27.0 (motion solver correctness release: Newton step units, prior Hessian once, chain order `[rigid, eddy]`, `linear_part` order; priors available, off by default)
+next WP: default prior decision for 6.28 behind the bias-aware gate (three phantoms within 10 % of no prior AND cohort readout floor / alignment held); audit notes 4 to 7; plan steps 3 to 5 (docs/MOTION_NEXT_STEPS_PLAN_2026-10-28.md)
 blockers: none
-active work: R12 below
+active work: R14 below
 device: Apple Silicon MPS / CPU (macOS arm64)
 last updated: 2026-10-28
 
 ---
+
+## R14 (solver correctness: Newton units, prior Hessian, chain order; curvature-unit priors, shrinkage, frame gain; v6.27.0, 2026-10-28)
+- **Newton step unit conversion** (`motion_batched._run_converging_stage`): the parameter step was `dv / to_vox` instead of
+  `dv * to_vox` since 6.24, so translations moved 9x too little and rotations hundreds of times too far and were rejected by
+  the line search; found when a prior with weight 0.1 left real BOLD FD unchanged. Fixed; phantom FD error fell for every
+  engine (unified DWI 0.319 -> 0.242, joint DWI 0.202 -> 0.157, joint ASL 0.054 -> 0.042). Test
+  `test_newton_stage_converts_voxel_steps_to_parameters_correctly`. Every number released in 6.24 to 6.26 was measured on
+  this solver and is superseded by the reports below.
+- **Correctness audit** (independent agent, `ml-correctness-audit`): coupled Newton counted the roughness prior twice and the
+  shrinkage three times (fixed, prior Hessian added once; fitted multipliers 0.999 / 1.000); convergence was judged on the
+  damped step (fixed: undamped step, rejections counted); the written chain `[eddy, rigid]` resampled `rigid(eddy(x))` while
+  the solver fitted `eddy(rigid(x))` (a transform list acts on the reference-space point first-listed first, verified with a
+  point source through `ants.apply_transforms` and `syntx.transforms.apply_transforms`). Fixed: chain `[rigid, eddy]`; every
+  reader selects the rigid by name (`motion_batched.rigid_transform_of`, `is_eddy_transform`): `motion.py`,
+  `motion_design._joint`, `motion_reference` (forward chains now the plain inverses `[eddy_fwd, rigid_fwd]`, cross-group
+  debias, nuisance), `motion_simulation`. `_assert_written_chain_reproduces_the_fitted_model` (joint and projected DWI tests):
+  resampling the written chain equals one resampling through the single matrix of the fitted model and differs from the
+  opposite order. `TransformChain.linear_part` composed in the reverse order of the point mapper (bvec rotation through the
+  wrong composition for eddy + rigid or crosses + rigid chains): fixed, `tests/test_transform_chain_order.py`. Open audit
+  notes (per-level weights overwritten in the projected engine, one-level init centre, core level-gauge guard, `fd_raw_power`
+  name) are in the plan.
+- **Prior units and terms** (`motion_batched.py`, `motion_design.py`): `surround_scale="curvature"` (prior weight relative to
+  the image curvature measured by `probe_manifold` per stage; metric-independent, so valid under MI) is the default scale when
+  a prior term is set; `pose_shrinkage` (shrinkage toward identity, `mu (|t|^2 + |50 omega|^2)`) with analytic Hessian in every
+  L-BFGS / Newton stage; `frame_gain=True` (scanner drift as a per-frame global gain refreshed with the design model, on in the
+  joint engine); `pe_info["prior"]`, `["frame_gain"]`, `["design_model"]`. `surround_prior_hessian(_full)` autograd-checked.
+- **Default prior decision**: cohort scan (`benchmarks/cohort_shrinkage_report.py`, `docs/reports/cohort_shrinkage_report_2026-10-28.html`,
+  five series x mu 0 / 0.03 / 0.1 / 0.3, pre-flight check that mu changes the outcome) chose shrinkage 0.1 by the readout-floor
+  rule (FD -11 to -41 %, readout step within 0.023 mm). On the fixed solver the drifting phantoms show the mechanism: shrinkage
+  at any weight pulls the trajectory toward identity (ASL FD error 0.042 -> 0.129 mm at 0.1, 0.100 at 0.03; rotation 0.058 ->
+  0.362 deg; antsxslowflow trajectory test 0.060 vs 0.05); roughness 0.1 is nearly free on ASL (0.068) and best on DWI (0.103)
+  but still fails the ASL-matches-unified test (0.085 vs 0.077). Author's decision: ship with both priors OFF
+  (`JOINT_POSE_SHRINKAGE = 0.0`, `JOINT_SURROUND_WEIGHT = 0.0`), available per call; the default is decided in 6.28 behind a gate
+  the three phantoms and the cohort both pass. `benchmarks/ten_minute_questions.py`
+  (`docs/reports/ten_minute_questions_2026-10-28.html`): the projected engine still over-reports readout jitter on real DWI
+  (0.112 vs joint 0.040 mm on BLAST031, odd-in-g 65 %: an eddy-like leak), roughness 0.1 acts as designed.
+- **Other**: `motion_decomposition.image_variance_decomposition(frame_gain=)`, `misattribution_angles`; `band_limited_fd`
+  Power / Jenkinson consistency; `make_design("shells")` stores `bvals` / `bvecs`; benchmarks `dwi_design_decision.py`,
+  `slice_residual_diagnostic.py`, `slice_parity_term.py`, `shrinkage_weight_scan.py`, `cohort_shrinkage_report.py`,
+  `ten_minute_questions.py` with reports under `docs/reports/`. The ISMRM abstract (`docs/abstracts/`) is parked: its numbers
+  predate the Newton and chain fixes and are being re-measured (`benchmarks/ismrm_cases.py`, priors off).
+- Tests (targeted, per the author's instruction; no full suite): see the release commit. `tests/test_motion_overlapping_window.py::
+  TestOverlappingWindowBOLD::test_bold_nyquist_sagittal_ripple_...` fails identically at b90cb1a in a clean worktree
+  (`wiener_shrinkage_eta` list empty): pre-existing, its own ticket. `antsxqc.lint src/syntx`: 0 findings.
 
 ## R13 (ISMRM abstract, decomposition module, FD consistency, 2026-10-28; uncommitted solver work)
 - **Abstract** (`docs/abstracts/ISMRM_2027_motion_solver.md`, 747-word body): one solver, four series (breacher 3315 resting BOLD,

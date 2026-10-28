@@ -89,7 +89,8 @@ def sequential_sums_of_squares(Y: np.ndarray, blocks: Sequence[Tuple[str, np.nda
 
 
 def image_variance_decomposition(series: np.ndarray, blocks: Sequence[Tuple[str, np.ndarray]], motion: Optional[np.ndarray],
-                                 mask: np.ndarray, fd: Optional[np.ndarray] = None, n_voxels: int = 60000, seed: int = 0) -> Dict[str, Any]:
+                                 mask: np.ndarray, fd: Optional[np.ndarray] = None, n_voxels: int = 60000, seed: int = 0,
+                                 frame_gain: Optional[np.ndarray] = None) -> Dict[str, Any]:
     """``series`` (X, Y, Z, T) array, ``blocks`` from ``design_blocks``, ``motion`` (T, k) regressors (poses and FD) entered after
     the design, ``mask`` (X, Y, Z) bool. Returns total SS, the sequential fractions, the residual's per-frame RMS and its
     correlation with ``fd``."""
@@ -101,11 +102,24 @@ def image_variance_decomposition(series: np.ndarray, blocks: Sequence[Tuple[str,
     idx = rng.choice(idx, size=min(int(n_voxels), idx.size), replace=False)
     Y = series.reshape(-1, T)[idx].T.astype(np.float64)
     Y = Y - Y.mean(axis=0, keepdims=True)
+    gain_term = None
+    if frame_gain is not None:
+        # the solver's per-frame global gain: a KNOWN spatial pattern (the voxel's mean) times a known time course, removed
+        # first and credited as its own term (it is not a free-pattern block: a free pattern on a slow time course would
+        # take slow motion with it)
+        gfac = 1.0 / np.asarray(frame_gain, dtype=np.float64).reshape(T)            # the drift the gain corrected
+        mu = series.reshape(-1, T)[idx].T.astype(np.float64).mean(axis=0, keepdims=True)
+        gain_term = (gfac[:, None] - gfac.mean()) * mu
+        Y = Y - gain_term
     blocks = list(blocks)
     if motion is not None:
         M = np.asarray(motion, dtype=np.float64).reshape(T, -1)
         blocks.append(("motion regressors after the design", M - M.mean(axis=0, keepdims=True)))
     tot, ss = sequential_sums_of_squares(Y, blocks)
+    if gain_term is not None:
+        g_ss = float((gain_term ** 2).sum())
+        tot = tot + g_ss
+        ss = [("global gain drift (solver term)", g_ss, 1)] + ss
     design_only = [b for b in blocks if not b[0].startswith("motion")]
     X = np.hstack([np.asarray(B, dtype=np.float64).reshape(T, -1) for _, B in design_only])
     Q, _ = np.linalg.qr(X)
@@ -154,4 +168,56 @@ def pose_step_decomposition(translations_mm: np.ndarray, rotations_deg: np.ndarr
         total = head + b
         out["rotations"][name] = {"total_step_sd_mm": float(np.std(np.diff(total))), "head": share(head, total),
                                   "removed_design_locked_term": share(b, total)}
+    return out
+
+
+def misattribution_angles(series: np.ndarray, blocks: Sequence[Tuple[str, np.ndarray]], spacing: Sequence[float],
+                          direction: np.ndarray, center_of_mass: np.ndarray, mask: np.ndarray, n_voxels: int = 60000,
+                          rot_radius_mm: float = 50.0, seed: int = 0) -> Dict[str, Any]:
+    """Principal angles between the six rigid-derivative images of the series mean (what a pose change does to the
+    images) and the design-locked spatial patterns (the per-point coefficients of every non-intercept design block fitted
+    to the series). An angle of zero means a design-locked pattern is indistinguishable from a rigid motion: no metric can
+    separate them and the pose absorbs it; ninety degrees means the design cannot be mistaken for motion. Returns the
+    angles in degrees (ascending), the smallest, and its cos^2 (the misattribution fraction), per cumulative block set."""
+    rng = np.random.default_rng(seed)
+    T = series.shape[-1]
+    mean = series.mean(axis=-1)
+    sp = np.asarray(spacing, dtype=np.float64)[:3]
+    D = np.asarray(direction, dtype=np.float64)[:3, :3]
+    grads = np.gradient(mean, *sp)                                  # d/d(voxel axis i) in intensity per mm, voxel axes
+    # physical gradient at every voxel: chain rule through the direction matrix (voxel-axis derivatives -> physical)
+    gv = np.stack([g.reshape(-1) for g in grads], axis=1)         # (N, 3) along voxel axes
+    gp = gv @ D.T                                                   # (N, 3) along physical axes
+    idx = np.flatnonzero(np.asarray(mask).reshape(-1))
+    idx = rng.choice(idx, size=min(int(n_voxels), idx.size), replace=False)
+    shape = mean.shape
+    ii = np.stack(np.unravel_index(idx, shape), axis=1).astype(np.float64)
+    phys = (ii * sp) @ D.T                                          # origin irrelevant for the lever about the centre of mass
+    com = np.asarray(center_of_mass, dtype=np.float64)
+    rel = phys - (com - 0.0)
+    J = np.zeros((idx.size, 6))
+    J[:, :3] = gp[idx]
+    for j in range(3):
+        e = np.zeros(3); e[j] = 1.0
+        J[:, 3 + j] = (gp[idx] * np.cross(e, rel)).sum(axis=1) / rot_radius_mm          # per (radian x lever / 50 mm): mm units
+    Y = series.reshape(-1, T)[idx].T.astype(np.float64)
+    Y = Y - Y.mean(axis=0, keepdims=True)
+    Qj, _ = np.linalg.qr(J - J.mean(axis=0, keepdims=True))
+    out: Dict[str, Any] = {"n_voxels": int(idx.size), "sets": []}
+    X = np.zeros((T, 0)); names = []
+    for name, B in blocks:
+        B = np.asarray(B, dtype=np.float64).reshape(T, -1)
+        X = np.c_[X, B]; names.append(name)
+        if name.startswith("level intercepts"):
+            continue
+        coef = np.linalg.lstsq(X, Y, rcond=None)[0]                 # (K, V)
+        n_int = sum(np.asarray(b, dtype=np.float64).reshape(T, -1).shape[1] for n, b in blocks if n.startswith("level intercepts"))
+        C = coef[n_int:].T                                          # (V, K_design) design-locked spatial patterns
+        C = C - C.mean(axis=0, keepdims=True)
+        Qc, Rc = np.linalg.qr(C)
+        keep = np.abs(np.diag(Rc)) > 1e-10 * max(np.abs(np.diag(Rc)).max(), 1e-30)
+        sv = np.linalg.svd(Qj.T @ Qc[:, keep], compute_uv=False)
+        ang = np.degrees(np.arccos(np.clip(sv, -1, 1)))
+        out["sets"].append({"blocks": list(names), "angles_deg": sorted(float(a) for a in ang),
+                            "min_angle_deg": float(ang.min()), "misattribution_fraction": float(np.max(sv) ** 2)})
     return out

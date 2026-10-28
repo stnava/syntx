@@ -20,6 +20,7 @@ from antsxqc.metrics import FD_SCRUBBING_THRESHOLD_MM
 CASES = {
     "bold": ("breacher/sub-3315/ses-initial-day2/func/sub-3315_ses-initial-day2_task-rest_run-01_bold.nii.gz", "resting BOLD, breacher sub-3315, TR 1.0 s"),
     "asl": ("ExpArt/sub-EAS020/ses-01/asl/sub-EAS020_ses-01_run-001_dir-PA_asl.nii.gz", "ASL, ExpArt sub-EAS020"),
+    "asl60": ("/Users/stnava/data/ds004856/sub-1003/ses-wave1/perf/sub-1003_ses-wave1_acq-ASL_run-1_asl.nii.gz", "ASL, OpenNeuro ds004856 sub-1003, PCASL 30 pairs"),
     "dwi031": ("FPA/sub-BLAST031/ses-01/dwi/sub-BLAST031_ses-01_run-001_dir-AP_dwi.nii.gz", "DWI, FPA sub-BLAST031 dir-AP, high motion"),
     "dwi11": ("/Users/stnava/data/blast_cohorts/BIDS/SOCOM/sub-Blast-11/ses-01/dwi/sub-Blast-11_ses-01_run-001_dir-PA_dwi.nii.gz", "DWI, SOCOM sub-Blast-11 dir-PA, low SNR"),
 }
@@ -33,7 +34,7 @@ def _pe_axis(path, img):
     return v / np.linalg.norm(v), sc
 
 
-def run_case(key, path, device):
+def run_case(key, path, device, shrinkage=0.0):
     import ants
     import syntx
     from syntx.motion_decomposition import design_blocks, image_variance_decomposition, pose_step_decomposition
@@ -43,15 +44,19 @@ def run_case(key, path, device):
     tr = float(sc.get("RepetitionTime", img.spacing[3]))
     if key == "bold":
         design = syntx.make_design("none", n_frames=img.shape[-1]); bv = g = None
-    elif key == "asl":
-        vt = [l.strip() for l in open(path.replace("_asl.nii.gz", "_aslcontext.tsv")).read().splitlines()[1:]]
+    elif key.startswith("asl"):
+        ctx = path.replace("_asl.nii.gz", "_aslcontext.tsv")
+        if not os.path.exists(ctx):
+            ctx = glob.glob(os.path.join(os.path.dirname(path), "*_aslcontext.tsv"))[0]
+        vt = [l.strip() for l in open(ctx).read().splitlines()[1:]]
         design = syntx.make_design("tag_control", volume_types=vt); bv = g = None
     else:
         bv = np.loadtxt(path.replace(".nii.gz", ".bval")); g = np.loadtxt(path.replace(".nii.gz", ".bvec")).T
         design = syntx.make_design("shells", bvals=bv, bvecs=g, pe_axis=pe)
     t0 = time.time()
     T = img.shape[-1]
-    r = syntx.motion_correct_design(img, design, engine="joint", device=device, verbose=False, tr=tr)
+    extra = {"pose_shrinkage": float(shrinkage), "surround_scale": "likelihood"} if shrinkage > 0 else {}
+    r = syntx.motion_correct_design(img, design, engine="joint", device=device, verbose=False, tr=tr, **extra)
     secs = time.time() - t0
     fd = np.asarray(r["fd"], float)
     # the censoring series: band-limited FD for BOLD and ASL (periodic physiology faster than the sampling); the rigid FD
@@ -74,12 +79,14 @@ def run_case(key, path, device):
     # motion regressors after the design: the six poses and FD when the series is long enough to spend seven degrees of
     # freedom on them (T >= 60), FD alone otherwise (a 16-frame ASL series would be overfitted)
     motion = np.c_[t, rot, fd] if T >= 60 else fd[:, None]
-    dec_c = image_variance_decomposition(corr, blocks, motion, mask, fd=fd)
-    dec_r = image_variance_decomposition(raw, blocks, motion, mask, fd=fd)
+    gain = None if r.get("frame_gain") is None else np.asarray(r["frame_gain"], float)
+    dec_c = image_variance_decomposition(corr, blocks, motion, mask, fd=fd, frame_gain=gain)
+    dec_r = image_variance_decomposition(raw, blocks, motion, mask, fd=fd, frame_gain=gain)
     rec = {"series": path, "T": T, "tr": tr, "design": design.name, "levels": int(design.n_levels), "seconds": secs,
            "fd_mean": float(fd[1:].mean()), "fd_max": float(fd.max()), "fd_bandlimited_mean": float(fdb[1:].mean()), "fd_band": r.get("fd_band"),
            "frac_gt_thr_raw": float(np.mean(fd > FD_SCRUBBING_THRESHOLD_MM)), "frac_gt_thr_bandlimited": float(np.mean(fdb > FD_SCRUBBING_THRESHOLD_MM)),
-           "frame_converged_frac": float(np.mean(conv)),
+           "frame_converged_frac": float(np.mean(conv)), "shrinkage": float(shrinkage),
+           "frame_gain_range": None if gain is None else [float(gain.min()), float(gain.max())],
            "pose": pose, "image_corrected": {k: v for k, v in dec_c.items() if k != "residual_rms_per_frame"},
            "image_raw": {k: v for k, v in dec_r.items() if k != "residual_rms_per_frame"},
            "traces": {"t_ro": (t @ np.asarray(img.direction)[:3, 0]).tolist(), "t_pe": (t @ np.asarray(img.direction)[:3, 1]).tolist(),
@@ -120,13 +127,14 @@ def _html(results, fig_path, path):
     for k, r in results.items():
         ro = r["pose"]["axes"]["readout"]; pe = r["pose"]["axes"]["phase_encode"]
         tc = {t_["term"]: t_["fraction"] for t_ in r["image_corrected"]["terms"]}; trw = {t_["term"]: t_["fraction"] for t_ in r["image_raw"]["terms"]}
-        design_c = sum(v for n, v in tc.items() if n not in ("residual", "motion regressors after the design"))
-        design_r = sum(v for n, v in trw.items() if n not in ("residual", "motion regressors after the design"))
+        design_c = sum(v for n, v in tc.items() if n not in ("residual", "motion regressors after the design", "global gain drift (solver term)"))
+        design_r = sum(v for n, v in trw.items() if n not in ("residual", "motion regressors after the design", "global gain drift (solver term)"))
+        drift = f"{100 * trw.get('global gain drift (solver term)', 0):.1f} / {100 * tc.get('global gain drift (solver term)', 0):.1f}"
         rows.append(f"<tr><td>{CASES[k][1]}</td><td>{r['T']}</td><td>{r['fd_mean']:.3f} / {r['fd_max']:.2f}</td><td>{r['fd_bandlimited_mean']:.3f}</td>"
                     f"<td>{100 * r['frac_gt_thr_raw']:.0f} / {100 * r['frac_gt_thr_bandlimited']:.0f}</td>"
                     f"<td>{100 * ro['head']['share']:.0f} / {100 * ro['applied_acquisition_term']['share']:.0f} / {100 * ro['removed_design_locked_term']['share']:.0f}</td>"
                     f"<td>{100 * pe['head']['share']:.0f} / {100 * pe['applied_acquisition_term']['share']:.0f} / {100 * pe['removed_design_locked_term']['share']:.0f}</td>"
-                    f"<td>{100 * design_r:.1f} / {100 * design_c:.1f}</td><td>{100 * trw['motion regressors after the design']:.2f} / {100 * tc['motion regressors after the design']:.2f}</td>"
+                    f"<td>{drift}</td><td>{100 * design_r:.1f} / {100 * design_c:.1f}</td><td>{100 * trw['motion regressors after the design']:.2f} / {100 * tc['motion regressors after the design']:.2f}</td>"
                     f"<td>{100 * trw['residual']:.1f} / {100 * tc['residual']:.1f}</td><td>{r['image_raw']['residual_rms_fd_corr']:.2f} / {r['image_corrected']['residual_rms_fd_corr']:.2f}</td>"
                     f"<td>{r['frame_converged_frac']:.2f}</td><td>{r['seconds']:.0f}</td></tr>")
     html = f"""<!doctype html><html><head><meta charset="utf-8"><title>One motion solver, four modalities</title>
@@ -138,7 +146,7 @@ the readout (B0-immune) and phase-encode axes held by the head pose / the applie
 Image: percent of the per-voxel temporal variance at foreground voxels explained by the acquisition design (level intercepts, l = 2 and l = 4 direction
 terms per shell), by the motion regressors after the design, and the residual, raw / corrected; r: correlation of the per-frame residual RMS with FD.</p>
 <table><tr><th>case</th><th>T</th><th>FD mean / max</th><th>FD band-lim.</th><th>censored % raw / bl</th><th>readout: head / acq / design %</th>
-<th>PE: head / acq / design %</th><th>design % raw / corr</th><th>motion % raw / corr</th><th>residual % raw / corr</th><th>resid~FD r raw / corr</th><th>conv</th><th>s</th></tr>
+<th>PE: head / acq / design %</th><th>drift % raw / corr</th><th>design % raw / corr</th><th>motion % raw / corr</th><th>residual % raw / corr</th><th>resid~FD r raw / corr</th><th>conv</th><th>s</th></tr>
 {''.join(rows)}</table><img src="data:image/png;base64,{base64.b64encode(open(fig_path, 'rb').read()).decode()}" style="max-width:100%"></body></html>"""
     open(path, "w").write(html)
 
@@ -146,7 +154,8 @@ terms per shell), by the motion regressors after the design, and the residual, r
 def main(argv=None):
     ap = argparse.ArgumentParser()
     ap.add_argument("root"); ap.add_argument("out")
-    ap.add_argument("--only", default="bold,asl,dwi031,dwi11"); ap.add_argument("--device", default="auto")
+    ap.add_argument("--only", default="bold,asl,asl60,dwi031,dwi11"); ap.add_argument("--device", default="auto")
+    ap.add_argument("--shrinkage", type=float, default=0.0, help="pose_shrinkage in likelihood units (decision 7); 0 = off")
     args = ap.parse_args(argv)
     os.makedirs(args.out, exist_ok=True)
     out_json = os.path.join(args.out, "ismrm_cases.json")
@@ -156,7 +165,7 @@ def main(argv=None):
             continue
         rel, _ = CASES[key]
         path = rel if rel.startswith("/") else os.path.join(args.root, rel)
-        results[key] = run_case(key, path, args.device)
+        results[key] = run_case(key, path, args.device, shrinkage=args.shrinkage)
         json.dump(results, open(out_json, "w"), indent=1, default=float)
         r = results[key]
         print(key, json.dumps({k: (round(r[k], 3) if isinstance(r[k], float) else r[k]) for k in ("T", "fd_mean", "fd_bandlimited_mean", "frac_gt_thr_raw", "frac_gt_thr_bandlimited", "seconds")}), flush=True)

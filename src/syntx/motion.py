@@ -953,7 +953,7 @@ def motion_correction(
                                "convergence_tol_vox", "max_extend_factor", "encoding_covariates", "window_size",
                                "window_stride", "surround_weight", "surround_delta_mm", "slice_axis", "sidecar",
                                "frame_levels", "init_pose", "schedule", "design_matrix", "design_point_scale",
-                               "design_levels", "design_model_live", "tr", "surround_scale"}
+                               "design_levels", "design_model_live", "tr", "surround_scale", "design_gauge", "pose_shrinkage", "frame_gain"}
     if backend == "pytorch_batched" and set(kwargs) - _batched_allowed_kwargs:
         raise TypeError(f"backend='pytorch_batched' accepts only {sorted(_batched_allowed_kwargs)}; got "
                         f"{sorted(set(kwargs) - _batched_allowed_kwargs)}")
@@ -1166,6 +1166,9 @@ def motion_correction(
                         design_point_scale=bool(kwargs.get("design_point_scale", True)),
                         design_model_live=bool(kwargs.get("design_model_live", False)),
                         surround_scale=str(kwargs.get("surround_scale", "raw")),
+                        design_gauge=None if kwargs.get("design_gauge") is None else np.asarray(kwargs["design_gauge"])[list(batch_indices)],
+                        pose_shrinkage=float(kwargs.get("pose_shrinkage", 0.0)),
+                        frame_gain=bool(kwargs.get("frame_gain", False)),
                     )
                     if pe_batch is not None:
                         if "sampling" in pe_batch:
@@ -1174,6 +1177,8 @@ def motion_correction(
                             pe_frames["design_model"] = pe_batch["design_model"]
                         if "prior" in pe_batch:
                             pe_frames["prior"] = pe_batch["prior"]
+                        if "frame_gain" in pe_batch:
+                            pe_frames["frame_gain"] = pe_batch["frame_gain"]
                         if "bias" in pe_batch:
                             pe_frames["bias"] = pe_batch["bias"]
                         if pe_batch.get("encoding_pose_bias_mm_rad") is not None:
@@ -1230,8 +1235,9 @@ def motion_correction(
                 )
                 if t in pe_frames["jacobian"] and pe_frames["jacobian"][t] != 1.0:
                     warped_t = warped_t * float(pe_frames["jacobian"][t])  # signal conservation under the PE scale
-                # the rigid pose is the LAST file of the chain (an eddy PE-affine, when present, precedes it)
-                tx_obj = ants.read_transform(fwd_tx[-1])
+                # the rigid pose is the chain's rigid file, found by name (an eddy PE-affine, when present, follows it)
+                from .motion_batched import rigid_transform_of
+                tx_obj = ants.read_transform(rigid_transform_of(fwd_tx))
                 trans, rot, T_h = _extract_rigid_parameters(tx_obj, spatial_dim)
             else:
                 reg_args = dict(kwargs)
@@ -1414,6 +1420,7 @@ def motion_correction(
         "sampling": pe_frames["sampling"],
         "design_model": pe_frames.get("design_model"),
         "prior": pe_frames.get("prior"),
+        "frame_gain": pe_frames.get("frame_gain"),
         "convergence": None if not pe_frames["stages"] else {
             "tol_vox": float(kwargs.get("convergence_tol_vox", 0.05)), "max_extend_factor": int(kwargs.get("max_extend_factor", 4)),
             "frame_converged": [bool(pe_frames["frame_converged"].get(t, True)) for t in range(num_frames)],

@@ -290,7 +290,10 @@ class TestGroupedEddyPEAffine:
         assert np.mean(out.fd[2:]) < 0.25  # rigid part: no motion was imposed
         assert np.mean(out.fd_raw[2:]) > 2 * np.mean(out.fd[2:])  # the eddy term is in the full chain
         for chain in out.fwdtransforms[2:]:
-            assert len(chain) == 3 and "_eddy" in chain[-2]  # [cross, eddy, rigid]
+            # the list acts first-listed first: forward fits eddy(rigid(x)) -> [cross, rigid, eddy]; backward writes the
+            # inverse R^-1(E^-1(x)) -> [cross, eddy_fwd, rigid_fwd]. Exactly one eddy element in the frame's own part.
+            own_eddy = ["_eddy" in f for f in chain[1:]]
+            assert len(chain) == 3 and own_eddy == ([False, True] if direction == "forward" else [True, False]), chain
         arr = out.motion_corrected.numpy()
         for t in range(2, n):
             assert np.corrcoef(arr[..., 0].ravel(), arr[..., t].ravel())[0, 1] > 0.99

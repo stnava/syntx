@@ -33,6 +33,8 @@ import ants
 import numpy as np
 from scipy.spatial.transform import Rotation as _Rot
 
+from .motion_batched import is_eddy_transform
+
 __all__ = [
     "HeadPhantom",
     "make_head_phantom",
@@ -395,7 +397,7 @@ def evaluate_motion_estimate(fwdtransforms, sim: SimulatedSeries, fd_radius: flo
         # acting first on the point; the eddy PE affine (``*_eddy.mat``) is a real displacement, not head motion
         h = np.eye(4)
         for f in chain:
-            if not str(f).endswith("_eddy.mat"):
+            if not is_eddy_transform(f):
                 h = _matrix_from_tx(ants.read_transform(f)) @ h
         return matrix_to_pose(h, p0)
 

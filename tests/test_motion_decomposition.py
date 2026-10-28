@@ -57,3 +57,46 @@ def test_pose_step_decomposition_shares():
     assert ax["phase_encode"]["applied_acquisition_term"]["share"] > 0.8
     assert ax["slice"]["removed_design_locked_term"]["share"] > 0.8
     assert abs(ax["slice"]["removed_design_locked_term"]["step_sd_mm"] - 0.2) < 1e-3
+
+
+def test_misattribution_angles_zero_for_a_translation_pattern_and_large_for_a_random_one():
+    from syntx.motion_decomposition import misattribution_angles
+
+    rng = np.random.default_rng(3)
+    X, Y, Z, T = 24, 24, 20, 40
+    xx, yy, zz = np.mgrid[:X, :Y, :Z]
+    base = np.exp(-((xx - 12) ** 2 + (yy - 12) ** 2 + (zz - 10) ** 2) / 30.0) * 100
+    gx = np.gradient(base, 2.0, axis=0)
+    d = np.where(np.arange(T) % 2 == 0, 1.0, -1.0)
+    levels = (np.arange(T) % 2).astype(int)
+    inter = np.stack([(levels == k).astype(float) for k in (0, 1)], 1)
+    series_t = base[..., None] + 0.5 * gx[..., None] * d + rng.standard_normal((X, Y, Z, T)) * 0.1     # pattern = x-derivative
+    series_r = base[..., None] + 0.5 * rng.standard_normal((X, Y, Z))[..., None] * d + rng.standard_normal((X, Y, Z, T)) * 0.1
+    mask = base > 5
+    kw = dict(spacing=(2.0, 2.0, 2.0), direction=np.eye(3), center_of_mass=np.array([24.0, 24.0, 20.0]), mask=mask, n_voxels=3000)
+    a_t = misattribution_angles(series_t, [("level intercepts", inter)], **kw)
+    a_r = misattribution_angles(series_r, [("level intercepts", inter)], **kw)
+    assert a_t["sets"] == [] and a_r["sets"] == []   # intercept-only designs have no design-locked pattern beyond the level mean
+    blocks = [("level intercepts", inter[:, :1] * 0 + 1), ("alternation", d[:, None])]
+    a_t = misattribution_angles(series_t, blocks, **kw); a_r = misattribution_angles(series_r, blocks, **kw)
+    assert a_t["sets"][0]["min_angle_deg"] < 15 and a_t["sets"][0]["misattribution_fraction"] > 0.9
+    assert a_r["sets"][0]["min_angle_deg"] > 60
+
+
+def test_frame_gain_term_takes_a_planted_global_drift_before_motion():
+    rng = np.random.default_rng(5)
+    T, V = 80, 500
+    levels = np.zeros(T, int)
+    blocks = design_blocks(levels, "none")
+    base = 100 + 20 * rng.standard_normal((1, V))
+    gain = 1.0 + 0.1 * np.linspace(0, 1, T)                                 # 10 % multiplicative drift over the run
+    motion = np.c_[np.cumsum(rng.standard_normal((T, 6)) * 0.02, axis=0), np.abs(rng.standard_normal(T))]   # slow drifting poses
+    sig = base * gain[:, None] + rng.standard_normal((T, V))
+    series = sig.T.reshape(V, 1, 1, T)
+    mask = np.ones((V, 1, 1), bool)
+    a = image_variance_decomposition(series, blocks, motion, mask, n_voxels=V)
+    b = image_variance_decomposition(series, blocks, motion, mask, n_voxels=V, frame_gain=1.0 / gain)
+    fa = {t["term"]: t["fraction"] for t in a["terms"]}; fb = {t["term"]: t["fraction"] for t in b["terms"]}
+    assert fa["motion regressors after the design"] > 0.3            # without the gain term the drifting poses soak up the drift
+    assert fb["global gain drift (solver term)"] > 0.8 and fb["motion regressors after the design"] < 0.05
+    assert abs(sum(fb.values()) - 1.0) < 1e-9
