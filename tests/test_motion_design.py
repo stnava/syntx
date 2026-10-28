@@ -63,7 +63,7 @@ def test_dispatch_reproduces_the_modality_call_bold_and_asl():
 
     bold = simulate_bold_series(n_frames=16, seed=3)
     a = motion_correction(bold.image, reference="mean", type_of_transform="Rigid", preset="bold", device="cpu")
-    b = motion_correct_design(bold.image, make_design("none", n_frames=16), device="cpu")
+    b = motion_correct_design(bold.image, make_design("none", n_frames=16), engine="dispatch", device="cpu")
     np.testing.assert_allclose(params(a["fwdtransforms"]), params(b["fwdtransforms"]), atol=1e-6)
     assert b["design"]["call"] == "motion_correction(preset='bold')"
 
@@ -71,8 +71,35 @@ def test_dispatch_reproduces_the_modality_call_bold_and_asl():
     vt = ["control" if s > 0 else "label" for s in asl.encoding_covariates]
     a = motion_correction(asl.image, reference="mean", type_of_transform="Rigid", preset="asl",
                           encoding_covariates=asl.encoding_covariates, device="cpu")
-    b = motion_correct_design(asl.image, make_design("tag_control", volume_types=vt), device="cpu")
+    b = motion_correct_design(asl.image, make_design("tag_control", volume_types=vt), engine="dispatch", device="cpu")
     np.testing.assert_allclose(params(a["fwdtransforms"]), params(b["fwdtransforms"]), atol=1e-6)
+
+
+def test_default_engine_is_joint_and_custom_encoding_reaches_it():
+    """Since 6.30.0 ``motion_correct_design`` runs the joint engine by default, and a ``custom`` design's caller-supplied
+    ``encoding`` columns enter the joint design (one-level path and multi-level columns) instead of being ignored."""
+    from syntx.motion_simulation import simulate_asl_series
+
+    sim = simulate_asl_series(n_frames=12, seed=3)
+    r = motion_correct_design(sim.image, make_design("none", n_frames=12), device="cpu")
+    assert r["design"]["engine"] == "joint" and r["design"]["surround_form"] == "cauchy"
+    # one level + one continuous covariate (12 frames >= 6 x 1): forwarded to the solver
+    enc = np.asarray(sim.encoding_covariates, dtype=float)
+    r1 = motion_correct_design(sim.image, make_design("custom", levels=np.zeros(12, int), encoding=enc), device="cpu")
+    assert r1.get("encoding_pose_bias_mm_rad") is not None
+    # two levels + the same covariate: the joint columns carry the level indicator and the custom column
+    lev = (enc < 0).astype(int)
+    r2 = motion_correct_design(sim.image, make_design("custom", levels=lev, encoding=enc), device="cpu")
+    assert any(c.startswith("custom x 1") for c in r2["design"]["columns"]), r2["design"]["columns"]
+
+
+def test_encoding_states_design_is_one_hot_for_three_states():
+    d = make_design("encoding_states", state_labels=[0, 1, 2, 0, 1, 2, 0, 1, 2])
+    assert d.n_levels == 3 and d.encoding.shape == (9, 2)
+    np.testing.assert_array_equal(d.encoding[:, 0], [0, 1, 0, 0, 1, 0, 0, 1, 0])
+    np.testing.assert_array_equal(d.encoding[:, 1], [0, 0, 1, 0, 0, 1, 0, 0, 1])
+    d2 = make_design("encoding_states", state_labels=[0, 1, 0, 1])
+    assert d2.encoding.shape == (4, 1)
 
 
 def test_level_layout_interleaved_blocked_and_lone_frames():

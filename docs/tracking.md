@@ -1,12 +1,27 @@
 # Tracking Summary
-current phase: v6.29.0 (per-modality default prior: cauchy 0.05 for one-level designs, 0.03 for multi-level; ISMRM abstract rebuilt and verified)
-next WP: a phantom whose jitter is in the images, not the trajectory; per-axis curvature scaling (plateau transient on featureless phantoms); audit notes 4 to 6; plan steps 3 to 5 (docs/MOTION_NEXT_STEPS_PLAN_2026-10-28.md)
+current phase: v6.30.0 (motion_correct_design defaults to engine="joint"; custom encoding columns reach the joint engine; one-hot encoding states)
+next WP: a phantom whose jitter is in the images, not the trajectory; per-axis curvature scaling; audit notes 4 to 6; plan steps 3 to 5 (docs/MOTION_NEXT_STEPS_PLAN_2026-10-28.md); eddy covariates for slow-flow encodings
 blockers: none
-active work: R16 below
+active work: R17 below
 device: Apple Silicon MPS / CPU (macOS arm64)
 last updated: 2026-10-28
 
 ---
+
+## R17 (design-matrix review follow-ups; v6.30.0, 2026-10-28)
+- An external review of the design matrices (DWI, ASL, slow flow, BOLD, custom) was checked against the code
+  (`docs/DESIGN_MATRIX_REVIEW_FOLLOWUPS_PLAN_2026-10-28.md`): the solver description is accurate; three findings fixed here.
+- **`motion_correct_design(engine="joint")` is the default** (was `"dispatch"`, the legacy per-modality calls). Every consumer
+  already passed `engine="joint"`; a direct caller who omitted it got the legacy path without the joint pass or the prior. The
+  dispatch-identity tests pass `engine="dispatch"` explicitly; `test_default_engine_is_joint_and_custom_encoding_reaches_it`.
+- **Custom designs' `encoding` columns reach the joint engine** (`joint_design_columns`, and the one-level path forwards them as
+  `encoding_covariates`), gated at `FRAMES_PER_BETA_COLUMN` frames per live column and recorded in `design.beta_dropped`; the
+  design record lists them as `custom x K`. Before, the joint engine silently ignored them while `unified` and `dispatch` used them.
+- **`make_design("encoding_states")` stores one-hot indicators of the non-anchor states** as `encoding` (T, K - 1): the legacy
+  `dispatch` path passed the integer labels as one linear ramp, wrong for three or more states; the joint engine, which uses
+  the levels, is unchanged (antsxslowflow's trajectory phantom is the regression check).
+- The ISMRM abstract is left as committed in 6.29.0 by the author's instruction.
+- Tests (targeted): see the release commit. `antsxqc.lint src/syntx` 0.
 
 ## R16 (one-level default prior 0.05; ISMRM abstract verified; v6.29.0, 2026-10-28)
 - **`JOINT_SURROUND_WEIGHT_ONE_LEVEL = 0.05`** (`motion_design._joint`, one-level path): the readout-floor rule that rejected 0.05 is a

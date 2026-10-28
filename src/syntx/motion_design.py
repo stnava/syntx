@@ -20,7 +20,8 @@ Menu (``DESIGNS``; ``make_design(name, ...)`` builds a :class:`Design` from the 
 - ``encoding_states``  slow flow: integer encoding-state labels.
 - ``custom``           caller-supplied ``levels`` and ``encoding`` columns.
 
-``engine="unified"`` is the design-driven estimator; ``engine="dispatch"`` reproduces, for each design, the call each
+``engine="joint"`` (default since 6.30.0) is the gated solver; ``engine="unified"`` is the earlier design-driven estimator;
+``engine="dispatch"`` reproduces, for each design, the call each
 modality makes today (ASL: antsxfunctional
 ``syntx_motion_correction``; DWI: antsxdwi ``motion_correct``; slow flow: antsxslowflow ``preset="slowflow"``; BOLD:
 ``preset="bold"``), so the menu can replace those call sites without changing results.
@@ -168,10 +169,15 @@ def _design_shells(bvals, bvecs=None, pe_axis=None, b0_threshold: float = 50.0) 
 
 
 def _design_encoding_states(state_labels) -> Design:
+    """One level per encoding state; ``encoding`` holds the one-hot indicators of the non-anchor states (T, K - 1), so the
+    legacy ``dispatch`` and ``unified`` paths see categorical states (until 6.30.0 the integer labels went in as one linear
+    ramp, which is wrong for three or more states); the joint engine builds its own level indicators from ``levels``."""
     lab = np.asarray(state_labels).reshape(-1)
     _, levels = np.unique(lab, return_inverse=True)
-    return Design("encoding_states", levels.astype(int), encoding=lab.astype(np.float64),
-                  detail={"n_states": int(levels.max() + 1)})
+    levels = levels.astype(int)
+    n_states = int(levels.max() + 1)
+    enc = np.stack([(levels == k).astype(np.float64) for k in range(1, n_states)], axis=1) if n_states > 1 else None
+    return Design("encoding_states", levels, encoding=enc, detail={"n_states": n_states})
 
 
 def _design_custom(levels, encoding=None) -> Design:
@@ -467,6 +473,15 @@ def joint_design_columns(design: Design, layout: Dict[int, dict]) -> tuple:
                 if np.any(blk != 0):
                     blocks.append(blk)
             pe_cov = np.hstack(blocks) if blocks else None
+    if design.name == "custom" and design.encoding is not None:
+        # caller-supplied covariates (T, K): kept only with FRAMES_PER_BETA_COLUMN frames per column (6.30.0; before, the joint
+        # engine silently ignored them while the unified and dispatch paths used them)
+        ext = np.asarray(design.encoding, dtype=np.float64).reshape(T, -1)
+        live = int(np.sum(np.ptp(ext, axis=0) > 0))
+        if live and T < FRAMES_PER_BETA_COLUMN * live:
+            dropped.append(f"custom encoding ({T} frames < {FRAMES_PER_BETA_COLUMN} x {live})")
+        elif live:
+            cols.append(ext[:, np.ptp(ext, axis=0) > 0])
     enc = np.hstack(cols) if cols else None
     return enc, pe_cov, dropped
 
@@ -572,6 +587,12 @@ def _joint(image, design: Design, *, init: str = "levels", surround_weight: Opti
         kw = {**knobs, **kwargs}
         if design.pe_axis is not None:
             kw.setdefault("pe_axis", design.pe_axis)
+        if design.name == "custom" and design.encoding is not None:
+            ext = np.asarray(design.encoding, dtype=np.float64).reshape(T, -1)
+            if T >= FRAMES_PER_BETA_COLUMN * int(np.sum(np.ptp(ext, axis=0) > 0)):
+                kw["encoding_covariates"] = ext          # caller covariates on the one-level path (6.30.0)
+                if window_size is not None:
+                    kw["window_size"] = int(window_size)
         # the one-level path carries the same solver terms as the multi-level one (drift gain, shrinkage, prior units)
         kw.update(frame_gain=bool(frame_gain))
         if pose_shrinkage > 0.0:
@@ -746,7 +767,8 @@ def _joint(image, design: Design, *, init: str = "levels", surround_weight: Opti
     out["frame_gain"] = r1.get("frame_gain")
     out["design"].update(layout=layout, links=list(h0.get("cross_link") or []), beta=("metric" if projected else "columns"), beta_dropped=dropped,
                          columns=(([f"intercept x {design.n_levels}"] + ([f"l2 x shells ({D_metric.shape[1] - design.n_levels} cols)"] if D_metric.shape[1] > design.n_levels else [])) if projected
-                                  else [f"level{k}" for k in est_levels] + ([f"l2 x {design.n_levels - 1} shells"] if (enc is not None and design.name == "shells" and enc.shape[1] > len(est_levels)) else [])),
+                                  else [f"level{k}" for k in est_levels] + ([f"l2 x {design.n_levels - 1} shells"] if (enc is not None and design.name == "shells" and enc.shape[1] > len(est_levels)) else [])
+                                  + ([f"custom x {enc.shape[1] - len(est_levels)}"] if (enc is not None and design.name == "custom" and enc.shape[1] > len(est_levels)) else [])),
                          n_columns=0 if enc is None else int(enc.shape[1]), surround_weight=lam, surround_delta_mm=float(surround_delta_mm),
                          surround_form=str(surround_form),
                          beta_levels=beta_levels, beta_levels_estimable=beta_levels is not None)
@@ -756,8 +778,11 @@ def _joint(image, design: Design, *, init: str = "levels", surround_weight: Opti
 ENGINES = {"dispatch": _dispatch, "unified": _unified, "joint": _joint, "projected": _projected}
 
 
-def motion_correct_design(image, design: Design, *, engine: str = "dispatch", **kwargs) -> dict:
+def motion_correct_design(image, design: Design, *, engine: str = "joint", **kwargs) -> dict:
     """Motion correction of a 4-D series under an acquisition :class:`Design` (``make_design``).
+
+    ``engine="joint"`` (the default since 6.30.0; the gated solver with the per-modality prior) or ``"projected"``,
+    ``"unified"``, ``"dispatch"`` (the legacy per-modality calls).
 
     Returns the underlying result (``motion_corrected``, ``fwdtransforms``, ``fd``, ...) plus ``design`` (name, engine,
     the call made, levels). ``kwargs`` go to that call (``device``, ``outprefix``, ``sample_seed``, ...)."""
