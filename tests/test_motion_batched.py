@@ -474,8 +474,7 @@ class TestSamplePointsOffVoxelCentres:
 
 class TestSafeBatchedEigh:
     """Regression guard for ``torch._C._LinAlgError: linalg.eigh: (Batch element k): error code: 5``
-    observed on 5/18 ExpArt rsfMRI sessions in single-precision LAPACK ``ssyevd`` when finite-difference
-    6x6 frame Hessians had repeated/clustered eigenvalues."""
+    and verification that the Newton linear-algebra path stays pure PyTorch and float32."""
 
     def test_repeated_eigenvalues_and_nonfinite_entries(self):
         import torch
@@ -487,7 +486,6 @@ class TestSafeBatchedEigh:
         rng = np.random.default_rng(42)
         q, _ = np.linalg.qr(rng.normal(size=(P, P)))
         q_t = torch.from_numpy(q.astype(np.float32))
-        # Clustered eigenvalues that stress single-precision ssyevd deflation
         evals_clustered = torch.tensor([1.0, 1.0 + 1e-7, 1.0 - 1e-7, 2.0, 2.0 + 1e-7, 0.0], dtype=torch.float32)
         H[8] = q_t @ torch.diag(evals_clustered) @ q_t.T
         H[9, 0, 1] = float("nan")
@@ -497,36 +495,74 @@ class TestSafeBatchedEigh:
         assert ev.shape == (B, P) and Q.shape == (B, P, P)
         assert ev.dtype == torch.float32 and Q.dtype == torch.float32
         assert torch.isfinite(ev).all() and torch.isfinite(Q).all()
+        assert bool((ev[:, 1:] >= ev[:, :-1]).all())
         recon = Q[8] @ torch.diag(ev[8]) @ Q[8].T
         sym8 = 0.5 * (H[8] + H[8].T)
         assert torch.allclose(recon, sym8, atol=1e-5)
 
-    def test_fallback_when_torch_eigh_raises_linalg_error(self, monkeypatch):
+    def test_pure_pytorch_float32_jacobi_fallback_when_eigh_fails(self, monkeypatch):
         import torch
         from syntx.motion_batched import _safe_batched_eigh
 
-        orig_eigh = torch.linalg.eigh
-        calls = {"batched": 0, "elem": 0}
+        calls = {"batched": 0, "dtypes": []}
 
-        def flaky_eigh(A, *args, **kwargs):
-            if A.ndim == 3:
-                calls["batched"] += 1
-                raise RuntimeError("linalg.eigh: (Batch element 2): error code: 5")
-            calls["elem"] += 1
-            if calls["elem"] == 3:
-                raise RuntimeError("linalg.eigh: simulated element failure")
-            return orig_eigh(A, *args, **kwargs)
+        def failing_eigh(A, *args, **kwargs):
+            calls["batched"] += 1
+            calls["dtypes"].append(A.dtype)
+            raise RuntimeError("linalg.eigh: (Batch element 2): error code: 5")
 
-        monkeypatch.setattr(torch.linalg, "eigh", flaky_eigh)
+        monkeypatch.setattr(torch.linalg, "eigh", failing_eigh)
         rng = np.random.default_rng(7)
-        M = rng.normal(size=(4, 6, 6)).astype(np.float32)
+        M = rng.normal(size=(6, 6, 6)).astype(np.float32)
         H = torch.from_numpy(0.5 * (M + np.swapaxes(M, 1, 2)))
+        H[2] = 4.0 * torch.eye(6)
         ev, Q = _safe_batched_eigh(H, dev="cpu")
         assert calls["batched"] == 1
-        assert calls["elem"] == 4
+        assert calls["dtypes"] == [torch.float32]
+        assert ev.dtype == torch.float32 and Q.dtype == torch.float32
         assert torch.isfinite(ev).all() and torch.isfinite(Q).all()
-        for b in range(4):
+        assert bool((ev[:, 1:] >= ev[:, :-1]).all())
+        for b in range(6):
             recon = Q[b] @ torch.diag(ev[b]) @ Q[b].T
             assert torch.allclose(recon, H[b], atol=1e-4)
             assert torch.allclose(Q[b].T @ Q[b], torch.eye(6), atol=1e-4)
+
+    def test_vectorized_surround_hessian_full_and_float32_coupled_solve(self):
+        import torch
+        from syntx.motion_batched import (
+            _solve_coupled_spd_f32,
+            _surround_hessian_terms,
+            surround_prior_hessian_full,
+        )
+
+        torch.manual_seed(11)
+        B = 10
+        t_p = 0.25 * torch.randn(B, 3, dtype=torch.float32)
+        om_p = 0.01 * torch.randn(B, 3, dtype=torch.float32)
+        weight, delta_mm, rot_r, shrink = 0.4, 0.2, 50.0, 0.03
+        H_vec = surround_prior_hessian_full(t_p, om_p, weight, delta_mm, rot_r, shrinkage=shrink, form="charbonnier")
+
+        H_ref = torch.zeros((B, 6, B, 6), dtype=torch.float32)
+        unit = torch.tensor([1.0, 1.0, 1.0, rot_r, rot_r, rot_r], dtype=torch.float32)
+        for b in range(B):
+            H_ref[b, :, b, :] += 2.0 * shrink * torch.diag(unit * unit)
+        Hu = _surround_hessian_terms(t_p, om_p, weight, delta_mm, rot_r, "charbonnier")
+        Hu = Hu * unit.view(1, 6, 1) * unit.view(1, 1, 6)
+        for j in range(B - 2):
+            t = j + 1
+            for a, ca in ((-1, -0.5), (0, 1.0), (1, -0.5)):
+                for b, cb in ((-1, -0.5), (0, 1.0), (1, -0.5)):
+                    H_ref[t + a, :, t + b, :] += ca * cb * Hu[j]
+        assert torch.allclose(H_vec, H_ref, atol=1e-6)
+
+        R6 = torch.randn(B, 6, 6, dtype=torch.float32)
+        idx = torch.arange(B)
+        H_sys = H_vec.clone()
+        H_sys[idx, :, idx, :] += R6 @ R6.transpose(1, 2) + 0.1 * torch.eye(6)
+        A = H_sys.reshape(B * 6, B * 6)
+        rhs = torch.randn(B * 6, dtype=torch.float32)
+        sol = _solve_coupled_spd_f32(A, rhs)
+        assert sol.dtype == torch.float32
+        assert float((A @ sol - rhs).norm() / rhs.norm()) < 1e-4
+
 

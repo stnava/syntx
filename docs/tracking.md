@@ -1,12 +1,26 @@
 # Tracking Summary
-current phase: v6.30.2 (robust float64 + MRRR fallback eigensolve for batched Newton 6x6 motion Hessians)
+current phase: v6.30.3 (pure-PyTorch float32 Newton motion-correction compute path & active-frame slicing)
 next WP: a phantom whose jitter is in the images, not the trajectory; per-axis curvature scaling; audit notes 4 to 6; plan steps 3 to 5 (docs/MOTION_NEXT_STEPS_PLAN_2026-10-28.md); eddy covariates for slow-flow encodings
 blockers: none
-active work: R19 below
+active work: R20 below
 device: Apple Silicon MPS / CPU (macOS arm64)
 last updated: 2026-10-29
 
 ---
+
+## R20 (pure-PyTorch float32 Newton motion-correction compute path; v6.30.3, 2026-10-29)
+- **Zero SciPy / float32 `_safe_batched_eigh` + `_torch_jacobi_eigh`**: Replaced the `float64` + `scipy.linalg.eigh` fallback in
+  `motion_batched` with `float32` `torch.linalg.eigh` backed by a 100% pure-PyTorch pre-scaled cyclic Jacobi symmetric eigensolver
+  (`_torch_jacobi_eigh`) in `float32` (`2.7 ms` normal path, `9.1 ms` full-batch Jacobi fallback at `B=750, P=6`).
+- **Pure-PyTorch float32 coupled SPD Cholesky solve (`_solve_coupled_spd_f32`)**: Replaced the `.cpu().double()` `2x`
+  `torch.linalg.solve` (`334.7 ms/iter` at `B=750`) with `float32` `torch.linalg.cholesky_ex` + `torch.cholesky_solve` with
+  scale-relative diagonal jitter escalation (`42.7 ms` at `n_act=750`, `0.68 ms` at `n_act=100`), reusing the undamped solve
+  whenever `lam == 0` across active frames.
+- **Vectorized `surround_prior_hessian_full` & Newton active-frame slicing**: Replaced Python per-frame tensor loops (`8,232`
+  slice ops at `B=750`, `122.8 ms/iter`) with vectorized index tensors (`4.16 ms/iter`, `max_diff=0.0`), eliminated the duplicate
+  coupled base-loss evaluation, and added cached active-frame slicing (`_act_slice_cache`, `loss_active_fn`) for Newton gradient
+  probes and line search (`76 passed` across `test_motion_batched.py` and `test_motion_design.py`, `10 passed` in
+  `test_implementation_standards.py`, `0` findings in `antsxqc.lint`).
 
 ## R19 (safe batched Newton Hessian eigendecomposition; v6.30.2, 2026-10-29)
 - **`_safe_batched_eigh` in `motion_batched._run_converging_stage`**: single-precision CPU `torch.linalg.eigh` (`ssyevd`) raised

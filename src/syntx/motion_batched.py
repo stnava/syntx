@@ -937,68 +937,119 @@ def surround_prior_hessian_full(t_param: torch.Tensor, omega: torch.Tensor, weig
     H = torch.zeros((B, 6, B, 6), **f32)
     if float(shrinkage) > 0.0:
         unit0 = torch.tensor([1.0, 1.0, 1.0, rot_radius_mm, rot_radius_mm, rot_radius_mm], **f32)
-        for b in range(B):
-            H[b, :, b, :] += 2.0 * float(shrinkage) * torch.diag(unit0 * unit0)
+        diag_idx = torch.arange(B, device=t_param.device)
+        H[diag_idx, :, diag_idx, :] += 2.0 * float(shrinkage) * torch.diag(unit0 * unit0)
     if B < 3 or float(weight) <= 0.0:
         return H
     with torch.no_grad():
         Hu = _surround_hessian_terms(t_param, omega, weight, delta_mm, rot_radius_mm, form)
         unit = torch.tensor([1.0, 1.0, 1.0, rot_radius_mm, rot_radius_mm, rot_radius_mm], **f32)
         Hu = Hu * unit.view(1, 6, 1) * unit.view(1, 1, 6)
-        coef = {-1: -0.5, 0: 1.0, 1: -0.5}
-        for j in range(B - 2):
-            t = j + 1
-            for a, ca in coef.items():
-                for b, cb in coef.items():
-                    H[t + a, :, t + b, :] += ca * cb * Hu[j]
+        idx = torch.arange(1, B - 1, device=t_param.device)
+        for a, ca in ((-1, -0.5), (0, 1.0), (1, -0.5)):
+            ia = idx + a
+            for b, cb in ((-1, -0.5), (0, 1.0), (1, -0.5)):
+                H[ia, :, idx + b, :] += (ca * cb) * Hu
     return H
 
 
-def _safe_batched_eigh(Hv: torch.Tensor, dev: torch.device | str) -> Tuple[torch.Tensor, torch.Tensor]:
-    """Batched symmetric eigendecomposition for small (B, P, P) Newton Hessians.
+def _torch_jacobi_eigh(H: torch.Tensor, sweeps: int = 10) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Pure-PyTorch batched cyclic Jacobi symmetric eigensolver for small (B, P, P) float32 Hessians.
 
-    Runs in float64 on CPU (avoiding single-precision LAPACK ``ssyevd`` convergence failure
-    ``error code: 5`` on clustered/repeated eigenvalues seen on inactive or low-curvature
-    BOLD frames) and falls back per-element to SciPy's MRRR ``evr`` / QR ``ev`` drivers if
-    ``dsyevd`` still fails on an individual matrix.
+    Unconditionally convergent on repeated, clustered, or zero eigenvalues where single-precision
+    divide-and-conquer ``ssyevd`` can raise ``error code: 5``. Pre-scales each matrix into ``[-1, 1]``
+    to prevent float32 overflow/underflow and returns ascending ``(eigenvalues, eigenvectors)``.
     """
-    H64 = torch.nan_to_num(Hv.detach().cpu().to(torch.float64), nan=0.0, posinf=0.0, neginf=0.0)
-    H64 = 0.5 * (H64 + H64.transpose(1, 2))
-    try:
-        ev64, Q64 = torch.linalg.eigh(H64)
-    except RuntimeError:
-        import scipy.linalg
+    B_n, P_n, _ = H.shape
+    H_sym = 0.5 * (H + H.transpose(1, 2))
+    if P_n == 1:
+        return H_sym[:, 0, 0].clone(), torch.ones((B_n, 1, 1), dtype=H.dtype, device=H.device)
+    scale = H_sym.abs().amax(dim=(1, 2), keepdim=True)
+    A = torch.where(scale > 0, H_sym / scale.clamp_min(1e-30), torch.zeros_like(H_sym))
+    V = torch.eye(P_n, dtype=H.dtype, device=H.device).unsqueeze(0).expand(B_n, P_n, P_n).clone()
+    pairs = [(p, q) for p in range(P_n) for q in range(p + 1, P_n)]
+    zero = torch.zeros(B_n, dtype=H.dtype, device=H.device)
+    one = torch.ones(B_n, dtype=H.dtype, device=H.device)
+    for _ in range(sweeps):
+        max_off = zero
+        for p, q in pairs:
+            apq = A[:, p, q]
+            abs_apq = apq.abs()
+            max_off = torch.maximum(max_off, abs_apq)
+            app = A[:, p, p]
+            aqq = A[:, q, q]
+            act = abs_apq > 1e-7 * (app.abs() + aqq.abs()).clamp_min(1e-30)
+            if not bool(act.any()):
+                continue
+            diff = aqq - app
+            sgn = torch.where(diff >= 0, one, -one)
+            den = diff.abs() + torch.sqrt(diff * diff + 4.0 * apq * apq)
+            t = torch.where(act, (2.0 * apq * sgn) / den.clamp_min(1e-30), zero)
+            c = torch.rsqrt(1.0 + t * t)
+            s = t * c
+            c1, s1 = c.unsqueeze(1), s.unsqueeze(1)
+            aip = A[:, :, p].clone()
+            aiq = A[:, :, q].clone()
+            A[:, :, p] = c1 * aip - s1 * aiq
+            A[:, :, q] = s1 * aip + c1 * aiq
+            apj = A[:, p, :].clone()
+            aqj = A[:, q, :].clone()
+            A[:, p, :] = c1 * apj - s1 * aqj
+            A[:, q, :] = s1 * apj + c1 * aqj
+            A[:, p, q] = zero
+            A[:, q, p] = zero
+            vip = V[:, :, p].clone()
+            viq = V[:, :, q].clone()
+            V[:, :, p] = c1 * vip - s1 * viq
+            V[:, :, q] = s1 * vip + c1 * viq
+        if float(max_off.max()) < 1e-7:
+            break
+    ev = torch.diagonal(A, dim1=1, dim2=2) * scale.view(B_n, 1)
+    idx = torch.argsort(ev, dim=1)
+    ev = torch.gather(ev, 1, idx)
+    V = torch.gather(V, 2, idx.unsqueeze(1).expand_as(V))
+    return ev, V
 
-        B_n, P_n, _ = H64.shape
-        ev_list: List[torch.Tensor] = []
-        Q_list: List[torch.Tensor] = []
-        for b in range(B_n):
-            Hb = H64[b]
-            try:
-                ev_b, Q_b = torch.linalg.eigh(Hb)
-            except RuntimeError:
-                Hb_np = Hb.numpy()
-                try:
-                    w_np, v_np = scipy.linalg.eigh(Hb_np, driver="evr", check_finite=False)
-                except Exception:
-                    try:
-                        w_np, v_np = scipy.linalg.eigh(Hb_np, driver="ev", check_finite=False)
-                    except Exception:
-                        w_np = np.zeros(P_n, dtype=np.float64)
-                        v_np = np.eye(P_n, dtype=np.float64)
-                ev_b = torch.from_numpy(np.asarray(w_np, dtype=np.float64))
-                Q_b = torch.from_numpy(np.asarray(v_np, dtype=np.float64))
-            ev_list.append(ev_b)
-            Q_list.append(Q_b)
-        ev64 = torch.stack(ev_list, dim=0)
-        Q64 = torch.stack(Q_list, dim=0)
-    return ev64.to(dtype=Hv.dtype, device=dev), Q64.to(dtype=Hv.dtype, device=dev)
+
+def _safe_batched_eigh(Hv: torch.Tensor, dev: torch.device | str) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Pure-PyTorch float32 batched symmetric eigendecomposition for small (B, P, P) Newton Hessians.
+
+    Uses ``torch.linalg.eigh`` in float32 (CPU unified memory when ``Hv`` is on MPS, where
+    ``aten::linalg_eigh`` is not implemented) and falls back to pure-PyTorch ``_torch_jacobi_eigh``
+    in float32 if ``ssyevd`` raises a convergence ``RuntimeError`` on clustered/repeated eigenvalues.
+    """
+    work_dev = "cpu" if Hv.device.type == "mps" else Hv.device
+    work_dtype = Hv.dtype if Hv.dtype in (torch.float32, torch.float64) else torch.float32
+    H32 = torch.nan_to_num(Hv.detach().to(device=work_dev, dtype=work_dtype), nan=0.0, posinf=0.0, neginf=0.0)
+    H32 = 0.5 * (H32 + H32.transpose(1, 2))
+    try:
+        ev, Q = torch.linalg.eigh(H32)
+    except RuntimeError:
+        ev, Q = _torch_jacobi_eigh(H32)
+    return ev.to(dtype=Hv.dtype, device=dev), Q.to(dtype=Hv.dtype, device=dev)
+
+
+def _solve_coupled_spd_f32(Ha: torch.Tensor, rhs: torch.Tensor) -> torch.Tensor:
+    """Solve symmetric positive-definite ``Ha @ x = rhs`` in pure PyTorch float32 using Cholesky
+    factorisation with scale-relative diagonal jitter escalation."""
+    solve_dev = "cpu" if Ha.device.type == "mps" else Ha.device
+    A = torch.nan_to_num(Ha.to(device=solve_dev, dtype=torch.float32), nan=0.0, posinf=0.0, neginf=0.0)
+    A = 0.5 * (A + A.T)
+    b = torch.nan_to_num(rhs.to(device=solve_dev, dtype=torch.float32), nan=0.0, posinf=0.0, neginf=0.0)
+    n = int(A.shape[0])
+    diag_scale = float(torch.diagonal(A).abs().mean().clamp_min(1e-12))
+    eye_n = torch.eye(n, dtype=torch.float32, device=solve_dev)
+    for rel_jit in (1e-7, 1e-6, 1e-5, 1e-4, 1e-3):
+        L, info = torch.linalg.cholesky_ex(A + (rel_jit * diag_scale) * eye_n)
+        if int(info.item()) == 0:
+            return torch.cholesky_solve(b.unsqueeze(1), L).squeeze(1)
+    return torch.linalg.solve(A + (1e-2 * diag_scale) * eye_n, b)
 
 
 def _run_converging_stage(*, optimizer, params, per_frame_params, loss_fn, points_fn, iters, B, dev, tol, max_extend,
                           lr_groups=None, lr_t=None, lr_r=0.0, point_radius=0.0, probe_fn=None, confirm_vox=None, axes=None, stage_voxel=None,
                           max_step_vox=1.0, label="", level=1, shared_params=None, reg_loss_fn=None, resample_fn=None,
-                          reg_hess_fn=None, reg_frame_fn=None, reg_hess_full_fn=None):
+                          reg_hess_fn=None, reg_frame_fn=None, reg_hess_full_fn=None, loss_active_fn=None):
     """One optimiser stage that ends when every frame has CONVERGED, not when an iteration count is spent.
 
     ``loss_fn()`` returns the (B,) per-frame loss; ``points_fn()`` the (B, S, 3) physical positions of a fixed subset of the
@@ -1087,10 +1138,16 @@ def _run_converging_stage(*, optimizer, params, per_frame_params, loss_fn, point
         for ax in axes:
             if not any(ax.tensor is lf for lf in leaves):
                 leaves.append(ax.tensor)
+        act = torch.nonzero(tracker.active).flatten()
+
+        def _loss_act():
+            if loss_active_fn is not None:
+                return loss_active_fn(act)
+            return loss_fn().index_select(0, act)
 
         def _grad_param(include_reg=True):
             with torch.enable_grad():
-                total = loss_fn()[tracker.active].sum()
+                total = _loss_act().sum()
                 if include_reg and reg_loss_fn is not None:
                     total = total + reg_loss_fn()
                 gs = torch.autograd.grad(total, leaves, allow_unused=True)
@@ -1122,12 +1179,11 @@ def _run_converging_stage(*, optimizer, params, per_frame_params, loss_fn, point
                 _shift(a, +d)
                 H_par[:, :, a] = (gp - gm) / (2.0 * d)
             H_par = 0.5 * (H_par + H_par.transpose(1, 2))
-            H_img_par = H_par
             if reg_hess_fn is not None and reg_hess_full_fn is None:
                 H_par = H_par + reg_hess_fn()
             Gv = g_par * to_vox
             Hv = H_par * to_vox.view(1, P, 1) * to_vox.view(1, 1, P)
-            ev, Q = _safe_batched_eigh(Hv, dev)   # B x 6 x 6: float64 + MRRR fallback avoids float32 ssyevd error 5
+            ev, Q = _safe_batched_eigh(Hv, dev)   # pure-PyTorch float32 eigh + cyclic Jacobi fallback
             floor = 1e-3 * ev.abs().max(dim=1, keepdim=True).values.clamp_min(1e-12)
             inv = 1.0 / (torch.maximum(ev.abs(), floor) + lam.unsqueeze(1))
             inv0 = 1.0 / torch.maximum(ev.abs(), floor)                   # undamped: the convergence test must not see the damping
@@ -1136,22 +1192,26 @@ def _run_converging_stage(*, optimizer, params, per_frame_params, loss_fn, point
                 dv0 = -(Q @ (inv0 * (Q.transpose(1, 2) @ Gv.unsqueeze(-1)).squeeze(-1)).unsqueeze(-1)).squeeze(-1)
             else:
                 # coupled Newton step: the image Hessian per frame (saddle-free, damped) on the block diagonal, the prior's
-                # full block-tridiagonal Hessian between frames (added ONCE); solved over the ACTIVE frames (frozen ones fixed)
-                Hv_img = Q @ torch.diag_embed(torch.maximum(ev.abs(), floor) + lam.unsqueeze(1)) @ Q.transpose(1, 2)
+                # full block-pentadiagonal Hessian between frames (added ONCE); solved in pure PyTorch float32 over ACTIVE frames
                 Hv_img0 = Q @ torch.diag_embed(torch.maximum(ev.abs(), floor)) @ Q.transpose(1, 2)
                 Hp = reg_hess_full_fn() * to_vox.view(1, P, 1, 1) * to_vox.view(1, 1, 1, P)       # (B,P,B,P) voxel units
-                Hfull = Hp.clone(); Hfull0 = Hp.clone()
-                for b in range(B):
-                    Hfull[b, :, b, :] = Hfull[b, :, b, :] + Hv_img[b]
-                    Hfull0[b, :, b, :] = Hfull0[b, :, b, :] + Hv_img0[b]
-                act = torch.nonzero(tracker.active).flatten()
                 dv = torch.zeros(B, P, device=dev); dv0 = torch.zeros(B, P, device=dev)
-                if act.numel() > 0:
-                    ga = Gv[act].reshape(-1).cpu().double()
-                    for Hsrc, target in ((Hfull, dv), (Hfull0, dv0)):
-                        Ha = Hsrc[act][:, :, act, :].reshape(act.numel() * P, act.numel() * P).cpu().double()
-                        sol = torch.linalg.solve(Ha + 1e-9 * torch.eye(Ha.shape[0], dtype=Ha.dtype), -ga).float().view(act.numel(), P)
-                        target[act] = sol.to(dev)
+                n_act = int(act.numel())
+                if n_act > 0:
+                    idx_a = torch.arange(n_act, device=dev)
+                    Hp_act = Hp.index_select(0, act).index_select(2, act)
+                    neg_ga = -Gv.index_select(0, act).reshape(-1)
+                    H0_act = Hp_act.clone()
+                    H0_act[idx_a, :, idx_a, :] += Hv_img0.index_select(0, act)
+                    sol0 = _solve_coupled_spd_f32(H0_act.reshape(n_act * P, n_act * P), neg_ga).view(n_act, P).to(dtype=dv0.dtype, device=dev)
+                    dv0[act] = sol0
+                    if bool((lam.index_select(0, act) > 0).any()):
+                        Hv_img = Q @ torch.diag_embed(torch.maximum(ev.abs(), floor) + lam.unsqueeze(1)) @ Q.transpose(1, 2)
+                        Hp_act[idx_a, :, idx_a, :] += Hv_img.index_select(0, act)
+                        sol = _solve_coupled_spd_f32(Hp_act.reshape(n_act * P, n_act * P), neg_ga).view(n_act, P).to(dtype=dv.dtype, device=dev)
+                        dv[act] = sol
+                    else:
+                        dv[act] = sol0
             # convergence is judged on the UNDAMPED Newton step (the remaining distance to the optimum to second order); the
             # damped step shrinks with every rejected line search and would declare a stuck frame converged (audit 2026-10-28)
             remaining = dv0.abs().max(dim=1).values
@@ -1159,31 +1219,37 @@ def _run_converging_stage(*, optimizer, params, per_frame_params, loss_fn, point
             done_now = tracker.active & (remaining <= confirm_vox)
             if bool(done_now.any()):          # the Newton step is its own evidence of convergence: no extra probe
                 tracker.active = tracker.active & ~done_now
+                act = torch.nonzero(tracker.active).flatten()
             if tracker.all_converged:
                 done += 1
                 break
             dv = dv * torch.clamp(trust.unsqueeze(1) / dv.norm(dim=1, keepdim=True).clamp_min(1e-12), max=1.0) * tracker.active.unsqueeze(1).float()
             with torch.no_grad():
                 base = [ax.tensor[ax.index].clone() for ax in axes]
-                _f_frame = (lambda: loss_fn().detach() + reg_frame_fn()) if reg_frame_fn is not None else (lambda: loss_fn().detach())
-                f0 = _f_frame()
-                best_f, best_a = f0.clone(), torch.zeros(B, device=dev)
                 coupled = reg_hess_full_fn is not None
-                tot0 = float(loss_fn().detach()[tracker.active].sum() + reg_loss_fn().detach()) if coupled else None
-                best_tot, best_alpha = tot0, 0.0
+                best_a = torch.zeros(B, device=dev)
+                if coupled:
+                    tot0 = float(_loss_act().detach().sum() + reg_loss_fn().detach())
+                    best_tot, best_alpha = tot0, 0.0
+                else:
+                    best_f_act = _loss_act().detach()
+                    if reg_frame_fn is not None:
+                        best_f_act = best_f_act + reg_frame_fn().index_select(0, act)
                 for alpha in (1.0, 0.5, 0.25, 0.1):
                     for k, ax in enumerate(axes):
                         ax.tensor[ax.index] = base[k] + alpha * dv[:, k] * to_vox[k]   # voxels of displacement -> parameter units (dp = dv * dparam/dvox)
                     if coupled:
                         # one objective, one line search: the frames' steps are a joint step of the coupled system
-                        tot = float(loss_fn().detach()[tracker.active].sum() + reg_loss_fn().detach())
+                        tot = float(_loss_act().detach().sum() + reg_loss_fn().detach())
                         if tot < best_tot:
                             best_tot, best_alpha = tot, alpha
                         continue
-                    f = _f_frame()
-                    better = tracker.active & (f < best_f)
-                    best_f = torch.where(better, f, best_f)
-                    best_a = torch.where(better, torch.full_like(best_a, alpha), best_a)
+                    f_act = _loss_act().detach()
+                    if reg_frame_fn is not None:
+                        f_act = f_act + reg_frame_fn().index_select(0, act)
+                    better_act = f_act < best_f_act
+                    best_f_act = torch.where(better_act, f_act, best_f_act)
+                    best_a[act] = torch.where(better_act, torch.full_like(best_f_act, alpha), best_a.index_select(0, act))
                 if coupled:
                     best_a = torch.where(tracker.active, torch.full_like(best_a, best_alpha), best_a)
                 moved = best_a > 0
@@ -1850,10 +1916,11 @@ def _batched_rigid_register_pass_core(
         hi = float(fixed_t.max())
         hi_b = None
 
-    def _scale(vals, per_frame_rows):
-        """[-1, 1] intensity scaling; ``vals`` (B, S) per frame or (S,) shared; the per-frame range when available."""
+    def _scale(vals, per_frame_rows, active_idx=None):
+        """[-1, 1] intensity scaling; ``vals`` (B_cur, S) per frame or (S,) shared; the per-frame range when available."""
         if hi_b is not None and per_frame_rows:
-            return (vals - lo) / (hi_b.unsqueeze(1) - lo + 1e-8) * 2.0 - 1.0
+            hb = hi_b if active_idx is None else hi_b.index_select(0, active_idx)
+            return (vals - lo) / (hb.unsqueeze(1) - lo + 1e-8) * 2.0 - 1.0
         return (vals - lo) / (hi - lo + 1e-8) * 2.0 - 1.0
 
     _warp_cache = {}
@@ -2302,27 +2369,53 @@ def _batched_rigid_register_pass_core(
             gain_t.copy_(g)
             gain_log.append(g.detach().cpu().numpy().astype(float).tolist())
 
-    def _warped_values(X_stage, moving_tensor, shape_stage, level_stage=1):
-        """Intensities (B, S) of every frame at the physical points ``X_stage`` under the current total pose (and eddy
-        term), from the moving tensor of pyramid ``level_stage``: the one warp the metric and the design model share.
-        With ``frame_gain`` the frame's global gain is applied here."""
+    _act_slice_cache: dict = {"key": None, "act_ref": None, "mov": None, "grad": None}
+
+    def _warped_values(X_stage, moving_tensor, shape_stage, level_stage=1, active_idx=None):
+        """Intensities (B_cur, S) of every (or ``active_idx``) frame at the physical points ``X_stage`` under the current
+        total pose (and eddy term), from the moving tensor of pyramid ``level_stage``: the one warp the metric and the
+        design model share. With ``frame_gain`` the frame's global gain is applied here."""
+        use_sub = active_idx is not None and int(active_idx.numel()) < B
         t_eff, om_eff = _total_pose()
+        if use_sub:
+            t_eff = t_eff.index_select(0, active_idx)
+            om_eff = om_eff.index_select(0, active_idx)
+        n_cur = int(t_eff.shape[0])
+        if n_cur == 0:
+            return t_eff.new_zeros((0, int(X_stage.shape[0])))
         R = _batched_rodrigues(om_eff)
         Xc = X_stage - C_phys
         y_phys = torch.einsum("bij,sj->bsi", R, Xc) + C_phys + t_eff.unsqueeze(1)
         if pe_on:
             a_pe, jac_pe = pe_terms()
+            if use_sub:
+                a_pe = a_pe.index_select(0, active_idx)
+                jac_pe = jac_pe.index_select(0, active_idx)
             y_phys = apply_pe(y_phys, a_pe)
         grid_norm = warp_to_moving_norm(y_phys, shape_stage, level=level_stage)
-        grid = grid_norm.view(B, 1, 1, -1, 3)
-        warped = grid_sample_nd(moving_tensor.unsqueeze(1), grid, mode="bilinear",
+        grid = grid_norm.view(n_cur, 1, 1, -1, 3)
+        grad_full = get_grad_I(moving_tensor)
+        if use_sub:
+            ckey = (id(moving_tensor), id(active_idx))
+            if _act_slice_cache["key"] != ckey:
+                _act_slice_cache["key"] = ckey
+                _act_slice_cache["act_ref"] = active_idx
+                _act_slice_cache["mov"] = moving_tensor.index_select(0, active_idx).unsqueeze(1)
+                _act_slice_cache["grad"] = None if grad_full is None else grad_full.index_select(0, active_idx)
+            mov_in = _act_slice_cache["mov"]
+            grad_in = _act_slice_cache["grad"]
+        else:
+            mov_in = moving_tensor.unsqueeze(1)
+            grad_in = grad_full
+        warped = grid_sample_nd(mov_in, grid, mode="bilinear",
                                  padding_mode="zeros", align_corners=True,
                                  interpolator="linear", use_analytical_gradients=True,
-                                 precomputed_grad_I=get_grad_I(moving_tensor)).reshape(B, -1)
+                                 precomputed_grad_I=grad_in).reshape(n_cur, -1)
         if pe_on:
             warped = warped * jac_pe.unsqueeze(1)
         if frame_gain:
-            warped = warped * gain_t.unsqueeze(1)
+            gt = gain_t.index_select(0, active_idx) if use_sub else gain_t
+            warped = warped * gt.unsqueeze(1)
         return warped
 
     # Design-model references (``design_matrix``, the ``projected`` engine): at every point the reference of frame t is the
@@ -2364,17 +2457,32 @@ def _batched_rigid_register_pass_core(
             design_model["refreshes"] += 1
 
     def compute_loss(X_stage, w_y_stage, moving_tensor, shape_stage, level_stage=1,
-                      fixed_vals_stage=None, corr_weight=0.0, fixed_tensor=None, w_pts=None):
-        warped = _warped_values(X_stage, moving_tensor, shape_stage, level_stage)
+                      fixed_vals_stage=None, corr_weight=0.0, fixed_tensor=None, w_pts=None, active_idx=None):
+        if active_idx is not None and design_model is not None and design_model.get("live"):
+            return compute_loss(X_stage, w_y_stage, moving_tensor, shape_stage, level_stage=level_stage,
+                                fixed_vals_stage=fixed_vals_stage, corr_weight=corr_weight,
+                                fixed_tensor=fixed_tensor, w_pts=w_pts, active_idx=None).index_select(0, active_idx)
+        if active_idx is not None and int(active_idx.numel()) == 0:
+            return t_param.new_zeros((0,))
+        use_sub = active_idx is not None and int(active_idx.numel()) < B
+        sub_idx = active_idx if use_sub else None
+        warped = _warped_values(X_stage, moving_tensor, shape_stage, level_stage, active_idx=sub_idx)
+        n_cur = int(warped.shape[0])
         if design_model is not None and design_model.get("live"):
             # the profile likelihood: the design model is re-fitted to the CURRENT warped values inside the loss, so a pose
             # change that the design explains (a constant offset of one level, a term in g) costs nothing and the head
             # prior resolves it; the gradient flows through the fit. The Newton stage holds the model fixed instead
             # (refreshed before every iteration): its per-frame Hessian must not see the frames' coupling through the fit.
             fixed_vals_stage = design_model["P"] @ warped
-        w_scaled = _scale(warped, True)
+        elif use_sub and fixed_vals_stage is not None and fixed_vals_stage.dim() == 2:
+            fixed_vals_stage = fixed_vals_stage.index_select(0, active_idx)
+        if use_sub and w_pts is not None:
+            w_pts = w_pts.index_select(0, active_idx)
+        if use_sub and w_y_stage is not None and w_y_stage.dim() == 3:
+            w_y_stage = w_y_stage.index_select(0, active_idx)
+        w_scaled = _scale(warped, True, active_idx=sub_idx)
         if metric == "huber":
-            fixed_scaled_stage = _scale(fixed_vals_stage, fixed_vals_stage.dim() == 2)
+            fixed_scaled_stage = _scale(fixed_vals_stage, fixed_vals_stage.dim() == 2, active_idx=sub_idx)
             target = fixed_scaled_stage if fixed_scaled_stage.dim() == 2 else fixed_scaled_stage.unsqueeze(0).expand_as(w_scaled)
             elem = huber_loss_nd(w_scaled, target, delta=huber_delta, reduction="none")
             if w_pts is None:
@@ -2387,7 +2495,7 @@ def _batched_rigid_register_pass_core(
                 # weighted joint histogram: each point enters with its frame's weight (sqrt on each factor)
                 sw = torch.sqrt(w_pts).unsqueeze(-1)
                 w_x = w_x * sw
-                w_y_stage = (w_y_stage if w_y_stage.dim() == 3 else w_y_stage.unsqueeze(0).expand(B, -1, -1)) * sw
+                w_y_stage = (w_y_stage if w_y_stage.dim() == 3 else w_y_stage.unsqueeze(0).expand(n_cur, -1, -1)) * sw
             per_frame_loss = batched_mattes_mi_from_weights(w_x, w_y_stage)
         if corr_weight > 0.0 and fixed_vals_stage is not None:
             per_frame_loss = per_frame_loss + corr_weight * pearson_correlation_loss(warped, fixed_vals_stage)
@@ -2492,6 +2600,10 @@ def _batched_rigid_register_pass_core(
             loss_fn=lambda: compute_loss(cur["X"], cur["w_y"], moving_tensor, shape_stage, level_stage=level,
                                          fixed_vals_stage=cur["fixed_vals"], corr_weight=corr_weight,
                                          fixed_tensor=lvl_data["fixed_tensor"], w_pts=cur["w_pts"]),
+            loss_active_fn=lambda act: compute_loss(cur["X"], cur["w_y"], moving_tensor, shape_stage, level_stage=level,
+                                                    fixed_vals_stage=cur["fixed_vals"], corr_weight=corr_weight,
+                                                    fixed_tensor=lvl_data["fixed_tensor"], w_pts=cur["w_pts"],
+                                                    active_idx=act),
             resample_fn=resample_fn,
             points_fn=stage_points, iters=int(stage["iters"]), B=B, dev=dev,
             tol=float(convergence_tol_vox) * stage_voxel, max_extend=int(max_extend_factor),
@@ -2508,6 +2620,7 @@ def _batched_rigid_register_pass_core(
             reg_hess_fn=(lambda: _surround_reg_hess(probe_axes)) if prior_stage else None,
             reg_hess_full_fn=(lambda: _surround_reg_hess_full(probe_axes)) if prior_stage else None,
             reg_frame_fn=_surround_frame_terms if prior_stage else None)
+        _act_slice_cache.update(key=None, act_ref=None, mov=None, grad=None)
         _project_encoding_gauge()
         _project_level_gauge()
         convergence_log.append(rec)
