@@ -954,6 +954,47 @@ def surround_prior_hessian_full(t_param: torch.Tensor, omega: torch.Tensor, weig
     return H
 
 
+def _safe_batched_eigh(Hv: torch.Tensor, dev: torch.device | str) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Batched symmetric eigendecomposition for small (B, P, P) Newton Hessians.
+
+    Runs in float64 on CPU (avoiding single-precision LAPACK ``ssyevd`` convergence failure
+    ``error code: 5`` on clustered/repeated eigenvalues seen on inactive or low-curvature
+    BOLD frames) and falls back per-element to SciPy's MRRR ``evr`` / QR ``ev`` drivers if
+    ``dsyevd`` still fails on an individual matrix.
+    """
+    H64 = torch.nan_to_num(Hv.detach().cpu().to(torch.float64), nan=0.0, posinf=0.0, neginf=0.0)
+    H64 = 0.5 * (H64 + H64.transpose(1, 2))
+    try:
+        ev64, Q64 = torch.linalg.eigh(H64)
+    except RuntimeError:
+        import scipy.linalg
+
+        B_n, P_n, _ = H64.shape
+        ev_list: List[torch.Tensor] = []
+        Q_list: List[torch.Tensor] = []
+        for b in range(B_n):
+            Hb = H64[b]
+            try:
+                ev_b, Q_b = torch.linalg.eigh(Hb)
+            except RuntimeError:
+                Hb_np = Hb.numpy()
+                try:
+                    w_np, v_np = scipy.linalg.eigh(Hb_np, driver="evr", check_finite=False)
+                except Exception:
+                    try:
+                        w_np, v_np = scipy.linalg.eigh(Hb_np, driver="ev", check_finite=False)
+                    except Exception:
+                        w_np = np.zeros(P_n, dtype=np.float64)
+                        v_np = np.eye(P_n, dtype=np.float64)
+                ev_b = torch.from_numpy(np.asarray(w_np, dtype=np.float64))
+                Q_b = torch.from_numpy(np.asarray(v_np, dtype=np.float64))
+            ev_list.append(ev_b)
+            Q_list.append(Q_b)
+        ev64 = torch.stack(ev_list, dim=0)
+        Q64 = torch.stack(Q_list, dim=0)
+    return ev64.to(dtype=Hv.dtype, device=dev), Q64.to(dtype=Hv.dtype, device=dev)
+
+
 def _run_converging_stage(*, optimizer, params, per_frame_params, loss_fn, points_fn, iters, B, dev, tol, max_extend,
                           lr_groups=None, lr_t=None, lr_r=0.0, point_radius=0.0, probe_fn=None, confirm_vox=None, axes=None, stage_voxel=None,
                           max_step_vox=1.0, label="", level=1, shared_params=None, reg_loss_fn=None, resample_fn=None,
@@ -1086,7 +1127,7 @@ def _run_converging_stage(*, optimizer, params, per_frame_params, loss_fn, point
                 H_par = H_par + reg_hess_fn()
             Gv = g_par * to_vox
             Hv = H_par * to_vox.view(1, P, 1) * to_vox.view(1, 1, P)
-            ev, Q = (t.to(dev) for t in torch.linalg.eigh(Hv.detach().cpu()))   # B x 6 x 6: eigh is not implemented on MPS, and is tiny
+            ev, Q = _safe_batched_eigh(Hv, dev)   # B x 6 x 6: float64 + MRRR fallback avoids float32 ssyevd error 5
             floor = 1e-3 * ev.abs().max(dim=1, keepdim=True).values.clamp_min(1e-12)
             inv = 1.0 / (torch.maximum(ev.abs(), floor) + lam.unsqueeze(1))
             inv0 = 1.0 / torch.maximum(ev.abs(), floor)                   # undamped: the convergence test must not see the damping

@@ -1,12 +1,21 @@
 # Tracking Summary
-current phase: v6.30.1 (Newton Levenberg-Marquardt damping clamp and stagnation guard in motion_batched)
+current phase: v6.30.2 (robust float64 + MRRR fallback eigensolve for batched Newton 6x6 motion Hessians)
 next WP: a phantom whose jitter is in the images, not the trajectory; per-axis curvature scaling; audit notes 4 to 6; plan steps 3 to 5 (docs/MOTION_NEXT_STEPS_PLAN_2026-10-28.md); eddy covariates for slow-flow encodings
 blockers: none
-active work: R18 below
+active work: R19 below
 device: Apple Silicon MPS / CPU (macOS arm64)
-last updated: 2026-10-28
+last updated: 2026-10-29
 
 ---
+
+## R19 (safe batched Newton Hessian eigendecomposition; v6.30.2, 2026-10-29)
+- **`_safe_batched_eigh` in `motion_batched._run_converging_stage`**: single-precision CPU `torch.linalg.eigh` (`ssyevd`) raised
+  `torch._C._LinAlgError: linalg.eigh: (Batch element 8): The algorithm failed to converge because the input matrix is
+  ill-conditioned or has too many repeated eigenvalues (error code: 5)` on 5 of 18 real cohort BOLD (`rsfMRI`) runs when inactive
+  or low-curvature frames produced clustered/repeated 6x6 Hessian eigenvalues in `float32`. `_safe_batched_eigh` sanitizes
+  non-finite entries, symmetrizes in `float64` (`dsyevd`), and falls back per-element to `scipy.linalg.eigh(..., driver="evr")`
+  (MRRR) / `"ev"` (QR) / `(0, I)` if needed before casting back to `Hv.dtype` on `dev`. Covered by `TestSafeBatchedEigh` in
+  `tests/test_motion_batched.py`.
 
 ## R18 (Newton Levenberg-Marquardt damping clamp and stagnation guard; v6.30.1, 2026-10-28)
 - **`motion_batched._run_converging_stage`**: When coupled Newton (`iters=20, max_extend=4`, 80 calls) encountered 65+ consecutive

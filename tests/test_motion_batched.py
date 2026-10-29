@@ -470,3 +470,63 @@ class TestSamplePointsOffVoxelCentres:
         rms = float(np.sqrt(np.mean(np.square(errs_alone))))
         # 0.58 mm on the voxel-centre sampling this guards against, 0.22 mm (the synthetic noise floor) with the fix
         assert rms < 0.35, f"still noisy pair registered {rms:.3f} mm away from the identity ({errs_alone})"
+
+
+class TestSafeBatchedEigh:
+    """Regression guard for ``torch._C._LinAlgError: linalg.eigh: (Batch element k): error code: 5``
+    observed on 5/18 ExpArt rsfMRI sessions in single-precision LAPACK ``ssyevd`` when finite-difference
+    6x6 frame Hessians had repeated/clustered eigenvalues."""
+
+    def test_repeated_eigenvalues_and_nonfinite_entries(self):
+        import torch
+        from syntx.motion_batched import _safe_batched_eigh
+
+        B, P = 12, 6
+        H = torch.zeros(B, P, P, dtype=torch.float32)
+        H[1] = 3.5 * torch.eye(P)
+        rng = np.random.default_rng(42)
+        q, _ = np.linalg.qr(rng.normal(size=(P, P)))
+        q_t = torch.from_numpy(q.astype(np.float32))
+        # Clustered eigenvalues that stress single-precision ssyevd deflation
+        evals_clustered = torch.tensor([1.0, 1.0 + 1e-7, 1.0 - 1e-7, 2.0, 2.0 + 1e-7, 0.0], dtype=torch.float32)
+        H[8] = q_t @ torch.diag(evals_clustered) @ q_t.T
+        H[9, 0, 1] = float("nan")
+        H[9, 2, 2] = float("inf")
+
+        ev, Q = _safe_batched_eigh(H, dev="cpu")
+        assert ev.shape == (B, P) and Q.shape == (B, P, P)
+        assert ev.dtype == torch.float32 and Q.dtype == torch.float32
+        assert torch.isfinite(ev).all() and torch.isfinite(Q).all()
+        recon = Q[8] @ torch.diag(ev[8]) @ Q[8].T
+        sym8 = 0.5 * (H[8] + H[8].T)
+        assert torch.allclose(recon, sym8, atol=1e-5)
+
+    def test_fallback_when_torch_eigh_raises_linalg_error(self, monkeypatch):
+        import torch
+        from syntx.motion_batched import _safe_batched_eigh
+
+        orig_eigh = torch.linalg.eigh
+        calls = {"batched": 0, "elem": 0}
+
+        def flaky_eigh(A, *args, **kwargs):
+            if A.ndim == 3:
+                calls["batched"] += 1
+                raise RuntimeError("linalg.eigh: (Batch element 2): error code: 5")
+            calls["elem"] += 1
+            if calls["elem"] == 3:
+                raise RuntimeError("linalg.eigh: simulated element failure")
+            return orig_eigh(A, *args, **kwargs)
+
+        monkeypatch.setattr(torch.linalg, "eigh", flaky_eigh)
+        rng = np.random.default_rng(7)
+        M = rng.normal(size=(4, 6, 6)).astype(np.float32)
+        H = torch.from_numpy(0.5 * (M + np.swapaxes(M, 1, 2)))
+        ev, Q = _safe_batched_eigh(H, dev="cpu")
+        assert calls["batched"] == 1
+        assert calls["elem"] == 4
+        assert torch.isfinite(ev).all() and torch.isfinite(Q).all()
+        for b in range(4):
+            recon = Q[b] @ torch.diag(ev[b]) @ Q[b].T
+            assert torch.allclose(recon, H[b], atol=1e-4)
+            assert torch.allclose(Q[b].T @ Q[b], torch.eye(6), atol=1e-4)
+
