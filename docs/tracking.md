@@ -1,12 +1,33 @@
 # Tracking Summary
-current phase: v6.30.3 (pure-PyTorch float32 Newton motion-correction compute path & active-frame slicing)
+current phase: v6.30.4 (pure-PyTorch float32 batched 4D motion & order-3 B-spline resampling)
 next WP: a phantom whose jitter is in the images, not the trajectory; per-axis curvature scaling; audit notes 4 to 6; plan steps 3 to 5 (docs/MOTION_NEXT_STEPS_PLAN_2026-10-28.md); eddy covariates for slow-flow encodings
 blockers: none
-active work: R20 below
+active work: R21 below
 device: Apple Silicon MPS / CPU (macOS arm64)
 last updated: 2026-10-29
 
 ---
+
+## R21 (pure-PyTorch float32 batched 4D motion & order-3 B-spline resampling; v6.30.4, 2026-10-29)
+- **Pure-PyTorch `float32` ITK-matching order-3 B-spline interpolation (`transforms._bspline_prefilter_and_pad_5d` + `_sample_bspline_padded_5d`)**:
+  Previously, `interpolator="bSpline"` (default of `DWI_MOTION_PRESET` and `antsxdwi` topup+motion resampling) fell back to sequential
+  per-volume C++ CPU `ants.apply_transforms`. Implemented exact 1D tridiagonal cardinal B-spline prefiltering + 2-voxel mirror padding +
+  Sigg-Hadwiger 8-tap trilinear `F.grid_sample` in pure PyTorch `float32` across `TransformChain.apply`, `_apply_timeseries_4d`, and
+  `resample_series` (`15.12 s` -> `2.90 s`, `5.21x` faster on 100-volume `140x140x104` DWI warp+motion `resample_series` on MPS).
+- **Eliminated per-frame resampling & C/Fortran transpose loops across `motion`, `motion_reference`, `motion_design`, and `transforms`**:
+  Generalized `resample_series` to `field_path=None` + `volume_scales` with a direct `F.affine_grid` `3x4` fast-path and zero-copy
+  Fortran `.T` memory layout (avoiding multi-GB C<->Fortran transposes in `ants.from_numpy`); replaced per-frame `_apply_transforms`,
+  `ants.slice_image`, and `ants.list_to_ndimage` loops in `motion._run_pass`, `motion_reference` (`_register_group_backward`,
+  `build_low_motion_reference`, `motion_correct_grouped`), and `motion_design._joint`; cached MPS grid-scale tensors in
+  `AnalyticalGridSample.backward` and foreground-masked `calculate_dvars` before `np.diff`.
+- **Real-data end-to-end speedup & fidelity (`v6.30.2` -> `v6.30.4` on `ExpArt sub-EAS003 ses-01`, MPS)**:
+  - 100-frame 1.5 mm DWI (`motion_correct_design("shells", engine="joint")`): `94.61 s` -> `44.01 s` (`2.15x` faster, `-53.5%`;
+    non-solver resampling `35.94 s` -> `11.89 s`, `3.02x` faster; median `|dt| = 0.132 mm`, FD `r = 0.990`, tSNR `1.886` vs `1.885`).
+  - 750-frame 2.0 mm rsfMRI BOLD (`motion_correct_design("none", engine="joint", tr=0.8)`): `121.39 s` -> `87.68 s` (`1.38x` faster,
+    `-27.8%`; non-solver resampling `20.85 s` -> `10.56 s`, `1.97x` faster; bit-identical poses `|dt| = 0.00000 mm`, FD `r = 1.000000`,
+    tSNR `8.090`).
+  - `171 passed` across `syntx` motion/transforms/standards suites, `29 passed` in `antsxfunctional` motion tests, `0` findings in
+    `antsxqc.lint`.
 
 ## R20 (pure-PyTorch float32 Newton motion-correction compute path; v6.30.3, 2026-10-29)
 - **Zero SciPy / float32 `_safe_batched_eigh` + `_torch_jacobi_eigh`**: Replaced the `float64` + `scipy.linalg.eigh` fallback in

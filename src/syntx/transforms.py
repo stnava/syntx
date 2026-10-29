@@ -325,6 +325,8 @@ class TransformChain:
             mode = "nearest"
         elif interp_lower in ("genericlabel", "multilabel"):
             mode = "genericlabel"
+        elif interp_lower == "bspline":
+            mode = "bspline"
         else:
             return _ants_path()
 
@@ -385,6 +387,123 @@ class TransformChain:
 _DISP_FIELD_CACHE: dict[tuple[str, float, str], Any] = {}
 _DISP_GRAD_CACHE: dict[tuple[str, float, str], Any] = {}
 _MAPPED_GRID_CACHE: dict[tuple[Any, ...], Any] = {}
+_BSPLINE_PREFILTER_CACHE: dict[tuple[int, str, torch.dtype], torch.Tensor] = {}
+
+
+def _bspline_prefilter_1d_matrix(
+    n: int, target_dev: torch.device, dtype: torch.dtype = torch.float32
+) -> torch.Tensor:
+    """Exact 1D cubic B-spline decomposition operator (whole-sample mirror boundary, matching ITK)."""
+    key = (int(n), str(target_dev), dtype)
+    cached = _BSPLINE_PREFILTER_CACHE.get(key)
+    if cached is not None:
+        return cached
+    if n <= 1:
+        mat = torch.ones((max(1, n), max(1, n)), device=target_dev, dtype=dtype)
+    else:
+        a_mat = torch.zeros((n, n), dtype=torch.float32)
+        idx = torch.arange(n)
+        a_mat[idx, idx] = 4.0 / 6.0
+        a_mat[idx[:-1], idx[1:]] = 1.0 / 6.0
+        a_mat[idx[1:], idx[:-1]] = 1.0 / 6.0
+        a_mat[0, 1] = 2.0 / 6.0
+        a_mat[-1, -2] = 2.0 / 6.0
+        mat = torch.linalg.inv(a_mat).to(device=target_dev, dtype=dtype)
+    if len(_BSPLINE_PREFILTER_CACHE) >= 64:
+        _BSPLINE_PREFILTER_CACHE.pop(next(iter(_BSPLINE_PREFILTER_CACHE)))
+    _BSPLINE_PREFILTER_CACHE[key] = mat
+    return mat
+
+
+def _mirror_idx_1d(k: int, n: int) -> int:
+    if n <= 1:
+        return 0
+    period = 2 * (n - 1)
+    m = abs(k) % period
+    return m if m < n else period - m
+
+
+_MIRROR_PAD_IDX_CACHE: dict[tuple[int, str], torch.Tensor] = {}
+
+
+def _pad_mirror_2_3d(x: torch.Tensor) -> torch.Tensor:
+    """Pad a 5D ``(B, C, Z, Y, X)`` tensor by 2 whole-sample mirror voxels per spatial side."""
+    dev_str = str(x.device)
+    for dim in (2, 3, 4):
+        n = int(x.shape[dim])
+        key = (n, dev_str)
+        idx_t = _MIRROR_PAD_IDX_CACHE.get(key)
+        if idx_t is None:
+            indices = [
+                _mirror_idx_1d(-2, n),
+                _mirror_idx_1d(-1, n),
+                *range(n),
+                _mirror_idx_1d(n, n),
+                _mirror_idx_1d(n + 1, n),
+            ]
+            idx_t = torch.tensor(indices, device=x.device, dtype=torch.long)
+            _MIRROR_PAD_IDX_CACHE[key] = idx_t
+        x = x.index_select(dim, idx_t)
+    return x.contiguous()
+
+
+def _bspline_prefilter_and_pad_5d(t_bcdhw: torch.Tensor) -> torch.Tensor:
+    """Compute cubic B-spline coefficients on ``(B, C, Z, Y, X)`` and mirror-pad by 2 voxels."""
+    tgt_dev = t_bcdhw.device
+    dt = t_bcdhw.dtype
+    nz, ny, nx = int(t_bcdhw.shape[2]), int(t_bcdhw.shape[3]), int(t_bcdhw.shape[4])
+    px = _bspline_prefilter_1d_matrix(nx, tgt_dev, dt)
+    py = _bspline_prefilter_1d_matrix(ny, tgt_dev, dt)
+    pz = _bspline_prefilter_1d_matrix(nz, tgt_dev, dt)
+    c = torch.matmul(t_bcdhw, px.T)
+    c = torch.matmul(py, c)
+    c = torch.matmul(pz, c.transpose(2, 3)).transpose(2, 3)
+    return _pad_mirror_2_3d(c)
+
+
+def _sample_bspline_padded_5d(
+    c_pad: torch.Tensor, cidx_b: torch.Tensor, shape_t: torch.Tensor
+) -> torch.Tensor:
+    """Evaluate 3D cubic B-spline on mirror-padded coefficients ``c_pad`` ``(B, C, Z+4, Y+4, X+4)``
+    at continuous voxel indices ``cidx_b`` ``(B, N_pts, 3)`` via exact 8-tap trilinear decomposition
+    (Sigg & Hadwiger 2005), returning ``(B, C, N_pts)``."""
+    b_sz, n_ch = int(c_pad.shape[0]), int(c_pad.shape[1])
+    n_pts = int(cidx_b.shape[1])
+    c_clamped = torch.minimum(
+        torch.maximum(cidx_b, torch.full_like(shape_t, -0.5)), shape_t - 0.5 - 1e-6
+    )
+    i0 = torch.floor(c_clamped)
+    t = c_clamped - i0
+    del c_clamped
+    omt = 1.0 - t
+    w0 = (omt * omt * omt) * (1.0 / 6.0)
+    w1 = (3.0 * t * t * t - 6.0 * t * t + 4.0) * (1.0 / 6.0)
+    w3 = (t * t * t) * (1.0 / 6.0)
+    del t, omt
+    g0 = w0 + w1
+    g1 = 1.0 - g0
+    pad_half_span = 0.5 * (shape_t + 3.0)
+    norm0 = ((i0 + 1.0) + w1 / g0.clamp(min=1e-12)) / pad_half_span - 1.0
+    norm1 = ((i0 + 3.0) + w3 / g1.clamp(min=1e-12)) / pad_half_span - 1.0
+    del i0, w0, w1, w3
+
+    acc = torch.zeros((b_sz, n_ch, n_pts), dtype=c_pad.dtype, device=c_pad.device)
+    for bx in (0, 1):
+        gx = g0[..., 0] if bx == 0 else g1[..., 0]
+        nx = norm0[..., 0] if bx == 0 else norm1[..., 0]
+        for by in (0, 1):
+            gy = g0[..., 1] if by == 0 else g1[..., 1]
+            ny = norm0[..., 1] if by == 0 else norm1[..., 1]
+            gxy = gx * gy
+            for bz in (0, 1):
+                gz = g0[..., 2] if bz == 0 else g1[..., 2]
+                nz = norm0[..., 2] if bz == 0 else norm1[..., 2]
+                grid = torch.stack((nx, ny, nz), dim=-1).view(b_sz, 1, 1, n_pts, 3)
+                s = F.grid_sample(
+                    c_pad, grid, mode="bilinear", padding_mode="border", align_corners=True
+                ).view(b_sz, n_ch, n_pts)
+                acc.addcmul_((gxy * gz).unsqueeze(1), s)
+    return acc
 
 
 # ==============================================================================
@@ -397,12 +516,13 @@ def _sample_field_itk(
     mode: str = "bilinear",
     defaultvalue: float = 0.0,
 ) -> torch.Tensor:
-    """Sample a ContinuousField matching ITK's ResampleImageFilter + Linear/Nearest/GenericLabel:
+    """Sample a ContinuousField matching ITK's ResampleImageFilter + Linear/Nearest/GenericLabel/BSpline:
     - Continuous index interval is half-open: c_d in [-0.5, N_d - 0.5). Points outside return defaultvalue.
     - Inside [-0.5, N_d - 0.5):
       - 'bilinear': clamped to [0, N_d - 1] (padding_mode='border') with trilinear weights.
       - 'nearest': ITK RoundHalfIntegerUp, i.e. floor(c_d + 0.5) clamped to [0, N_d - 1].
       - 'genericlabel': 8-corner trilinear label voting matching ITK LabelImageGenericInterpolateImageFunction.
+      - 'bspline': exact order-3 cardinal B-spline matching ITK BSplineInterpolateImageFunction.
     """
     flat_coords = pts_phys.view(-1, 3).to(device=field.device, dtype=field.dtype)
     coords_norm = physical_to_normalized(flat_coords, field.M_norm, field.b_norm)
@@ -418,6 +538,11 @@ def _sample_field_itk(
         sampled = F.grid_sample(field.tensor, grid, mode="nearest", padding_mode="border", align_corners=True)
         C = field.tensor.shape[1]
         out = sampled.view(C, -1).T if field.is_vector else sampled.view(-1)
+    elif mode == "bspline":
+        c_pad = _bspline_prefilter_and_pad_5d(field.tensor)
+        sampled_b = _sample_bspline_padded_5d(c_pad, cidx.unsqueeze(0), shape_t)
+        C = field.tensor.shape[1]
+        out = sampled_b.view(C, -1).T if field.is_vector else sampled_b.view(-1)
     elif mode == "genericlabel" and not field.is_vector:
         c_clamped = torch.minimum(torch.maximum(cidx, torch.zeros_like(shape_t)), shape_t - 1.0)
         n_pts = c_clamped.shape[0]
@@ -865,26 +990,33 @@ def _auto_select_4d_batch_size(
     dev: torch.device,
     *,
     per_volume_grid: bool = False,
+    bspline: bool = False,
+    affine_grid_only: bool = False,
 ) -> int:
     """Auto-select a memory-safe 4D volume batch size based on local device memory and 3D image dimensions."""
     if nvol <= 1:
         return 1
     avail_bytes = _get_available_device_bytes(dev)
-    max_cap_bytes = (512 if dev.type == "cuda" else 256) * 1024 * 1024
-    budget_bytes = max(32 * 1024 * 1024, min(int(avail_bytes * 0.15), max_cap_bytes))
+    max_cap_bytes = 1024 * 1024 * 1024
+    budget_bytes = max(64 * 1024 * 1024, min(int(avail_bytes * 0.20), max_cap_bytes))
 
     mov_vox = max(1, int(mov_shape_3d[0]) * int(mov_shape_3d[1]) * int(mov_shape_3d[2]))
     ref_vox = max(1, int(ref_shape_3d[0]) * int(ref_shape_3d[1]) * int(ref_shape_3d[2]))
-    fixed_overhead = 48 * ref_vox  # pts_fixed, pts_moving/pts_after_field, base grid buffers
+    fixed_overhead = 0 if affine_grid_only else 24 * ref_vox
 
-    if per_volume_grid:
-        # Per-volume 5D sampling grid + bmm coords + cidx + inside + input/output volume buffers
-        bytes_per_vol = int(1.5 * (8 * mov_vox + 48 * ref_vox))
+    if per_volume_grid and bspline:
+        bytes_per_vol = int(1.25 * (8 * mov_vox + 64 * ref_vox))
         max_batch_cap = 16
+    elif per_volume_grid:
+        bytes_per_vol = int(1.25 * (4 * mov_vox + (20 if affine_grid_only else 40) * ref_vox))
+        max_batch_cap = 64
+    elif bspline:
+        bytes_per_vol = int(1.25 * (8 * mov_vox + 16 * ref_vox))
+        max_batch_cap = 32
     else:
         # Shared 5D sampling grid across channels + input/output volume buffers
-        bytes_per_vol = int(1.5 * (8 * mov_vox + 8 * ref_vox))
-        max_batch_cap = 32
+        bytes_per_vol = int(1.25 * (4 * mov_vox + 8 * ref_vox))
+        max_batch_cap = 64
 
     usable_budget = max(bytes_per_vol, budget_bytes - fixed_overhead)
     batch_sz = int(usable_budget // max(bytes_per_vol, 1))
@@ -911,6 +1043,8 @@ def _apply_timeseries_4d(
         mode = "nearest"
     elif interp_lower in ("genericlabel", "multilabel"):
         mode = "genericlabel"
+    elif interp_lower == "bspline":
+        mode = "bspline"
     else:
         return ants.apply_transforms(
             fixed=reference,
@@ -930,12 +1064,20 @@ def _apply_timeseries_4d(
     pts_moving = _map_points_to_moving_tensor(pts_fixed, chain, dev)
     del pts_fixed
 
-    arr4d = np.ascontiguousarray(image.numpy(), dtype=np.float32)
+    raw4d = image.numpy()
+    vols_tzyx = (
+        raw4d.T
+        if (raw4d.dtype == np.float32 and raw4d.flags["F_CONTIGUOUS"])
+        else np.ascontiguousarray(np.transpose(raw4d, (3, 2, 1, 0)), dtype=np.float32)
+    )
     vol_origin = tuple(float(x) for x in image.origin[:3])
     vol_spacing = tuple(float(x) for x in image.spacing[:3])
     vol_dir = np.asarray(image.direction, dtype=np.float64)[:3, :3]
 
-    if mode in ("bilinear", "nearest"):
+    out_tzyx = np.empty((nvol, ref_shape[2], ref_shape[1], ref_shape[0]), dtype=np.float32)
+    out4d = out_tzyx.T
+
+    if mode in ("bilinear", "nearest", "bspline"):
         M_norm, b_norm = get_physical_to_normalized_affine(
             shape=mov_shape,
             spacing=vol_spacing,
@@ -952,36 +1094,47 @@ def _apply_timeseries_4d(
         half_span = 0.5 * (shape_t - 1.0)
         cidx = (coords_norm + 1.0) * half_span
         inside = ((cidx >= -0.5 - 1e-5) & (cidx < (shape_t - 0.5) - 1e-5)).all(dim=-1)
-        if mode == "nearest":
-            cidx_nearest = torch.floor(cidx + 0.5 + 1e-5).clamp(min=torch.zeros_like(shape_t), max=shape_t - 1.0)
-            coords_norm = cidx_nearest / half_span.clamp(min=1e-6) - 1.0
-        del cidx
-        grid = coords_norm.view(1, 1, 1, -1, 3)
+        cidx_shared: torch.Tensor | None = None
+        grid: torch.Tensor | None = None
+        if mode == "bspline":
+            cidx_shared = cidx.unsqueeze(0)
+            del coords_norm, cidx
+        else:
+            if mode == "nearest":
+                cidx_nearest = torch.floor(cidx + 0.5 + 1e-5).clamp(min=torch.zeros_like(shape_t), max=shape_t - 1.0)
+                coords_norm = cidx_nearest / half_span.clamp(min=1e-6) - 1.0
+            del cidx
+            grid = coords_norm.view(1, 1, 1, -1, 3)
         mask = inside.to(torch.float32).unsqueeze(0)  # (1, N_vox)
         del inside
 
-        chunk_vols = _auto_select_4d_batch_size(mov_shape, ref_shape, nvol, dev, per_volume_grid=False)
-        out4d = np.empty(ref_shape + (nvol,), dtype=np.float32)
+        chunk_vols = _auto_select_4d_batch_size(
+            mov_shape, ref_shape, nvol, dev, per_volume_grid=False, bspline=(mode == "bspline")
+        )
         s_idx = 0
         while s_idx < nvol:
             e_idx = min(nvol, s_idx + chunk_vols)
             c_len = e_idx - s_idx
             try:
-                t_in = torch.from_numpy(np.ascontiguousarray(arr4d[..., s_idx:e_idx])).to(
-                    device=dev, dtype=torch.float32
-                )
-                t_cdhw = t_in.permute(3, 2, 1, 0).unsqueeze(0).contiguous()
-                del t_in
-                sampled = F.grid_sample(
-                    t_cdhw, grid, mode=mode, padding_mode="border", align_corners=True
-                ).view(c_len, -1)
-                del t_cdhw
+                t_cdhw = torch.from_numpy(vols_tzyx[s_idx:e_idx]).unsqueeze(0).to(device=dev, dtype=torch.float32)
+                if mode == "bspline":
+                    assert cidx_shared is not None
+                    c_pad = _bspline_prefilter_and_pad_5d(t_cdhw)
+                    del t_cdhw
+                    sampled = _sample_bspline_padded_5d(c_pad, cidx_shared, shape_t).view(c_len, -1)
+                    del c_pad
+                else:
+                    assert grid is not None
+                    sampled = F.grid_sample(
+                        t_cdhw, grid, mode=mode, padding_mode="border", align_corners=True
+                    ).view(c_len, -1)
+                    del t_cdhw
                 if defaultvalue == 0.0:
                     sampled = sampled * mask
                 else:
                     sampled = sampled * mask + float(defaultvalue) * (1.0 - mask)
-                out4d[..., s_idx:e_idx] = (
-                    sampled.view(c_len, *ref_shape).permute(1, 2, 3, 0).contiguous().detach().cpu().numpy()
+                out_tzyx[s_idx:e_idx] = (
+                    sampled.view(c_len, *ref_shape).permute(0, 3, 2, 1).contiguous().detach().cpu().numpy()
                 )
                 del sampled
                 s_idx = e_idx
@@ -994,21 +1147,24 @@ def _apply_timeseries_4d(
                         continue
                     if dev.type != "cpu":
                         dev = torch.device("cpu")
-                        grid = grid.to(device=dev)
+                        if grid is not None:
+                            grid = grid.to(device=dev)
+                        if cidx_shared is not None:
+                            cidx_shared = cidx_shared.to(device=dev)
+                        shape_t = shape_t.to(device=dev)
                         mask = mask.to(device=dev)
                         chunk_vols = _auto_select_4d_batch_size(
-                            mov_shape, ref_shape, nvol - s_idx, dev, per_volume_grid=False
+                            mov_shape, ref_shape, nvol - s_idx, dev, per_volume_grid=False, bspline=(mode == "bspline")
                         )
                         continue
                 raise
     else:
-        out4d = np.empty(ref_shape + (nvol,), dtype=np.float32)
         field_vol: ContinuousField | None = None
         for k in range(nvol):
-            vol_arr = arr4d[..., k]
+            vol_arr = raw4d[..., k]
             if field_vol is None:
                 field_vol = ContinuousField(
-                    vol_arr,
+                    np.asarray(vol_arr, dtype=np.float32),
                     origin=vol_origin,
                     spacing=vol_spacing,
                     direction=vol_dir,
@@ -1016,8 +1172,7 @@ def _apply_timeseries_4d(
                     dtype=torch.float32,
                 )
             else:
-                arr_dhw = np.transpose(vol_arr, (2, 1, 0))[None, None, ...]
-                field_vol.tensor = torch.as_tensor(np.ascontiguousarray(arr_dhw), device=dev, dtype=torch.float32)
+                field_vol.tensor = torch.as_tensor(vols_tzyx[k][None, None, ...], device=dev, dtype=torch.float32)
             sampled = _sample_field_itk(field_vol, pts_moving, mode=mode, defaultvalue=defaultvalue)
             out4d[..., k] = sampled.reshape(ref_shape).detach().cpu().numpy()
 
@@ -1802,21 +1957,31 @@ def chain_linear_jacobian(chain: "TransformChain | None") -> float:
 def resample_series(
     img4d: Any,
     motion_chains: Sequence[TransformChain | None],
-    field_path: str,
-    reference: Any,
+    field_path: str | None = None,
+    reference: Any = None,
     jacobian: bool = True,
     interpolator: str = "linear",
     device: str | None = None,
+    volume_scales: Sequence[float] | np.ndarray | None = None,
 ) -> Any:
     """Resample every volume of a 4D series onto ``reference`` with exactly ONE interpolation each on Torch/MPS/CUDA."""
     import ants
 
+    if reference is None:
+        raise ValueError("resample_series requires reference")
     nvol = int(img4d.shape[3])
     if len(motion_chains) != nvol:
         raise ValueError(f"len(motion_chains)={len(motion_chains)} != number of volumes {nvol}")
-    jac = jacobian_modulation(field_path, reference).numpy() if jacobian else None
-    # per-volume intensity factor of the motion chain's affine part (the eddy Jacobian; 1 for a rigid-only chain)
-    jac_motion = np.array([chain_linear_jacobian(ch) for ch in motion_chains], dtype=np.float64) if jacobian else np.ones(nvol)
+    jac = jacobian_modulation(field_path, reference).numpy() if (jacobian and field_path is not None) else None
+    if volume_scales is not None:
+        jac_motion = np.asarray(volume_scales, dtype=np.float64).reshape(-1)
+        if jac_motion.size != nvol:
+            raise ValueError(f"len(volume_scales)={jac_motion.size} != number of volumes {nvol}")
+    elif jacobian:
+        # per-volume intensity factor of the motion chain's affine part (the eddy Jacobian; 1 for a rigid-only chain)
+        jac_motion = np.array([chain_linear_jacobian(ch) for ch in motion_chains], dtype=np.float64)
+    else:
+        jac_motion = np.ones(nvol, dtype=np.float64)
 
     interp_lower = interpolator.lower()
     if interp_lower in ("linear", "bilinear", "trilinear"):
@@ -1825,6 +1990,8 @@ def resample_series(
         mode = "nearest"
     elif interp_lower in ("genericlabel", "multilabel"):
         mode = "genericlabel"
+    elif interp_lower == "bspline":
+        mode = "bspline"
     else:
         mode = None
 
@@ -1833,22 +2000,180 @@ def resample_series(
         ref_shape = tuple(int(s) for s in reference.shape[:3])
         mov_shape = tuple(int(s) for s in img4d.shape[:3])
         n_vox = ref_shape[0] * ref_shape[1] * ref_shape[2]
-        pts_fixed = _reference_grid_points_lps(reference, dev)
-        field_chain = TransformChain.from_paths([str(field_path)])
-        pts_after_field = _map_points_to_moving_tensor(pts_fixed, field_chain, dev)
         jac_t = torch.as_tensor(jac.reshape(-1), dtype=torch.float32, device=dev) if jac is not None else None
         jac_motion_t = torch.as_tensor(jac_motion, dtype=torch.float32, device=dev)
 
-        arr4d = np.ascontiguousarray(img4d.numpy(), dtype=np.float32)
+        raw4d = img4d.numpy()
+        vols_tzyx = (
+            raw4d.T
+            if (raw4d.dtype == np.float32 and raw4d.flags["F_CONTIGUOUS"])
+            else np.ascontiguousarray(np.transpose(raw4d, (3, 2, 1, 0)), dtype=np.float32)
+        )
         vol_origin = tuple(float(x) for x in img4d.origin[:3])
         vol_spacing = tuple(float(x) for x in img4d.spacing[:3])
         vol_dir = np.asarray(img4d.direction, dtype=np.float64)[:3, :3]
+        ref_dir = _as_direction(reference.direction)
+        same_3d_grid = (
+            field_path is None
+            and mov_shape == ref_shape
+            and np.allclose(vol_spacing, reference.spacing[:3])
+            and np.allclose(vol_origin, reference.origin[:3])
+            and np.allclose(vol_dir, ref_dir)
+        )
+
+        out_tzyx = np.empty((nvol, ref_shape[2], ref_shape[1], ref_shape[0]), dtype=np.float32)
+        out4d = out_tzyx.T
 
         all_linear = all(
             (ch is None) or all(e.kind in (*_LINEAR, "identity") for e in ch.elements)
             for ch in motion_chains
         )
-        if all_linear and mode in ("bilinear", "nearest"):
+        use_affine_grid = (
+            field_path is None
+            and all_linear
+            and mode in ("bilinear", "nearest", "bspline")
+            and min(mov_shape) > 1
+            and min(ref_shape) > 1
+        )
+        if use_affine_grid:
+            M_list = []
+            b_list = []
+            for ch in motion_chains:
+                M_acc = np.eye(3, dtype=np.float64)
+                b_acc = np.zeros(3, dtype=np.float64)
+                if ch is not None:
+                    for el in ch.elements:
+                        if el.kind == "identity":
+                            continue
+                        M_step, b_step = _read_itk_affine(el.path, invert=el.invert)
+                        b_acc = M_step @ b_acc + b_step
+                        M_acc = M_step @ M_acc
+                M_list.append(M_acc)
+                b_list.append(b_acc)
+            half_ref = 0.5 * (np.asarray(ref_shape, dtype=np.float64) - 1.0)
+            r_ref = ref_dir * np.asarray(reference.spacing[:3], dtype=np.float64)[None, :]
+            o_ref = np.asarray(reference.origin[:3], dtype=np.float64)
+            a_ref = r_ref @ np.diag(half_ref)
+            c_ref = r_ref @ half_ref + o_ref
+            r_mov_inv = np.linalg.inv(vol_dir * np.asarray(vol_spacing, dtype=np.float64)[None, :])
+            o_mov = np.asarray(vol_origin, dtype=np.float64)
+            m_np = np.stack(M_list, axis=0)
+            b_np = np.stack(b_list, axis=0)
+            a_cidx = np.einsum("ij,tjk,kl->til", r_mov_inv, m_np, a_ref)
+            t_cidx = np.einsum("ij,tj->ti", r_mov_inv, (m_np @ c_ref) + b_np - o_mov[None, :])
+            shape_t = torch.tensor(mov_shape, dtype=torch.float32, device=dev)
+            half_span = 0.5 * (shape_t - 1.0)
+            if mode == "bilinear":
+                inv_half_mov = 1.0 / (0.5 * (np.asarray(mov_shape, dtype=np.float64) - 1.0))
+                theta_np = np.concatenate(
+                    [
+                        a_cidx * inv_half_mov[None, :, None],
+                        (t_cidx * inv_half_mov[None, :] - 1.0)[..., None],
+                    ],
+                    axis=-1,
+                )
+                lo_norm = torch.as_tensor(-1.0 - (0.5 + 1e-5) * inv_half_mov, dtype=torch.float32, device=dev)
+                hi_norm = torch.as_tensor(1.0 + (0.5 - 1e-5) * inv_half_mov, dtype=torch.float32, device=dev)
+            else:
+                theta_np = np.concatenate([a_cidx, t_cidx[..., None]], axis=-1)
+                lo_norm = shape_t
+                hi_norm = shape_t
+            theta_t = torch.as_tensor(theta_np, dtype=torch.float32, device=dev)
+            batch_sz = _auto_select_4d_batch_size(
+                mov_shape,
+                ref_shape,
+                nvol,
+                dev,
+                per_volume_grid=True,
+                bspline=(mode == "bspline"),
+                affine_grid_only=True,
+            )
+            rz, ry, rx = ref_shape[2], ref_shape[1], ref_shape[0]
+            s_idx = 0
+            while s_idx < nvol:
+                e_idx = min(nvol, s_idx + batch_sz)
+                b_len = e_idx - s_idx
+                try:
+                    t_vols_b = torch.from_numpy(vols_tzyx[s_idx:e_idx]).unsqueeze(1).to(
+                        device=dev, dtype=torch.float32
+                    )
+                    grid_or_cidx = F.affine_grid(
+                        theta_t[s_idx:e_idx], [b_len, 1, rz, ry, rx], align_corners=True
+                    )
+                    if mode == "bilinear":
+                        inside = ((grid_or_cidx >= lo_norm) & (grid_or_cidx < hi_norm)).all(dim=-1)
+                        sampled = F.grid_sample(
+                            t_vols_b,
+                            grid_or_cidx,
+                            mode="bilinear",
+                            padding_mode="border",
+                            align_corners=True,
+                        ).squeeze(1)
+                        del t_vols_b, grid_or_cidx
+                    elif mode == "bspline":
+                        inside = ((grid_or_cidx >= -0.5 - 1e-5) & (grid_or_cidx < (shape_t - 0.5) - 1e-5)).all(dim=-1)
+                        c_pad = _bspline_prefilter_and_pad_5d(t_vols_b)
+                        del t_vols_b
+                        sampled = _sample_bspline_padded_5d(
+                            c_pad, grid_or_cidx.view(b_len, n_vox, 3), shape_t
+                        ).view(b_len, rz, ry, rx)
+                        del c_pad, grid_or_cidx
+                    else:
+                        inside = ((grid_or_cidx >= -0.5 - 1e-5) & (grid_or_cidx < (shape_t - 0.5) - 1e-5)).all(dim=-1)
+                        cidx_nearest = torch.floor(grid_or_cidx + 0.5 + 1e-5).clamp(
+                            min=torch.zeros_like(shape_t), max=shape_t - 1.0
+                        )
+                        del grid_or_cidx
+                        grid_n = cidx_nearest / half_span.clamp(min=1e-6) - 1.0
+                        del cidx_nearest
+                        sampled = F.grid_sample(
+                            t_vols_b,
+                            grid_n,
+                            mode="nearest",
+                            padding_mode="border",
+                            align_corners=True,
+                        ).squeeze(1)
+                        del t_vols_b, grid_n
+                    sampled = sampled * inside.to(torch.float32)
+                    del inside
+                    sampled = sampled * jac_motion_t[s_idx:e_idx].to(sampled.device).view(b_len, 1, 1, 1)
+                    out_tzyx[s_idx:e_idx] = sampled.detach().cpu().numpy()
+                    del sampled
+                    s_idx = e_idx
+                except RuntimeError as exc:
+                    msg = str(exc).lower()
+                    if "out of memory" in msg or "mps" in msg or "buffer" in msg:
+                        _empty_device_cache(dev)
+                        if batch_sz > 1:
+                            batch_sz = max(1, batch_sz // 2)
+                            continue
+                        host_dev = torch.zeros(1).device
+                        if dev != host_dev:
+                            dev = host_dev
+                            theta_t = theta_t.to(device=dev)
+                            shape_t = shape_t.to(device=dev)
+                            half_span = half_span.to(device=dev)
+                            lo_norm = lo_norm.to(device=dev)
+                            hi_norm = hi_norm.to(device=dev)
+                            batch_sz = _auto_select_4d_batch_size(
+                                mov_shape,
+                                ref_shape,
+                                nvol - s_idx,
+                                dev,
+                                per_volume_grid=True,
+                                bspline=(mode == "bspline"),
+                                affine_grid_only=True,
+                            )
+                            continue
+                    raise
+        elif all_linear and mode in ("bilinear", "nearest", "bspline"):
+            pts_fixed = _reference_grid_points_lps(reference, dev)
+            if field_path is not None:
+                field_chain = TransformChain.from_paths([str(field_path)])
+                pts_after_field = _map_points_to_moving_tensor(pts_fixed, field_chain, dev)
+                del pts_fixed
+            else:
+                pts_after_field = pts_fixed
             M_list = []
             b_list = []
             for ch in motion_chains:
@@ -1876,20 +2201,18 @@ def resample_series(
             shape_t = torch.tensor(mov_shape, dtype=torch.float32, device=dev)
             half_span = 0.5 * (shape_t - 1.0)
 
-            batch_sz = _auto_select_4d_batch_size(mov_shape, ref_shape, nvol, dev, per_volume_grid=True)
-            out4d = np.empty(ref_shape + (nvol,), dtype=np.float32)
+            batch_sz = _auto_select_4d_batch_size(
+                mov_shape, ref_shape, nvol, dev, per_volume_grid=True, bspline=(mode == "bspline")
+            )
 
             s_idx = 0
             while s_idx < nvol:
                 e_idx = min(nvol, s_idx + batch_sz)
                 b_len = e_idx - s_idx
                 try:
-                    t_in_b = torch.from_numpy(np.ascontiguousarray(arr4d[..., s_idx:e_idx])).to(
+                    t_vols_b = torch.from_numpy(vols_tzyx[s_idx:e_idx]).unsqueeze(1).to(
                         device=dev, dtype=torch.float32
                     )
-                    t_vols_b = t_in_b.permute(3, 2, 1, 0).unsqueeze(1).contiguous()  # (b_len, 1, Z, Y, X)
-                    del t_in_b
-
                     pts_b = (
                         torch.bmm(
                             pts_after_field.unsqueeze(0).expand(b_len, -1, -1),
@@ -1901,27 +2224,34 @@ def resample_series(
                     del pts_b
                     cidx = (coords_norm + 1.0) * half_span
                     inside = ((cidx >= -0.5 - 1e-5) & (cidx < (shape_t - 0.5) - 1e-5)).all(dim=-1)
-                    if mode == "nearest":
-                        cidx_nearest = torch.floor(cidx + 0.5 + 1e-5).clamp(
-                            min=torch.zeros_like(shape_t), max=shape_t - 1.0
-                        )
-                        coords_norm = cidx_nearest / half_span.clamp(min=1e-6) - 1.0
-                    del cidx
-                    sampled = F.grid_sample(
-                        t_vols_b,
-                        coords_norm.view(b_len, 1, 1, n_vox, 3),
-                        mode=mode,
-                        padding_mode="border",
-                        align_corners=True,
-                    ).view(b_len, n_vox)
-                    del t_vols_b, coords_norm
+                    if mode == "bspline":
+                        del coords_norm
+                        c_pad = _bspline_prefilter_and_pad_5d(t_vols_b)
+                        del t_vols_b
+                        sampled = _sample_bspline_padded_5d(c_pad, cidx, shape_t).view(b_len, n_vox)
+                        del c_pad, cidx
+                    else:
+                        if mode == "nearest":
+                            cidx_nearest = torch.floor(cidx + 0.5 + 1e-5).clamp(
+                                min=torch.zeros_like(shape_t), max=shape_t - 1.0
+                            )
+                            coords_norm = cidx_nearest / half_span.clamp(min=1e-6) - 1.0
+                        del cidx
+                        sampled = F.grid_sample(
+                            t_vols_b,
+                            coords_norm.view(b_len, 1, 1, n_vox, 3),
+                            mode=mode,
+                            padding_mode="border",
+                            align_corners=True,
+                        ).view(b_len, n_vox)
+                        del t_vols_b, coords_norm
                     sampled = sampled * inside.to(torch.float32)
                     del inside
                     if jac_t is not None:
                         sampled = sampled * jac_t.unsqueeze(0)
                     sampled = sampled * jac_motion_t[s_idx:e_idx].to(sampled.device).unsqueeze(1)
-                    out4d[..., s_idx:e_idx] = (
-                        sampled.view(b_len, *ref_shape).permute(1, 2, 3, 0).contiguous().detach().cpu().numpy()
+                    out_tzyx[s_idx:e_idx] = (
+                        sampled.view(b_len, *ref_shape).permute(0, 3, 2, 1).contiguous().detach().cpu().numpy()
                     )
                     del sampled
                     s_idx = e_idx
@@ -1944,12 +2274,23 @@ def resample_series(
                             if jac_t is not None:
                                 jac_t = jac_t.to(device=dev)
                             batch_sz = _auto_select_4d_batch_size(
-                                mov_shape, ref_shape, nvol - s_idx, dev, per_volume_grid=True
+                                mov_shape,
+                                ref_shape,
+                                nvol - s_idx,
+                                dev,
+                                per_volume_grid=True,
+                                bspline=(mode == "bspline"),
                             )
                             continue
                     raise
         else:
-            out4d = np.empty(ref_shape + (nvol,), dtype=np.float32)
+            pts_fixed = _reference_grid_points_lps(reference, dev)
+            if field_path is not None:
+                field_chain = TransformChain.from_paths([str(field_path)])
+                pts_after_field = _map_points_to_moving_tensor(pts_fixed, field_chain, dev)
+                del pts_fixed
+            else:
+                pts_after_field = pts_fixed
             field_vol: ContinuousField | None = None
             for k in range(nvol):
                 chain = motion_chains[k]
@@ -1958,10 +2299,10 @@ def resample_series(
                     if (chain is not None and len(chain) > 0)
                     else pts_after_field
                 )
-                vol_arr = arr4d[..., k]
+                vol_arr = raw4d[..., k]
                 if field_vol is None:
                     field_vol = ContinuousField(
-                        vol_arr,
+                        np.asarray(vol_arr, dtype=np.float32),
                         origin=vol_origin,
                         spacing=vol_spacing,
                         direction=vol_dir,
@@ -1969,8 +2310,7 @@ def resample_series(
                         dtype=torch.float32,
                     )
                 else:
-                    arr_dhw = np.transpose(vol_arr, (2, 1, 0))[None, None, ...]
-                    field_vol.tensor = torch.as_tensor(np.ascontiguousarray(arr_dhw), device=dev, dtype=torch.float32)
+                    field_vol.tensor = torch.as_tensor(vols_tzyx[k][None, None, ...], device=dev, dtype=torch.float32)
 
                 sampled = _sample_field_itk(field_vol, pts_k, mode=mode)
                 if jac_t is not None:
@@ -1978,29 +2318,42 @@ def resample_series(
                 sampled = sampled * float(jac_motion[k])
                 out4d[..., k] = sampled.reshape(ref_shape).detach().cpu().numpy()
 
-        spacing = list(reference.spacing) + [float(img4d.spacing[3])]
-        origin = list(reference.origin) + [float(img4d.origin[3])]
+        if same_3d_grid:
+            for k, ch in enumerate(motion_chains):
+                if ch is None or all(el.kind == "identity" for el in ch.elements):
+                    out_tzyx[k] = vols_tzyx[k] * float(jac_motion[k])
+
+        spacing = list(reference.spacing[:3]) + [float(img4d.spacing[3])]
+        origin = list(reference.origin[:3]) + [float(img4d.origin[3])]
         direction = np.eye(4)
-        direction[:3, :3] = _as_direction(reference.direction)
+        direction[:3, :3] = ref_dir
         return ants.from_numpy(out4d, origin=origin, spacing=spacing, direction=direction)
 
     out = []
     for k in range(nvol):
         chain = motion_chains[k]
-        tl = [str(field_path)] + (chain.paths() if chain is not None else [])
-        inv = [False] + (chain.whichtoinvert() if chain is not None else [])
-        vol = ants.slice_image(img4d, axis=3, idx=k)
-        w = ants.apply_transforms(
-            fixed=reference, moving=vol, transformlist=tl, whichtoinvert=inv, interpolator=interpolator
+        real_ch = (
+            [(p_, inv_) for p_, inv_ in zip(chain.paths(), chain.whichtoinvert()) if str(p_).lower() != "identity"]
+            if chain is not None
+            else []
         )
+        tl = ([str(field_path)] if field_path is not None else []) + [p_ for p_, _ in real_ch]
+        inv = ([False] if field_path is not None else []) + [inv_ for _, inv_ in real_ch]
+        vol = ants.slice_image(img4d, axis=3, idx=k)
+        if tl:
+            w = ants.apply_transforms(
+                fixed=reference, moving=vol, transformlist=tl, whichtoinvert=inv, interpolator=interpolator
+            )
+        else:
+            w = ants.resample_image_to_target(vol, reference, interp_type=interpolator)
         if jac is not None:
             w = w.new_image_like(w.numpy() * jac)
         if jac_motion[k] != 1.0:
             w = w.new_image_like(w.numpy() * float(jac_motion[k]))
         out.append(w)
     res = ants.list_to_ndimage(img4d, out)
-    spacing = list(reference.spacing) + [float(img4d.spacing[3])]
-    origin = list(reference.origin) + [float(img4d.origin[3])]
+    spacing = list(reference.spacing[:3]) + [float(img4d.spacing[3])]
+    origin = list(reference.origin[:3]) + [float(img4d.origin[3])]
     direction = np.eye(4)
     direction[:3, :3] = _as_direction(reference.direction)
     res.set_spacing(spacing)

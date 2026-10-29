@@ -695,10 +695,9 @@ def calculate_dvars(
     if not np.any(mask_arr):
         mask_arr = np.ones(arr.shape[:-1], dtype=bool)
 
-    diff = np.diff(arr, axis=-1)  # shape: (..., num_frames - 1)
-    diff_mask = diff[mask_arr]  # shape: (num_voxels, num_frames - 1)
-
-    dvars[1:] = np.sqrt(np.mean(diff_mask**2, axis=0))
+    diff_mask = np.diff(arr[mask_arr], axis=-1)  # shape: (num_voxels, num_frames - 1)
+    n_fg = max(1, int(diff_mask.shape[0]))
+    dvars[1:] = np.sqrt(np.einsum("vt,vt->t", diff_mask, diff_mask, dtype=np.float64) / n_fg)
     if reference_intensity is not None and reference_intensity > 0:
         dvars = dvars / reference_intensity
     return dvars
@@ -1004,7 +1003,7 @@ def motion_correction(
     per_frame_refs = None
     if isinstance(reference, str):
         if reference.lower() == "mean":
-            mean_data = np.mean([f.numpy() for f in frames], axis=0)
+            mean_data = np.mean(image.numpy(), axis=-1)
             ref_img = ants.new_image_like(frames[0], mean_data.astype(frames[0].dtype))
         elif reference.lower() == "bilateral":
             from .motion_reference import build_bilateral_window_references
@@ -1213,6 +1212,48 @@ def motion_correction(
                           f"registered in one batch ({batch_elapsed:.2f}s, "
                           f"{batch_elapsed / len(batch_indices):.3f}s/frame amortized).")
 
+        if backend in ("pytorch_batched", "pytorch_batched_temporal", "pytorch_batched_adaptive"):
+            from .motion_batched import rigid_transform_of
+            from .transforms import TransformChain, resample_series
+
+            chains_pass: List[Optional[TransformChain]] = []
+            vol_scales = np.ones(num_frames, dtype=np.float64)
+            for t in range(num_frames):
+                frame_prefix = f"{run_prefix}_{pass_tag}vol{t:04d}_"
+                if current_ref_idx is not None and t == current_ref_idx:
+                    id_tx_path = f"{frame_prefix}IdentityAffine.mat"
+                    tx_obj = _create_identity_transform(spatial_dim, id_tx_path)
+                    fwd_tx = [id_tx_path]
+                    inv_tx = [id_tx_path]
+                    chains_pass.append(None)
+                    trans, rot, T_h = _extract_rigid_parameters(tx_obj, spatial_dim)
+                else:
+                    fwd_tx, inv_tx = batched_results[t]
+                    chains_pass.append(TransformChain.from_paths(fwd_tx))
+                    if t in pe_frames["jacobian"]:
+                        vol_scales[t] = float(pe_frames["jacobian"][t])
+                    # the rigid pose is the chain's rigid file, found by name (an eddy PE-affine, when present, follows it)
+                    tx_obj = ants.read_transform(rigid_transform_of(fwd_tx))
+                    trans, rot, T_h = _extract_rigid_parameters(tx_obj, spatial_dim)
+                fwd_tx_all.append(fwd_tx)
+                inv_tx_all.append(inv_tx)
+                params_all[t] = np.concatenate([trans, rot])
+                homog_all.append(T_h)
+                if verbose:
+                    print(f"[syntx.motion] Frame {t + 1}/{num_frames} aligned.")
+
+            corrected_4d = resample_series(
+                image,
+                chains_pass,
+                None,
+                current_ref,
+                jacobian=False,
+                interpolator=interpolator,
+                device=motion_device,
+                volume_scales=vol_scales,
+            )
+            return corrected_4d, fwd_tx_all, inv_tx_all, params_all, homog_all
+
         for t in range(num_frames):
             frame_t = frames[t]
             frame_prefix = f"{run_prefix}_{pass_tag}vol{t:04d}_"
@@ -1225,21 +1266,6 @@ def motion_correction(
                 fwd_tx = [id_tx_path]
                 inv_tx = [id_tx_path]
                 warped_t = frame_t.clone()
-                trans, rot, T_h = _extract_rigid_parameters(tx_obj, spatial_dim)
-            elif backend in ("pytorch_batched", "pytorch_batched_temporal", "pytorch_batched_adaptive"):
-                from .transforms import apply_transforms as _apply_transforms
-                fwd_tx, inv_tx = batched_results[t]
-                warped_t = _apply_transforms(
-                    fixed=current_ref,
-                    moving=frame_t,
-                    transformlist=fwd_tx,
-                    interpolator=interpolator,
-                )
-                if t in pe_frames["jacobian"] and pe_frames["jacobian"][t] != 1.0:
-                    warped_t = warped_t * float(pe_frames["jacobian"][t])  # signal conservation under the PE scale
-                # the rigid pose is the chain's rigid file, found by name (an eddy PE-affine, when present, follows it)
-                from .motion_batched import rigid_transform_of
-                tx_obj = ants.read_transform(rigid_transform_of(fwd_tx))
                 trans, rot, T_h = _extract_rigid_parameters(tx_obj, spatial_dim)
             else:
                 reg_args = dict(kwargs)
@@ -1312,14 +1338,21 @@ def motion_correction(
 
     if two_pass and isinstance(reference, str) and reference.lower() == "mean":
         # Pass 2: compute sharp mean from Pass 1 corrected images
-        pass1_mean = np.mean([f.numpy() for f in corrected_frames], axis=0)
+        if isinstance(corrected_frames, ants.ANTsImage):
+            pass1_mean = np.mean(corrected_frames.numpy(), axis=-1)
+        else:
+            pass1_mean = np.mean([f.numpy() for f in corrected_frames], axis=0)
         ref_img = ants.new_image_like(frames[0], pass1_mean.astype(frames[0].dtype))
         corrected_frames, fwd_transforms, inv_transforms, raw_params, homog_matrices = _run_pass(
             ref_img, None, "p2_"
         )
 
     # 6. Re-assemble motion-corrected time-series image
-    motion_corrected = ants.list_to_ndimage(image, corrected_frames)
+    motion_corrected = (
+        corrected_frames
+        if isinstance(corrected_frames, ants.ANTsImage)
+        else ants.list_to_ndimage(image, corrected_frames)
+    )
 
     # 7. Package MotionParameters
     col_names = ["tx", "ty", "tz", "rx", "ry", "rz"] if spatial_dim == 3 else ["tx", "ty", "rz"]

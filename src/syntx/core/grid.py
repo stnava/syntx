@@ -146,6 +146,9 @@ def _image_spatial_gradient(image):
     return torch.stack(grads[::-1], dim=2)
 
 
+_GRID_SCALE_CACHE: dict = {}
+
+
 class AnalyticalGridSample(torch.autograd.Function):
     """
     ``F.grid_sample`` whose backward returns an approximate gradient for ``grid`` only.
@@ -206,13 +209,16 @@ class AnalyticalGridSample(torch.autograd.Function):
         grad_out_cast = grad_output.to(dtype=grid.dtype)
         grad_grid = torch.sum(grad_out_cast.unsqueeze(2) * grad_I_sampled, dim=1).movedim(1, -1)  # (B, *spatial_grid, dim)
 
-        # 4. Apply voxel-to-normalized grid coordinate scaling
-        scales = []
-        for d in range(dim):
-            size = spatial_shape[dim - 1 - d]  # X is dim - 1, Y is dim - 2, Z is dim - 3
-            s = (size - 1) / 2.0 if align_corners else size / 2.0
-            scales.append(s)
-        scale_t = torch.tensor(scales, dtype=grad_grid.dtype, device=grad_grid.device)
+        # 4. Apply voxel-to-normalized grid coordinate scaling (cached per shape/device/dtype)
+        cache_key = (tuple(int(s) for s in spatial_shape), bool(align_corners), str(grad_grid.device), grad_grid.dtype)
+        scale_t = _GRID_SCALE_CACHE.get(cache_key)
+        if scale_t is None:
+            scales = [
+                (spatial_shape[dim - 1 - d] - 1) / 2.0 if align_corners else spatial_shape[dim - 1 - d] / 2.0
+                for d in range(dim)
+            ]
+            scale_t = torch.tensor(scales, dtype=grad_grid.dtype, device=grad_grid.device)
+            _GRID_SCALE_CACHE[cache_key] = scale_t
         grad_grid = grad_grid * scale_t
 
         return None, grad_grid, None, None, None, None

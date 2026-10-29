@@ -640,14 +640,20 @@ def _joint(image, design: Design, *, init: str = "levels", surround_weight: Opti
         if design.pe_axis is not None:
             kw00.setdefault("pe_axis", design.pe_axis)
         r0 = motion_correction(image, reference="mean", type_of_transform="Rigid", backend=backend, **kw00)
-        h0 = {"motion_corrected": r0["motion_corrected"], "fwdtransforms": [list(c) for c in r0.fwdtransforms],
-              "group_means": [_mean_image([ants.slice_image(r0["motion_corrected"], axis=3, idx=t) for t in range(T)])],
+        mc0 = r0["motion_corrected"]
+        ref0_h0 = ants.slice_image(mc0, axis=3, idx=0)
+        h0 = {"motion_corrected": mc0, "fwdtransforms": [list(c) for c in r0.fwdtransforms],
+              "group_means": [ref0_h0.new_image_like(mc0.numpy().mean(axis=-1).astype(np.float32))],
               "cross_link": [], "cross_converged": [], "cross_registrations": None}
     else:
         h0 = motion_correct_grouped(image, levels, cross_link=links, cross_group_debias=False, **kw0)
     corrected0 = h0["motion_corrected"]
-    frames0 = [ants.slice_image(corrected0, axis=3, idx=t) for t in range(T)]
-    ref_level = {int(k): _mean_image([frames0[t] for t in np.flatnonzero(levels == k)]) for k in np.unique(levels)}
+    arr0 = corrected0.numpy()
+    ref0_3d = h0["group_means"][0]
+    ref_level = {
+        int(k): ref0_3d.new_image_like(arr0[..., levels == k].mean(axis=-1).astype(np.float32))
+        for k in np.unique(levels)
+    }
     refs = [ref_level[int(levels[t])] for t in range(T)]
 
     # H1: the joint pass on the ORIGINAL frames against their level's reference in the anchor space, started from the

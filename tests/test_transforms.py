@@ -911,3 +911,67 @@ def test_auto_select_4d_batch_size_and_chunked_streaming(tmp_path, monkeypatch):
     np.testing.assert_allclose(res_b2, res_b5, rtol=1e-5, atol=1e-5)
 
 
+def test_bspline_and_fieldless_resample_series_parity_vs_ants(tmp_path):
+    """Verify pure-PyTorch order-3 B-spline interpolation (3D, 4D imagetype=3, and resample_series)
+    and field_path=None batched motion resampling match ants.apply_transforms."""
+    rng = np.random.default_rng(801)
+    fix_cfg = SPACE_CONFIGS["oblique_a"]
+    mov_cfg = SPACE_CONFIGS["oblique_b"]
+    fix = _make_smooth_image(fix_cfg, seed=802)
+    mov = _make_smooth_image(mov_cfg, seed=803)
+    aff1 = _write_affine(tmp_path / "bs_aff1.mat", _rot_matrix(6.0, -4.0, 7.0), offset=(0.35, -0.25, 0.15))
+    aff2 = _write_affine(tmp_path / "bs_aff2.mat", _rot_matrix(-3.0, 5.0, -2.0), offset=(-0.2, 0.4, -0.3))
+    warp = _write_warp(tmp_path / "bs_warp.nii.gz", fix_cfg, scale_mm=0.4, seed=804)
+
+    # 3D scalar bSpline parity (affine + warp)
+    exp_3d = ants.apply_transforms(fixed=fix, moving=mov, transformlist=[warp, aff1], interpolator="bSpline").numpy()
+    act_3d = apply_transforms(fixed=fix, moving=mov, transformlist=[warp, aff1], interpolator="bSpline").numpy()
+    np.testing.assert_allclose(act_3d, exp_3d, rtol=1e-4, atol=5e-4)
+
+    # 4D shared-grid imagetype=3 bSpline parity
+    arr4d = rng.uniform(2.0, 30.0, size=fix_cfg["shape"] + (4,)).astype(np.float32)
+    dir4d = np.eye(4)
+    dir4d[:3, :3] = fix_cfg["direction"]
+    img4d = ants.from_numpy(
+        arr4d,
+        origin=tuple(fix_cfg["origin"]) + (0.0,),
+        spacing=tuple(fix_cfg["spacing"]) + (1.2,),
+        direction=dir4d,
+    )
+    exp_4d = ants.apply_transforms(
+        fixed=fix, moving=img4d, transformlist=[warp, aff1], imagetype=3, interpolator="bSpline"
+    ).numpy()
+    act_4d = apply_transforms(
+        fixed=fix, moving=img4d, transformlist=[warp, aff1], imagetype=3, interpolator="bSpline"
+    ).numpy()
+    np.testing.assert_allclose(act_4d, exp_4d, rtol=1e-4, atol=5e-4)
+
+    # resample_series with field_path=None, volume_scales, identity frame bypass, linear & bSpline
+    chains = [
+        None,
+        TransformChain.from_paths([aff1]),
+        TransformChain.from_paths([aff2]),
+        TransformChain.from_paths([aff1, aff2]),
+    ]
+    scales = np.array([1.0, 1.03, 0.97, 1.01], dtype=np.float64)
+    for interp in ("linear", "bSpline"):
+        res_4d = resample_series(
+            img4d,
+            chains,
+            None,
+            fix,
+            jacobian=False,
+            interpolator=interp,
+            volume_scales=scales,
+        ).numpy()
+        # Volume 0 has chain=None on identical 3D grid -> exact bit-identity
+        np.testing.assert_array_equal(res_4d[..., 0], arr4d[..., 0])
+        for k in (1, 2, 3):
+            vol_k = ants.slice_image(img4d, axis=3, idx=k)
+            exp_k = (
+                ants.apply_transforms(
+                    fixed=fix, moving=vol_k, transformlist=chains[k].paths(), interpolator=interp
+                ).numpy()
+                * scales[k]
+            )
+            np.testing.assert_allclose(res_4d[..., k], exp_k, rtol=1e-4, atol=5e-4)

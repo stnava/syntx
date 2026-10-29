@@ -68,13 +68,18 @@ def _register_group_backward(img4d_g, mean_img, kw, backend, verbose, ref_intens
     ``smoothing_mm`` smooths the images used by the metric only; the data are resampled from the originals.
     """
     from .motion import _extract_rigid_parameters, motion_correction
-    from .transforms import apply_transforms as _apply_transforms
+    from .transforms import TransformChain, resample_series
 
     n = img4d_g.shape[-1]
     frames = [ants.slice_image(img4d_g, axis=3, idx=i) for i in range(n)]
     refs = [ants.smooth_image(f, smoothing_mm) if smoothing_mm else f for f in frames]
     mean_m = ants.smooth_image(mean_img, smoothing_mm) if smoothing_mm else mean_img
-    mov4d = ants.list_to_ndimage(img4d_g, [mean_m] * n)
+    mov4d = ants.from_numpy(
+        np.repeat(mean_m.numpy()[..., None], n, axis=3),
+        origin=list(img4d_g.origin),
+        spacing=list(img4d_g.spacing),
+        direction=np.asarray(img4d_g.direction, dtype=float),
+    )
     res_b = motion_correction(mov4d, reference=refs, backend=backend, verbose=verbose,
                               dvars_reference_intensity=ref_intensity, **kw)
     # backward chain per frame: [rigid_b, eddy_b] maps frame points -> mean points as E_b o R_b (a transform list acts
@@ -96,12 +101,17 @@ def _register_group_backward(img4d_g, mean_img, kw, backend, verbose, ref_intens
         params.append(np.concatenate([tr_, rot_]))
         homogs.append(T_h)
         jac_f.append(1.0 / float(pe_b["jacobian"][li]) if pe_b is not None else 1.0)
-    corrected = []
-    for li in range(n):
-        w = _apply_transforms(fixed=mean_img, moving=frames[li], transformlist=fwd[li], interpolator=interp)
-        corrected.append(w * jac_f[li] if jac_f[li] != 1.0 else w)
     out = dict(res_b)
-    out["motion_corrected"] = ants.list_to_ndimage(img4d_g, corrected)
+    out["motion_corrected"] = resample_series(
+        img4d_g,
+        [TransformChain.from_paths(c) for c in fwd],
+        None,
+        mean_img,
+        jacobian=False,
+        interpolator=interp,
+        device=kw.get("device"),
+        volume_scales=np.asarray(jac_f, dtype=np.float64),
+    )
     out["fwdtransforms"] = fwd
     out["invtransforms"] = [list(c) for c in fwd]
     mp = res_b.motion_parameters
@@ -192,12 +202,26 @@ def build_low_motion_reference(
         selected_mean, selected, device=device, num_bins=num_bins, verbose=False,
         seed_mode="narrow", schedule_mode="fast",
     )
-    from .transforms import apply_transforms as _apply_transforms
-    corrected = [
-        _apply_transforms(fixed=selected_mean, moving=im, transformlist=f, interpolator="linear")
-        for im, f in zip(selected, fwd)
-    ]
-    final_ref = _mean_image(corrected)
+    from .transforms import TransformChain, resample_series
+
+    sel_dir = np.eye(4, dtype=float)
+    sel_dir[:3, :3] = np.asarray(ants.get_direction(selected[0]), dtype=float)[:3, :3]
+    sel_4d = ants.from_numpy(
+        np.stack([im.numpy() for im in selected], axis=-1).astype(np.float32, copy=False),
+        origin=list(ants.get_origin(selected[0])) + [0.0],
+        spacing=list(ants.get_spacing(selected[0])) + [1.0],
+        direction=sel_dir,
+    )
+    corr_4d = resample_series(
+        sel_4d,
+        [TransformChain.from_paths(f) for f in fwd],
+        None,
+        selected_mean,
+        jacobian=False,
+        interpolator="linear",
+        device=None if device == "auto" else device,
+    )
+    final_ref = selected[0].new_image_like(corr_4d.numpy().mean(axis=-1).astype(np.float32))
 
     if verbose:
         print(f"[syntx.motion_reference] build_low_motion_reference: {_time.time() - t0:.2f}s "
@@ -729,7 +753,7 @@ def motion_correct_grouped(
     """
     from .motion import _extract_rigid_parameters, motion_correction
     from .robust_affine import robust_affine
-    from .transforms import apply_transforms as _apply_transforms
+    from .transforms import TransformChain, resample_series
 
     if nuisance_covariates is not None or nuisance_axis is not None:
         warnings.warn(
@@ -768,13 +792,23 @@ def motion_correct_grouped(
     # built ants images drift in origin/direction and are rejected by the batched passes' grid check).
     ref3d = ants.slice_image(image, axis=3, idx=0)
     tr = float(image.spacing[3]) if image.dimension == 4 else 1.0
-    img4d, imgs, means = [], [], []
+    spc4 = list(ants.get_spacing(ref3d)) + [tr]
+    org4 = list(ants.get_origin(ref3d)) + [0.0]
+    dir4 = np.eye(4, dtype=float)
+    dir4[:3, :3] = np.asarray(ants.get_direction(ref3d), dtype=float)[:3, :3]
+    arr4d_full = image.numpy()
+    arr_tzyx_full = arr4d_full.T if arr4d_full.flags["F_CONTIGUOUS"] else np.ascontiguousarray(arr4d_full.T)
+    img4d, means = [], []
     for g in range(n_groups):
-        c4 = ants.list_to_ndimage(_make_4d_template_from_3d(ref3d, len(idx[g]), tr=tr),
-                                  [ants.slice_image(image, axis=3, idx=int(i)) for i in idx[g]])
+        c4 = ants.from_numpy(
+            arr_tzyx_full[idx[g]].T,
+            origin=org4,
+            spacing=spc4,
+            direction=dir4,
+        )
         img4d.append(c4)
-        imgs.append([ants.slice_image(c4, axis=3, idx=i) for i in range(len(idx[g]))])
-        means.append(build_low_motion_reference(imgs[g], n_low_motion=n_low_motion, verbose=verbose))
+        imgs_g = [ants.slice_image(c4, axis=3, idx=i) for i in range(len(idx[g]))]
+        means.append(build_low_motion_reference(imgs_g, n_low_motion=n_low_motion, verbose=verbose))
     if verbose:
         print(f"[syntx.motion_reference] motion_correct_grouped: group sizes {[len(i) for i in idx]} of {n_frames} frames.")
 
@@ -845,8 +879,10 @@ def motion_correct_grouped(
     links = [cross_link] * (n_groups - 1) if isinstance(cross_link, str) else list(cross_link)
     if len(links) != n_groups - 1:
         raise ValueError(f"cross_link has {len(links)} entries for {n_groups - 1} adjacent group pairs")
-    cmeans = [_mean_image([ants.slice_image(results[g].motion_corrected, axis=3, idx=i) for i in range(len(idx[g]))])
-              for g in range(n_groups)]
+    cmeans = [
+        means[g].new_image_like(results[g].motion_corrected.numpy().mean(axis=-1).astype(np.float32))
+        for g in range(n_groups)
+    ]
     cross = [_cross_link(cmeans[g - 1], cmeans[g], links[g - 1], verbose=verbose, device=kwargs.get("device"),
                          num_bins=cross_num_bins, convergence_tol_vox=kwargs.get("convergence_tol_vox", 0.05),
                          max_extend_factor=kwargs.get("max_extend_factor", 4)) for g in range(1, n_groups)]
@@ -880,8 +916,10 @@ def motion_correct_grouped(
                                            dvars_reference_intensity=group_ref_intensities[g], **kw2)
             reference_modes[g] = reference_modes[g] + " + masked metric"
         mask_pass = True
-        cmeans = [_mean_image([ants.slice_image(results[g].motion_corrected, axis=3, idx=i) for i in range(len(idx[g]))])
-                  for g in range(n_groups)]
+        cmeans = [
+            means[g].new_image_like(results[g].motion_corrected.numpy().mean(axis=-1).astype(np.float32))
+            for g in range(n_groups)
+        ]
         cross = [_cross_link(cmeans[g - 1], cmeans[g], links[g - 1], verbose=verbose, device=kwargs.get("device"),
                              num_bins=cross_num_bins, convergence_tol_vox=kwargs.get("convergence_tol_vox", 0.05),
                              max_extend_factor=kwargs.get("max_extend_factor", 4)) for g in range(1, n_groups)]
@@ -921,18 +959,49 @@ def motion_correct_grouped(
             for gi, corr_path in cross_group_offset.pop("correction_paths").items():
                 chains[gi] = [corr_path] + chains[gi]   # first in the chain: acts on the anchor-space point first
 
-    frames_out: list = [None] * n_frames
+    ref_shape3d = tuple(int(s) for s in means[0].shape[:3])
+    out_tzyx = np.empty((n_frames, ref_shape3d[2], ref_shape3d[1], ref_shape3d[0]), dtype=np.float32)
+    out4d = out_tzyx.T
+    mc0_tzyx = results[0].motion_corrected.numpy().T
+    vol_scales = np.ones(n_frames, dtype=np.float64)
+    todo_gi: list[int] = []
     for g in range(n_groups):
+        pe_g = results[g].get("pe_affine")
         for li, gi in enumerate(idx[g]):
-            if g == 0 and len(chains[gi]) == len(results[0].fwdtransforms[li]):
-                frames_out[gi] = ants.slice_image(results[0].motion_corrected, axis=3, idx=li)
-            else:  # ONE resampling from the original through the composed chain: every interpolation blurs
-                frames_out[gi] = _apply_transforms(fixed=means[0], moving=imgs[g][li], transformlist=chains[gi],
-                                                   interpolator=interp)
-                pe_g = results[g].get("pe_affine")
-                if pe_g is not None and pe_g["jacobian"][li] != 1.0:
-                    frames_out[gi] = frames_out[gi] * float(pe_g["jacobian"][li])
-    motion_corrected = ants.list_to_ndimage(_make_4d_template_from_3d(frames_out[0], n_frames, tr=tr), frames_out)
+            gi_int = int(gi)
+            if pe_g is not None:
+                vol_scales[gi_int] = float(pe_g["jacobian"][li])
+            if g == 0 and len(chains[gi_int]) == len(results[0].fwdtransforms[li]):
+                out_tzyx[gi_int] = mc0_tzyx[li]
+            else:
+                todo_gi.append(gi_int)
+    if todo_gi:
+        # ONE batched resampling from the originals through the composed chains: every interpolation blurs
+        todo_4d = ants.from_numpy(
+            arr_tzyx_full[todo_gi].T,
+            origin=org4,
+            spacing=spc4,
+            direction=dir4,
+        )
+        res_todo = resample_series(
+            todo_4d,
+            [TransformChain.from_paths(chains[gi_int]) for gi_int in todo_gi],
+            None,
+            means[0],
+            jacobian=False,
+            interpolator=interp,
+            device=kwargs.get("device"),
+            volume_scales=vol_scales[todo_gi],
+        )
+        out_tzyx[todo_gi] = res_todo.numpy().T
+    dir4_out = np.eye(4, dtype=float)
+    dir4_out[:3, :3] = np.asarray(ants.get_direction(means[0]), dtype=float)[:3, :3]
+    motion_corrected = ants.from_numpy(
+        out4d,
+        origin=list(ants.get_origin(means[0])) + [0.0],
+        spacing=list(ants.get_spacing(means[0])) + [tr],
+        direction=dir4_out,
+    )
 
     mats = [[_extract_rigid_parameters(ants.read_transform(f), 3)[2] for f in chain] for chain in chains]
     # index of the frame's own rigid within its chain (by name: the own part is [rigid] or [rigid, eddy])
