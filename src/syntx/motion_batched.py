@@ -1145,14 +1145,18 @@ def _run_converging_stage(*, optimizer, params, per_frame_params, loss_fn, point
                     best_a = torch.where(better, torch.full_like(best_a, alpha), best_a)
                 if coupled:
                     best_a = torch.where(tracker.active, torch.full_like(best_a, best_alpha), best_a)
+                moved = best_a > 0
                 for k, ax in enumerate(axes):
-                    ax.tensor[ax.index] = base[k] + best_a * dv[:, k] * to_vox[k]
-            moved = best_a > 0
+                    step_k = best_a * dv[:, k] * to_vox[k]
+                    ax.tensor[ax.index] = torch.where(moved & torch.isfinite(step_k), base[k] + step_k, base[k])
             n_rejected[0] += int((tracker.active & ~moved).sum())
             full_step = best_a >= 1.0
-            trust = torch.where(full_step, torch.clamp(trust * 2.0, max=4.0 * float(max_step_vox)), torch.where(moved, trust, trust * 0.5))
-            lam = torch.where(moved, lam * 0.5, lam * 4.0 + 1e-3 * ev.abs().max(dim=1).values)
+            ev_max = ev.abs().max(dim=1).values.clamp_min(1e-12)
+            trust = torch.where(full_step, torch.clamp(trust * 2.0, max=4.0 * float(max_step_vox)), torch.where(moved, trust, torch.clamp(trust * 0.5, min=1e-4)))
+            lam = torch.where(moved, lam * 0.5, torch.clamp(lam * 4.0 + 1e-3 * ev_max, max=1e6 * ev_max))
             done += 1
+            if not bool(moved.any()) and resample_fn is None and float(dv[tracker.active].abs().max()) <= 1e-3:
+                break
         blocks = math.ceil((call + 1) / max(1, int(iters)))
     elif optimizer == "lbfgs":
         opt = torch.optim.LBFGS(params, lr=1.0, max_iter=_CHECK_EVERY_LBFGS, history_size=10, tolerance_grad=1e-9,

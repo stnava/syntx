@@ -1,12 +1,25 @@
 # Tracking Summary
-current phase: v6.30.0 (motion_correct_design defaults to engine="joint"; custom encoding columns reach the joint engine; one-hot encoding states)
+current phase: v6.30.1 (Newton Levenberg-Marquardt damping clamp and stagnation guard in motion_batched)
 next WP: a phantom whose jitter is in the images, not the trajectory; per-axis curvature scaling; audit notes 4 to 6; plan steps 3 to 5 (docs/MOTION_NEXT_STEPS_PLAN_2026-10-28.md); eddy covariates for slow-flow encodings
 blockers: none
-active work: R17 below
+active work: R18 below
 device: Apple Silicon MPS / CPU (macOS arm64)
 last updated: 2026-10-28
 
 ---
+
+## R18 (Newton Levenberg-Marquardt damping clamp and stagnation guard; v6.30.1, 2026-10-28)
+- **`motion_batched._run_converging_stage`**: When coupled Newton (`iters=20, max_extend=4`, 80 calls) encountered 65+ consecutive
+  line-search rejections (e.g., on 242-volume BOLD `ds002898` `sub-01` `run-1` once the damped step shrank below the `float32`
+  Mattes MI ULP floor), unclamped Levenberg-Marquardt damping `lam * 4.0` overflowed `float32` (`> 3.4e38`) to `inf`, producing
+  `NaN` in `Q @ diag(ev + lam) @ Q.T` and corrupting `ax.tensor` via `0.0 * NaN = NaN` on rejected steps (`best_a == 0`), which
+  crashed `torch.linalg.eigh(Hv)` at call 80.
+- Fixed by clamping `lam` to `1e6 * ev_max` and `trust` to `>= 1e-4`, updating `ax.tensor` via `torch.where(moved & isfinite, ...)`
+  so rejected steps preserve `base[k]` bit-for-bit, and exiting the stage loop when no frame moved (`not moved.any()`), points are
+  not resampled (`resample_fn is None`), and the damped step is already `<= 1e-3` voxels.
+- Verified on `ds002898` `sub-01` `run-1` (completes in 50.4s with mean FD 0.1492 mm) and regression test
+  `test_newton_stage_damping_clamp_prevents_float32_overflow_on_repeated_rejections` (`test_motion_design.py`: 37 passed;
+  `test_implementation_standards.py`: 10 passed; `antsxqc.lint src/syntx`: 0 findings).
 
 ## R17 (design-matrix review follow-ups; v6.30.0, 2026-10-28)
 - An external review of the design matrices (DWI, ASL, slow flow, BOLD, custom) was checked against the code

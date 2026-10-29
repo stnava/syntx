@@ -673,3 +673,40 @@ def test_newton_stage_converts_voxel_steps_to_parameters_correctly():
     t1 = np.array([h[:3, 3] + (h[:3, :3] - np.eye(3)) @ com for h in H1]); om1 = np.array([Rot.from_matrix(h[:3, :3]).as_rotvec() for h in H1])
     assert np.abs(t1 - t_true).max() < 0.1 * vox, np.abs(t1 - t_true).max() / vox
     assert np.degrees(np.abs(om1 - om_true).max()) < 0.1, np.degrees(np.abs(om1 - om_true).max())
+
+
+def test_newton_stage_damping_clamp_prevents_float32_overflow_on_repeated_rejections():
+    """Regression for repeated line-search rejections in coupled Newton (iters=20, max_extend=4 -> 80 calls):
+    without an upper clamp on Levenberg-Marquardt damping ``lam`` and a stagnation exit, 65 rejections multiplied
+    ``lam`` by 4^65 > float32_max (inf), turning ``Q @ diag(ev + lam) @ Q.T`` and ``0.0 * dv`` into NaN and crashing
+    ``torch.linalg.eigh`` on the next iteration."""
+    import torch
+    from syntx.core.parameter_scales import rigid_axes
+    from syntx.motion_batched import _run_converging_stage
+
+    B = 4
+    t_param = torch.zeros((B, 3), dtype=torch.float32, requires_grad=True)
+    omega = torch.zeros((B, 3), dtype=torch.float32, requires_grad=True)
+    pts = torch.randn((32, 3), dtype=torch.float32) * 30.0
+    center = torch.zeros(3, dtype=torch.float32)
+    axes = rigid_axes(t_param, omega, pts, center)
+
+    # Linear tilt gradient at origin so undamped Newton step is non-zero (> confirm_vox), but objective returns a constant
+    # on no_grad line-search evaluations so every line-search trial is rejected.
+    def loss_fn():
+        if torch.is_grad_enabled():
+            return 0.5 * ((t_param - 1.0) ** 2).sum(dim=1) + 0.5 * ((omega - 0.02) ** 2).sum(dim=1)
+        return torch.ones(B, dtype=torch.float32)
+
+    rec = _run_converging_stage(
+        optimizer="newton", params=[t_param, omega], per_frame_params=[t_param, omega],
+        loss_fn=loss_fn, points_fn=lambda: torch.zeros((B, 8, 3), dtype=torch.float32),
+        iters=25, B=B, dev=torch.device("cpu"), tol=0.05, max_extend=4,
+        confirm_vox=0.01, axes=axes, stage_voxel=3.0, max_step_vox=1.0,
+        label="newton@L1", level=1,
+        reg_loss_fn=lambda: 0.01 * (t_param ** 2).sum(),
+        reg_hess_full_fn=lambda: torch.zeros((B, 6, B, 6), dtype=torch.float32),
+    )
+    assert torch.isfinite(t_param).all() and torch.isfinite(omega).all()
+    assert rec["iterations"] < 25, rec
+
