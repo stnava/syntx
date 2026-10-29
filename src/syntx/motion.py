@@ -953,7 +953,7 @@ def motion_correction(
                                "convergence_tol_vox", "max_extend_factor", "encoding_covariates", "window_size",
                                "window_stride", "surround_weight", "surround_delta_mm", "slice_axis", "sidecar",
                                "frame_levels", "init_pose", "schedule", "design_matrix", "design_point_scale",
-                               "design_levels", "design_model_live", "tr", "surround_scale", "surround_form", "design_gauge", "pose_shrinkage", "frame_gain"}
+                               "design_levels", "design_model_live", "tr", "surround_scale", "surround_form", "design_gauge", "pose_shrinkage", "frame_gain", "pe_b0_split"}
     if backend == "pytorch_batched" and set(kwargs) - _batched_allowed_kwargs:
         raise TypeError(f"backend='pytorch_batched' accepts only {sorted(_batched_allowed_kwargs)}; got "
                         f"{sorted(set(kwargs) - _batched_allowed_kwargs)}")
@@ -1052,7 +1052,7 @@ def motion_correction(
     # 4. Helper inner registration loop
     pe_frames: dict = {"axis": None, "coefficients": [], "a": {}, "jacobian": {}, "bias": None,
                       "encoding_pose_bias_mm_rad": None, "sampling": None,
-                      "frame_converged": {}, "stages": []}  # batched backends
+                      "frame_converged": {}, "stages": [], "pe_b0_debias": None}  # batched backends
 
     def _run_pass(
         current_ref: ants.ANTsImage,
@@ -1066,7 +1066,7 @@ def motion_correction(
         List[np.ndarray],
     ]:
         pe_frames["coefficients"].clear(); pe_frames["a"].clear(); pe_frames["jacobian"].clear()
-        pe_frames["bias"] = None; pe_frames["encoding_pose_bias_mm_rad"] = None
+        pe_frames["bias"] = None; pe_frames["encoding_pose_bias_mm_rad"] = None; pe_frames["pe_b0_debias"] = None
         corrected_vols: List[ants.ANTsImage] = []
         fwd_tx_all: List[List[str]] = []
         inv_tx_all: List[List[str]] = []
@@ -1170,18 +1170,15 @@ def motion_correction(
                         design_gauge=None if kwargs.get("design_gauge") is None else np.asarray(kwargs["design_gauge"])[list(batch_indices)],
                         pose_shrinkage=float(kwargs.get("pose_shrinkage", 0.0)),
                         frame_gain=bool(kwargs.get("frame_gain", False)),
+                        pe_b0_split=bool(kwargs.get("pe_b0_split", False)),
                     )
                     if pe_batch is not None:
-                        if "sampling" in pe_batch:
-                            pe_frames["sampling"] = pe_batch["sampling"]
-                        if "design_model" in pe_batch:
-                            pe_frames["design_model"] = pe_batch["design_model"]
-                        if "prior" in pe_batch:
-                            pe_frames["prior"] = pe_batch["prior"]
-                        if "frame_gain" in pe_batch:
-                            pe_frames["frame_gain"] = pe_batch["frame_gain"]
-                        if "bias" in pe_batch:
-                            pe_frames["bias"] = pe_batch["bias"]
+                        for k_pe in (
+                            "sampling", "design_model", "prior",
+                            "frame_gain", "bias", "pe_b0_debias",
+                        ):
+                            if k_pe in pe_batch:
+                                pe_frames[k_pe] = pe_batch[k_pe]
                         if pe_batch.get("encoding_pose_bias_mm_rad") is not None:
                             enc_b = dict(pe_batch["encoding_pose_bias_mm_rad"])
                             dY_full = np.zeros((num_frames, 6), dtype=np.float64)   # the identity reference frame has no offset
@@ -1199,12 +1196,15 @@ def motion_correction(
                                     pe_frames["frame_converged"][batch_indices[pos + local_i]] = bool(all(st["converged"][local_i] for st in ([s for s in stages if s.get("level", 1) == 1][-1:] or stages[-1:])))
                                 pe_frames["stages"].append(stages)
                                 pos += n_chunk
-                        if "coefficients" in pe_batch:
-                            pe_frames["coefficients"].append(pe_batch["coefficients"])
+                        if "a" in pe_batch and pe_batch["a"] is not None:
+                            if pe_batch.get("coefficients") is not None:
+                                pe_frames["coefficients"].append(pe_batch["coefficients"])
                             pe_frames["axis"] = pe_batch["axis"]
                             for local_i, t in enumerate(batch_indices):
                                 pe_frames["a"][t] = pe_batch["a"][local_i]
                                 pe_frames["jacobian"][t] = pe_batch["jacobian"][local_i]
+
+
                 for local_i, t in enumerate(batch_indices):
                     batched_results[t] = (fwd_batch[local_i], inv_batch[local_i])
                 if verbose:
@@ -1429,6 +1429,7 @@ def motion_correction(
 
     transforms_collection = TransformCollection(fwd_transforms, inv_transforms)
 
+    a_full = np.stack([pe_frames["a"].get(t, np.zeros(4)) for t in range(num_frames)]) if pe_frames["a"] else None
     result = MotionCorrectionResult({
         "motion_corrected": motion_corrected,
         "transforms": transforms_collection,
@@ -1444,11 +1445,12 @@ def motion_correction(
         "reference": ref_img,
         "summary": summary_metrics,
         "preset": preset,
-        "pe_affine": None if not pe_frames["a"] else {
+        "pe_affine": None if a_full is None else {
             "axis": pe_frames["axis"],
-            "coefficients": pe_frames["coefficients"],
-            "a": np.stack([pe_frames["a"].get(t, np.zeros(4)) for t in range(num_frames)]),
+            "coefficients": pe_frames["coefficients"] if pe_frames["coefficients"] else None,
+            "a": a_full,
             "jacobian": np.array([pe_frames["jacobian"].get(t, 1.0) for t in range(num_frames)]),
+            "shift_mm": a_full[:, 0].copy(),
         },
         "bias": pe_frames["bias"],
         "encoding_pose_bias_mm_rad": pe_frames["encoding_pose_bias_mm_rad"],
@@ -1462,6 +1464,27 @@ def motion_correction(
             "stages": pe_frames["stages"],
         },
     })
+    if a_full is not None and spatial_dim == 3:
+        homog_all_composed = []
+        raw_params_composed = np.zeros_like(raw_params)
+        for t_i, chain in enumerate(fwd_transforms):
+            h = np.eye(4)
+            for p_tx in chain:
+                h = _extract_rigid_parameters(ants.read_transform(p_tx), 3)[2] @ h
+            homog_all_composed.append(h)
+            tx_c = ants.create_ants_transform(transform_type="AffineTransform", precision="float", dimension=3)
+            c_ref = np.asarray(center_of_sphere, dtype=np.float64)
+            tx_c.set_parameters(np.concatenate([h[:3, :3].flatten(), h[:3, 3] + (h[:3, :3] - np.eye(3)) @ c_ref]))
+            tx_c.set_fixed_parameters(c_ref)
+            tr_c, rot_c, _ = _extract_rigid_parameters(tx_c, 3)
+            raw_params_composed[t_i] = np.concatenate([tr_c, rot_c])
+        mp_raw = MotionParameters(raw_params_composed, columns=col_names, rad_to_deg_cols=rad_cols, spatial_dim=3)
+        fd_p_raw, fd_j_raw = calculate_framewise_displacement(
+            motion_parameters=mp_raw, homogeneous_matrices=homog_all_composed, radius=fd_radius, center_of_sphere=center_of_sphere
+        )
+        result["fd_raw"] = fd_j_raw if fd_method.lower() == "jenkinson" else fd_p_raw
+        if pe_frames.get("pe_b0_debias") is not None:
+            result["pe_pseudomotion_debias"] = pe_frames["pe_b0_debias"]
     attach_band_limited_fd(result, image if isinstance(image, ants.ANTsImage) else None, motion_params.translations,
                            motion_params.rotations_deg, tr_s=kwargs.get("tr"), radius=fd_radius,
                            fd_method=("jenkinson" if fd_method.lower() == "jenkinson" else "power"), center_of_mass=center_of_sphere)

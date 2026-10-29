@@ -735,3 +735,55 @@ def test_joint_shells_single_pass_mask_and_eddy_decoupled_prior():
     assert e_prior["fd_error_mm"] < e_none["fd_error_mm"], (e_prior, e_none)
 
 
+def test_pe_axis_b0_split_across_none_tag_control_and_encoding_states():
+    """When ``pe_axis`` is supplied to ``Design.none`` (BOLD/PET), ``Design.tag_control`` (ASL), or
+    ``Design.encoding_states`` (slow-flow), ``motion_correct_design`` splits high-frequency PE ``Delta B0(t)``
+    pseudomotion into ``*_eddy.mat`` so ``[0000.mat, 0000_eddy.mat]`` sharpens the resampled 4D volume while ``0000.mat``
+    and ``fd`` report pure 3D rigid head motion."""
+    import ants
+    from syntx.motion_simulation import simulate_bold_series
+
+    T = 16
+    pe_axis = (0.0, 1.0, 0.0)
+    sim = simulate_bold_series(T, seed=19, drift_mm=0.25, drift_deg=0.1, jumps=(), jitter_mm=0.02)
+    b0_ty = 0.45 * np.sin(2.0 * np.pi * np.arange(T) / 3.2)
+
+    base_frames = []
+    for t in range(T):
+        f = ants.slice_image(sim.image, axis=3, idx=t)
+        tx = ants.create_ants_transform(transform_type="AffineTransform", precision="float", dimension=3)
+        tx.set_parameters(np.concatenate([np.eye(3).ravel(), np.array([0.0, b0_ty[t], 0.0])]))
+        base_frames.append(tx.apply_to_image(f, reference=f))
+
+    img_none = ants.list_to_ndimage(sim.image, base_frames)
+    vt = ["control" if t % 2 == 0 else "label" for t in range(T)]
+    img_tc = ants.list_to_ndimage(
+        sim.image,
+        [f.new_image_like(f.numpy() * (1.03 if t % 2 == 0 else 0.97)) for t, f in enumerate(base_frames)],
+    )
+    states = [t % 4 for t in range(T)]
+    state_scales = (1.00, 0.96, 1.04, 0.98)
+    img_enc = ants.list_to_ndimage(
+        sim.image,
+        [f.new_image_like(f.numpy() * state_scales[states[t]]) for t, f in enumerate(base_frames)],
+    )
+
+    cases = [
+        ("none", img_none, make_design("none", n_frames=T, pe_axis=pe_axis)),
+        ("tag_control", img_tc, make_design("tag_control", volume_types=vt, pe_axis=pe_axis)),
+        ("encoding_states", img_enc, make_design("encoding_states", state_labels=states, pe_axis=pe_axis)),
+    ]
+    for name, img4d, design in cases:
+        res = motion_correct_design(img4d, design, engine="joint", device="cpu")
+        assert res.get("pe_affine") is not None, f"{name}: missing pe_affine"
+        shift_mm = np.asarray(res["pe_affine"]["shift_mm"], dtype=float)
+        assert float(np.max(np.abs(shift_mm))) > 0.20, f"{name}: max |shift_mm|={np.max(np.abs(shift_mm)):.3f}"
+        assert any(len(c) == 2 and c[1].endswith("_eddy.mat") and not c[0].endswith("_eddy.mat")
+                   for c in res["fwdtransforms"]), f"{name}: expected [rigid.mat, rigid_eddy.mat] chains"
+        assert res.get("pe_pseudomotion_debias") is not None, f"{name}: missing pe_pseudomotion_debias"
+        fd_clean = float(np.mean(np.asarray(res["fd"])[1:]))
+        fd_raw = float(np.mean(np.asarray(res["fd_raw"])[1:]))
+        assert fd_clean < 0.60 * fd_raw, f"{name}: fd_clean={fd_clean:.3f} not < 0.60 * fd_raw={fd_raw:.3f}"
+
+
+

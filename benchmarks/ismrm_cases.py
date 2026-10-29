@@ -43,13 +43,13 @@ def run_case(key, path, device, shrinkage=0.0):
     pe, sc = _pe_axis(path, img)
     tr = float(sc.get("RepetitionTime", img.spacing[3]))
     if key == "bold":
-        design = syntx.make_design("none", n_frames=img.shape[-1]); bv = g = None
+        design = syntx.make_design("none", n_frames=img.shape[-1], pe_axis=pe); bv = g = None
     elif key.startswith("asl"):
         ctx = path.replace("_asl.nii.gz", "_aslcontext.tsv")
         if not os.path.exists(ctx):
             ctx = glob.glob(os.path.join(os.path.dirname(path), "*_aslcontext.tsv"))[0]
         vt = [l.strip() for l in open(ctx).read().splitlines()[1:]]
-        design = syntx.make_design("tag_control", volume_types=vt); bv = g = None
+        design = syntx.make_design("tag_control", volume_types=vt, pe_axis=pe); bv = g = None
     else:
         bv = np.loadtxt(path.replace(".nii.gz", ".bval")); g = np.loadtxt(path.replace(".nii.gz", ".bvec")).T
         design = syntx.make_design("shells", bvals=bv, bvecs=g, pe_axis=pe)

@@ -576,17 +576,16 @@ def _shrink_pe_pseudomotion_core(
             "step_lag1_autocorr_pe": float(lag1_autocorrs[0]),
             "sagittal_nyquist": bool(sagittal_nyquist),
         }
-        if sagittal_nyquist:
-            meta.update(
-                step_noise_floor_sl_mm=sigs[1],
-                step_noise_floor_r_ro_mm=sigs[2],
-                step_lag1_autocorr_sl=float(lag1_autocorrs[1]),
-                step_lag1_autocorr_r_ro=float(lag1_autocorrs[2]),
-                wiener_shrinkage_eta_sl=float(eta_sl),
-                wiener_shrinkage_eta_r_ro=float(eta_r_ro),
-                sl_shift_rms_mm=float(np.sqrt(np.mean(deltas[:, 1] ** 2))),
-                r_ro_shift_rms_mm=float(np.sqrt(np.mean(deltas[:, 2] ** 2))),
-            )
+        meta.update(
+            step_noise_floor_sl_mm=sigs[1],
+            step_noise_floor_r_ro_mm=sigs[2],
+            step_lag1_autocorr_sl=float(lag1_autocorrs[1]),
+            step_lag1_autocorr_r_ro=float(lag1_autocorrs[2]),
+            wiener_shrinkage_eta_sl=float(eta_sl),
+            wiener_shrinkage_eta_r_ro=float(eta_r_ro),
+            sl_shift_rms_mm=float(np.sqrt(np.mean(deltas[:, 1] ** 2))),
+            r_ro_shift_rms_mm=float(np.sqrt(np.mean(deltas[:, 2] ** 2))),
+        )
         return R_clean, t_clean, deltas, meta
 
     elif mode == "grouped":
@@ -828,13 +827,9 @@ def separate_bold_pe_pseudomotion(
     meta = dict(meta)
     meta["slice_axis"] = {"voxel_axis": int(sl_inf.voxel_axis), "source": sl_inf.source}
     meta["sigma_ref_mm"] = meta.get("step_noise_floor_ref_mm")
-    sigs_list = [meta.get("step_noise_floor_pe_mm")]
-    ac1_list = [meta.get("step_lag1_autocorr_pe")]
-    eta_list = [meta.get("wiener_shrinkage_eta")]
-    if sagittal_nyquist:
-        sigs_list.extend([meta.get("step_noise_floor_sl_mm"), meta.get("step_noise_floor_r_ro_mm")])
-        ac1_list.extend([meta.get("step_lag1_autocorr_sl"), meta.get("step_lag1_autocorr_r_ro")])
-        eta_list.extend([meta.get("wiener_shrinkage_eta_sl"), meta.get("wiener_shrinkage_eta_r_ro")])
+    sigs_list = [meta.get("step_noise_floor_pe_mm"), meta.get("step_noise_floor_sl_mm"), meta.get("step_noise_floor_r_ro_mm")]
+    ac1_list = [meta.get("step_lag1_autocorr_pe"), meta.get("step_lag1_autocorr_sl"), meta.get("step_lag1_autocorr_r_ro")]
+    eta_list = [meta.get("wiener_shrinkage_eta"), meta.get("wiener_shrinkage_eta_sl"), meta.get("wiener_shrinkage_eta_r_ro")]
     meta["sigma_epi_mm"] = sigs_list
     meta["lag1_step_autocorr"] = ac1_list
     meta["wiener_shrinkage_eta"] = eta_list
@@ -1362,6 +1357,7 @@ def batched_rigid_register_pass(
     design_gauge: Optional[np.ndarray] = None,
     pose_shrinkage: float = 0.0,
     frame_gain: bool = False,
+    pe_b0_split: bool = False,
 ):
     """Rigidly register every frame in ``moving_imgs`` to the same ``reference_img``, in one
     or more batched optimisations, optionally with a per-frame eddy-current (phase-encode affine) term whose
@@ -1426,6 +1422,7 @@ def batched_rigid_register_pass(
             init_pose=init_pose, design_matrix=design_matrix, design_point_scale=design_point_scale,
             design_levels=design_levels, design_model_live=design_model_live, surround_scale=surround_scale, surround_form=surround_form,
             design_gauge=design_gauge, pose_shrinkage=pose_shrinkage, frame_gain=frame_gain,
+            pe_b0_split=pe_b0_split,
         )
         return out if return_pe_affine else out[:3]
 
@@ -1466,6 +1463,7 @@ def batched_rigid_register_pass(
             design_model_live=design_model_live, surround_scale=surround_scale, surround_form=surround_form,
             design_gauge=None if design_gauge is None else np.asarray(design_gauge)[start:start + chunk_size],
             pose_shrinkage=pose_shrinkage, frame_gain=frame_gain,
+            pe_b0_split=pe_b0_split,
         )
         fwd_all.extend(fwd_c)
         inv_all.extend(inv_c)
@@ -1503,6 +1501,8 @@ def batched_rigid_register_pass(
                 "a": np.concatenate([np.zeros((n, 4)) if pc is None or "a" not in pc else pc["a"] for pc, n in zip(pe_chunks, sizes)]),
                 "jacobian": np.concatenate([np.ones(n) if pc is None or "jacobian" not in pc else pc["jacobian"] for pc, n in zip(pe_chunks, sizes)]),
             })
+        if any(pc is not None and "pe_b0_debias" in pc for pc in pe_chunks):
+            pe_info["pe_b0_debias"] = next(pc["pe_b0_debias"] for pc in pe_chunks if pc is not None and "pe_b0_debias" in pc)
     return (fwd_all, inv_all, elapsed_total, pe_info) if return_pe_affine else (fwd_all, inv_all, elapsed_total)
 
 
@@ -1545,6 +1545,7 @@ def _batched_rigid_register_pass_core(
     design_gauge: Optional[np.ndarray] = None,
     pose_shrinkage: float = 0.0,
     frame_gain: bool = False,
+    pe_b0_split: bool = False,
 ) -> Tuple[List[List[str]], List[List[str]], float, Optional[dict]]:
     """
     Rigidly register every frame in ``moving_imgs`` to the same ``reference_img`` in one
@@ -2791,21 +2792,32 @@ def _batched_rigid_register_pass_core(
             t_final = Y_c[:, :3]
             bias_info = {"coefficients": beta[1:].tolist(), "removed_rms_mm": float(np.sqrt((fit[:, :3] ** 2).sum(1).mean())),
                          "removed_rms_deg": float(np.degrees(np.sqrt((fit[:, 3:] ** 2).sum(1).mean()))), "n_covariates": int(Z.shape[1])}
-    if pe_on and B >= 12:
+    if (pe_on or (pe_b0_split and pe_axis is not None)) and B >= 12:
         from .acquisition_axes import encoding_frame
 
         D_dir = np.asarray(reference_img.direction, dtype=np.float64)[:3, :3]
-        j_pe = int(np.argmax(np.abs(D_dir.T @ p_np)))
+        p_in = p_np if pe_on else pe_axis
+        p_pe_tmp, _, _ = encoding_frame(D_dir, p_in, 2)
+        j_pe = int(np.argmax(np.abs(D_dir.T @ p_pe_tmp)))
         sl_vox = 2 if j_pe != 2 else int(np.argmax([reference_img.spacing[ax] if ax != j_pe else -1.0 for ax in range(3)]))
-        p_pe, p_sl, p_ro = encoding_frame(D_dir, p_np, sl_vox)
+        p_pe, p_sl, p_ro = encoding_frame(D_dir, p_in, sl_vox)
         _, _, deltas_pe, pe_b0_meta = _shrink_pe_pseudomotion_core(
             R_final.astype(np.float64), t_final, com_f, p_pe, p_sl, p_ro, fd_radius=50.0, mode="bold"
         )
         if pe_b0_meta is not None:
             delta_pe = deltas_pe[:, 0]
-            t_final = t_final - np.outer(delta_pe, p_np)
-            a_np[:, 0] = a_np[:, 0] + jac_np * delta_pe
-            pe_info["pe_b0_debias"] = pe_b0_meta
+            t_final = t_final - np.outer(delta_pe, p_pe)
+            if pe_on:
+                a_np[:, 0] = a_np[:, 0] + jac_np * delta_pe
+                pe_info["pe_b0_debias"] = pe_b0_meta
+            else:
+                p_np = p_pe
+                a_np = np.zeros((B, 4), dtype=np.float64)
+                a_np[:, 0] = delta_pe
+                jac_np = np.ones(B, dtype=np.float64)
+                if pe_info is None:
+                    pe_info = {}
+                pe_info.update(axis=p_np.tolist(), coefficients=None, a=a_np, jacobian=jac_np, pe_b0_debias=pe_b0_meta)
     if bias_info is not None:
         if pe_info is None:
             pe_info = {}
@@ -2830,6 +2842,7 @@ def _batched_rigid_register_pass_core(
     pe_info["sampling"] = {**sampler.provenance(), "resample_points": bool(resample_points), "sample_seed": int(sample_seed),
                            "n_sample_full_resolution": int(n_sample)}
     fwd_transforms, inv_transforms = [], []
+    has_eddy = pe_on or (pe_b0_split and pe_info is not None and pe_info.get("a") is not None)
     for b in range(B):
         tx = ants.create_ants_transform(transform_type="AffineTransform", precision="float", dimension=3)
         tx.set_parameters(np.concatenate([R_final[b].flatten(), t_final[b]]))
@@ -2837,7 +2850,7 @@ def _batched_rigid_register_pass_core(
         tx_path = f"{prefix}{b:04d}.mat"
         ants.write_transform(tx, tx_path)
         chain = [tx_path]
-        if pe_on and np.any(a_np[b] != 0):
+        if has_eddy and np.any(a_np[b] != 0):
             # y' = M (y - c) + c + T with M = I + p a^T (a = shears/scale), T = p a0; applied AFTER the rigid, so it is
             # listed after it (a transform list acts on the point first-listed first; see ``rigid_transform_of``)
             M = np.eye(3) + np.outer(p_np, a_np[b, 1:4])

@@ -112,7 +112,7 @@ def _design_none(n_frames: int, pe_axis=None) -> Design:
     return Design("none", np.zeros(int(n_frames), dtype=int), pe_axis=pe_axis)
 
 
-def _design_tag_control(volume_types: Sequence[str]) -> Design:
+def _design_tag_control(volume_types: Sequence[str], pe_axis=None) -> Design:
     vt = [str(v).lower().replace("tag", "label") for v in volume_types]
     others = sorted(set(vt) - {"control", "label"})
     seen = []
@@ -132,7 +132,7 @@ def _design_tag_control(volume_types: Sequence[str]) -> Design:
     s_tc = np.array([1.0 if v == "control" else (-1.0 if v == "label" else 0.0) for v in vt])
     n_tc = int(np.sum(np.abs(s_tc) > 0))
     enc = s_tc if (n_tc >= 6 and {"control", "label"} <= set(vt)) else None
-    return Design("tag_control", levels, encoding=enc,
+    return Design("tag_control", levels, encoding=enc, pe_axis=pe_axis,
                   detail={"other_volume_types": others, "anchor_volume_type": anchor_type,
                           "n_control_label": n_tc,
                           "encoding": "tag_control_pm1" if enc is not None else
@@ -168,7 +168,7 @@ def _design_shells(bvals, bvecs=None, pe_axis=None, b0_threshold: float = 50.0) 
                           "bvals": bv.tolist(), "bvecs": None if bvecs is None else np.asarray(bvecs, dtype=np.float64).tolist()})
 
 
-def _design_encoding_states(state_labels) -> Design:
+def _design_encoding_states(state_labels, pe_axis=None) -> Design:
     """One level per encoding state; ``encoding`` holds the one-hot indicators of the non-anchor states (T, K - 1), so the
     legacy ``dispatch`` and ``unified`` paths see categorical states (until 6.30.0 the integer labels went in as one linear
     ramp, which is wrong for three or more states); the joint engine builds its own level indicators from ``levels``."""
@@ -177,13 +177,14 @@ def _design_encoding_states(state_labels) -> Design:
     levels = levels.astype(int)
     n_states = int(levels.max() + 1)
     enc = np.stack([(levels == k).astype(np.float64) for k in range(1, n_states)], axis=1) if n_states > 1 else None
-    return Design("encoding_states", levels, encoding=enc, detail={"n_states": n_states})
+    return Design("encoding_states", levels, encoding=enc, pe_axis=pe_axis, detail={"n_states": n_states})
 
 
-def _design_custom(levels, encoding=None) -> Design:
+def _design_custom(levels, encoding=None, pe_axis=None) -> Design:
     lev = np.asarray(levels).reshape(-1)
     _, levels_i = np.unique(lev, return_inverse=True)
-    return Design("custom", levels_i.astype(int), encoding=None if encoding is None else np.asarray(encoding, dtype=np.float64))
+    return Design("custom", levels_i.astype(int), encoding=None if encoding is None else np.asarray(encoding, dtype=np.float64),
+                  pe_axis=pe_axis)
 
 
 DESIGNS: Dict[str, Callable[..., Design]] = {
@@ -412,7 +413,7 @@ JOINT_SURROUND_FORM = "cauchy"
 # independent task-fMRI evaluation (OpenNeuro ds007693 sub-07, four 340-volume runs) at 0.05 lowered FD on every run
 # (0.202 -> 0.199 mm), left the censored volumes unchanged (12 of 1360), preserved the first-level GLM maps (voxelwise beta
 # correlation 0.994 to 0.999 against no prior) and ran 4.3x faster end to end. Multi-level designs keep 0.03.
-JOINT_SURROUND_WEIGHT_ONE_LEVEL = 0.05
+JOINT_SURROUND_WEIGHT_ONE_LEVEL = JOINT_SURROUND_WEIGHT
 # The ``projected`` engine's head prior is OFF until its weight is in the image term's units: the image loss is a MEAN over
 # sample points, so its gradient is small, while the prior with the 50 mm rotation lever is comparable to it at 0.02 and
 # stops L-BFGS from correcting a smooth rotation error (plain phantom, no jitter: rotation RMS 0.065 deg with the prior
@@ -587,6 +588,7 @@ def _joint(image, design: Design, *, init: str = "levels", surround_weight: Opti
         kw = {**knobs, **kwargs}
         if design.pe_axis is not None:
             kw.setdefault("pe_axis", design.pe_axis)
+            kw.setdefault("pe_b0_split", True)
         if design.name == "custom" and design.encoding is not None:
             ext = np.asarray(design.encoding, dtype=np.float64).reshape(T, -1)
             if T >= FRAMES_PER_BETA_COLUMN * int(np.sum(np.ptp(ext, axis=0) > 0)):
@@ -718,7 +720,10 @@ def _joint(image, design: Design, *, init: str = "levels", surround_weight: Opti
             kw1["design_gauge"] = D_metric[:, cols] if cols else None
         kw1.setdefault("surround_scale", "curvature")    # prior weights relative to the measured image curvature (metric-independent)
     if pe_cov is not None:
-        kw1.update(pe_affine_covariates=pe_cov, pe_axis=design.pe_axis)
+        kw1.update(pe_affine_covariates=pe_cov, pe_axis=design.pe_axis, pe_b0_split=True)
+    elif design.pe_axis is not None:
+        kw1.setdefault("pe_axis", design.pe_axis)
+        kw1.setdefault("pe_b0_split", True)
     if sample_mask_fn is not None:
         kw1["sample_mask"] = h0.get("sample_mask") if h0.get("sample_mask") is not None else sample_mask_fn(ref_level[0])
     kw1.update(surround_weight=lam, surround_delta_mm=float(surround_delta_mm), surround_form=str(surround_form), init_pose=(t_init, om_init),
@@ -769,7 +774,7 @@ def _joint(image, design: Design, *, init: str = "levels", surround_weight: Opti
     out.update(motion_corrected=motion_corrected, fd=fd, fd_raw=fd_raw, translations_mm=translations_mm, rotations_deg=rotations_deg,
                nuisance=None, pe_affine=pe_affine, reference_modes=["joint: corrected level means"],
                masked_metric=sample_mask_fn is not None, bias=[r1.get("bias")], encoding_pose_bias_mm_rad=[enc_info],
-               cross_group_offset=beta_levels, group_offset_fd=None, pe_pseudomotion_debias=None,
+               cross_group_offset=beta_levels, group_offset_fd=None, pe_pseudomotion_debias=r1.get("pe_pseudomotion_debias"),
                frame_converged=(np.asarray(r1["convergence"]["frame_converged"], dtype=bool) if r1.get("convergence") else np.ones(T, dtype=bool)),
                cross_converged=list(h0.get("cross_converged") or []), cross_link=list(h0.get("cross_link") or []),
                fwdtransforms=chains, group_results=[r1], group_indices=[np.arange(T)], group_means=[ref_level[int(k)] for k in sorted(ref_level)],

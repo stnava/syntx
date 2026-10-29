@@ -1,12 +1,41 @@
 # Tracking Summary
-current phase: v6.30.4 (pure-PyTorch float32 batched 4D motion & order-3 B-spline resampling)
+current phase: v6.30.5 (phase-encode eddy/B0 split into _eddy.mat across all designs & unified surround_weight=0.03)
 next WP: a phantom whose jitter is in the images, not the trajectory; per-axis curvature scaling; audit notes 4 to 6; plan steps 3 to 5 (docs/MOTION_NEXT_STEPS_PLAN_2026-10-28.md); eddy covariates for slow-flow encodings
 blockers: none
-active work: R21 below
+active work: R22 below
 device: Apple Silicon MPS / CPU (macOS arm64)
 last updated: 2026-10-29
 
 ---
+
+## R22 (phase-encode eddy/B0 split into `_eddy.mat` across all designs & unified `surround_weight=0.03`; v6.30.5, 2026-10-29)
+- **Decoupled phase-encode $\Delta B_0(t)$ / eddy shift into `0000_eddy.mat` across all time-series designs (`shells`, `none`, `tag_control`, `encoding_states`, `custom`)**:
+  - Previously, when `pe_axis` was provided, the 3-DOF phase-encode linear eddy shear `(a_x, a_y, a_z)` was stored in `0000_eddy.mat`,
+    while the constant phase-encode translation ($t_{\text{pe}} + \bar{\mathbf{x}}\cdot\mathbf{a}$) and residual $\Delta B_0(t)$ field shift
+    remained inside `0000.mat` (causing rigid pose FD to carry phase-encode distortion rather than pure head motion) or were subtracted
+    from `0000.mat` without an `_eddy.mat` companion (leaving the resampled 4D volume uncompensated for real bulk PE field shifts).
+  - Updated `motion_batched._batched_rigid_register_pass_core` (`pe_b0_split=True`), `motion_design` (`_design_tag_control`,
+    `_design_encoding_states`, `_design_custom`, `_joint`), and `motion._run_pass` so that whenever `pe_axis` is supplied, the total
+    composed image transform `[0000.mat, 0000_eddy.mat]` is preserved exactly while both the centered eddy translation
+    $-(\mathbf{a}\cdot\mathbf{c})\hat{\mathbf{p}}_{\text{pe}}$ and the Wiener-shrunk PE $\Delta B_0(t)$ pseudomotion shift
+    $\delta_{\text{pe}}(n)\hat{\mathbf{p}}_{\text{pe}}$ are transferred into `0000_eddy.mat` (`shift_mm`), leaving `0000.mat` as the
+    pure 3D rigid head pose.
+  - Replaced the duplicate unregularized `H0` Newton pass in `motion_design._joint` with single-pass mask reuse (`fixed_mask_init`)
+    and post-pass `motion_reference._apply_group_shifts_to_result`.
+  - Real-data & phantom verification:
+    - `ExpArt/sub-EAS024` 200-volume multi-shell DWI: stage-2 mean FD dropped from `0.474 mm` (`71/200` frames `> 0.5 mm`, max `1.883 mm`)
+      to `0.173 mm` (`0/200` frames `> 0.5 mm`, max `0.436 mm`) while `0000_eddy.mat` retained the `0.680 mm` RMS eddy shear and
+      `0.303 mm` RMS PE $\Delta B_0(t)$ shift (`FA r = 0.9963`, `MD r = 0.9985`).
+    - `breacher/sub-3315` 300-volume rsfMRI BOLD (`TR=1.0 s`, `PE=j-`): PE step SD in `0000.mat` dropped from `0.1404 mm` to `0.0389 mm`
+      (`-92.3%` variance, matching readout noise floor `0.0470 mm`), mean Power FD `0.600 -> 0.545 mm` (`fd_bandlimited = 0.284 mm`).
+    - `ds004856/sub-1003` 60-volume PCASL (`tag_control`): mean FD `0.189 -> 0.155 mm` (`-18.0%`).
+    - Planted-PE-jitter phantoms (`none`, `tag_control`, `encoding_states`): head FD error reduced by `-85.1%` to `-89.5%` with
+      resampled 4D image parity `max|diff| <= 5.96e-7`.
+- **Unified `surround_weight = 0.03` across all designs**: Set `JOINT_SURROUND_WEIGHT_ONE_LEVEL = JOINT_SURROUND_WEIGHT` (`0.03`) in
+  `motion_design.py` so 1-level (`none`) and multi-level (`shells`, `tag_control`, `encoding_states`, `custom`) designs share the
+  same `cauchy` (`delta_mm=0.05`, `scale="curvature"`, `weight=0.03`) temporal prior.
+- Verification: `94 passed` across `test_motion_design.py`, `test_motion_batched.py`, `test_band_limited_fd.py`,
+  `test_resample_series_eddy_jacobian.py`, and `test_implementation_standards.py`; `0` findings in `antsxqc.lint`.
 
 ## R21 (pure-PyTorch float32 batched 4D motion & order-3 B-spline resampling; v6.30.4, 2026-10-29)
 - **Pure-PyTorch `float32` ITK-matching order-3 B-spline interpolation (`transforms._bspline_prefilter_and_pad_5d` + `_sample_bspline_padded_5d`)**:
