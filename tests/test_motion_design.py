@@ -710,3 +710,28 @@ def test_newton_stage_damping_clamp_prevents_float32_overflow_on_repeated_reject
     assert torch.isfinite(t_param).all() and torch.isfinite(omega).all()
     assert rec["iterations"] < 25, rec
 
+
+def test_joint_shells_single_pass_mask_and_eddy_decoupled_prior():
+    """WP1-WP3 regression: for ``shells`` in ``engine='joint'``, ``sample_mask_fn`` is evaluated once in H0
+    (``mask_single_pass=True``) and reused in H1, and the eddy-decoupled surround prior improves FD error on
+    ``simulate_dwi_series`` relative to ``surround_weight=0.0``."""
+    from syntx.motion_simulation import evaluate_motion_estimate, simulate_dwi_series
+
+    sim = simulate_dwi_series(16, seed=42, eddy_mm_per_unit=0.4)
+    bv, bvec = sim.extra["bvals"], sim.extra["bvecs"]
+    d = make_design("shells", bvals=bv, bvecs=bvec, pe_axis=sim.pe_axis)
+    calls = [0]
+
+    def mask_fn(ref_img):
+        calls[0] += 1
+        arr = (ref_img.numpy() > 0.2 * float(ref_img.numpy().max())).astype(np.float32)
+        return ref_img.new_image_like(arr)
+
+    r_prior = motion_correct_design(sim.image, d, engine="joint", device="cpu", sample_mask_fn=mask_fn)
+    assert calls[0] == 1, f"expected sample_mask_fn to be called once across H0 and H1, got {calls[0]}"
+    r_none = motion_correct_design(sim.image, d, engine="joint", device="cpu", surround_weight=0.0, sample_mask_fn=mask_fn)
+    e_prior = evaluate_motion_estimate(r_prior["fwdtransforms"], sim)
+    e_none = evaluate_motion_estimate(r_none["fwdtransforms"], sim)
+    assert e_prior["fd_error_mm"] < e_none["fd_error_mm"], (e_prior, e_none)
+
+

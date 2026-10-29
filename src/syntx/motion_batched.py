@@ -1752,6 +1752,8 @@ def _batched_rigid_register_pass_core(
 
     # eddy-current PE-affine term, tied across frames through the covariates (see docstring)
     pe_on = False
+    a0_pe = None
+    B0_pe_np = None
     if pe_affine_covariates is not None:
         cov_np = np.asarray(pe_affine_covariates, dtype=np.float64).reshape(B, -1)
         if np.any(cov_np != 0):
@@ -1764,6 +1766,8 @@ def _batched_rigid_register_pass_core(
             # from t_final after optimisation so it does not create a translation gauge nullspace with t_param.
             pe_scale = torch.tensor([0.0, 0.01, 0.01, 0.01], **f32).unsqueeze(1)
             Ccoef = torch.zeros(4, cov_t.shape[1], device=dev, requires_grad=True)
+            a0_pe = torch.zeros(B, **f32)
+            B0_pe_np = np.zeros(cov_np.shape[1], dtype=np.float64)
             # Projector on the span of the eddy covariates over frames (the ODD-in-g part of a per-frame scalar): the
             # encoding gauge may carry a translation along p only in the complement, so it can never take the linear
             # eddy translation (that is the applied term, attributed from the head translations after the fit), while a
@@ -1824,6 +1828,8 @@ def _batched_rigid_register_pass_core(
     def pe_terms():
         """Per-frame eddy coefficients a (B, 4) and Jacobian (B,)."""
         a = cov_t @ (Ccoef * pe_scale).t()
+        if a0_pe is not None:
+            a = torch.cat([a[:, 0:1] + a0_pe.unsqueeze(1), a[:, 1:4]], dim=1)
         return a, 1.0 + a[:, 1:4] @ p_vec
 
     def apply_pe(y_phys, a):
@@ -2156,15 +2162,44 @@ def _batched_rigid_register_pass_core(
         dY = _encoding_offset()
         return t_param + dY[:, :3], omega + dY[:, 3:]
 
+    def _head_t(t_in: torch.Tensor) -> torch.Tensor:
+        """Pure head translation with any within-stage odd-in-g eddy drift along p_vec projected out."""
+        if not pe_on:
+            return t_in
+        tp = (t_in * p_vec).sum(dim=-1)
+        return t_in - (P_odd_t @ tp).unsqueeze(1) * p_vec
+
+    def _estimate_pe_eddy_b0(tp_vec: np.ndarray) -> np.ndarray:
+        """Surround-Tukey estimate (or OLS for B < 8) of the odd-in-g linear eddy translation coefficients B0."""
+        if B >= 8:
+            Yp = np.zeros((B, 6), dtype=np.float64)
+            Yp[:, 0] = tp_vec
+            B0_full, _, _ = _project_encoding_surround_tukey_np(Yp, cov_np, np.ones((B, 1)))
+            return B0_full[0, :, 0]
+        b0_ls, *_ = np.linalg.lstsq(cov_np, tp_vec, rcond=None)
+        return b0_ls
+
     def _surround_reg_loss():
         """Penalty (``surround_rho``, form ``surround_form``) on the second-order surround of the HEAD trajectory only (mm;
         rotations x 50 mm). Smooth drift is in its nullspace; a real jump costs ~linearly (not quadratically), so it is not
         pulled toward its neighbours; the ``sparse`` form drives sub-knee jitter to zero."""
-        u_t = t_param[1:-1] - 0.5 * (t_param[:-2] + t_param[2:])
+        t_h = _head_t(t_param)
+        u_t = t_h[1:-1] - 0.5 * (t_h[:-2] + t_h[2:])
         u_w = 50.0 * (omega[1:-1] - 0.5 * (omega[:-2] + omega[2:]))
-        u_sq = (u_t * u_t).sum(dim=-1) + (u_w * u_w).sum(dim=-1)
-        rough = surround_rho(u_sq, surr_w, surr_delta, surround_form)[0].sum()
-        shrink = shrink_w * ((t_param * t_param).sum() + 2500.0 * (omega * omega).sum())
+        if pe_on and a0_pe is not None:
+            t_raw = t_h.detach() + a0_pe.detach().unsqueeze(1) * p_vec
+            u_t_raw = t_raw[1:-1] - 0.5 * (t_raw[:-2] + t_raw[2:])
+            u_pe = (u_t * p_vec).sum(dim=-1, keepdim=True) * p_vec
+            u_orth = u_t - u_pe
+            u_sq_orth = (u_orth * u_orth).sum(dim=-1) + (u_w * u_w).sum(dim=-1) + ((u_t_raw * p_vec).sum(dim=-1) ** 2).detach()
+            u_sq_pe = (u_orth.detach() * u_orth.detach()).sum(dim=-1) + (u_w.detach() * u_w.detach()).sum(dim=-1) + (u_pe * u_pe).sum(dim=-1)
+            rough = (surround_rho(u_sq_orth, surr_w, surr_delta, surround_form)[0]
+                     + surround_rho(u_sq_pe, surr_w, surr_delta, surround_form)[0]
+                     - surround_rho(u_sq_pe.detach(), surr_w, surr_delta, surround_form)[0]).sum()
+        else:
+            u_sq = (u_t * u_t).sum(dim=-1) + (u_w * u_w).sum(dim=-1)
+            rough = surround_rho(u_sq, surr_w, surr_delta, surround_form)[0].sum()
+        shrink = shrink_w * ((t_h * t_h).sum() + 2500.0 * (omega * omega).sum())
         return surr_scale[0] * (rough + shrink)
 
     def _prior_scale_curvature(loss_closure, axes, stage_voxel_mm):
@@ -2202,20 +2237,31 @@ def _batched_rigid_register_pass_core(
         """The prior's per-term values (B-2,), one per second difference, attributed to its centre frame for the per-frame
         Newton line search: (B,) with zeros at the two ends."""
         with torch.no_grad():
-            u_t = t_param[1:-1] - 0.5 * (t_param[:-2] + t_param[2:])
+            t_h = _head_t(t_param)
+            u_t = t_h[1:-1] - 0.5 * (t_h[:-2] + t_h[2:])
             u_w = 50.0 * (omega[1:-1] - 0.5 * (omega[:-2] + omega[2:]))
             u_sq = (u_t * u_t).sum(dim=-1) + (u_w * u_w).sum(dim=-1)
             terms = surr_scale[0] * surround_rho(u_sq, surr_w, surr_delta, surround_form)[0]
             out = torch.zeros(B, **f32)
             out[1:-1] = terms
-            out = out + surr_scale[0] * shrink_w * ((t_param * t_param).sum(dim=1) + 2500.0 * (omega * omega).sum(dim=1))
+            out = out + surr_scale[0] * shrink_w * ((t_h * t_h).sum(dim=1) + 2500.0 * (omega * omega).sum(dim=1))
         return out
 
     def _surround_reg_hess(axes):
         """Per-frame Hessian block (B, P, P) of the surround prior in the order of ``axes`` (``surround_prior_hessian``)."""
         cols = [(3 if ax.tensor is omega else 0) + int(ax.index[1]) for ax in axes]
-        return surround_prior_hessian(t_param.detach(), omega.detach(), surr_scale[0] * surr_w, surr_delta, shrinkage=surr_scale[0] * shrink_w,
-                                      form=surround_form)[:, cols][:, :, cols]
+        t_h = _head_t(t_param.detach())
+        H = surround_prior_hessian(t_h, omega.detach(), surr_scale[0] * surr_w, surr_delta, shrinkage=surr_scale[0] * shrink_w,
+                                   form=surround_form)
+        if pe_on and a0_pe is not None:
+            t_raw = t_h + a0_pe.detach().unsqueeze(1) * p_vec
+            H_raw = surround_prior_hessian(t_raw, omega.detach(), surr_scale[0] * surr_w, surr_delta, shrinkage=surr_scale[0] * shrink_w,
+                                           form=surround_form)
+            P6_pe = torch.zeros((6, 6), **f32)
+            P6_pe[:3, :3] = torch.outer(p_vec, p_vec)
+            P6_orth = torch.eye(6, **f32) - P6_pe
+            H = torch.einsum("ij,bjk,kl->bil", P6_orth, H_raw, P6_orth) + torch.einsum("ij,bjk,kl->bil", P6_pe, H, P6_pe)
+        return H[:, cols][:, :, cols]
 
     # Level gauge of the ``projected`` engine: a constant pose offset of one level against the anchor is a nullspace of a
     # within-level metric (its model moves with its frames), and physics says levels differ in contrast, not in pose. The
@@ -2261,9 +2307,34 @@ def _batched_rigid_register_pass_core(
     def _surround_reg_hess_full(axes):
         """Full coupled Hessian (B, P, B, P) of the surround prior in the order of ``axes``."""
         cols = [(3 if ax.tensor is omega else 0) + int(ax.index[1]) for ax in axes]
-        H = surround_prior_hessian_full(t_param.detach(), omega.detach(), surr_scale[0] * surr_w, surr_delta, shrinkage=surr_scale[0] * shrink_w,
+        t_h = _head_t(t_param.detach())
+        H = surround_prior_hessian_full(t_h, omega.detach(), surr_scale[0] * surr_w, surr_delta, shrinkage=surr_scale[0] * shrink_w,
                                         form=surround_form)
+        if pe_on and a0_pe is not None:
+            t_raw = t_h + a0_pe.detach().unsqueeze(1) * p_vec
+            H_raw = surround_prior_hessian_full(t_raw, omega.detach(), surr_scale[0] * surr_w, surr_delta, shrinkage=surr_scale[0] * shrink_w,
+                                                form=surround_form)
+            P6_pe = torch.zeros((6, 6), **f32)
+            P6_pe[:3, :3] = torch.outer(p_vec, p_vec)
+            P6_orth = torch.eye(6, **f32) - P6_pe
+            H = torch.einsum("ij,bjck,kl->bicl", P6_orth, H_raw, P6_orth) + torch.einsum("ij,bjck,kl->bicl", P6_pe, H, P6_pe)
         return H[:, cols][:, :, :, cols]
+
+    def _project_pe_eddy_gauge():
+        """Attribute the odd-in-g linear eddy translation along p_vec from t_param into a0_pe using the surround Tukey
+        estimator, keeping the total displacement y_phys invariant while ensuring t_param holds pure head translation."""
+        if not pe_on or a0_pe is None:
+            return
+        with torch.no_grad():
+            t_param.add_(a0_pe.unsqueeze(1) * p_vec)
+            a0_pe.zero_()
+            p_np = p_vec.detach().cpu().numpy().astype(np.float64)
+            tp = t_param.detach().cpu().numpy().astype(np.float64) @ p_np
+            B0 = _estimate_pe_eddy_b0(tp)
+            B0_pe_np[:] = B0
+            a0_np = cov_np @ B0
+            a0_pe.copy_(torch.tensor(a0_np, **f32))
+            t_param.sub_(a0_pe.unsqueeze(1) * p_vec)
 
     def _project_encoding_gauge():
         """Re-split the total pose into head motion and encoding offset with the closed-form Tukey surround projection.
@@ -2273,27 +2344,43 @@ def _batched_rigid_register_pass_core(
         of a real head jump that lowered the surround penalty -- returns to the head trajectory. The total pose (and so
         the image loss) is unchanged."""
         if not enc_on:
+            _project_pe_eddy_gauge()
             return None
         with torch.no_grad():
             dY_old = _encoding_offset()
             t_param.add_(dY_old[:, :3])
             omega.add_(dY_old[:, 3:])
+            if pe_on and a0_pe is not None:
+                t_param.add_(a0_pe.unsqueeze(1) * p_vec)
+                a0_pe.zero_()
             B_win.zero_()
             Y_tot = np.c_[t_param.detach().cpu().numpy().astype(np.float64), omega.detach().cpu().numpy().astype(np.float64)]
             Y_fit = Y_tot
+            p_unit = None
             if pe_on and pe_axis is not None:
                 p_arr = np.asarray(pe_axis, dtype=np.float64)
                 p_norm = np.linalg.norm(p_arr)
                 if p_norm > 1e-8:
                     p_unit = p_arr / p_norm
                     Y_fit = Y_tot.copy()   # the odd-in-g translation along p is the eddy term's, not the gauge's
-                    Y_fit[:, :3] -= np.outer(P_odd_np @ (Y_fit[:, :3] @ p_unit), p_unit)
+                    B0_init = _estimate_pe_eddy_b0(Y_fit[:, :3] @ p_unit)
+                    Y_fit[:, :3] -= np.outer(cov_np @ B0_init, p_unit)
             B_np, _, w_np = _project_encoding_surround_tukey_np(Y_fit, E_np, psi_np, fd_radius=50.0, surround_weight=0.0)
             B_win.copy_(torch.tensor(B_np, **f32) / enc_unit)
             dY_new = _encoding_offset()            # applies the odd-only projection to the new gauge
             t_param.sub_(dY_new[:, :3])
             omega.sub_(dY_new[:, 3:])
+            if pe_on and p_unit is not None and a0_pe is not None:
+                tp_rem = t_param.detach().cpu().numpy().astype(np.float64) @ p_unit
+                B0_fin = _estimate_pe_eddy_b0(tp_rem)
+                B0_pe_np[:] = B0_fin
+                a0_np = cov_np @ B0_fin
+                a0_pe.copy_(torch.tensor(a0_np, **f32))
+                t_param.sub_(a0_pe.unsqueeze(1) * p_vec)
         return w_np
+
+    if init_pose is not None and pe_on:
+        _project_pe_eddy_gauge()
 
     # Coarse-to-fine schedule: Adam at real avg_pool3d-downsampled levels (broad, cheap
     # capture) -> LBFGS at level 1 with point-sampling (precise polish). Dual-metric
@@ -2660,33 +2747,29 @@ def _batched_rigid_register_pass_core(
     t_final = t_param.detach().cpu().numpy().astype(np.float64)
     pe_info = None
     if pe_on:
+        if not enc_on:
+            _project_pe_eddy_gauge()
         with torch.no_grad():
             a_np, jac_np = (x.detach().cpu().numpy().astype(np.float64) for x in pe_terms())
         p_np = p_vec.cpu().numpy().astype(np.float64)
         C_np = (Ccoef * pe_scale).detach().cpu().numpy().astype(np.float64)
-        # Attribution of the translation along p. A per-frame rigid translation and a tied eddy translation a0 = C0 . g
-        # fit the data equally well (t_k can carry p * C0 . g_k frame by frame), so the joint optimum is a family; shears
-        # and scale have no rigid counterpart and are identified by the fit alone. The family is resolved by the same
-        # statement that defines the model -- head motion is independent of the gradient -- as the constraint that the
-        # rigid translations along p are uncorrelated with the covariates: their least-squares projection on g moves
-        # into C0. Only the head-motion part is attributed: an encoding-locked offset (registration bias, not removed from
-        # the data) must not reappear as an applied eddy shift. The projection is estimated on second-order SURROUND
-        # differences with Tukey weights (``_project_encoding_surround_tukey_np``, covariates as given, one window): a
-        # constant offset and smooth drift are in its nullspace and isolated jumps are downweighted, so real head motion
-        # that happens to correlate with g over a short series is not reassigned to the eddy term (plain least squares on
-        # the poses did that: simulated DWI, 20 directions, a 1.2 mm jump -> 0.12 mm head error along PE, corr(err, g_pe)
-        # -0.74). Fewer than 8 frames: plain least squares (no surround statistics).
+        t_final = t_param.detach().cpu().numpy().astype(np.float64)
         tp = t_final @ p_np
-        if B >= 8:
-            Yp = np.zeros((B, 6))
-            Yp[:, 0] = tp
-            B0_full, dY_pe, _ = _project_encoding_surround_tukey_np(Yp, cov_np, np.ones((B, 1)))
-            B0 = B0_full[0, :, 0]
-        else:
-            B0, *_ = np.linalg.lstsq(cov_np, tp, rcond=None)
-        t_final = t_final - np.outer(cov_np @ B0, p_np)
-        C_np[0] += B0
-        a_np[:, 0] += cov_np @ B0
+        B0_res = _estimate_pe_eddy_b0(tp)
+        t_final = t_final - np.outer(cov_np @ B0_res, p_np)
+        B0_tot = (B0_pe_np if B0_pe_np is not None else 0.0) + B0_res
+        C_np[0] += B0_tot
+        a_np[:, 0] += cov_np @ B0_res
+        if B >= 6 * int(cov_np.shape[1]):
+            from scipy.spatial.transform import Rotation as _Rot
+
+            rv_o = _Rot.from_matrix(R_final.astype(np.float64)).as_rotvec()
+            Y_orth = np.c_[t_final - np.outer(t_final @ p_np, p_np), rv_o]
+            Zc_o = cov_np - cov_np.mean(axis=0, keepdims=True)
+            _, fit_orth, _ = _project_encoding_surround_tukey_np(Y_orth, Zc_o, np.ones((B, 1)))
+            fit_t_orth = fit_orth[:, :3] - np.outer(fit_orth[:, :3] @ p_np, p_np)
+            t_final = t_final - fit_t_orth
+            R_final = _Rot.from_rotvec(rv_o - fit_orth[:, 3:]).as_matrix().astype(R_final.dtype)
         pe_info = {"axis": p_np.tolist(), "coefficients": C_np, "a": a_np, "jacobian": jac_np}
     bias_info = None
     if bias_covariates is not None:
@@ -2708,6 +2791,21 @@ def _batched_rigid_register_pass_core(
             t_final = Y_c[:, :3]
             bias_info = {"coefficients": beta[1:].tolist(), "removed_rms_mm": float(np.sqrt((fit[:, :3] ** 2).sum(1).mean())),
                          "removed_rms_deg": float(np.degrees(np.sqrt((fit[:, 3:] ** 2).sum(1).mean()))), "n_covariates": int(Z.shape[1])}
+    if pe_on and B >= 12:
+        from .acquisition_axes import encoding_frame
+
+        D_dir = np.asarray(reference_img.direction, dtype=np.float64)[:3, :3]
+        j_pe = int(np.argmax(np.abs(D_dir.T @ p_np)))
+        sl_vox = 2 if j_pe != 2 else int(np.argmax([reference_img.spacing[ax] if ax != j_pe else -1.0 for ax in range(3)]))
+        p_pe, p_sl, p_ro = encoding_frame(D_dir, p_np, sl_vox)
+        _, _, deltas_pe, pe_b0_meta = _shrink_pe_pseudomotion_core(
+            R_final.astype(np.float64), t_final, com_f, p_pe, p_sl, p_ro, fd_radius=50.0, mode="bold"
+        )
+        if pe_b0_meta is not None:
+            delta_pe = deltas_pe[:, 0]
+            t_final = t_final - np.outer(delta_pe, p_np)
+            a_np[:, 0] = a_np[:, 0] + jac_np * delta_pe
+            pe_info["pe_b0_debias"] = pe_b0_meta
     if bias_info is not None:
         if pe_info is None:
             pe_info = {}

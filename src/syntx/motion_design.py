@@ -630,6 +630,14 @@ def _joint(image, design: Design, *, init: str = "levels", surround_weight: Opti
     kw0.pop("sample_mask", None)
     if design.name == "shells":
         kw0 = {"preset": "dwi", **_DWI_DEFAULTS, **kw0}
+        if design.pe_affine_covariates is not None and design.pe_axis is not None:
+            kw0.setdefault("pe_affine_covariates", design.pe_affine_covariates)
+            kw0.setdefault("pe_axis", design.pe_axis)
+        if design.bias_covariates is not None:
+            kw0.setdefault("bias_covariates", design.bias_covariates)
+        if sample_mask_fn is not None:
+            kw0.setdefault("sample_mask_fn", sample_mask_fn)
+            kw0.setdefault("mask_single_pass", True)
     else:
         kw0.update(backend=backend, **knobs)
     if kw0.get("outprefix") is not None:
@@ -661,13 +669,16 @@ def _joint(image, design: Design, *, init: str = "levels", surround_weight: Opti
     anchor = h0["group_means"][0]
     com = np.asarray(anchor.get_center_of_mass(), dtype=np.float64)
     from scipy.spatial.transform import Rotation as _Rot
+    from .motion_batched import is_eddy_transform
 
-    def _compose(paths):
+    def _compose(paths, *, include_eddy: bool = True):
         h = np.eye(4)
         for f in paths:
+            if not include_eddy and is_eddy_transform(f):
+                continue
             h = _extract_rigid_parameters(ants.read_transform(f), 3)[2] @ h
         return h
-    H0 = [_compose(h0["fwdtransforms"][t]) for t in range(T)]
+    H0 = [_compose(h0["fwdtransforms"][t], include_eddy=False) for t in range(T)]
     t_init = np.array([H[:3, 3] + (H[:3, :3] - np.eye(3)) @ com for H in H0])
     om_init = np.array([_Rot.from_matrix(H[:3, :3]).as_rotvec() for H in H0])
     kw1 = dict(kwargs)
@@ -709,7 +720,7 @@ def _joint(image, design: Design, *, init: str = "levels", surround_weight: Opti
     if pe_cov is not None:
         kw1.update(pe_affine_covariates=pe_cov, pe_axis=design.pe_axis)
     if sample_mask_fn is not None:
-        kw1["sample_mask"] = sample_mask_fn(ref_level[0])
+        kw1["sample_mask"] = h0.get("sample_mask") if h0.get("sample_mask") is not None else sample_mask_fn(ref_level[0])
     kw1.update(surround_weight=lam, surround_delta_mm=float(surround_delta_mm), surround_form=str(surround_form), init_pose=(t_init, om_init),
                schedule_mode=schedule_mode)
     if pose_shrinkage > 0.0:

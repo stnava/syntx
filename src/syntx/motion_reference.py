@@ -637,6 +637,7 @@ def motion_correct_grouped(
     reference_predictor=None,
     reference_iterations: int = 1,
     sample_mask_fn=None,
+    mask_single_pass: bool = False,
     bias_covariates: Optional[np.ndarray] = None,
     registration_direction: str = "forward",
     metric_smoothing_mm: float = 0.0,
@@ -820,6 +821,8 @@ def motion_correct_grouped(
     results = []
     reference_modes: list = []
     group_kw: list = []
+    mask_anchor = None
+    mask_pass = False
     for g in range(n_groups):
         ref_int_g = group_ref_intensities[g]
         # group 0's corrected frames are final outputs; later groups' only feed their mean (resampled once from the originals below)
@@ -845,6 +848,8 @@ def motion_correct_grouped(
                 kw["encoding_covariates"] = ec_g
         if window_size is not None and "encoding_covariates" in kw:
             kw["window_size"] = int(window_size)
+        if g >= 1 and mask_anchor is not None:
+            kw["sample_mask"] = mask_anchor
         group_kw.append(kw)
         if registration_direction == "backward":
             res_g = _register_group_backward(img4d[g], means[g], kw, backend, verbose, ref_int_g, metric_smoothing_mm, interp if g == 0 else "linear")
@@ -872,6 +877,12 @@ def motion_correct_grouped(
                 res_g = motion_correction(img4d[g], reference=ref_input, backend=backend, verbose=verbose,
                                           dvars_reference_intensity=ref_int_g, **kw_it)
                 mode_g = f"predicted (iteration {it + 1})"
+        if g == 0 and sample_mask_fn is not None and mask_single_pass and n_groups > 1:
+            cmean_0 = means[0].new_image_like(res_g.motion_corrected.numpy().mean(axis=-1).astype(np.float32))
+            mask_anchor = sample_mask_fn(cmean_0)
+            mask_pass = True
+        if g >= 1 and mask_anchor is not None:
+            mode_g = mode_g + " + masked metric"
         reference_modes.append(mode_g)
         results.append(res_g)
 
@@ -898,8 +909,7 @@ def motion_correct_grouped(
 
     # Second pass on the direction-dependent groups with the metric restricted to the caller's mask (anchor space ->
     # each group's mean space through the inverse cross chain); the cross registrations are then recomputed.
-    mask_pass = False
-    if sample_mask_fn is not None and n_groups > 1:
+    if sample_mask_fn is not None and n_groups > 1 and not mask_single_pass:
         mask_anchor = sample_mask_fn(cmeans[0])
         for g in range(1, n_groups):
             chain_paths = list(root_prefix.get(info[g]["root"], []))
@@ -1160,6 +1170,7 @@ def motion_correct_grouped(
     out["pe_affine"] = pe_affine
     out["reference_modes"] = reference_modes
     out["masked_metric"] = mask_pass
+    out["sample_mask"] = mask_anchor
     out["bias"] = [r.get("bias") for r in results]
     out["encoding_pose_bias_mm_rad"] = [r.get("encoding_pose_bias_mm_rad") for r in results]
     out["cross_group_offset"] = cross_group_offset
