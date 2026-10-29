@@ -1,12 +1,25 @@
 # Tracking Summary
-current phase: v6.30.6 (fix PE B0 split + debias_pe_pseudomotion interaction & non-eddy rigid selection)
+current phase: v6.30.7 (L-BFGS physical-mm parameter preconditioning, freeze closure invariance & runaway guards)
 next WP: a phantom whose jitter is in the images, not the trajectory; per-axis curvature scaling; audit notes 4 to 6; plan steps 3 to 5 (docs/MOTION_NEXT_STEPS_PLAN_2026-10-28.md); eddy covariates for slow-flow encodings
 blockers: none
-active work: R23 below
+active work: R24 below
 device: Apple Silicon MPS / CPU (macOS arm64)
 last updated: 2026-10-29
 
 ---
+
+## R24 (L-BFGS physical-mm parameter preconditioning, freeze closure invariance & runaway guards; v6.30.7, 2026-10-29)
+- **Fixed L-BFGS single-frame rotational runaway in `motion_batched._run_converging_stage` (`optimizer="lbfgs"`), `_batched_rigid_register_pass_core`, and `batched_group_bias_register_pass`**:
+  - **Root cause 1 (2500:1 Hessian conditioning mismatch)**: `Adam`, `Newton`, `B_win` (`enc_unit`), and `Ccoef` (`pe_scale`) all parameterized pose displacements in `mm`, whereas `L-BFGS` optimized raw axis-angle `omega` in **radians** (`1 rad ≈ 50 mm`) concatenated alongside `mm` parameters under a single scalar initial Hessian `H_0 = (s^T y / y^T y) I` and rank-10 secant history, amplifying rotational steps ~50x–2500x.
+  - **Root cause 2 (Batch-sum Strong-Wolfe cross-frame coupling & stale secant history on freeze)**: Cross-frame secant coupling could drive one high-b frame's `omega` uphill (`d_b · g_b > 0`) by `>30°` (`-0.43° -> -39.17°` on `ExpArt/sub-EAS003` `dir-PA` frame 28, `b=3000`, causing an `18.97 mm` FD spike) while lowering the 99-frame batch sum; furthermore, frozen frame/shared parameters were only restored *after* `opt.step(closure)` rather than clamped/zero-grad inside `closure()`, and L-BFGS history was not reset when frames froze.
+  - **Fixes**:
+    1. Preconditioned all L-BFGS parameters (`z = p * s`) by `ax.scale_mm` (`ParamAxis` in both `_batched_rigid_register_pass_core` and `batched_group_bias_register_pass`) so `1.0` unit in `z` equals `1.0 mm` of physical displacement across `t_param`, `omega`, `Ccoef`, `B_win`, `t_group`, and `omega_group`.
+    2. Clamped frozen frame rows (`~tracker.active`) and frozen shared tensors (`shared_is_frozen`) and zeroed their gradients *inside* `closure()` (with `.contiguous()` gradients for MPS `LBFGS._gather_flat_grad`), resetting L-BFGS curvature history whenever any frame or shared tensor freezes or sample points redraw.
+    3. Added per-block physical displacement runaway protection (`block_cap_mm`), monotone stage-exit per-frame loss regression protection, and a post-schedule `init_pose` fallback guard for unconverged `refine` frames.
+    4. Fixed a pre-existing `float32` line-search precision-floor check in `optimizer="newton"` so active frames whose undamped residual already satisfies `remaining * vox <= max(confirm_vox * vox, tol)` are certified converged when breaking at `|dv| <= 1e-3` vox.
+- **Verification**:
+  - Real `ExpArt/sub-EAS003/ses-01` `dir-PA` 99-volume multi-shell DWI (`b = 0..3000`): eliminated the `18.97 mm` FD spike (`max_FD: 18.9716 -> 0.4705 mm` on MPS, `0.4877 mm` on CPU; `mean_FD: 0.5956 -> 0.1906 mm` on MPS, `0.1846 mm` on CPU; frame 28 `rx_deg: -32.614° -> +0.212°` on MPS / `+0.153°` on CPU; `unconverged: [28] -> []`).
+  - `92 passed` across `syntx` motion & implementation-standards suites (including `TestLbfgsRigidPreconditioningAndGuards`), `17 passed` in `antsxdwi` (`test_motion.py`, `test_motion_convergence.py`), `3 passed` in `antsxfunctional` (`test_asl_tag_control_motion_debias.py`), and `0 finding(s)` in `antsxqc.lint`.
 
 ## R23 (fix `pe_b0_split` + `debias_pe_pseudomotion` interaction & non-eddy rigid selection; v6.30.6, 2026-10-29)
 - **Fixed rigid pose & FD collapse (`~5.9e-5 mm`) when `debias_pe_pseudomotion=True` is combined with `pe_b0_split=True` (`[0000.mat, 0000_eddy.mat]` chains)**:

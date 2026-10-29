@@ -41,7 +41,7 @@ from .robust_affine import compute_center_of_mass
 from .sampling import DEFAULT_SAMPLING
 from .core.losses import batched_mattes_mi_from_weights, huber_loss_nd, parzen_weights, pearson_correlation_loss
 from .core.optimizers import PointStepTracker
-from .core.parameter_scales import probe_manifold, rigid_axes, rotation_axis_scale
+from .core.parameter_scales import ParamAxis, probe_manifold, rigid_axes, rotation_axis_scale
 from .pyramid import build_pyramid, prebuild_warp
 from .core.grid import grid_sample_nd, _image_spatial_gradient
 
@@ -1085,7 +1085,8 @@ def _run_converging_stage(*, optimizer, params, per_frame_params, loss_fn, point
     if int(level) != 1:   # coarse levels only SEED the finest one: one block with the early stop, never extended
         max_extend = 1
     tracker = PointStepTracker(tol=tol, patience=2)
-    tracker.start(points_fn())
+    pts0 = points_fn()
+    tracker.start(pts0)
     frozen = {id(p): p.detach().clone() for p in per_frame_params}
     shared_list = list(shared_params) if shared_params else []
     frozen_shared = {id(p): p.detach().clone() for p in shared_list}
@@ -1109,13 +1110,16 @@ def _run_converging_stage(*, optimizer, params, per_frame_params, loss_fn, point
 
     def _freeze(newly):
         newly = _confirm(newly)
-        if bool(newly.any()):
+        changed = bool(newly.any())
+        if changed:
             for p in per_frame_params:
                 frozen[id(p)][newly] = p.detach()[newly]
         if shared_list and not shared_is_frozen[0] and int(tracker.active.sum()) < min_active_for_shared:
             for p in shared_list:
                 frozen_shared[id(p)] = p.detach().clone()
             shared_is_frozen[0] = True
+            changed = True
+        return changed
 
     def _restore():
         if not bool((~tracker.active).any()) and not shared_is_frozen[0]:
@@ -1275,30 +1279,123 @@ def _run_converging_stage(*, optimizer, params, per_frame_params, loss_fn, point
             lam = torch.where(moved, lam * 0.5, torch.clamp(lam * 4.0 + 1e-3 * ev_max, max=1e6 * ev_max))
             done += 1
             if not bool(moved.any()) and resample_fn is None and float(dv[tracker.active].abs().max()) <= 1e-3:
+                at_tol_floor = tracker.active & (remaining * vox <= max(float(confirm_vox) * vox, float(tol)))
+                if bool(at_tol_floor.any()):
+                    tracker.active = tracker.active & ~at_tol_floor
                 break
         blocks = math.ceil((call + 1) / max(1, int(iters)))
     elif optimizer == "lbfgs":
-        opt = torch.optim.LBFGS(params, lr=1.0, max_iter=_CHECK_EVERY_LBFGS, history_size=10, tolerance_grad=1e-9,
-                                tolerance_change=1e-11, line_search_fn="strong_wolfe")
+        # Precondition every parameter tensor to physical mm displacement units (z = p * s) so L-BFGS's scalar initial
+        # Hessian H_0 = (s^T y / y^T y) I and rank-10 secant updates treat rotations (~50 mm/rad), translations (1 mm),
+        # eddy terms and encoding-bias terms commensurately instead of amplifying raw radian steps ~50x-2500x.
+        vox_mm = max(float(stage_voxel) if stage_voxel is not None else max(float(tol) * 20.0, 1.0), 1e-6)
+        entry_frame = {id(p): p.detach().clone() for p in per_frame_params}
+        per_frame_ids = {id(p) for p in per_frame_params}
+        shared_ids = {id(p) for p in shared_list}
+        param_scales = []
+        for p in params:
+            s = torch.ones_like(p.detach())
+            matched_axis = False
+            if axes is not None:
+                for ax in axes:
+                    if ax.tensor is p:
+                        s[ax.index] = max(float(ax.scale_mm), 1e-6)
+                        matched_axis = True
+            if not matched_axis and id(p) not in shared_ids and p.shape[-1] == 3 and point_radius > 0.0:
+                if len(per_frame_params) >= 2 and p is per_frame_params[1]:
+                    s.fill_(max(float(point_radius), 1e-6))
+            param_scales.append(s)
+
+        def _sync_z_to_params(z_list):
+            with torch.no_grad():
+                inact = ~tracker.active
+                has_inact = bool(inact.any())
+                for p, z, s in zip(params, z_list, param_scales):
+                    val = z / s
+                    if id(p) in per_frame_ids and has_inact:
+                        mask = inact.view(-1, *([1] * (p.dim() - 1)))
+                        val = torch.where(mask, frozen[id(p)], val)
+                    elif id(p) in shared_ids and shared_is_frozen[0]:
+                        val = frozen_shared[id(p)]
+                    p.copy_(val)
+
+        def _make_lbfgs():
+            z_list = [(p.detach() * s).clone().requires_grad_(True) for p, s in zip(params, param_scales)]
+            opt_ = torch.optim.LBFGS(z_list, lr=1.0, max_iter=_CHECK_EVERY_LBFGS, history_size=10,
+                                     tolerance_grad=1e-9, tolerance_change=1e-11, line_search_fn="strong_wolfe")
+            return z_list, opt_
+
+        z_params, opt = _make_lbfgs()
 
         def closure():
             opt.zero_grad(set_to_none=True)
-            l = _active_loss()
-            l.backward()
+            _sync_z_to_params(z_params)
+            with torch.enable_grad():
+                l = _active_loss()
+                grads_p = torch.autograd.grad(l, params, allow_unused=True)
+            inact = ~tracker.active
+            has_inact = bool(inact.any())
+            for p, z, s, gp in zip(params, z_params, param_scales, grads_p):
+                if gp is None or (id(p) in shared_ids and shared_is_frozen[0]):
+                    z.grad = torch.zeros_like(z)
+                else:
+                    gz = gp / s
+                    if id(p) in per_frame_ids and has_inact:
+                        mask = inact.view(-1, *([1] * (p.dim() - 1)))
+                        gz = torch.where(mask, torch.zeros_like(gz), gz)
+                    z.grad = torch.nan_to_num(gz, nan=0.0, posinf=0.0, neginf=0.0).contiguous()
             return l
 
+        block_cap_mm = 8.0 * max(float(max_step_vox), 1.0) * vox_mm
         n_blocks = max(1, math.ceil(iters / _CHECK_EVERY_LBFGS))
         for call in range(n_blocks * max_extend):
+            pts_before = points_fn()
+            frame_before = {id(p): p.detach().clone() for p in per_frame_params}
             opt.step(closure)
+            _sync_z_to_params(z_params)
             done += _CHECK_EVERY_LBFGS
-            _freeze(tracker.update(points_fn()))
+
+            # Guard against single-frame runaway under the batch-sum Strong-Wolfe line search
+            pts_after = points_fn()
+            rms_move = (pts_after - pts_before).pow(2).sum(-1).mean(-1).sqrt()
+            runaway = tracker.active & (rms_move > block_cap_mm)
+            reset_needed = False
+            if bool(runaway.any()):
+                with torch.no_grad():
+                    for p in per_frame_params:
+                        mask_f = runaway.view(-1, *([1] * (p.dim() - 1)))
+                        p.copy_(torch.where(mask_f, frame_before[id(p)], p))
+                reset_needed = True
+
+            froze_any = _freeze(tracker.update(points_fn()))
             _restore()
+            with torch.no_grad():
+                for p, z, s in zip(params, z_params, param_scales):
+                    z.copy_(p.detach() * s)
             if tracker.all_converged:
                 break
             if resample_fn is not None:
                 resample_fn()
-                opt = torch.optim.LBFGS(params, lr=1.0, max_iter=_CHECK_EVERY_LBFGS, history_size=10, tolerance_grad=1e-9,
-                                        tolerance_change=1e-11, line_search_fn="strong_wolfe")
+                reset_needed = True
+            if froze_any or reset_needed:
+                z_params, opt = _make_lbfgs()
+
+        with torch.no_grad():
+            drift_from_entry_mm = (points_fn() - pts0).pow(2).sum(-1).mean(-1).sqrt()
+            large_drift = drift_from_entry_mm > 3.0 * vox_mm
+            if bool(large_drift.any()):
+                end_loss = loss_fn().detach()
+                saved_end = {id(p): p.detach().clone() for p in per_frame_params}
+                for p in per_frame_params:
+                    mask_d = large_drift.view(-1, *([1] * (p.dim() - 1)))
+                    p.copy_(torch.where(mask_d, entry_frame[id(p)], p))
+                rev_loss = loss_fn().detach()
+                keep_rev = large_drift & (end_loss > rev_loss + 0.05)
+                for p in per_frame_params:
+                    mask_k = keep_rev.view(-1, *([1] * (p.dim() - 1)))
+                    p.copy_(torch.where(mask_k, entry_frame[id(p)], saved_end[id(p)]))
+                if bool(keep_rev.any()):
+                    tracker.active = tracker.active | keep_rev
         blocks = math.ceil((call + 1) / n_blocks)
     else:
         lr_scale = 1.0
@@ -2733,6 +2830,52 @@ def _batched_rigid_register_pass_core(
         _project_level_gauge()
         convergence_log.append(rec)
 
+    if init_pose is not None and convergence_log and not all(convergence_log[-1]["converged"]) and cur:
+        with torch.no_grad():
+            unconv_idx = torch.nonzero(
+                torch.tensor([not c for c in convergence_log[-1]["converged"]], dtype=torch.bool, device=dev)
+            ).flatten()
+            if int(unconv_idx.numel()) > 0:
+                live_prev = design_model["live"] if design_model is not None else False
+                if design_model is not None:
+                    design_model["live"] = False
+                try:
+                    _act_slice_cache.update(key=None, act_ref=None, mov=None, grad=None)
+                    loss_end = compute_loss(
+                        cur["X"], cur["w_y"], moving_tensor, shape_stage, level_stage=level,
+                        fixed_vals_stage=cur["fixed_vals"], corr_weight=0.0,
+                        fixed_tensor=lvl_data["fixed_tensor"], w_pts=cur["w_pts"], active_idx=unconv_idx,
+                    )
+                    _pts1 = cur["X"][::max(1, cur["X"].shape[0] // _N_CONVERGENCE_POINTS)]
+                    t_eff_u, om_eff_u = (x.index_select(0, unconv_idx) for x in _total_pose())
+                    t_ini_u = torch.tensor(t_init, device=dev, dtype=t_param.dtype).index_select(0, unconv_idx)
+                    om_ini_u = torch.tensor(omega_init, device=dev, dtype=omega.dtype).index_select(0, unconv_idx)
+                    y_end = torch.einsum("bij,sj->bsi", _batched_rodrigues(om_eff_u), _pts1 - C_phys) + C_phys + t_eff_u.unsqueeze(1)
+                    y_ini = torch.einsum("bij,sj->bsi", _batched_rodrigues(om_ini_u), _pts1 - C_phys) + C_phys + t_ini_u.unsqueeze(1)
+                    drift_u = (y_end - y_ini).pow(2).sum(-1).mean(-1).sqrt()
+                    dY_u = _encoding_offset().index_select(0, unconv_idx) if enc_on else torch.zeros((int(unconv_idx.numel()), 6), **f32)
+                    saved_t_u = t_param.index_select(0, unconv_idx).clone()
+                    saved_om_u = omega.index_select(0, unconv_idx).clone()
+                    t_param[unconv_idx] = t_ini_u - dY_u[:, :3]
+                    omega[unconv_idx] = om_ini_u - dY_u[:, 3:]
+                    _act_slice_cache.update(key=None, act_ref=None, mov=None, grad=None)
+                    loss_ini = compute_loss(
+                        cur["X"], cur["w_y"], moving_tensor, shape_stage, level_stage=level,
+                        fixed_vals_stage=cur["fixed_vals"], corr_weight=0.0,
+                        fixed_tensor=lvl_data["fixed_tensor"], w_pts=cur["w_pts"], active_idx=unconv_idx,
+                    )
+                    use_fb = (loss_end > loss_ini + 0.02) & (drift_u > 2.0 * ref_min_sp)
+                    t_param[unconv_idx] = torch.where(use_fb.unsqueeze(1), t_ini_u - dY_u[:, :3], saved_t_u)
+                    omega[unconv_idx] = torch.where(use_fb.unsqueeze(1), om_ini_u - dY_u[:, 3:], saved_om_u)
+                    if bool(use_fb.any()):
+                        _project_encoding_gauge()
+                        _project_level_gauge()
+                        convergence_log[-1]["init_pose_fallback_frames"] = unconv_idx[use_fb].cpu().numpy().tolist()
+                finally:
+                    if design_model is not None:
+                        design_model["live"] = live_prev
+                    _act_slice_cache.update(key=None, act_ref=None, mov=None, grad=None)
+
     elapsed = time.time() - t0
 
     if outprefix is None:
@@ -3507,6 +3650,13 @@ def batched_group_bias_register_pass(
         if stage.get("optimizer", "adam") != "lbfgs":
             lr_groups = [{"params": [t_param, t_group], "lr": stage["step_t_vox"] * ref_min_sp},
                          {"params": [omega, omega_group], "lr": stage["step_r_vox"] * ref_min_sp / rot_scale_mean}]
+        _pts_g = X_stage[::max(1, X_stage.shape[0] // _N_CONVERGENCE_POINTS)]
+        group_axes = rigid_axes(t_param, omega, _pts_g, C_phys) + [
+            ParamAxis(t_group, (j,), 1.0) for j in range(3)
+        ] + [
+            ParamAxis(omega_group, (j,), rotation_axis_scale(_pts_g, C_phys, j)) for j in range(3)
+        ]
+        stage_voxel_g = ref_min_sp * max(int(level), 1)
         rec = _run_converging_stage(
             optimizer=stage.get("optimizer", "adam"), params=params, per_frame_params=[t_param, omega],
             loss_fn=lambda: compute_loss(X_stage, w_y_stage, moving_tensor, shape_stage, level_stage=level,
@@ -3515,6 +3665,7 @@ def batched_group_bias_register_pass(
             tol=float(convergence_tol_vox) * ref_min_sp, max_extend=int(max_extend_factor),
             lr_groups=lr_groups, lr_t=stage.get("step_t_vox", 0.0) * ref_min_sp,
             lr_r=stage.get("step_r_vox", 0.0) * ref_min_sp / rot_scale_mean, point_radius=rot_scale_mean,
+            axes=group_axes, stage_voxel=stage_voxel_g, shared_params=[t_group, omega_group],
             label=f"{stage.get('optimizer', 'adam')}@L{level}", level=level)
         convergence_log.append(rec)
 

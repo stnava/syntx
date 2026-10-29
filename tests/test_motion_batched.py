@@ -566,3 +566,186 @@ class TestSafeBatchedEigh:
         assert float((A @ sol - rhs).norm() / rhs.norm()) < 1e-4
 
 
+class TestLbfgsRigidPreconditioningAndGuards:
+    """Regression tests for L-BFGS radian-vs-mm preconditioning, closure freeze invariance, and runaway guards."""
+
+    def test_lbfgs_mm_preconditioning_and_frozen_closure_invariance(self):
+        import torch
+        from syntx.core.parameter_scales import ParamAxis
+        from syntx.motion_batched import _batched_rodrigues, _run_converging_stage
+
+        B = 12
+        rot_r = 50.0
+        t_true = torch.zeros(B, 3, dtype=torch.float32)
+        om_true = torch.zeros(B, 3, dtype=torch.float32)
+        t_true[10] = torch.tensor([1.4, -0.9, 0.6])
+        om_true[10] = torch.deg2rad(torch.tensor([2.4, -1.8, 1.1]))
+        t_true[11] = torch.tensor([-1.1, 0.8, -0.5])
+        om_true[11] = torch.deg2rad(torch.tensor([-2.1, 1.5, -0.9]))
+
+        t_param = torch.zeros(B, 3, dtype=torch.float32, requires_grad=True)
+        omega = torch.zeros(B, 3, dtype=torch.float32, requires_grad=True)
+        b_shared = torch.tensor([0.35, -0.25, 0.15], dtype=torch.float32, requires_grad=True)
+
+        C_phys = torch.zeros(3, dtype=torch.float32)
+        pts_ref = rot_r * torch.tensor(
+            [[1.0, 0.0, 0.0], [-1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, -1.0, 0.0], [0.0, 0.0, 1.0], [0.0, 0.0, -1.0]],
+            dtype=torch.float32,
+        )
+        axes = [ParamAxis(t_param, (slice(None), j), 1.0) for j in range(3)] + [
+            ParamAxis(omega, (slice(None), j), rot_r) for j in range(3)
+        ]
+
+        closure_trace = []
+
+        def loss_fn():
+            closure_trace.append((t_param.detach().clone(), omega.detach().clone(), b_shared.detach().clone()))
+            dt = (t_param + 0.1 * b_shared.unsqueeze(0)) - t_true
+            dom = rot_r * (omega - om_true)
+            return 0.5 * ((dt * dt).sum(dim=1) + (dom * dom).sum(dim=1))
+
+        def reg_loss_fn():
+            return 0.5 * (b_shared * b_shared).sum()
+
+        def points_fn():
+            with torch.no_grad():
+                R = _batched_rodrigues(omega)
+                return torch.einsum("bij,sj->bsi", R, pts_ref - C_phys) + C_phys + t_param.unsqueeze(1)
+
+        rec = _run_converging_stage(
+            optimizer="lbfgs",
+            params=[t_param, omega, b_shared],
+            per_frame_params=[t_param, omega],
+            shared_params=[b_shared],
+            loss_fn=loss_fn,
+            reg_loss_fn=reg_loss_fn,
+            points_fn=points_fn,
+            iters=20,
+            B=B,
+            dev="cpu",
+            tol=1e-3,
+            max_extend=3,
+            point_radius=rot_r,
+            axes=axes,
+            stage_voxel=2.0,
+            label="lbfgs@L1",
+            level=1,
+        )
+
+        assert all(rec["converged"])
+        om_err_deg = torch.rad2deg((omega.detach() - om_true).abs()).max().item()
+        t_err_mm = (t_param.detach() + 0.1 * b_shared.detach().unsqueeze(0) - t_true).abs().max().item()
+        assert om_err_deg < 0.05
+        assert t_err_mm < 0.05
+        assert torch.allclose(t_param.detach()[:10], torch.zeros(10, 3), atol=1e-6)
+        assert torch.allclose(omega.detach()[:10], torch.zeros(10, 3), atol=1e-7)
+
+        # Verify that after frames 0..9 froze (leaving only 2 < min_active_for_shared=6 active frames),
+        # neither frozen frame parameters nor frozen shared parameters ever drifted inside closure().
+        post_freeze = [snap for snap in closure_trace if float((snap[1][10] - om_true[10]).abs().max()) < 0.02]
+        assert len(post_freeze) >= 2
+        b_frozen_ref = post_freeze[-1][2]
+        for t_s, om_s, b_s in post_freeze[-2:]:
+            assert torch.equal(t_s[:10], post_freeze[-1][0][:10])
+            assert torch.equal(om_s[:10], post_freeze[-1][1][:10])
+            assert torch.equal(b_s, b_frozen_ref)
+
+    def test_lbfgs_runaway_and_stage_degradation_guards(self):
+        import torch
+        from syntx.core.parameter_scales import ParamAxis
+        from syntx.motion_batched import _batched_rodrigues, _run_converging_stage
+
+        B = 8
+        rot_r = 50.0
+        t_param = torch.zeros(B, 3, dtype=torch.float32, requires_grad=True)
+        omega = torch.zeros(B, 3, dtype=torch.float32, requires_grad=True)
+        pts_ref = rot_r * torch.eye(3, dtype=torch.float32)
+        C_phys = torch.zeros(3, dtype=torch.float32)
+        axes = [ParamAxis(t_param, (slice(None), j), 1.0) for j in range(3)] + [
+            ParamAxis(omega, (slice(None), j), rot_r) for j in range(3)
+        ]
+
+        # Frame 3 has a true minimum near 0 deg, while frames 0..2 pull strongly; inject an adversarial false cliff on frame 3
+        # beyond 0.08 rad (~4.6 deg) that mimics cross-frame Strong-Wolfe runaway if unguarded, while evaluating worse > 0.05
+        # if displaced into the wrong basin.
+        target_t = torch.zeros(B, 3, dtype=torch.float32)
+        target_t[:3, 0] = 2.0
+
+        def loss_fn():
+            dt = 0.5 * ((t_param - target_t) ** 2).sum(dim=1)
+            dom = 0.5 * ((rot_r * omega) ** 2).sum(dim=1)
+            out = dt + dom
+            # Corrupt frame 3 gradient locally near 0 to push toward +0.5 rad, where image loss is actually +0.4 worse
+            om3 = omega[3, 0]
+            bump = 0.4 * torch.sigmoid(20.0 * (om3.abs() - 0.05)) - 2.0 * om3 * torch.exp(-50.0 * om3 * om3)
+            out = out.clone()
+            out[3] = dt[3] + bump
+            return out
+
+        def points_fn():
+            with torch.no_grad():
+                R = _batched_rodrigues(omega)
+                return torch.einsum("bij,sj->bsi", R, pts_ref - C_phys) + C_phys + t_param.unsqueeze(1)
+
+        _run_converging_stage(
+            optimizer="lbfgs",
+            params=[t_param, omega],
+            per_frame_params=[t_param, omega],
+            loss_fn=loss_fn,
+            points_fn=points_fn,
+            iters=15,
+            B=B,
+            dev="cpu",
+            tol=1e-3,
+            max_extend=1,
+            point_radius=rot_r,
+            axes=axes,
+            stage_voxel=2.0,
+            label="lbfgs@L1",
+            level=1,
+        )
+        max_rot3_deg = float(torch.rad2deg(omega.detach()[3].abs()).max())
+        assert max_rot3_deg < 5.0
+
+    def test_joint_multishell_refine_converges_without_rotational_runaway(self):
+        import ants
+        import syntx
+
+        rng = np.random.default_rng(20261029)
+        nx, ny, nz, nt = 24, 24, 20, 14
+        grid = np.stack(np.meshgrid(np.linspace(-1, 1, nx), np.linspace(-1, 1, ny), np.linspace(-1, 1, nz), indexing="ij"), axis=-1)
+        r2 = (grid ** 2).sum(axis=-1)
+        brain = np.exp(-2.8 * r2).astype(np.float32) * (
+            1.0 + 0.35 * np.sin(5.0 * grid[..., 0]) * np.cos(4.0 * grid[..., 1]) + 0.25 * np.cos(5.0 * grid[..., 2])
+        ).astype(np.float32)
+        brain = np.clip(brain, 0.0, None)
+
+        bvals = np.array([0, 0, 1000, 1000, 1000, 1000, 2000, 2000, 2000, 2000, 0, 1000, 2000, 2000], dtype=float)
+        bvecs = rng.normal(size=(nt, 3))
+        bvecs /= np.linalg.norm(bvecs, axis=1, keepdims=True) + 1e-12
+        bvecs[bvals == 0] = 0.0
+
+        vols = []
+        base_3d = ants.from_numpy(brain, spacing=(2.5, 2.5, 2.5))
+        com = np.asarray(ants.get_center_of_mass(base_3d), dtype=float)
+        for t in range(nt):
+            atten = float(np.exp(-bvals[t] / 1800.0)) * (1.0 - 0.15 * float(bvecs[t, 0] ** 2))
+            v = ants.from_numpy((brain * atten * 500.0).astype(np.float32), spacing=(2.5, 2.5, 2.5))
+            ang_rad = np.radians(0.8 * np.sin(0.5 * t))
+            tx = ants.create_ants_transform(transform_type="Euler3DTransform", center=com, translation=[0.3 * np.cos(t), -0.2 * np.sin(t), 0.0])
+            p = list(tx.parameters)
+            p[0] = float(ang_rad)
+            tx.set_parameters(p)
+            vols.append(ants.apply_ants_transform_to_image(tx, v, v, interpolation="linear").numpy())
+
+        arr4d = np.stack(vols, axis=-1).astype(np.float32)
+        img4d = ants.from_numpy(arr4d, spacing=(2.5, 2.5, 2.5, 1.0))
+        design = syntx.make_design("shells", bvals=bvals, bvecs=bvecs, pe_axis=np.array([0.0, -1.0, 0.0]), b0_threshold=50.0)
+        res = syntx.motion_correct_design(img4d, design, engine="joint", device="cpu")
+        rot_deg = np.asarray(res["rotations_deg"], dtype=float)
+        fd = np.asarray(res["fd"], dtype=float)
+        assert np.all(np.isfinite(rot_deg)) and np.all(np.isfinite(fd))
+        assert float(np.abs(rot_deg).max()) < 3.5
+        assert float(fd.max()) < 2.5
+
+
