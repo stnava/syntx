@@ -809,7 +809,14 @@ def motion_correct_grouped(
         )
         img4d.append(c4)
         imgs_g = [ants.slice_image(c4, axis=3, idx=i) for i in range(len(idx[g]))]
-        means.append(build_low_motion_reference(imgs_g, n_low_motion=n_low_motion, verbose=verbose))
+        means.append(
+            build_low_motion_reference(
+                imgs_g,
+                n_low_motion=n_low_motion,
+                device=kwargs.get("device") or "auto",
+                verbose=verbose,
+            )
+        )
     if verbose:
         print(f"[syntx.motion_reference] motion_correct_grouped: group sizes {[len(i) for i in idx]} of {n_frames} frames.")
 

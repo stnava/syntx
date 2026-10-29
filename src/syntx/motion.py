@@ -1319,6 +1319,7 @@ def motion_correction(
                         moving=frame_t,
                         transformlist=fwd_tx,
                         interpolator=interpolator,
+                        device=motion_device,
                     )
                 else:
                     warped_t = reg["warpedmovout"]

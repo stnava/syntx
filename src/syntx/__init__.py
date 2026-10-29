@@ -294,6 +294,11 @@ from .curves import (
     enforce_monotone,
     kabsch_rigid,
     match_curves,
+    can_batch_open_match,
+    match_open_curves_batch,
+    open_tangents_and_curvature,
+    resample_open_curves_batch,
+    smooth_open_curves_batch,
     path_to_map_subsample,
     project_monotone_l2,
     correspondence_error,
@@ -341,7 +346,7 @@ from .liouville import liouville_determinant, determinant_summary
 syngs = syngs_registration
 affine_benchmark = evaluate_affine_benchmark
 
-__version__ = "6.30.7"
+__version__ = "6.31.0"
 
 
 
@@ -391,6 +396,11 @@ __all__ = [
     "enforce_monotone",
     "kabsch_rigid",
     "match_curves",
+    "can_batch_open_match",
+    "match_open_curves_batch",
+    "open_tangents_and_curvature",
+    "resample_open_curves_batch",
+    "smooth_open_curves_batch",
     "path_to_map_subsample",
     "project_monotone_l2",
     "correspondence_error",

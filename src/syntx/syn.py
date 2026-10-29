@@ -3082,8 +3082,9 @@ def registration(
         
     # 6. Apply transforms to generate warped output images
     from .transforms import apply_transforms as _apply_transforms
-    warpedmovout = _apply_transforms(fixed=fixed_primary, moving=moving_primary, transformlist=fwd_transforms)
-    warpedfixout = _apply_transforms(fixed=moving_primary, moving=fixed_primary, transformlist=inv_transforms, whichtoinvert=whichtoinvert_inv)
+    _apply_dev = str(device) if backend == 'pytorch' else None
+    warpedmovout = _apply_transforms(fixed=fixed_primary, moving=moving_primary, transformlist=fwd_transforms, device=_apply_dev)
+    warpedfixout = _apply_transforms(fixed=moving_primary, moving=fixed_primary, transformlist=inv_transforms, whichtoinvert=whichtoinvert_inv, device=_apply_dev)
     
     fwd_midpoint_warp = None
     inv_midpoint_warp = None
@@ -3103,13 +3104,13 @@ def registration(
         fwd_midpoint_warp = fwd_mid_file
         inv_midpoint_warp = inv_mid_file
 
-        midpoint_fixed = _apply_transforms(fixed=fixed_primary, moving=fixed_primary, transformlist=[fwd_midpoint_warp])
+        midpoint_fixed = _apply_transforms(fixed=fixed_primary, moving=fixed_primary, transformlist=[fwd_midpoint_warp], device=_apply_dev)
         if affine_file is not None and (initial_transform is None or init_M_phys is not None):
-            midpoint_moving = _apply_transforms(fixed=fixed_primary, moving=moving_primary, transformlist=[inv_midpoint_warp, affine_file])
+            midpoint_moving = _apply_transforms(fixed=fixed_primary, moving=moving_primary, transformlist=[inv_midpoint_warp, affine_file], device=_apply_dev)
         elif initial_transform is not None:
-            midpoint_moving = _apply_transforms(fixed=fixed_primary, moving=moving_primary, transformlist=[inv_midpoint_warp] + tx_list)
+            midpoint_moving = _apply_transforms(fixed=fixed_primary, moving=moving_primary, transformlist=[inv_midpoint_warp] + tx_list, device=_apply_dev)
         else:
-            midpoint_moving = _apply_transforms(fixed=fixed_primary, moving=moving_primary, transformlist=[inv_midpoint_warp])
+            midpoint_moving = _apply_transforms(fixed=fixed_primary, moving=moving_primary, transformlist=[inv_midpoint_warp], device=_apply_dev)
 
     ret_dict = {'model': model,
         'warpedmovout': warpedmovout,

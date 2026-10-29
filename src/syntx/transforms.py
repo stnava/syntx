@@ -656,9 +656,10 @@ def _get_disp_and_grad_fields(path: str, device: Any) -> tuple[ContinuousField, 
     if field is None or grad_field is None:
         disp_img = ants.image_read(path)
         field = ContinuousField(disp_img, device=device, dtype=torch.float32)
-        u = np.asarray(disp_img.numpy(), dtype=np.float64)
+        u = np.asarray(disp_img.numpy(), dtype=np.float32)
         sp_shape = u.shape[:3]
-        du_didx = np.zeros(sp_shape + (3, 3), dtype=np.float64)
+        du_didx = np.zeros(sp_shape + (3, 3), dtype=np.float32)
+        inv_three = np.float32(1.0 / 3.0)
         for d in range(3):
             n = sp_shape[d]
             idx = np.arange(n)
@@ -666,9 +667,9 @@ def _get_disp_and_grad_fields(path: str, device: Any) -> tuple[ContinuousField, 
             im1 = np.clip(idx - 1, 0, n - 1)
             ip2 = np.clip(idx + 2, 0, n - 1)
             im2 = np.clip(idx - 2, 0, n - 1)
-            d1 = 0.5 * (np.take(u, ip1, axis=d) - np.take(u, im1, axis=d))
-            d2 = 0.25 * (np.take(u, ip2, axis=d) - np.take(u, im2, axis=d))
-            du_didx[..., :, d] = (4.0 * d1 - d2) / 3.0
+            d1 = np.float32(0.5) * (np.take(u, ip1, axis=d) - np.take(u, im1, axis=d))
+            d2 = np.float32(0.25) * (np.take(u, ip2, axis=d) - np.take(u, im2, axis=d))
+            du_didx[..., :, d] = (np.float32(4.0) * d1 - d2) * inv_three
         for ax in range(3):
             if sp_shape[ax] >= 2:
                 sl0 = [slice(None)] * 3
@@ -679,8 +680,8 @@ def _get_disp_and_grad_fields(path: str, device: Any) -> tuple[ContinuousField, 
                 du_didx[tuple(sl1)] = 0.0
         d_mat = np.asarray(disp_img.direction, dtype=np.float64)[:3, :3]
         s_vec = np.asarray(disp_img.spacing, dtype=np.float64)[:3]
-        ds_inv = np.linalg.inv(d_mat @ np.diag(s_vec))
-        grad_phys = (du_didx @ ds_inv).reshape(*sp_shape, 9).astype(np.float32)
+        ds_inv = np.linalg.inv(d_mat @ np.diag(s_vec)).astype(np.float32)
+        grad_phys = (du_didx @ ds_inv).reshape(*sp_shape, 9)
         grad_field = ContinuousField(
             grad_phys,
             origin=field.origin,
@@ -1923,17 +1924,34 @@ def signed_jacobian_determinant(field_path_or_image: Any, reference: Any) -> Any
     f = ants.image_read(str(field_path_or_image)) if isinstance(field_path_or_image, str) else field_path_or_image
     if tuple(f.shape) != tuple(reference.shape):
         raise ValueError(f"field grid {tuple(f.shape)} differs from reference {tuple(reference.shape)}")
-    u = np.asarray(f.numpy(), dtype=np.float64)
+    u = np.asarray(f.numpy(), dtype=np.float32)
     if u.ndim != 4 or u.shape[-1] != 3:
         raise ValueError(f"expected a 3-component displacement image, got array shape {u.shape}")
     if not np.all(np.isfinite(u)):
         raise ValueError("displacement field contains non-finite values")
-    ds_inv = np.linalg.inv(_as_direction(reference.direction) @ np.diag(np.asarray(reference.spacing, float)))
-    du = np.stack([np.stack(np.gradient(u[..., i]), axis=-1) for i in range(3)], axis=-2)
-    det = np.linalg.det(np.eye(3) + du @ ds_inv)
+    ds_inv = np.linalg.inv(_as_direction(reference.direction) @ np.diag(np.asarray(reference.spacing, float))).astype(np.float32)
+    sp_shape = u.shape[:3]
+    du = np.empty(sp_shape + (3, 3), dtype=np.float32)
+    for ax in range(3):
+        du[..., :, ax] = np.gradient(u, axis=ax)
+    j = du @ ds_inv
+    j00 = np.float32(1.0) + j[..., 0, 0]
+    j01 = j[..., 0, 1]
+    j02 = j[..., 0, 2]
+    j10 = j[..., 1, 0]
+    j11 = np.float32(1.0) + j[..., 1, 1]
+    j12 = j[..., 1, 2]
+    j20 = j[..., 2, 0]
+    j21 = j[..., 2, 1]
+    j22 = np.float32(1.0) + j[..., 2, 2]
+    det = (
+        j00 * (j11 * j22 - j12 * j21)
+        - j01 * (j10 * j22 - j12 * j20)
+        + j02 * (j10 * j21 - j11 * j20)
+    )
     if not np.all(np.isfinite(det)):
         raise ValueError("Jacobian determinant contains non-finite values")
-    return reference.new_image_like(det.astype(np.float32))
+    return reference.new_image_like(det.astype(np.float32, copy=False))
 
 
 def jacobian_modulation(field_path_or_image: Any, reference: Any) -> Any:

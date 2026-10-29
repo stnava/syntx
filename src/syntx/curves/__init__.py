@@ -32,6 +32,13 @@ from syntx.curves.matching import (
     path_to_map_subsample,
     project_monotone_l2,
 )
+from syntx.curves.batched import (
+    can_batch_open_match,
+    match_open_curves_batch,
+    open_tangents_and_curvature,
+    resample_open_curves_batch,
+    smooth_open_curves_batch,
+)
 from syntx.curves.evaluation import correspondence_error
 from syntx.curves.viz import (
     compute_dec_colors,
@@ -63,6 +70,11 @@ __all__ = [
     "path_to_map_subsample",
     "project_monotone_l2",
     "match_curves",
+    "can_batch_open_match",
+    "match_open_curves_batch",
+    "open_tangents_and_curvature",
+    "resample_open_curves_batch",
+    "smooth_open_curves_batch",
     # Evaluation
     "correspondence_error",
     # Viz & Reporting

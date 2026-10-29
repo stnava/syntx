@@ -1,12 +1,24 @@
 # Tracking Summary
-current phase: v6.30.7 (L-BFGS physical-mm parameter preconditioning, freeze closure invariance & runaway guards)
+current phase: v6.31.0 (batched open-curve elastic matching `syntx.curves.batched`, end-to-end `device=` forwarding, and `float32` Sarrus warp Jacobians)
 next WP: a phantom whose jitter is in the images, not the trajectory; per-axis curvature scaling; audit notes 4 to 6; plan steps 3 to 5 (docs/MOTION_NEXT_STEPS_PLAN_2026-10-28.md); eddy covariates for slow-flow encodings
 blockers: none
-active work: R24 below
+active work: R25 (done)
 device: Apple Silicon MPS / CPU (macOS arm64)
 last updated: 2026-10-29
 
 ---
+
+## R25 (batched open-curve elastic matching `syntx.curves.batched`, end-to-end `device=` forwarding, and `float32` Sarrus warp Jacobians; v6.31.0, 2026-10-29)
+- **Batched open-curve continuous elastic matching in $\mathbb{R}^d$ (`src/syntx/curves/batched.py`, exported from `syntx.curves` and `syntx`)**:
+  - Added `match_open_curves_batch`, `can_batch_open_match`, `resample_open_curves_batch`, `smooth_open_curves_batch`, and `open_tangents_and_curvature` vectorising Avants & Gee (2003) scale-space curvature/tangent features, anti-diagonal 3-state dynamic programming (`_dp_match_open_batch`), and pre-factored Thomas ADMM monotone $L^2$ projection (`_project_monotone_l2_open_batch` with per-curve `alive` residual stopping) across $B$ curves simultaneously in arbitrary ambient dimension $d \ge 1$.
+  - Eliminated duplicate downstream curve-matching logic in `antsxdwi` (`tractometry.compute_elastic_bundle_centroid`: `2.1792 s -> 0.1549 s`, **`14.06x`** on 250 streamlines $\times$ 32 nodes, `max |diff| = 2.67e-5 mm`; `medial_sheet.evaluate_curve_matching_metrics`: `2.2880 s -> 0.1785 s`, **`12.82x`** on 400 streamlines $\times$ 32 nodes, `max |diff| = 6.39e-14`).
+- **End-to-end explicit `device=` forwarding (`motion_reference.py`, `motion.py`, `syn.py`)**:
+  - Forwarded `device=kwargs.get("device") or "auto"` into `build_low_motion_reference` inside `motion_correct_grouped`, `device=motion_device` into per-frame `_apply_transforms` inside `motion._run_pass`, and `device=str(device)` into post-registration `_apply_transforms` (`warpedmovout`, `warpedfixout`, `midpoint_fixed`, `midpoint_moving`) inside `syn.registration`.
+- **Eliminated `float64` full-volume allocations & double buffer copies on displacement fields (`transforms.py`, `spatial.py`)**:
+  - Replaced `float64` 9-component finite-difference and `np.linalg.det` buffers in `transforms._get_disp_and_grad_fields` and `transforms.signed_jacobian_determinant` with `float32` stencils + explicit 3x3 Sarrus rule determinants while keeping `ds_inv` header inversion in `float64` (`0.2539 s -> 0.0746 s`, **`3.40x`** on a `96x96x64x3` warp field, `max |det diff| = 3.58e-7`).
+  - Removed the redundant intermediate `.copy()` before `np.ascontiguousarray(disp_np[..., ::-1])` in `spatial.export_ants_displacement_field`, preserving exact `float32` and `float64` round-trip precision.
+- **Verification**:
+  - `155 passed` across `test_implementation_standards.py`, `test_curves_batched.py`, `test_curves_geometry.py`, `test_curves_matching.py`, `test_curves_evaluation.py`, `test_transforms.py`, `test_adversarial_coverage_m4.py`, and `test_motion_reference.py`; `0 finding(s)` in `antsxqc.lint`.
 
 ## R24 (L-BFGS physical-mm parameter preconditioning, freeze closure invariance & runaway guards; v6.30.7, 2026-10-29)
 - **Fixed L-BFGS single-frame rotational runaway in `motion_batched._run_converging_stage` (`optimizer="lbfgs"`), `_batched_rigid_register_pass_core`, and `batched_group_bias_register_pass`**:
