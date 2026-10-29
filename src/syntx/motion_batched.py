@@ -743,7 +743,14 @@ def separate_bold_pe_pseudomotion(
         warnings.warn(f"separate_bold_pe_pseudomotion: {T} frames < 12, too few to separate PE pseudomotion; unchanged",
                       RuntimeWarning, stacklevel=2)
         return moco, None
-    tx_objs = [ants.read_transform(p[-1]) for p in fwd_paths]
+    def _frame_rigid_path(p) -> str:
+        chain = [p] if isinstance(p, str) else list(p)
+        non_eddy = [f for f in chain if not is_eddy_transform(f)]
+        if not non_eddy:
+            raise ValueError(f"expected at least one non-eddy rigid element in chain, got {chain}")
+        return str(non_eddy[-1])
+
+    tx_objs = [ants.read_transform(_frame_rigid_path(p)) for p in fwd_paths]
 
     com = np.asarray(tx_objs[0].fixed_parameters[:3], dtype=np.float64)
     R_all = np.zeros((T, 3, 3), dtype=np.float64)
@@ -807,16 +814,26 @@ def separate_bold_pe_pseudomotion(
     )
 
     out = type(moco)(moco) if isinstance(moco, dict) else dict(moco)
-    out["fd_raw"] = np.asarray(moco.get("fd")).copy() if moco.get("fd") is not None else None
-    out["motion_parameters_raw"] = moco.get("motion_parameters")
+    prev_fd_raw = moco.get("fd_raw")
+    out["fd_raw"] = (
+        np.asarray(prev_fd_raw).copy()
+        if prev_fd_raw is not None
+        else (np.asarray(moco.get("fd")).copy() if moco.get("fd") is not None else None)
+    )
+    prev_mp_raw = moco.get("motion_parameters_raw")
+    out["motion_parameters_raw"] = prev_mp_raw if prev_mp_raw is not None else moco.get("motion_parameters")
     out["motion_parameters"] = mp_clean
     out["fd"] = fd_power
     out["fd_power"] = fd_power
     out["fd_jenkinson"] = fd_jenkinson
-    out["pe_b0_shift_mm"] = deltas[:, 0].copy()
+    prev_shift = moco.get("pe_b0_shift_mm")
+    if prev_shift is None and isinstance(moco.get("pe_affine"), dict):
+        prev_shift = moco["pe_affine"].get("shift_mm")
+    total_pe_shift = (np.asarray(prev_shift, dtype=np.float64) + deltas[:, 0]) if prev_shift is not None else deltas[:, 0]
+    out["pe_b0_shift_mm"] = total_pe_shift.copy()
     if isinstance(out.get("summary"), dict):
         summary = dict(out["summary"])
-        summary["fd_raw_mean"] = summary.get("fd_mean", 0.0)
+        summary.setdefault("fd_raw_mean", summary.get("fd_mean", 0.0))
         summary["fd_mean"] = float(np.mean(fd_power[1:])) if T > 1 else 0.0
         summary["fd_median"] = float(np.median(fd_power[1:])) if T > 1 else 0.0
         summary["fd_power_mean"] = float(np.mean(fd_power[1:])) if T > 1 else 0.0
@@ -833,7 +850,7 @@ def separate_bold_pe_pseudomotion(
     meta["sigma_epi_mm"] = sigs_list
     meta["lag1_step_autocorr"] = ac1_list
     meta["wiener_shrinkage_eta"] = eta_list
-    meta["removed_pe_rms_mm"] = float(np.sqrt(np.mean(deltas[:, 0] ** 2)))
+    meta["removed_pe_rms_mm"] = float(np.sqrt(np.mean(total_pe_shift ** 2)))
     meta["removed_slice_rms_mm"] = float(np.sqrt(np.mean(deltas[:, 1] ** 2)))
     meta["removed_pitch_rms_mm"] = float(np.sqrt(np.mean(deltas[:, 2] ** 2)))
     out["pe_pseudomotion_debias"] = meta
@@ -1358,6 +1375,7 @@ def batched_rigid_register_pass(
     pose_shrinkage: float = 0.0,
     frame_gain: bool = False,
     pe_b0_split: bool = False,
+    slice_axis: Optional[int] = None,
 ):
     """Rigidly register every frame in ``moving_imgs`` to the same ``reference_img``, in one
     or more batched optimisations, optionally with a per-frame eddy-current (phase-encode affine) term whose
@@ -1422,7 +1440,7 @@ def batched_rigid_register_pass(
             init_pose=init_pose, design_matrix=design_matrix, design_point_scale=design_point_scale,
             design_levels=design_levels, design_model_live=design_model_live, surround_scale=surround_scale, surround_form=surround_form,
             design_gauge=design_gauge, pose_shrinkage=pose_shrinkage, frame_gain=frame_gain,
-            pe_b0_split=pe_b0_split,
+            pe_b0_split=pe_b0_split, slice_axis=slice_axis,
         )
         return out if return_pe_affine else out[:3]
 
@@ -1463,7 +1481,7 @@ def batched_rigid_register_pass(
             design_model_live=design_model_live, surround_scale=surround_scale, surround_form=surround_form,
             design_gauge=None if design_gauge is None else np.asarray(design_gauge)[start:start + chunk_size],
             pose_shrinkage=pose_shrinkage, frame_gain=frame_gain,
-            pe_b0_split=pe_b0_split,
+            pe_b0_split=pe_b0_split, slice_axis=slice_axis,
         )
         fwd_all.extend(fwd_c)
         inv_all.extend(inv_c)
@@ -1493,16 +1511,17 @@ def batched_rigid_register_pass(
                 pe_info["bias"] = pe_info["encoding_pose_bias_mm_rad"]
         if "convergence" in first:
             pe_info["convergence"] = [pc["convergence"] for pc in pe_chunks if pc is not None]  # one stage list per chunk
-        if any("a" in pc for pc in pe_chunks if pc is not None):
+        if any(pc is not None and pc.get("a") is not None for pc in pe_chunks):
             # the tied eddy coefficients are estimated per chunk (each chunk is an independent fit): one matrix per chunk
+            coeffs_chunks = [None if pc is None else pc.get("coefficients") for pc in pe_chunks]
             pe_info.update({
                 "axis": next(pc for pc in pe_chunks if pc is not None and "axis" in pc)["axis"],
-                "coefficients": [None if pc is None or "coefficients" not in pc else pc["coefficients"] for pc in pe_chunks],
-                "a": np.concatenate([np.zeros((n, 4)) if pc is None or "a" not in pc else pc["a"] for pc, n in zip(pe_chunks, sizes)]),
-                "jacobian": np.concatenate([np.ones(n) if pc is None or "jacobian" not in pc else pc["jacobian"] for pc, n in zip(pe_chunks, sizes)]),
+                "coefficients": coeffs_chunks if any(c is not None for c in coeffs_chunks) else None,
+                "a": np.concatenate([np.zeros((n, 4)) if pc is None or pc.get("a") is None else pc["a"] for pc, n in zip(pe_chunks, sizes)]),
+                "jacobian": np.concatenate([np.ones(n) if pc is None or pc.get("jacobian") is None else pc["jacobian"] for pc, n in zip(pe_chunks, sizes)]),
             })
-        if any(pc is not None and "pe_b0_debias" in pc for pc in pe_chunks):
-            pe_info["pe_b0_debias"] = next(pc["pe_b0_debias"] for pc in pe_chunks if pc is not None and "pe_b0_debias" in pc)
+        if any(pc is not None and pc.get("pe_b0_debias") is not None for pc in pe_chunks):
+            pe_info["pe_b0_debias"] = next(pc["pe_b0_debias"] for pc in pe_chunks if pc is not None and pc.get("pe_b0_debias") is not None)
     return (fwd_all, inv_all, elapsed_total, pe_info) if return_pe_affine else (fwd_all, inv_all, elapsed_total)
 
 
@@ -1546,6 +1565,7 @@ def _batched_rigid_register_pass_core(
     pose_shrinkage: float = 0.0,
     frame_gain: bool = False,
     pe_b0_split: bool = False,
+    slice_axis: Optional[int] = None,
 ) -> Tuple[List[List[str]], List[List[str]], float, Optional[dict]]:
     """
     Rigidly register every frame in ``moving_imgs`` to the same ``reference_img`` in one
@@ -2799,13 +2819,34 @@ def _batched_rigid_register_pass_core(
         p_in = p_np if pe_on else pe_axis
         p_pe_tmp, _, _ = encoding_frame(D_dir, p_in, 2)
         j_pe = int(np.argmax(np.abs(D_dir.T @ p_pe_tmp)))
-        sl_vox = 2 if j_pe != 2 else int(np.argmax([reference_img.spacing[ax] if ax != j_pe else -1.0 for ax in range(3)]))
+        if slice_axis is not None and 0 <= int(slice_axis) <= 2 and int(slice_axis) != j_pe:
+            sl_vox = int(slice_axis)
+            sl_src = "inferred"
+        else:
+            sl_vox = 2 if j_pe != 2 else int(np.argmax([reference_img.spacing[ax] if ax != j_pe else -1.0 for ax in range(3)]))
+            sl_src = "geometry_fallback"
         p_pe, p_sl, p_ro = encoding_frame(D_dir, p_in, sl_vox)
         _, _, deltas_pe, pe_b0_meta = _shrink_pe_pseudomotion_core(
             R_final.astype(np.float64), t_final, com_f, p_pe, p_sl, p_ro, fd_radius=50.0, mode="bold"
         )
         if pe_b0_meta is not None:
             delta_pe = deltas_pe[:, 0]
+            pe_b0_meta = dict(pe_b0_meta)
+            pe_b0_meta["slice_axis"] = {"voxel_axis": int(sl_vox), "source": sl_src}
+            pe_b0_meta["sigma_ref_mm"] = pe_b0_meta.get("step_noise_floor_ref_mm")
+            pe_b0_meta["sigma_epi_mm"] = [
+                pe_b0_meta.get("step_noise_floor_pe_mm"),
+                pe_b0_meta.get("step_noise_floor_sl_mm"),
+                pe_b0_meta.get("step_noise_floor_r_ro_mm"),
+            ]
+            pe_b0_meta["lag1_step_autocorr"] = [
+                pe_b0_meta.get("step_lag1_autocorr_pe"),
+                pe_b0_meta.get("step_lag1_autocorr_sl"),
+                pe_b0_meta.get("step_lag1_autocorr_r_ro"),
+            ]
+            pe_b0_meta["removed_pe_rms_mm"] = float(np.sqrt(np.mean(delta_pe ** 2)))
+            pe_b0_meta["removed_slice_rms_mm"] = 0.0
+            pe_b0_meta["removed_pitch_rms_mm"] = 0.0
             t_final = t_final - np.outer(delta_pe, p_pe)
             if pe_on:
                 a_np[:, 0] = a_np[:, 0] + jac_np * delta_pe

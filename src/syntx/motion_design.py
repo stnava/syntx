@@ -595,6 +595,8 @@ def _joint(image, design: Design, *, init: str = "levels", surround_weight: Opti
                 kw["encoding_covariates"] = ext          # caller covariates on the one-level path (6.30.0)
                 if window_size is not None:
                     kw["window_size"] = int(window_size)
+                if kw.get("pe_b0_split") and not kw.get("debias_sagittal_nyquist", False):
+                    kw.pop("debias_pe_pseudomotion", None)
         # the one-level path carries the same solver terms as the multi-level one (drift gain, shrinkage, prior units)
         kw.update(frame_gain=bool(frame_gain))
         if pose_shrinkage > 0.0:
@@ -630,6 +632,8 @@ def _joint(image, design: Design, *, init: str = "levels", surround_weight: Opti
              for i in range(1, len(ks))]
     kw0 = dict(kwargs)
     kw0.pop("sample_mask", None)
+    if (pe_cov is not None or design.pe_axis is not None) and not kw0.get("debias_sagittal_nyquist", False):
+        kw0.pop("debias_pe_pseudomotion", None)
     if design.name == "shells":
         kw0 = {"preset": "dwi", **_DWI_DEFAULTS, **kw0}
         if design.pe_affine_covariates is not None and design.pe_axis is not None:
@@ -724,6 +728,8 @@ def _joint(image, design: Design, *, init: str = "levels", surround_weight: Opti
     elif design.pe_axis is not None:
         kw1.setdefault("pe_axis", design.pe_axis)
         kw1.setdefault("pe_b0_split", True)
+    if kw1.get("pe_b0_split") and not kw1.get("debias_sagittal_nyquist", False):
+        kw1.pop("debias_pe_pseudomotion", None)
     if sample_mask_fn is not None:
         kw1["sample_mask"] = h0.get("sample_mask") if h0.get("sample_mask") is not None else sample_mask_fn(ref_level[0])
     kw1.update(surround_weight=lam, surround_delta_mm=float(surround_delta_mm), surround_form=str(surround_form), init_pose=(t_init, om_init),
@@ -772,7 +778,8 @@ def _joint(image, design: Design, *, init: str = "levels", surround_weight: Opti
 
     out = GroupedMotionCorrectionResult()
     out.update(motion_corrected=motion_corrected, fd=fd, fd_raw=fd_raw, translations_mm=translations_mm, rotations_deg=rotations_deg,
-               nuisance=None, pe_affine=pe_affine, reference_modes=["joint: corrected level means"],
+               nuisance=None, pe_affine=pe_affine, pe_b0_shift_mm=None if pe_affine is None else pe_affine["shift_mm"].copy(),
+               reference_modes=["joint: corrected level means"],
                masked_metric=sample_mask_fn is not None, bias=[r1.get("bias")], encoding_pose_bias_mm_rad=[enc_info],
                cross_group_offset=beta_levels, group_offset_fd=None, pe_pseudomotion_debias=r1.get("pe_pseudomotion_debias"),
                frame_converged=(np.asarray(r1["convergence"]["frame_converged"], dtype=bool) if r1.get("convergence") else np.ones(T, dtype=bool)),

@@ -786,4 +786,81 @@ def test_pe_axis_b0_split_across_none_tag_control_and_encoding_states():
         assert fd_clean < 0.60 * fd_raw, f"{name}: fd_clean={fd_clean:.3f} not < 0.60 * fd_raw={fd_raw:.3f}"
 
 
+def test_debias_pe_pseudomotion_with_pe_b0_split_preserves_rigid_pose_and_fd():
+    """Regression test for the v6.30.5 rsfMRI flat-FD bug:
+    1) Passing ``debias_pe_pseudomotion=True`` alongside ``make_design(..., pe_axis=...)`` (exact ``antsxfunctional``
+       rsfMRI / task-fMRI call path) must NOT double-debias or read ``*_eddy.mat`` via ``p[-1]`` (which previously
+       zeroed 5 of 6 rigid DOFs and collapsed FD to ~1e-4 mm).
+    2) Calling ``separate_bold_pe_pseudomotion`` directly on a result whose ``fwdtransforms`` are
+       ``[rigid.mat, rigid_eddy.mat]`` must read the non-eddy rigid transform and preserve ``fd_raw``."""
+    import ants
+    from syntx.motion_batched import separate_bold_pe_pseudomotion
+    from syntx.motion_simulation import simulate_bold_series
 
+    T = 16
+    pe_axis = (0.0, 1.0, 0.0)
+    sim = simulate_bold_series(
+        T,
+        seed=23,
+        drift_mm=0.45,
+        drift_deg=0.35,
+        jumps=((8, 0.65, 0.35),),
+        jitter_mm=0.03,
+    )
+    b0_ty = 0.50 * np.sin(2.0 * np.pi * np.arange(T) / 3.1)
+    frames = []
+    for t in range(T):
+        f = ants.slice_image(sim.image, axis=3, idx=t)
+        tx = ants.create_ants_transform(transform_type="AffineTransform", precision="float", dimension=3)
+        tx.set_parameters(np.concatenate([np.eye(3).ravel(), np.array([0.0, b0_ty[t], 0.0])]))
+        frames.append(tx.apply_to_image(f, reference=f))
+    img4d = ants.list_to_ndimage(sim.image, frames)
+    img4d.set_spacing(tuple(sim.image.spacing[:3]) + (1.0,))
+
+    design_none = make_design("none", n_frames=T, pe_axis=pe_axis)
+    res_split_only = motion_correct_design(img4d, design_none, engine="joint", device="cpu", slice_axis=2, tr=1.0)
+    res_with_flag = motion_correct_design(
+        img4d,
+        design_none,
+        engine="joint",
+        device="cpu",
+        pe_axis=np.asarray(pe_axis, dtype=np.float64),
+        debias_pe_pseudomotion=True,
+        slice_axis=2,
+        tr=1.0,
+    )
+
+    mp = res_with_flag["motion_parameters"]
+    # Non-PE translations and all 3 rotations must carry real head motion (never zeroed by reading *_eddy.mat)
+    assert float(np.ptp(mp.translations[:, 0])) > 0.15 or float(np.ptp(mp.translations[:, 2])) > 0.15
+    assert float(np.max(np.ptp(mp.rotations_deg, axis=0))) > 0.15
+    assert float(np.mean(res_with_flag["fd"][1:])) > 0.05
+    # Exact parity with single pe_b0_split (no double shrinkage, fd_raw preserved > fd)
+    np.testing.assert_allclose(res_with_flag["fd"], res_split_only["fd"], rtol=1e-6, atol=1e-6)
+    np.testing.assert_allclose(res_with_flag["fd_raw"], res_split_only["fd_raw"], rtol=1e-6, atol=1e-6)
+    assert float(np.mean(res_with_flag["fd_raw"][1:])) > 1.3 * float(np.mean(res_with_flag["fd"][1:]))
+    assert res_with_flag.get("pe_b0_shift_mm") is not None
+    np.testing.assert_allclose(res_with_flag["pe_b0_shift_mm"], res_with_flag["pe_affine"]["shift_mm"])
+
+    # Direct separate_bold_pe_pseudomotion on [rigid.mat, rigid_eddy.mat] chains must also read rigid.mat, not *_eddy.mat
+    res_direct, _ = separate_bold_pe_pseudomotion(img4d, res_split_only, pe_axis=np.asarray(pe_axis), slice_axis=2)
+    mp_dir = res_direct["motion_parameters"]
+    assert float(np.max(np.ptp(mp_dir.rotations_deg, axis=0))) > 0.15
+    assert float(np.mean(res_direct["fd"][1:])) > 0.05
+    np.testing.assert_allclose(res_direct["fd_raw"], res_split_only["fd_raw"], rtol=1e-6, atol=1e-6)
+
+    # Multi-level design (tag_control) with encoding_covariates + pe_axis + debias_pe_pseudomotion=True must not raise
+    vt = ["control" if t % 2 == 0 else "label" for t in range(T)]
+    design_tc = make_design("tag_control", volume_types=vt, pe_axis=pe_axis)
+    res_tc = motion_correct_design(
+        img4d,
+        design_tc,
+        engine="joint",
+        device="cpu",
+        pe_axis=np.asarray(pe_axis, dtype=np.float64),
+        debias_pe_pseudomotion=True,
+        slice_axis=2,
+        tr=1.0,
+    )
+    assert float(np.mean(res_tc["fd"][1:])) > 0.05
+    assert float(np.max(np.ptp(res_tc["rotations_deg"], axis=0))) > 0.15

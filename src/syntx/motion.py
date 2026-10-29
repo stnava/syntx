@@ -1131,6 +1131,16 @@ def motion_correction(
 
                     cov_all = kwargs.get("pe_affine_covariates")
                     enc_all = kwargs.get("encoding_covariates")
+                    slice_axis_vox = None
+                    if (kwargs.get("pe_b0_split") or cov_all is not None) and kwargs.get("pe_axis") is not None and isinstance(image, ants.ANTsImage) and spatial_dim == 3:
+                        from .acquisition_axes import AcquisitionAxisUndecidable, infer_slice_axis
+
+                        try:
+                            slice_axis_vox = int(
+                                infer_slice_axis(image, slice_axis=slice_axis, sidecar=sidecar, levels=kwargs.get("frame_levels")).voxel_axis
+                            )
+                        except (AcquisitionAxisUndecidable, ValueError):
+                            slice_axis_vox = None
                     fwd_batch, inv_batch, batch_elapsed, pe_batch = batched_rigid_register_pass(
                         reference_img=[_cap(per_frame_refs[t]) for t in batch_indices] if per_frame_refs is not None else _cap(current_ref),
                         moving_imgs=[_cap(frames[t]) for t in batch_indices],
@@ -1171,6 +1181,7 @@ def motion_correction(
                         pose_shrinkage=float(kwargs.get("pose_shrinkage", 0.0)),
                         frame_gain=bool(kwargs.get("frame_gain", False)),
                         pe_b0_split=bool(kwargs.get("pe_b0_split", False)),
+                        slice_axis=slice_axis_vox,
                     )
                     if pe_batch is not None:
                         for k_pe in (
@@ -1482,12 +1493,20 @@ def motion_correction(
         fd_p_raw, fd_j_raw = calculate_framewise_displacement(
             motion_parameters=mp_raw, homogeneous_matrices=homog_all_composed, radius=fd_radius, center_of_sphere=center_of_sphere
         )
-        result["fd_raw"] = fd_j_raw if fd_method.lower() == "jenkinson" else fd_p_raw
+        fd_raw_arr = fd_j_raw if fd_method.lower() == "jenkinson" else fd_p_raw
+        result["fd_raw"] = fd_raw_arr
+        result["motion_parameters_raw"] = mp_raw
+        result["pe_b0_shift_mm"] = a_full[:, 0].copy()
+        if isinstance(result.get("summary"), dict):
+            result["summary"]["fd_raw_mean"] = float(np.mean(fd_raw_arr[1:])) if num_frames > 1 else 0.0
         if pe_frames.get("pe_b0_debias") is not None:
             result["pe_pseudomotion_debias"] = pe_frames["pe_b0_debias"]
-    attach_band_limited_fd(result, image if isinstance(image, ants.ANTsImage) else None, motion_params.translations,
-                           motion_params.rotations_deg, tr_s=kwargs.get("tr"), radius=fd_radius,
-                           fd_method=("jenkinson" if fd_method.lower() == "jenkinson" else "power"), center_of_mass=center_of_sphere)
+    pe_b0_already_split = (
+        bool(kwargs.get("pe_b0_split", False))
+        and backend == "pytorch_batched"
+        and kwargs.get("pe_axis") is not None
+        and num_frames >= 12
+    )
     if debias_pe_pseudomotion:
         if spatial_dim != 3:
             raise ValueError("debias_pe_pseudomotion needs a 3-D (+ time) series")
@@ -1495,18 +1514,23 @@ def motion_correction(
             raise ValueError("debias_pe_pseudomotion needs pe_axis (physical unit vector, or voxel axis index, of phase encode)")
         if kwargs.get("encoding_covariates") is not None:
             raise ValueError("debias_pe_pseudomotion and encoding_covariates both re-attribute pose; pass one of them")
-        from .motion_batched import separate_bold_pe_pseudomotion
+        if not (pe_b0_already_split and not debias_sagittal_nyquist):
+            from .motion_batched import separate_bold_pe_pseudomotion
 
-        result, _ = separate_bold_pe_pseudomotion(
-            image,
-            result,
-            pe_axis=kwargs.get("pe_axis"),
-            fd_radius=fd_radius,
-            window_size=kwargs.get("window_size"),
-            sagittal_nyquist=bool(debias_sagittal_nyquist),
-            slice_axis=slice_axis,
-            sidecar=sidecar,
-        )
+            result, _ = separate_bold_pe_pseudomotion(
+                image,
+                result,
+                pe_axis=kwargs.get("pe_axis"),
+                fd_radius=fd_radius,
+                window_size=kwargs.get("window_size"),
+                sagittal_nyquist=bool(debias_sagittal_nyquist),
+                slice_axis=slice_axis,
+                sidecar=sidecar,
+            )
+    final_mp = result["motion_parameters"]
+    attach_band_limited_fd(result, image if isinstance(image, ants.ANTsImage) else None, final_mp.translations,
+                           final_mp.rotations_deg, tr_s=kwargs.get("tr"), radius=fd_radius,
+                           fd_method=("jenkinson" if fd_method.lower() == "jenkinson" else "power"), center_of_mass=center_of_sphere)
     return result
 
 

@@ -1,12 +1,20 @@
 # Tracking Summary
-current phase: v6.30.5 (phase-encode eddy/B0 split into _eddy.mat across all designs & unified surround_weight=0.03)
+current phase: v6.30.6 (fix PE B0 split + debias_pe_pseudomotion interaction & non-eddy rigid selection)
 next WP: a phantom whose jitter is in the images, not the trajectory; per-axis curvature scaling; audit notes 4 to 6; plan steps 3 to 5 (docs/MOTION_NEXT_STEPS_PLAN_2026-10-28.md); eddy covariates for slow-flow encodings
 blockers: none
-active work: R22 below
+active work: R23 below
 device: Apple Silicon MPS / CPU (macOS arm64)
 last updated: 2026-10-29
 
 ---
+
+## R23 (fix `pe_b0_split` + `debias_pe_pseudomotion` interaction & non-eddy rigid selection; v6.30.6, 2026-10-29)
+- **Fixed rigid pose & FD collapse (`~5.9e-5 mm`) when `debias_pe_pseudomotion=True` is combined with `pe_b0_split=True` (`[0000.mat, 0000_eddy.mat]` chains)**:
+  - **Root cause 1 (`motion_batched.separate_bold_pe_pseudomotion`)**: `tx_objs = [ants.read_transform(p[-1]) for p in fwd_paths]` assumed the last element of `fwdtransforms` was the rigid `.mat`. After R22 (`v6.30.5`) appended `0000_eddy.mat` (`R = I_3`, `tx = tz = 0`, `ty = delta_pe`), `p[-1]` read `0000_eddy.mat` instead of `0000.mat`, causing `_shrink_pe_pseudomotion_core` to measure zero noise floor on all 5 B0-immune DOFs (`eta = 1.0`), zero out 5 of 6 rigid DOFs, and crush reported FD to `~5.9e-5 mm`. Fixed `_frame_rigid_path` to select the last non-eddy rigid transform (`not is_eddy_transform(f)`) and preserve pre-existing `fd_raw`, `motion_parameters_raw`, and `pe_b0_shift_mm`.
+  - **Root cause 2 (`motion.motion_correction` & `motion_design._joint`)**: Prevented duplicate PE shrinkage when `pe_b0_split=True` already separated PE $\Delta B_0(t)$ into `*_eddy.mat` (unless `debias_sagittal_nyquist=True`), avoided spurious `encoding_covariates` + `debias_pe_pseudomotion` conflict on multi-level/custom designs, passed `infer_slice_axis`-resolved `slice_axis` into `pe_b0_split`, exposed top-level `pe_b0_shift_mm` + `motion_parameters_raw`, and moved `attach_band_limited_fd` after final trajectory selection.
+- **Verification**:
+  - Real `ExpArt/sub-EAS002/ses-01` 750-volume rsfMRI BOLD (`104x104x72x750`, MPS, `PE=j-`, `debias_pe_pseudomotion=True`): restored `fd_mean = 0.1823 mm` (`fd_max = 0.7371 mm`), `fd_raw_mean = 0.2939 mm` (`fd_raw_max = 0.8625 mm`), `fd_bandlimited_mean = 0.1823 mm`, and full 6-DOF rigid ranges (`trans ptp = [0.600, 0.291, 1.216] mm`, `rot ptp = [0.521, 0.482, 1.056] deg`).
+  - `72 passed` across `syntx` motion/standards test suites (including new regression test `test_debias_pe_pseudomotion_with_pe_b0_split_preserves_rigid_pose_and_fd`), `61 passed` across `antsxfunctional` motion/rsfMRI suites, and `0 finding(s)` in `antsxqc.lint`.
 
 ## R22 (phase-encode eddy/B0 split into `_eddy.mat` across all designs & unified `surround_weight=0.03`; v6.30.5, 2026-10-29)
 - **Decoupled phase-encode $\Delta B_0(t)$ / eddy shift into `0000_eddy.mat` across all time-series designs (`shells`, `none`, `tag_control`, `encoding_states`, `custom`)**:
