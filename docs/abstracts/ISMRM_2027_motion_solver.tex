@@ -137,6 +137,14 @@ On 3D ground-truth phantoms (Figure~2A), non-redescending penalties ($w = 0.10$)
 \item \textbf{Resting-state BOLD ($T = 300$, TR 1.0\,s) and ASL ($T = 25$ and $T = 60$):} Phase-encode $\Delta B_0(t)$ shifts in $E_k$ account for \textbf{$53\,\%$} of phase-encode step variance in BOLD and \textbf{$52\text{--}56\,\%$} in ASL. On 1.0\,s BOLD, transferring $\delta_{\text{pe},k}$ into $E_k$ reduces rigid phase-encode step variance in $P_k$ by $92.3\,\%$ (from $0.140$ to $0.039$\,mm SD, matching the $0.047$\,mm readout floor), and $\text{FD}_{\text{bandlimited}}$ notches the remaining $0.48$\,Hz sagittal respiratory head nod to reduce mean censoring FD from $0.55$ to \textbf{$0.28$\,mm} (censored frames $38\,\% \to 11\,\%$).
 \end{itemize}
 
+\textbf{4. Fair head-to-head comparison against \texttt{ants.motion\_correction} (Table~\ref{tab:ants_compare}).}
+We compared our joint solver against standard pairwise mutual-information rigid registration (\texttt{ants.motion\_correction}, \texttt{BOLDRigid}: 32-bin Mattes MI registered frame-by-frame to the normalized temporal mean) across five 3D ground-truth synthetic phantoms and all five clinical reference series (Table~\ref{tab:ants_compare}). To ensure a strictly fair comparison, both methods were evaluated using the identical 50\,mm Power FD formula, identical demeaned ground-truth pose evaluator, identical respiratory band-stop filter ($\text{FD}_{\text{bandlimited}}$), and—on multi-shell DWI—both native linear interpolation and matched cubic B-spline interpolation:
+\begin{itemize}
+\item \textbf{Where \texttt{ants.motion\_correction} excels (single-contrast translation accuracy and respiratory nod agreement):} On the single-contrast BOLD phantom with pure rigid motion and zero $\Delta B_0(t)$ shift (\textbf{BOLD pure rigid}), \texttt{ants.motion\_correction} recovers 3D translations with \textbf{$0.015$\,mm RMS error}, slightly outperforming the joint solver ($0.020$\,mm). On clinical 300-volume resting BOLD ($\text{TR} = 1.0$\,s), both solvers report nearly identical raw Power FD (\textbf{$0.51$\,mm} for \texttt{ants.motion\_correction} vs.\ \textbf{$0.55$\,mm} for the joint solver, both flagging \textbf{$38\,\%$} of volumes above $0.50$\,mm). Moreover, applying our respiratory band-stop filter ($\text{FD}_{\text{bandlimited}}$) directly to \texttt{ants.motion\_correction}'s rigid trajectory reduces its censored volumes from \textbf{$38\,\%$ to $7\,\%$} (mean $0.26$\,mm, vs.\ $11\,\%$ and $0.28$\,mm for the joint solver), confirming that the $0.48$\,Hz sagittal breathing nod is a genuine physical trajectory component captured by both rigid solvers.
+\item \textbf{Why temporal coupling and phase-encode decomposition ($E_k$) are still needed on single-contrast BOLD:} Even on \textbf{BOLD pure rigid}, independent frame-by-frame optimization in \texttt{ants.motion\_correction} incurs $0.15^\circ$ rotational jitter that inflates frame-to-frame FD error to \textbf{$0.229$\,mm} (estimating mean $\text{FD} = 0.531$\,mm vs.\ true $0.322$\,mm), whereas the joint solver's weak ($w = 0.03$) Cauchy acceleration penalty damps sub-knee jitter to achieve \textbf{$0.052$\,mm FD error} (estimating $0.302$\,mm) in \textbf{$5.6\times$ less time} ($2.1$\,s vs.\ $11.8$\,s). When respiratory $\Delta B_0(t)$ phase-encode shifts ($\pm 0.40$\,mm) are present (\textbf{BOLD + resp $\Delta B_0(t)$}), \texttt{ants.motion\_correction} absorbs them into rigid pose ($0.285$\,mm translation RMS, $0.497$\,mm FD error), whereas the joint solver routes them into $E_k$ ($0.124$\,mm translation RMS, $0.112$\,mm FD error). On clinical resting BOLD, unwarping $E_k$ in a single cubic B-spline pass reduces rigid phase-encode step variance $12\times$ ($0.0181 \to 0.0015\,\text{mm}^2$) and lowers unexplained 4D voxel residual variance from \textbf{$78.5\,\%$ (\texttt{ants.motion\_correction}) to $70.0\,\%$ (Joint solver)} while running \textbf{$3.7\times$ faster} ($33$\,s vs.\ $122$\,s).
+\item \textbf{Where single-reference registration breaks down (multi-state ASL, DWI, and slow-flow):} On the ground-truth \textbf{ASL}, \textbf{DWI}, and \textbf{slow-flow} phantoms, registering alternating contrast states and eddy-sheared frames to a single mean template inflates \texttt{ants.motion\_correction} FD error to \textbf{$1.039$\,mm}, \textbf{$0.744$\,mm}, and \textbf{$0.602$\,mm}, versus \textbf{$0.043$\,mm}, \textbf{$0.114$\,mm}, and \textbf{$0.075$\,mm} for the joint solver (\textbf{$6.5\times$ to $24\times$ lower FD error}). On clinical \textbf{ASL} ($T = 25$ and $T = 60$), \texttt{ants.motion\_correction} doubles apparent mean FD (\textbf{$0.86$ vs.\ $0.47$\,mm} and \textbf{$0.33$ vs.\ $0.16$\,mm}; PCASL censoring \textbf{$17\,\%$ vs.\ $2\,\%$}) and leaves higher unexplained 4D voxel residual variance (\textbf{$1.4\,\%$ vs.\ $1.2\,\%$} and \textbf{$41.1\,\%$ vs.\ $38.5\,\%$}). On clinical \textbf{multi-shell DWI} ($T = 100$ and $T = 99$), \texttt{ants.motion\_correction} conflates eddy currents and shell/direction contrast changes into rigid pose, reporting \textbf{$2.28$\,mm and $1.59$\,mm mean Power FD ($99\,\%$ and $97\,\%$ of volumes falsely censored)} versus \textbf{$0.14$\,mm and $0.15$\,mm ($0\,\%$ and $1\,\%$ censored)} for the joint solver at \textbf{$2.1\times$ faster runtime} ($62\text{--}69$\,s vs.\ $136\text{--}138$\,s). Finally, while \texttt{ants.motion\_correction}'s default linear interpolation lowers high-frequency voxel variance by blurring shells (reducing mean shell sharpness by \textbf{$-7.6\,\%$} below the raw scan on \texttt{sub-BLAST031}: $0.1531 \to 0.1414$), re-evaluating \texttt{ants.motion\_correction}'s transforms with matched cubic B-spline interpolation shows that single-template cross-shell registration degrades $b = 0$-to-shell edge correlation below the raw scan ($0.5208 \to 0.5107$), whereas the joint solver improves both shell sharpness ($0.1531 \to 0.1619$, \textbf{$+8.5\,\%$ on $b = 3000$}) and cross-shell edge correlation ($0.5208 \to 0.5275$) with lower within-shell spherical-harmonic residual RMSE ($0.6307$ vs.\ $0.6379$).
+\end{itemize}
+
 \section*{Discussion and Limitations}
 
 Separating the composed image warp ($E_k \circ P_k$), the rigid patient trajectory ($P_k$), and the pulse-sequence contrast bias ($D_k\beta$) resolves the longstanding trade-off between image sharpness and motion-trace accuracy across EPI time series. On real multi-shell DWI and ASL, 52 to 93\,\% of phase-encode step variance and 68 to 87\,\% of DWI readout step variance arise from magnetic field fluctuations and scheduled contrast changes rather than movement of the patient's head. Applying $E_k \circ P_k$ unwarps the phase-encode shifts in the resampled volumes, while computing $\text{FD}$ strictly from $P_k$ and withholding $D_k\beta$ prevents both false scrubbing and contrast-induced subtraction artifacts.
@@ -207,6 +215,41 @@ DWI multi-shell, low SNR & 99 & 0.15 / 0.71 & 1 / 1 & 9 / 0 / 87 & 0 / 93 / 3 & 
 \bottomrule
 \end{tabular}
 \label{tab:results}
+\end{table}
+
+\begin{table}[p]
+\centering
+\caption{\textbf{Fair head-to-head comparison of \texttt{ants.motion\_correction} (\texttt{BOLDRigid}, 32-bin Mattes MI) versus the proposed joint solver across five 3D ground-truth phantoms (Part~A) and the five clinical reference series (Part~B).} Both methods are scored with the identical 50\,mm Power FD metric and identical respiratory band-limited FD ($\text{FD}_{\text{bl}}$). On multi-shell DWI (Part~B, $\dagger$), \texttt{ants.motion\_correction} is evaluated both with its native linear resampling and with matched cubic B-spline resampling (\texttt{lin / bSp}).}
+\resizebox{\linewidth}{!}{%
+\begin{tabular}{lcccccc}
+\toprule
+\textbf{Part A: 3D Ground-Truth Phantoms} & \textbf{True FD (mm)} & \textbf{\texttt{ants} Est.\ FD / Err (mm)} & \textbf{Joint Est.\ FD / Err (mm)} & \textbf{\texttt{ants} Trans RMS (mm)} & \textbf{Joint Trans RMS (mm)} & \textbf{Runtime (\texttt{ants} / Joint)} \\
+\midrule
+BOLD pure rigid (single contrast, no $\Delta B_0$) & 0.322 & 0.531 / 0.229 & \textbf{0.302 / 0.052} & \textbf{0.015} & 0.020 & 11.8\,s / \textbf{2.1\,s} \\
+BOLD + resp $\Delta B_0(t)$ ($\pm 0.40$\,mm PE shift) & 0.322 & 0.782 / 0.497 & \textbf{0.312 / 0.112} & 0.285 & \textbf{0.124} & 11.1\,s / \textbf{1.8\,s} \\
+ASL tag/control (drift + jitter, $T = 24$) & 0.407 & 1.446 / 1.039 & \textbf{0.412 / 0.043} & 0.121 & \textbf{0.009} & 8.8\,s / \textbf{5.3\,s} \\
+DWI multi-shell + eddy ($T = 48$) & 0.369 & 1.110 / 0.744 & \textbf{0.361 / 0.114} & 0.299 & \textbf{0.031} & \textbf{6.8\,s} / 16.9\,s \\
+Slow-flow 4-state + eddy ($T = 24$) & 0.382 & 0.984 / 0.602 & \textbf{0.376 / 0.075} & 0.246 & \textbf{0.028} & \textbf{8.4\,s} / 13.7\,s \\
+\bottomrule
+\end{tabular}%
+}
+
+\vspace{10pt}
+
+\resizebox{\linewidth}{!}{%
+\begin{tabular}{lcccccccc}
+\toprule
+\textbf{Part B: Clinical Reference Series} & \textbf{\texttt{ants} FD ($\text{FD}_{\text{bl}}$)} & \textbf{Joint FD ($\text{FD}_{\text{bl}}$)} & \textbf{\texttt{ants} Cens Raw/$\text{bl}$ (\%)} & \textbf{Joint Cens Raw/$\text{bl}$ (\%)} & \textbf{\texttt{ants} PE Step Var} & \textbf{Joint PE Step Var} & \textbf{4D Resid Var \texttt{ants} / Joint (\%)} & \textbf{Runtime (\texttt{ants} / Joint)} \\
+\midrule
+resting BOLD, TR 1.0\,s ($T = 300$) & 0.51 (0.26) & 0.55 (0.28) & 38 / \textbf{7} & 38 / 11 & 0.0181 & \textbf{0.0015} & 78.5 / \textbf{70.0} & 122\,s / \textbf{33\,s} \\
+ASL + $M_0$ ($T = 25$) & 0.86 (0.86) & \textbf{0.47 (0.47)} & 32 / 32 & \textbf{24 / 24} & 0.1419 & \textbf{0.0218} & 1.4 / \textbf{1.2} & \textbf{17\,s} / 32\,s \\
+PCASL, 30 pairs ($T = 60$) & 0.33 (0.33) & \textbf{0.16 (0.16)} & 17 / 17 & \textbf{2 / 2} & 0.0131 & \textbf{0.0010} & 41.1 / \textbf{38.5} & \textbf{26\,s} / 31\,s \\
+DWI multi-shell, high motion ($T = 100$)$^\dagger$ & 2.28 (2.28) & \textbf{0.14 (0.14)} & 99 / 99 & \textbf{0 / 0} & 1.3845 & \textbf{0.0018} & 2.1 (3.7 bSp) / \textbf{3.4} & 138\,s / \textbf{69\,s} \\
+DWI multi-shell, low SNR ($T = 99$)$^\dagger$ & 1.59 (1.59) & \textbf{0.15 (0.15)} & 97 / 97 & \textbf{1 / 1} & 0.6743 & \textbf{0.0010} & 2.6 / \textbf{3.7} & 136\,s / \textbf{62\,s} \\
+\bottomrule
+\end{tabular}%
+}
+\label{tab:ants_compare}
 \end{table}
 \end{landscape}
 
