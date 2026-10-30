@@ -339,6 +339,20 @@ from .transforms import (
 )
 
 
+from . import frames
+from .frames import (
+    VECTOR_FRAME,
+    bvecs_to_image_frame,
+    dec_rgb,
+    fsl_handedness,
+    image_frame_to_bvecs,
+    image_to_lps,
+    lps_to_image,
+    reference_directions,
+    reorient_gradient_table,
+)
+
+
 # Expose syn, registration, auto_reg, and tvf
 syn = registration
 tvf = tvf_registration
@@ -346,7 +360,7 @@ from .liouville import liouville_determinant, determinant_summary
 syngs = syngs_registration
 affine_benchmark = evaluate_affine_benchmark
 
-__version__ = "6.32.0"
+__version__ = "6.33.0"
 
 
 
@@ -590,5 +604,15 @@ __all__ = [
     "compute_hyperelastic_volumetric_penalty",
     "compute_deviatoric_strain_penalty",
     "joint_label_fusion",
+    "frames",
+    "VECTOR_FRAME",
+    "bvecs_to_image_frame",
+    "dec_rgb",
+    "fsl_handedness",
+    "image_frame_to_bvecs",
+    "image_to_lps",
+    "lps_to_image",
+    "reference_directions",
+    "reorient_gradient_table",
     "__version__",
 ]

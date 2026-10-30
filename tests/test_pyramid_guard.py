@@ -60,7 +60,7 @@ ALLOW = {
     ("dewarp.py", "ants_resample_to_target"): (1, "_apply_optional_mask: nearest-neighbour resampling of a caller mask onto the image grid (not a pyramid level)"),
     ("benchmark/msd.py", "ants_resample_image"): (2, "benchmark data loader: resamples MSD volumes to the benchmark spacing"),
     ("data/msd.py", "ants_resample_image"): (2, "data loader: resamples to the target shape"),
-    ("transforms.py", "ants_resample_to_target"): (3, "resample_image_to_target's ANTs fallbacks and the identity-chain resample of TransformChain.apply: geometry onto a target grid, not a pyramid level"),
+    ("transforms.py", "ants_resample_to_target"): (4, "resample_image_to_target's ANTs fallbacks and the identity-chain resamples of TransformChain.apply and resample_series: geometry onto a target grid, not a pyramid level"),
     ("viz/figures.py", "zoom"): (1, "figure compositing: shape-match for display"),
     # ---- thin wrappers over the central pyramid (they call build_pyramid / plan_levels; they do not implement a level)
     ("motion_batched.py", "def_pyramid_builder"): (1, "get_pyramid_level: caches central build_pyramid levels per level"),

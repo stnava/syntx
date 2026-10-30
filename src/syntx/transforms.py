@@ -789,11 +789,17 @@ def _map_points_and_inv_jacobian_tensor(
 
 
 def _polar_svd_3x3(mat: torch.Tensor) -> torch.Tensor:
-    """Exact orthogonal polar factor R = U V^T for a batch of 3x3 matrices (..., 3, 3)."""
+    """Exact orthogonal polar factor R in SO(3) (det = +1) for a batch of 3x3 matrices (..., 3, 3)."""
     orig_shape = mat.shape
     m_cpu = mat.detach().cpu().numpy().astype(np.float64).reshape(-1, 3, 3)
     u, _, vt = np.linalg.svd(m_cpu)
     r = u @ vt
+    dets = np.linalg.det(r)
+    reflection_mask = dets < 0.0
+    if np.any(reflection_mask):
+        vt_copy = vt.copy()
+        vt_copy[reflection_mask, -1, :] *= -1.0
+        r[reflection_mask] = u[reflection_mask] @ vt_copy[reflection_mask]
     return torch.as_tensor(r.astype(np.float32), dtype=mat.dtype, device=mat.device).reshape(orig_shape)
 
 
@@ -1663,6 +1669,11 @@ def reorient_vectors(
     Supports 3-component vector ``ANTsImage``, ``(*spatial, 3)`` arrays, ``(*spatial, K, 3)``
     multi-peak fixel arrays, or ``(N, 3)`` point vectors using either ``method='finite_strain'``
     (orthogonal polar SVD rotation) or ``method='ppd'`` (Preservation of Principal Direction).
+
+    Note on mapping duality:
+        ``warp=...`` computes forward deformation gradient F = I + \u2207u via ``deformation_gradient(warp)``
+        (matching ``antsxdwi.fixel``), while ``transformlist=[warp]`` evaluates ITK's inverse-mapping
+        pushforward J^-1 = I - \u2207u (matching ``ants.apply_transforms(imagetype=1)``).
     """
     import ants
 
@@ -1683,6 +1694,35 @@ def reorient_vectors(
             rot = deformation_gradient(warp, to_rotation=False)
         else:
             raise ValueError(f"Unknown reorientation method {method!r}. Options: 'finite_strain', 'ppd'.")
+
+        d_mov = (
+            _as_direction(moving_direction)
+            if moving_direction is not None
+            else (
+                _as_direction(vectors.direction[:3, :3])
+                if is_ants
+                else (
+                    _as_direction(warp.direction[:3, :3])
+                    if hasattr(warp, "direction")
+                    else np.eye(3)
+                )
+            )
+        )
+        d_fix = (
+            _as_direction(fixed_direction)
+            if fixed_direction is not None
+            else (
+                _as_direction(reference.direction[:3, :3])
+                if (reference is not None and hasattr(reference, "direction"))
+                else (
+                    _as_direction(warp.direction[:3, :3])
+                    if hasattr(warp, "direction")
+                    else d_mov
+                )
+            )
+        )
+        rot = np.einsum("ij,...jk,kl->...il", d_fix.T, rot, d_mov)
+
         if v_arr.ndim == rot.ndim - 1:
             v_rot = np.einsum("...ij,...j->...i", rot, v_arr)
         elif v_arr.ndim == rot.ndim:
@@ -1696,8 +1736,9 @@ def reorient_vectors(
         if isinstance(transformlist, (np.ndarray, torch.Tensor)):
             m_in = transformlist.detach().cpu().numpy() if isinstance(transformlist, torch.Tensor) else np.asarray(transformlist, dtype=np.float64)
             if method == "finite_strain":
-                u, _, vt = np.linalg.svd(m_in)
-                f_mat = u @ vt
+                from .spatial import polar_rotation_field
+
+                f_mat = polar_rotation_field(m_in)
             elif method == "ppd":
                 f_mat = m_in
             else:
@@ -1727,8 +1768,9 @@ def reorient_vectors(
             else:
                 j_inv_single = np.linalg.inv(chain.linear_part())
                 if method == "finite_strain":
-                    u, _, vt = np.linalg.svd(j_inv_single)
-                    f_mat = u @ vt
+                    from .spatial import polar_rotation_field
+
+                    f_mat = polar_rotation_field(j_inv_single)
                 elif method == "ppd":
                     f_mat = j_inv_single
                 else:
@@ -1855,13 +1897,14 @@ def reorient_tensors(
         if fixed_direction is not None
         else (_as_direction(ref_img.direction[:3, :3]) if ref_img is not None else d_mov)
     )
-    f_total = d_fix.T @ j_inv_np @ d_mov
-
     if method == "ppd":
+        f_total = d_fix.T @ j_inv_np @ d_mov
         out6 = _ppd_reorient_sym6(sym6, f_total, from_log_domain=False)
     elif method == "finite_strain":
-        u, _, vt = np.linalg.svd(f_total)
-        r_fs = u @ vt
+        from .spatial import polar_rotation_field
+
+        r_lps = polar_rotation_field(j_inv_np)
+        r_fs = d_fix.T @ r_lps @ d_mov
         d_in = sym6[:, _SYM6_TO_3X3].astype(np.float64)
         d_rot = np.einsum("nij,njk,nlk->nil", r_fs, d_in, r_fs)
         out6 = np.stack(

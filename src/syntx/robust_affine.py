@@ -28,6 +28,7 @@ parameterisation; the transform is written as an ITK ``.mat`` with its centre at
 image's centre of mass. Details and validation: docs/AFFINE_GUIDE.md.
 """
 
+import functools
 import logging
 import math
 import os
@@ -2097,7 +2098,7 @@ def _run_tournament_affine(
     }
 
 
-def robust_affine(
+def _robust_affine_impl(
     fixed: ants.ANTsImage,
     moving: ants.ANTsImage,
     initial_transform: str = None,
@@ -2267,11 +2268,10 @@ def robust_affine(
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)
 
-    try:
-        import ants
-        ants.config.set_ants_deterministic(True, seed)
-    except Exception:
-        pass
+    # Seed the ants.registration call in mode='ants' (passed as --random-seed). Do not enable
+    # ants.config deterministic mode: ANTsPy then rejects every non-"Repro" transform type,
+    # including the 'Affine' call below. The robust_affine wrapper restores the caller's seed.
+    ants.config._random_seed = seed
 
     # 0a. setting='intermodality_slab': translation-first multi-start capture ranked by native-resolution MI (syntx.slab_capture)
     if setting == 'intermodality_slab':
@@ -2515,6 +2515,17 @@ def robust_affine(
                 pass
         import gc
         gc.collect()
+
+
+@functools.wraps(_robust_affine_impl)
+def robust_affine(*args, **kwargs) -> dict:
+    # The ANTsPy random seed is process-global; scope robust_affine's seed to this call so it
+    # does not leak into the caller's later ants.registration calls.
+    prev_seed = ants.config._random_seed
+    try:
+        return _robust_affine_impl(*args, **kwargs)
+    finally:
+        ants.config._random_seed = prev_seed
 
 
 def robust_cross_modal_rigid(

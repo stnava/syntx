@@ -2152,14 +2152,42 @@ def _resolve_convention(convention: str) -> int:
     raise ValueError(f"unknown convention '{convention}' (use 'radiological' or 'neurological')")
 
 
-def ortho_view_spec(image, view: str, center_mm=None, convention: str = "radiological") -> Dict[str, Any]:
+def _image_center_of_mass_3d(image, org: np.ndarray, sp: np.ndarray, D: np.ndarray) -> np.ndarray:
+    """Compute 3-D center of mass in physical LPS mm, handling multicomponent/4-D images and raising on all-zero."""
+    import ants
+
+    arr = image.numpy()
+    is_multichannel = getattr(image, "has_components", False) or arr.ndim > 3
+    if is_multichannel:
+        norm_arr = np.linalg.norm(arr, axis=-1)
+        if not np.any(norm_arr > 0):
+            raise ValueError("image norm is all zero; cannot compute center of mass")
+        scalar_img = ants.from_numpy(
+            norm_arr.astype(np.float32),
+            origin=tuple(float(x) for x in org[:3]),
+            spacing=tuple(float(x) for x in sp[:3]),
+            direction=np.asarray(D[:3, :3], dtype=np.float64),
+        )
+        return np.array(ants.get_center_of_mass(scalar_img), dtype=np.float64)[:3]
+    if not np.any(arr != 0):
+        raise ValueError("image is all zero; cannot compute center of mass")
+    return np.array(ants.get_center_of_mass(image), dtype=np.float64)[:3]
+
+
+def ortho_view_spec(
+    image,
+    view: str,
+    center_mm=None,
+    convention: str = "radiological",
+    slice_index: int | None = None,
+) -> Dict[str, Any]:
     """Describe how to cut and arrange a native array so that the 2-D result obeys the display standard."""
     view = _VIEW_ALIASES.get(view, view)
     if view not in _VIEW_TABLE:
         raise ValueError(f"unknown view '{view}'")
     tbl = _VIEW_TABLE[view]
     org, sp, D = get_image_affine(image)
-    shape = tuple(int(s) for s in image.shape) if hasattr(image, "shape") else None
+    shape = tuple(int(s) for s in image.shape[:3]) if hasattr(image, "shape") else None
     a, s = dominant_axes(D)
 
     u_sign = tbl["u_sign"] if tbl["u_sign"] is not None else _resolve_convention(convention)
@@ -2170,10 +2198,13 @@ def ortho_view_spec(image, view: str, center_mm=None, convention: str = "radiolo
     flip_v = bool(s[pv] != v_sign)
 
     if center_mm is None:
-        if hasattr(image, "numpy"):
-            import ants
-
-            center_mm = np.array(ants.get_center_of_mass(image), dtype=np.float64)
+        if slice_index is not None:
+            if shape is not None:
+                center_mm = vox_to_physical(image, (np.array(shape) - 1) / 2.0)[0]
+            else:
+                raise ValueError("ortho_view_spec: image has no shape to compute geometric center")
+        elif hasattr(image, "numpy"):
+            center_mm = _image_center_of_mass_3d(image, org, sp, D)
         elif shape is not None:
             center_mm = vox_to_physical(image, (np.array(shape) - 1) / 2.0)[0]
         else:
@@ -2183,11 +2214,14 @@ def ortho_view_spec(image, view: str, center_mm=None, convention: str = "radiolo
             )
     ctr_vox = physical_to_vox(image, center_mm)[0]
     n_slice = shape[slice_axis] if shape is not None else None
-    slice_index = int(round(ctr_vox[slice_axis]))
+    if slice_index is None:
+        slice_idx = int(round(ctr_vox[slice_axis]))
+    else:
+        slice_idx = int(slice_index)
     if n_slice is not None:
-        slice_index = int(np.clip(slice_index, 0, n_slice - 1))
+        slice_idx = int(np.clip(slice_idx, 0, n_slice - 1))
     plane_vox = ctr_vox.copy()
-    plane_vox[slice_axis] = slice_index
+    plane_vox[slice_axis] = slice_idx
     plane_mm = vox_to_physical(image, plane_vox)[0]
     normal_dir = D[:, slice_axis] / (np.linalg.norm(D[:, slice_axis]) + 1e-12)
 
@@ -2203,7 +2237,7 @@ def ortho_view_spec(image, view: str, center_mm=None, convention: str = "radiolo
         name=view,
         convention=convention,
         slice_axis=slice_axis,
-        slice_index=slice_index,
+        slice_index=slice_idx,
         slice_pos_mm=float(plane_mm[pn]),
         plane_point_mm=plane_mm.astype(np.float32),
         normal_axis=pn,
@@ -2226,7 +2260,7 @@ def slice_from_spec(arr: np.ndarray, spec: Dict[str, Any]) -> np.ndarray:
     sl = np.take(arr, spec["slice_index"], axis=spec["slice_axis"])
     remaining = [ax for ax in range(3) if ax != spec["slice_axis"]]
     if remaining.index(spec["v_axis"]) == 1:
-        sl = sl.T
+        sl = np.swapaxes(sl, 0, 1)
     if spec["flip_u"]:
         sl = sl[:, ::-1]
     if spec["flip_v"]:
@@ -2237,10 +2271,9 @@ def slice_from_spec(arr: np.ndarray, spec: Dict[str, Any]) -> np.ndarray:
 def extract_ortho_slices(image, center_mm=None, convention: str = "radiological") -> Dict[str, Any]:
     """Axial, coronal and sagittal display slices through ``center_mm``."""
     arr = image.numpy()
+    org, sp, D = get_image_affine(image)
     if center_mm is None:
-        import ants
-
-        center_mm = np.array(ants.get_center_of_mass(image), dtype=np.float64)
+        center_mm = _image_center_of_mass_3d(image, org, sp, D)
     center_mm = np.asarray(center_mm, dtype=np.float64)
     views = {k: ortho_view_spec(image, k, center_mm, convention) for k in ("ax", "cor", "sag")}
     out: Dict[str, Any] = {}
@@ -2250,8 +2283,7 @@ def extract_ortho_slices(image, center_mm=None, convention: str = "radiological"
         out[f"flip_{k}"] = (spec["flip_u"], spec["flip_v"])
         out[f"labels_{k}"] = spec["labels"]
     ctr_vox = np.rint(physical_to_vox(image, center_mm)[0]).astype(int)
-    ctr_vox = np.clip(ctr_vox, 0, np.array(arr.shape) - 1)
-    org, sp, D = get_image_affine(image)
+    ctr_vox = np.clip(ctr_vox, 0, np.array(arr.shape[:3]) - 1)
     out.update(
         center_vox=ctr_vox,
         center_mm=center_mm.astype(np.float32),

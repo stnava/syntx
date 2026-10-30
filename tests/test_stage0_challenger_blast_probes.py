@@ -16,12 +16,12 @@ from syntx.motion_reference import level_adjacency, offset_identifiable
 
 
 def test_blast_cohort_fpa_dwi_probe():
-    """Empirically test FPA/sub-BLAST032/ses-01 DWI dir-AP probe."""
-    dpath = Path("/Users/stnava/data/blast_cohorts/BIDS/FPA/sub-BLAST032/ses-01/dwi")
-    dwi_nii = dpath / "sub-BLAST032_ses-01_run-001_dir-AP_dwi.nii.gz"
-    dwi_bval = dpath / "sub-BLAST032_ses-01_run-001_dir-AP_dwi.bval"
-    dwi_bvec = dpath / "sub-BLAST032_ses-01_run-001_dir-AP_dwi.bvec"
-    dwi_json = dpath / "sub-BLAST032_ses-01_run-001_dir-AP_dwi.json"
+    """Empirically test FPA/sub-BLAST070/ses-01 DWI dir-AP probe."""
+    dpath = Path("/Users/stnava/data/blast_cohorts/BIDS/FPA/sub-BLAST070/ses-01/dwi")
+    dwi_nii = dpath / "sub-BLAST070_ses-01_run-001_dir-AP_dwi.nii.gz"
+    dwi_bval = dpath / "sub-BLAST070_ses-01_run-001_dir-AP_dwi.bval"
+    dwi_bvec = dpath / "sub-BLAST070_ses-01_run-001_dir-AP_dwi.bvec"
+    dwi_json = dpath / "sub-BLAST070_ses-01_run-001_dir-AP_dwi.json"
 
     assert dwi_nii.exists(), f"DWI file missing: {dwi_nii}"
     bvals = np.loadtxt(dwi_bval)[:25]
@@ -159,11 +159,11 @@ def test_blast_cohort_breacher_bold_probe_optin_debias_success():
 
 
 def test_blast_cohort_expart_asl_probe():
-    """Empirically test ExpArt/sub-EAS002/ses-01 ASL probe."""
-    asl_path = Path("/Users/stnava/data/blast_cohorts/BIDS/ExpArt/sub-EAS002/ses-01/asl")
-    asl_nii = asl_path / "sub-EAS002_ses-01_run-001_dir-PA_asl.nii.gz"
-    asl_ctx = asl_path / "sub-EAS002_ses-01_run-001_dir-PA_aslcontext.tsv"
-    asl_json = asl_path / "sub-EAS002_ses-01_run-001_dir-PA_asl.json"
+    """Empirically test ExpArt/sub-EAS024/ses-01 ASL probe."""
+    asl_path = Path("/Users/stnava/data/blast_cohorts/BIDS/ExpArt/sub-EAS024/ses-01/asl")
+    asl_nii = asl_path / "sub-EAS024_ses-01_run-001_dir-PA_asl.nii.gz"
+    asl_ctx = asl_path / "sub-EAS024_ses-01_run-001_dir-PA_aslcontext.tsv"
+    asl_json = asl_path / "sub-EAS024_ses-01_run-001_dir-PA_asl.json"
 
     assert asl_nii.exists(), f"ASL file missing: {asl_nii}"
     assert asl_ctx.exists(), f"aslcontext missing: {asl_ctx}"

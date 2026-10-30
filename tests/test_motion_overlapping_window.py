@@ -32,8 +32,8 @@ def _make_brain_phantom_3d(shape: tuple[int, int, int] = (32, 32, 32), spacing: 
 def _apply_rigid_shift_3d(img3d: ants.ANTsImage, shift_mm: np.ndarray, rot_rad: np.ndarray | None = None) -> ants.ANTsImage:
     """Apply a ground-truth rigid transform (moving -> fixed pull) to create a synthetic frame."""
     com = np.asarray(img3d.get_center_of_mass(), dtype=np.float64)
-    tx = ants.create_ants_transform(transform_type="Euler3DTransform", dimension=3)
-    tx.set_fixed_parameters(com.tolist())
+    # ITK Euler3D fixed parameters are (cx, cy, cz, ComputeZYX); let ANTsPy fill them from the center.
+    tx = ants.create_ants_transform(transform_type="Euler3DTransform", dimension=3, center=com.tolist())
     r = np.zeros(3, dtype=np.float64) if rot_rad is None else np.asarray(rot_rad, dtype=np.float64)
     params = [float(r[0]), float(r[1]), float(r[2]), float(-shift_mm[0]), float(-shift_mm[1]), float(-shift_mm[2])]
     tx.set_parameters(params)

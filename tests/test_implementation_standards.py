@@ -40,10 +40,10 @@ ALLOWED_REGISTRATION_EXCEPTIONS: dict[str, str] = {
     "robust_affine.py:2479": (
         "mode='ants_fast' explicit C++ affine backend inside syntx (the registration engine itself)"
     ),
-    "robust_affine.py:2547": (
+    "robust_affine.py:2558": (
         "mode='ants_fast' explicit C++ affine backend inside syntx (the registration engine itself)"
     ),
-    "robust_affine.py:2639": (
+    "robust_affine.py:2650": (
         "mode='ants_fast' explicit C++ affine backend inside syntx (the registration engine itself)"
     ),
     "template.py:394": (
