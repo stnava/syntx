@@ -2303,6 +2303,9 @@ def registration(
     antisymmetric=True,
     restrict_transformation=None,
     seed=42,
+    midpoint_only=False,
+    export_midpoint=True,
+    return_warped=True,
     **kwargs
 ):
     """
@@ -2436,6 +2439,17 @@ def registration(
     backend : {'pytorch', 'jax'}, default 'pytorch'
         Note: the default regulariser is 'sobolev' with PyTorch but 'gaussian' with JAX.
     seed : int, default 42
+    midpoint_only : bool, default False
+        When True (and ``outprefix`` is None), skip exporting full end-to-end ``fwdtransforms`` /
+        ``invtransforms`` warp files, skip ``inverse_identity_errors``, and skip computing
+        ``warpedmovout`` / ``warpedfixout`` (retaining linear pre-alignment in ``fwdtransforms``
+        plus midpoint half-warps and midpoint warped images).
+    export_midpoint : bool, default True
+        When False (and ``not midpoint_only``), skip exporting ``fwd_midpoint_warp`` /
+        ``inv_midpoint_warp`` and ``midpoint_fixed`` / ``midpoint_moving``.
+    return_warped : bool, default True
+        When False, skip post-solve image resampling (``warpedmovout``, ``warpedfixout``,
+        ``midpoint_fixed``, and ``midpoint_moving`` are returned as ``None``).
     verbose : bool, default False
     vgg_layers, vgg_mode, vgg_patch_size, vgg_num_patches, vgg_lncc_window_size
         Deep-feature metric settings (layers [4], 'lncc_3d', 32, 8, 9).
@@ -2460,7 +2474,10 @@ def registration(
         ``'invtransforms'``, ``'whichtoinvert_inv'`` : the inverse direction.
         ``'warpedmovout'`` / ``'warpedfixout'`` : moving in fixed space / fixed in moving space.
         ``'midpoint_fixed'``, ``'midpoint_moving'``, ``'fwd_midpoint_warp'``,
-        ``'inv_midpoint_warp'`` : both images in the midpoint space and the half warps.
+        ``'inv_midpoint_warp'``, ``'fwd_midpoint_image'``, ``'inv_midpoint_image'`` :
+        both images in the midpoint space and the half warps (file paths + in-memory ``ANTsImage``s).
+        ``'fwd_warp_image'``, ``'inv_warp_image'`` : in-memory full end-to-end ``ANTsImage`` warps
+            (when exported).
         ``'syn_losses'``, ``'affine_losses'`` : loss history.
         ``'inverse_identity_errors'`` : forward-inverse consistency (mm).
         ``'model'`` : the fitted ``SyNTo`` (its half fields feed
@@ -2959,14 +2976,28 @@ def registration(
         )
     
     # 4. Save displacement fields to temp files to match ANTs file-based transforms
+    from .transforms import _cache_disp_image_and_field, apply_transforms as _apply_transforms
+    _apply_dev = str(device) if backend == 'pytorch' else None
     outprefix = kwargs.get('outprefix', None)
-    if outprefix is not None:
+    _has_midpoint_warps = (
+        sum(reg_iterations) > 0
+        and hasattr(model, 'midpoint_warp_l2r')
+        and hasattr(model, 'midpoint_warp_r2l')
+    )
+    _skip_full_warps = bool(midpoint_only and _has_midpoint_warps and outprefix is None)
+
+    fwd_file = None
+    inv_file = None
+    if sum(reg_iterations) > 0 and not _skip_full_warps:
+        if outprefix is not None:
+            os.makedirs(os.path.dirname(outprefix) or '.', exist_ok=True)
+            fwd_file = f"{outprefix}1Warp.nii.gz"
+            inv_file = f"{outprefix}1InverseWarp.nii.gz"
+        else:
+            fwd_file = tempfile.NamedTemporaryFile(suffix='_fwd.nii.gz', delete=False).name
+            inv_file = tempfile.NamedTemporaryFile(suffix='_inv.nii.gz', delete=False).name
+    elif outprefix is not None:
         os.makedirs(os.path.dirname(outprefix) or '.', exist_ok=True)
-        fwd_file = f"{outprefix}1Warp.nii.gz"
-        inv_file = f"{outprefix}1InverseWarp.nii.gz"
-    else:
-        fwd_file = tempfile.NamedTemporaryFile(suffix='_fwd.nii.gz', delete=False).name
-        inv_file = tempfile.NamedTemporaryFile(suffix='_inv.nii.gz', delete=False).name
     
     affine_file = None
     affine_inv_file = None
@@ -2976,7 +3007,7 @@ def registration(
 
     if backend == 'pytorch':
         with torch.no_grad():
-            if hasattr(model, 'warp_l2r') and hasattr(model, 'warp_r2l'):
+            if not _skip_full_warps and hasattr(model, 'warp_l2r') and hasattr(model, 'warp_r2l'):
                 total_fwd_deformable = model.warp_l2r.data
                 total_inv_deformable = model.warp_r2l.data
 
@@ -3003,7 +3034,7 @@ def registration(
         import jax.numpy as jnp
         from .syn_jax import get_affine_matrix_jax, get_physical_grid_jax, physical_to_normalized_jax, jax_grid_sample
         
-        if hasattr(model, 'warp_l2r') and hasattr(model, 'warp_r2l'):
+        if not _skip_full_warps and hasattr(model, 'warp_l2r') and hasattr(model, 'warp_r2l'):
             total_fwd_deformable = model.warp_l2r
             total_inv_deformable = model.warp_r2l
         
@@ -3024,8 +3055,10 @@ def registration(
                 affine_inv_file = tempfile.NamedTemporaryFile(suffix='.mat', delete=False).name
             tx_fwd, tx_inv = export_ants_affine_transform(M_phys, t_phys, dim=dim, filename=affine_file)
             ants.write_transform(tx_inv, affine_inv_file)
-        
-    if sum(reg_iterations) > 0:
+
+    fwd_warp_image = None
+    inv_warp_image = None
+    if sum(reg_iterations) > 0 and not _skip_full_warps:
         if total_fwd_deformable is None:
             tensor_shape = itk_shape_to_tensor_shape(fixed_primary.shape)
             total_fwd_deformable = np.zeros((1, *tensor_shape, dim), dtype=np.float32)
@@ -3036,6 +3069,10 @@ def registration(
         
         ants.image_write(fwd_img, fwd_file)
         ants.image_write(inv_img, inv_file)
+        _cache_disp_image_and_field(fwd_file, fwd_img, _apply_dev)
+        _cache_disp_image_and_field(inv_file, inv_img, _apply_dev)
+        fwd_warp_image = fwd_img
+        inv_warp_image = inv_img
         
         if affine_file is not None and (initial_transform is None or init_M_phys is not None):
             fwd_transforms = [fwd_file, affine_file]
@@ -3055,8 +3092,8 @@ def registration(
             inv_transforms = [affine_file]
             whichtoinvert_inv = [True]
         elif initial_transform is not None:
-            fwd_transforms = tx_list
-            inv_transforms = tx_list
+            fwd_transforms = list(tx_list)
+            inv_transforms = list(tx_list)
             whichtoinvert_inv = [True] * len(tx_list)
         else:
             fwd_transforms = []
@@ -3064,7 +3101,7 @@ def registration(
             whichtoinvert_inv = []
     
     inverse_identity_errors = {}
-    if sum(reg_iterations) > 0 and hasattr(model, 'warp_l2r') and hasattr(model, 'warp_r2l'):
+    if not midpoint_only and sum(reg_iterations) > 0 and hasattr(model, 'warp_l2r') and hasattr(model, 'warp_r2l'):
         import torch
         if backend == 'pytorch':
             w_l2r = model.warp_l2r.data.cpu()
@@ -3081,17 +3118,21 @@ def registration(
         inverse_identity_errors['phi_2'] = calculate_inverse_identity_error(w_r2l, w_r2l_inv, fixed_primary.spacing, fixed_primary.origin, fixed_primary.direction)
         
     # 6. Apply transforms to generate warped output images
-    from .transforms import apply_transforms as _apply_transforms
-    _apply_dev = str(device) if backend == 'pytorch' else None
-    warpedmovout = _apply_transforms(fixed=fixed_primary, moving=moving_primary, transformlist=fwd_transforms, device=_apply_dev)
-    warpedfixout = _apply_transforms(fixed=moving_primary, moving=fixed_primary, transformlist=inv_transforms, whichtoinvert=whichtoinvert_inv, device=_apply_dev)
+    if return_warped and not _skip_full_warps:
+        warpedmovout = _apply_transforms(fixed=fixed_primary, moving=moving_primary, transformlist=fwd_transforms, device=_apply_dev)
+        warpedfixout = _apply_transforms(fixed=moving_primary, moving=fixed_primary, transformlist=inv_transforms, whichtoinvert=whichtoinvert_inv, device=_apply_dev)
+    else:
+        warpedmovout = None
+        warpedfixout = None
     
     fwd_midpoint_warp = None
     inv_midpoint_warp = None
+    fwd_midpoint_image = None
+    inv_midpoint_image = None
     midpoint_fixed = None
     midpoint_moving = None
 
-    if sum(reg_iterations) > 0 and hasattr(model, 'midpoint_warp_l2r') and hasattr(model, 'midpoint_warp_r2l'):
+    if _has_midpoint_warps and (export_midpoint or midpoint_only):
         fwd_mid_file = tempfile.NamedTemporaryFile(suffix='.nii.gz', delete=False).name
         inv_mid_file = tempfile.NamedTemporaryFile(suffix='.nii.gz', delete=False).name
 
@@ -3100,25 +3141,34 @@ def registration(
 
         ants.image_write(fwd_mid_img, fwd_mid_file)
         ants.image_write(inv_mid_img, inv_mid_file)
+        _cache_disp_image_and_field(fwd_mid_file, fwd_mid_img, _apply_dev)
+        _cache_disp_image_and_field(inv_mid_file, inv_mid_img, _apply_dev)
 
         fwd_midpoint_warp = fwd_mid_file
         inv_midpoint_warp = inv_mid_file
+        fwd_midpoint_image = fwd_mid_img
+        inv_midpoint_image = inv_mid_img
 
-        midpoint_fixed = _apply_transforms(fixed=fixed_primary, moving=fixed_primary, transformlist=[fwd_midpoint_warp], device=_apply_dev)
-        if affine_file is not None and (initial_transform is None or init_M_phys is not None):
-            midpoint_moving = _apply_transforms(fixed=fixed_primary, moving=moving_primary, transformlist=[inv_midpoint_warp, affine_file], device=_apply_dev)
-        elif initial_transform is not None:
-            midpoint_moving = _apply_transforms(fixed=fixed_primary, moving=moving_primary, transformlist=[inv_midpoint_warp] + tx_list, device=_apply_dev)
-        else:
-            midpoint_moving = _apply_transforms(fixed=fixed_primary, moving=moving_primary, transformlist=[inv_midpoint_warp], device=_apply_dev)
+        if return_warped:
+            midpoint_fixed = _apply_transforms(fixed=fixed_primary, moving=fixed_primary, transformlist=[fwd_midpoint_warp], device=_apply_dev)
+            if affine_file is not None and (initial_transform is None or init_M_phys is not None):
+                midpoint_moving = _apply_transforms(fixed=fixed_primary, moving=moving_primary, transformlist=[inv_midpoint_warp, affine_file], device=_apply_dev)
+            elif initial_transform is not None:
+                midpoint_moving = _apply_transforms(fixed=fixed_primary, moving=moving_primary, transformlist=[inv_midpoint_warp] + tx_list, device=_apply_dev)
+            else:
+                midpoint_moving = _apply_transforms(fixed=fixed_primary, moving=moving_primary, transformlist=[inv_midpoint_warp], device=_apply_dev)
 
     ret_dict = {'model': model,
         'warpedmovout': warpedmovout,
         'warpedfixout': warpedfixout,
+        'fwd_warp_image': fwd_warp_image,
+        'inv_warp_image': inv_warp_image,
         'midpoint_fixed': midpoint_fixed,
         'midpoint_moving': midpoint_moving,
         'fwd_midpoint_warp': fwd_midpoint_warp,
         'inv_midpoint_warp': inv_midpoint_warp,
+        'fwd_midpoint_image': fwd_midpoint_image,
+        'inv_midpoint_image': inv_midpoint_image,
         'fwdtransforms': fwd_transforms,
         'invtransforms': inv_transforms,
         'whichtoinvert_inv': whichtoinvert_inv,

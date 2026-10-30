@@ -386,8 +386,32 @@ class TransformChain:
 
 _DISP_FIELD_CACHE: dict[tuple[str, float, str], Any] = {}
 _DISP_GRAD_CACHE: dict[tuple[str, float, str], Any] = {}
+_DISP_IMG_CACHE: dict[tuple[str, int, int], Any] = {}
 _MAPPED_GRID_CACHE: dict[tuple[Any, ...], Any] = {}
 _BSPLINE_PREFILTER_CACHE: dict[tuple[int, str, torch.dtype], torch.Tensor] = {}
+
+
+def _cache_disp_image_and_field(path: str, disp_img: Any, device: Any | None = None) -> None:
+    """Seed ``_DISP_IMG_CACHE`` and ``_DISP_FIELD_CACHE`` for a just-written 3D displacement
+    ``ANTsImage`` so immediate downstream ``jacobian_modulation`` / ``apply_transforms`` /
+    ``resample_series`` calls skip ``ants.image_read`` gzip decompression."""
+    if not isinstance(path, str) or len(getattr(disp_img, "shape", ())) != 3:
+        return
+    try:
+        st = os.stat(path)
+    except OSError:
+        return
+    img_key = (path, st.st_mtime_ns, st.st_size)
+    if len(_DISP_IMG_CACHE) >= 4:
+        _DISP_IMG_CACHE.pop(next(iter(_DISP_IMG_CACHE)))
+    _DISP_IMG_CACHE[img_key] = disp_img
+    if device is not None:
+        dev = device if isinstance(device, torch.device) else torch.device(resolve_device(device, task="model"))
+        disp_key = (path, os.path.getmtime(path), str(dev))
+        field = ContinuousField(disp_img, device=dev, dtype=torch.float32)
+        if len(_DISP_FIELD_CACHE) >= 8:
+            _DISP_FIELD_CACHE.pop(next(iter(_DISP_FIELD_CACHE)))
+        _DISP_FIELD_CACHE[disp_key] = field
 
 
 def _bspline_prefilter_1d_matrix(
@@ -1288,6 +1312,7 @@ def apply_transforms(
             has_components=True,
         )
         ants.image_write(disp_img, tfn)
+        _cache_disp_image_and_field(tfn, disp_img, dev)
         return tfn
 
     if (len(moving.shape) == 4) and (len(fixed.shape) == 3) and (imagetype == 0):
@@ -1921,7 +1946,17 @@ def signed_jacobian_determinant(field_path_or_image: Any, reference: Any) -> Any
     """Signed ``det(I + grad u)`` of a displacement field on ``reference``'s grid (unclipped)."""
     import ants
 
-    f = ants.image_read(str(field_path_or_image)) if isinstance(field_path_or_image, str) else field_path_or_image
+    if isinstance(field_path_or_image, str):
+        f = None
+        try:
+            st = os.stat(field_path_or_image)
+            f = _DISP_IMG_CACHE.get((field_path_or_image, st.st_mtime_ns, st.st_size))
+        except OSError:
+            pass
+        if f is None:
+            f = ants.image_read(field_path_or_image)
+    else:
+        f = field_path_or_image
     if tuple(f.shape) != tuple(reference.shape):
         raise ValueError(f"field grid {tuple(f.shape)} differs from reference {tuple(reference.shape)}")
     u = np.asarray(f.numpy(), dtype=np.float32)
@@ -1981,6 +2016,7 @@ def resample_series(
     interpolator: str = "linear",
     device: str | None = None,
     volume_scales: Sequence[float] | np.ndarray | None = None,
+    precomputed_field_jacobian: np.ndarray | None = None,
 ) -> Any:
     """Resample every volume of a 4D series onto ``reference`` with exactly ONE interpolation each on Torch/MPS/CUDA."""
     import ants
@@ -1990,7 +2026,19 @@ def resample_series(
     nvol = int(img4d.shape[3])
     if len(motion_chains) != nvol:
         raise ValueError(f"len(motion_chains)={len(motion_chains)} != number of volumes {nvol}")
-    jac = jacobian_modulation(field_path, reference).numpy() if (jacobian and field_path is not None) else None
+    if not jacobian:
+        jac = None
+    elif precomputed_field_jacobian is not None:
+        jac = np.asarray(precomputed_field_jacobian, dtype=np.float32)
+        ref_shape_3d = tuple(int(s) for s in reference.shape[:3])
+        if jac.shape != ref_shape_3d:
+            raise ValueError(
+                f"precomputed_field_jacobian shape {jac.shape} != reference shape {ref_shape_3d}"
+            )
+    elif field_path is not None:
+        jac = jacobian_modulation(field_path, reference).numpy()
+    else:
+        jac = None
     if volume_scales is not None:
         jac_motion = np.asarray(volume_scales, dtype=np.float64).reshape(-1)
         if jac_motion.size != nvol:

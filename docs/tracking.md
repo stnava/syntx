@@ -1,12 +1,21 @@
 # Tracking Summary
-current phase: v6.31.0 (batched open-curve elastic matching `syntx.curves.batched`, end-to-end `device=` forwarding, and `float32` Sarrus warp Jacobians)
+current phase: v6.32.0 (`syntx.syn` `midpoint_only`/`export_midpoint`/`return_warped` fastpaths, displacement write-through caching, and `resample_series(..., precomputed_field_jacobian=...)`)
 next WP: a phantom whose jitter is in the images, not the trajectory; per-axis curvature scaling; audit notes 4 to 6; plan steps 3 to 5 (docs/MOTION_NEXT_STEPS_PLAN_2026-10-28.md); eddy covariates for slow-flow encodings
 blockers: none
-active work: R25 (done)
+active work: R26 (done)
 device: Apple Silicon MPS / CPU (macOS arm64)
-last updated: 2026-10-29
+last updated: 2026-10-30
 
 ---
+
+## R26 (`syntx.syn` post-solve fastpaths, displacement write-through caching, and `precomputed_field_jacobian`; v6.32.0, 2026-10-30)
+- **`syntx.syn` (`registration`) post-solve export & warp fastpaths (`src/syntx/syn.py`)**:
+  - Added `midpoint_only: bool = False`, `export_midpoint: bool = True`, and `return_warped: bool = True` to `registration(...)`, and exposed in-memory displacement `ANTsImage` outputs (`fwd_warp_image`, `inv_warp_image`, `fwd_midpoint_image`, `inv_midpoint_image`) in the return dictionary so downstream callers do not need to decompress newly written `.nii.gz` fields back off disk.
+  - When `midpoint_only=True` (and `outprefix is None`), skips exporting unused full end-to-end `fwd_file`/`inv_file` warps, skips CPU `calculate_inverse_identity_error` passes on `phi_1`/`phi_2`, and skips computing `warpedmovout`/`warpedfixout` while preserving linear pre-alignment `.mat` paths in `fwdtransforms` plus midpoint half-warps and `midpoint_fixed`/`midpoint_moving`.
+  - When `export_midpoint=False` and `return_warped=False` (used by T1 residual anatomy refinement), skips exporting unused midpoint half-warps and skips 4 unused 3D post-solve image warps while retaining full `fwdtransforms` and `inverse_identity_errors`.
+- **Write-through displacement caching & single-pass Jacobian reuse (`src/syntx/transforms.py`)**:
+  - Added `mtime_ns`/`st_size`-keyed `_DISP_IMG_CACHE` and `_cache_disp_image_and_field` seeded immediately upon `ants.image_write` in `apply_transforms(..., compose=...)` and `syn.registration`, eliminating redundant `.nii.gz` decompression in immediate downstream `jacobian_modulation`, `apply_transforms`, and `resample_series` calls while invalidating automatically if a path is overwritten.
+  - Added `precomputed_field_jacobian: np.ndarray | None = None` to `resample_series(...)` (with 3D reference shape validation) so callers that already computed `jacobian_modulation(field_path, reference)` for QC range reporting do not recompute 3D `np.gradient` Sarrus Jacobians a second time.
 
 ## R25 (batched open-curve elastic matching `syntx.curves.batched`, end-to-end `device=` forwarding, and `float32` Sarrus warp Jacobians; v6.31.0, 2026-10-29)
 - **Batched open-curve continuous elastic matching in $\mathbb{R}^d$ (`src/syntx/curves/batched.py`, exported from `syntx.curves` and `syntx`)**:
