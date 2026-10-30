@@ -15,9 +15,9 @@ authors = [
 ]
 dependencies = [
     "numpy>=1.24",         # Array primitives and affine algebra
-    "scipy>=1.10",         # Spatial filtering and special functions
+    "scipy>=1.16",         # Spatial filtering and special functions
     "matplotlib>=3.7",     # Diagnostic report figure rendering
-    "antspyx>=0.5.4",      # ANTsImage I/O and transform containers
+    "antspyx>=0.6.3",      # ANTsImage I/O and transform containers
     "torch>=2.1",          # PyTorch tensor and autograd engine
     "torchvision>=0.16",   # Feature extractors
     "jax>=0.4",            # JAX array and JIT engine
