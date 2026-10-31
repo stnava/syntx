@@ -218,6 +218,7 @@ from .motion import (
     band_limited_fd,
     calculate_dvars,
 )
+from .motion_slice_sets import slice_set_clock, slice_set_clock_from_poses
 from .motion_batched import (
     batched_rigid_register_pass,
     batched_rigid_register_pass_temporal,
@@ -562,6 +563,8 @@ __all__ = [
     "MotionCorrectionResult",
     "calculate_framewise_displacement",
     "band_limited_fd",
+    "slice_set_clock",
+    "slice_set_clock_from_poses",
     "calculate_dvars",
     "batched_rigid_register_pass",
     "batched_rigid_register_pass_temporal",
