@@ -3,7 +3,8 @@
 **Document Path**: `docs/v_fire_ants/README.md`  
 **Related Benchmark**: Mindboggle `mbhard` (3D Human Brain Cortical Registration)  
 **Hardware Tested**: Apple Silicon GPU (`mps`) / PyTorch 2.13  
-**Reproduction Code**: [`examples/compare_fireants_vs_syntx.py`](file:///Users/stnava/code/syntx/examples/compare_fireants_vs_syntx.py)
+**Reproduction Code**: [`examples/compare_fireants_vs_syntx.py`](file:///Users/stnava/code/syntx/examples/compare_fireants_vs_syntx.py)  
+**Unidirectional Remediation & Causal Attribution**: [`FIREANTS_UNIDIRECTIONAL_REMEDIATION.md`](./FIREANTS_UNIDIRECTIONAL_REMEDIATION.md) | [`fireants_remediation_mbhard_report.html`](./fireants_remediation_mbhard_report.html)
 
 ---
 
