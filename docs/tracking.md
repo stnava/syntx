@@ -1,12 +1,19 @@
 # Tracking Summary
-current phase: v6.33.0 (unified vector coordinate frame `syntx.frames`, proper polar rotation in physical LPS, S7 multichannel ortho slicing, robust_affine ANTs-determinism leak fixed, stale tests repaired)
-next WP: fix the opt-in engine='projected' motion regression (xfail, bisected to 59513a9 and e066990)
+current phase: v6.34.0 (opt-in slice-set clock `syntx.slice_set_clock`: volume-locked breathing-band pseudomotion removed from a second FD series; breacher review, group and single-subject plans)
+next WP: per-run synthetic calibration of the clock thresholds (single-subject plan, Stage 1 step 3); fix the opt-in engine='projected' motion regression (xfail, bisected to 59513a9 and e066990)
 blockers: none
-active work: R27 (done)
+active work: R28 (done)
 device: Apple Silicon MPS / CPU (macOS arm64)
-last updated: 2026-10-30
+last updated: 2026-10-31
 
 ---
+
+## R28 (Slice-set clock, opt-in, for breathing-locked pseudomotion; v6.34.0, 2026-10-31)
+- **Why**: breacher resting BOLD (Siemens mMR `ep2d_pace*`, TR 2.0 s, interleaved, 300 frames) carries a breathing-rate (0.15-0.25 Hz) whole-image displacement, mostly along the slice axis, that the registration reads as motion and FD censors. It is not interleave order, not a field-induced slice shift (3-8 % of the PE shift), not a nod (pivot fits explain 1-38 %). `sagittal_nyquist` fails its nulls (keeps 71 % of white jitter, removes 20 % of a true nod); `band_limited_fd` leaves 5 of 6 runs un-notched (the band is broadband). `docs/BREACHER_PSEUDOMOTION_REVIEW_PROPOSAL.md`, `docs/BREACHER_PSEUDOMOTION_GROUP_MODEL_PLAN.md`, `docs/BREACHER_PSEUDOMOTION_SINGLE_SUBJECT_PLAN.md` (evidence E1-E4, D1-D4, M1-M6).
+- **`src/syntx/motion_slice_sets.py`** (`slice_set_clock`, `slice_set_clock_from_poses`, exported): the odd and even slice sets are registered separately (`motion_correct_design`, `"none"` design, joint engine) and compared per DOF in the band (Welch cross-spectrum, cross-power-weighted phase and coherence). A displacement the scanner applies between volumes (a prospective field-of-view update such as PACE) is identical in both sets (phase near 0); a continuous one (head, bed) is sampled TR/2 apart (360 f dt degrees, 69 deg on a synthetic nod). Calibration on synthetic pairs: volume-locked 3-5 deg, continuous 69 deg; fixed thresholds 35 / 55 deg, coherence 0.4. The volume-locked share (r^2 of the band-limited half-set poses) is removed from a second FD series only, `result["fd_head_vl"]`; transforms, the resampled series and `fd` are untouched. Early set from the sidecar `SliceTiming` (parities must occupy disjoint halves of the TR: sequential and multiband orders are refused), else assumed odd with a warning and `early_set_source='assumed_odd'`.
+- **Ten-run clock on breacher**: 8 volume-locked on t_sl (3-33 deg), sub-2026 continuous (a distinct `ep2d_pace_physio2` series), sub-0102 mixed; t_pe and t_ro volume-locked too (the FOV moves on all axes). Three unseen runs: mean FD 0.435 -> 0.318, 0.240 -> 0.205, 0.344 -> 0.253 mm; frames above 0.5 mm 22.4 -> 9.4 %, 5.4 -> 3.0 %, 13.7 -> 8.7 % (`benchmarks/breacher_slice_set_clock_wip.py`, `docs/reports/breacher_slice_set_clock_wip_2026-10-31.{html,json,png}`). 35-60 % of the half-set band variance is incoherent between the halves (not rigid motion; origin open).
+- **Downstream**: antsxfunctional 0.26.0 (`run_rsfmri(slice_set_clock=True)`, censoring on `fd_head_vl`) and antsxmm 4.10.0 (`antsxmm run --slice-set-clock`; `docs/SLICE_SET_CLOCK_CLI_PROPOSAL.md` there). Opt-in only: no automatic mode until per-run synthetic calibration and a test-retest censoring gate exist.
+- **Tests**: `tests/test_motion_slice_sets.py` (5: white jitter untouched, volume-locked removed from FD only, continuous kept, shape/band checks, non-interleaved timing refused). Full suite: 2759 passed, 43 skipped, 1 xfailed (46 min). `python -m antsxqc.lint src/syntx`: 0 findings, no allowlist.
 
 ## R27 (Unified Vector Coordinate Frame `syntx.frames` & Spatial Registration Verification; v6.33.0, 2026-10-30)
 - **Unified Vector Coordinate Frame (`src/syntx/frames.py`, `src/syntx/transforms.py`, `src/syntx/spatial.py`, `docs/frames.md`)**:
