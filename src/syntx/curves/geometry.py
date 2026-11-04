@@ -280,6 +280,11 @@ def select_matching_scale(
     the global minimum mismatch) is recovered with ``rel_tol=0``; it was brittle because counts agree
     trivially at coarse scales where all features are blurred away, so a single noisy count at a fine
     scale pushed the selection to a scale that erased the features being matched.
+
+    Downstream pin: ``sulceye.curve_matching.select_matching_scale`` calls this with ``rel_tol=0.0``
+    (strict argmin) and tests ``sigma_selected_mm`` against its v5.5.1 values so published SOCOM rim
+    numbers stay reproducible (sulceye migration note R8). Changing the default here does not change
+    sulceye; changing the ``rel_tol <= 0`` branch does.
     """
     sig = np.asarray(sigmas, dtype=np.float64)
     F1 = np.array([
