@@ -86,6 +86,7 @@ def test_sobolev_3d_syngs_stability_and_folding():
     assert min_det_j > 0.0, f"Min det(J) must be positive, got {min_det_j}"
 
 
+@pytest.mark.slow
 def test_sobolev_3d_jax_stability_and_dsti_separable():
     import jax.numpy as jnp
     m_3d = jnp.array(np.random.randn(1, 16, 16, 16, 3).astype(np.float32)) * 0.05

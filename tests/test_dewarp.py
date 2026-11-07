@@ -74,6 +74,7 @@ def test_transformlist_utilities(tmp_path):
     assert inv_flags == [True, False]
 
 
+@pytest.mark.slow
 def test_rigid_alignment_recovers_known_displacement(tmp_path):
     """Verify rigid alignment recovers a known integer voxel translation."""
     gt_img, mask_img, gt_arr = _make_asymmetric_phantom(shape=(24, 24, 24), spacing=(2.0, 2.0, 2.0))
@@ -152,6 +153,7 @@ def test_syn_only_does_not_silently_fall_back_to_plain_ants(tmp_path, monkeypatc
         )
 
 
+@pytest.mark.slow
 def test_syn_only_pe_restriction_on_known_shift(tmp_path):
     """Verify SyNOnly with restrict_transformation strictly confines deformation to PE axis.
 
@@ -170,7 +172,8 @@ def test_syn_only_pe_restriction_on_known_shift(tmp_path):
         anatomy_rigid=gt_img,
         output_directory=tmp_path / "syn_pe",
         restrict_transformation=(0, 1, 0),
-        reg_iterations=[20, 10],
+        reg_iterations=[8, 4],
+        device="cpu",
         verbose=False,
     )
 
@@ -196,6 +199,7 @@ def test_syn_only_pe_restriction_on_known_shift(tmp_path):
     assert corr > 0.85, f"Expected dewarped correlation > 0.85, got {corr:.4f}"
 
 
+@pytest.mark.slow
 def test_hybrid_dual_pe_recovers_ground_truth(tmp_path):
     """Test the complete hybrid dual-PE + T1 deformation pipeline with known equal-and-opposite shifts."""
     gt_img, mask_img, gt_arr = _make_asymmetric_phantom(shape=(24, 24, 24), spacing=(2.0, 2.0, 2.0))
@@ -257,6 +261,7 @@ def test_hybrid_dual_pe_recovers_ground_truth(tmp_path):
     assert app_from_anat.warped_image.shape == b0_ap.shape
 
 
+@pytest.mark.slow
 def test_single_pe_dewarp_to_anatomical(tmp_path):
     """Test single-PE path when secondary_reference is None.
 
@@ -297,6 +302,7 @@ def test_single_pe_dewarp_to_anatomical(tmp_path):
     assert corr - raw > 0.03, (raw, corr)
 
 
+@pytest.mark.slow
 def test_canonical_contract_slowflow_compatibility(tmp_path):
     """Verify antsxslowflow canonical_contract wrapper functions work on simulated data."""
     gt_img, mask_img, _ = _make_asymmetric_phantom(shape=(24, 24, 24), spacing=(2.0, 2.0, 2.0))
@@ -319,6 +325,19 @@ def test_canonical_contract_slowflow_compatibility(tmp_path):
     assert syn_res.motion_reference_in_t1_rigid is not None
 
 
+def test_foreground_mismatch_raises_fast_syn_only(tmp_path):
+    gt_img, _, gt_arr = _make_asymmetric_phantom(shape=(16, 16, 16), spacing=(2.0, 2.0, 2.0))
+    whole_head_img = ants.from_numpy((gt_arr + 0.5).astype(np.float32), spacing=gt_img.spacing)
+    with pytest.raises(ValueError, match="assert_comparable_foreground_extent"):
+        syn_only_reference_to_anatomy_rigid(
+            reference=whole_head_img,
+            anatomy_rigid=gt_img,
+            restrict_transformation=(0, 1, 0),
+            output_directory=tmp_path / "fg_mismatch_fast",
+        )
+
+
+@pytest.mark.slow
 def test_foreground_mismatch_raises_in_syn_only_and_dewarp(tmp_path):
     """Regression guard: passing an unmasked whole-head reference (~98% nonzero) against a
     brain-extracted anatomy_rigid (~15% nonzero) without reference_mask must raise ValueError
@@ -347,6 +366,7 @@ def test_foreground_mismatch_raises_in_syn_only_and_dewarp(tmp_path):
         )
 
 
+@pytest.mark.slow
 def test_dewarp_to_anatomical_with_reference_masks(tmp_path):
     """Supplying reference_mask and secondary_reference_mask masks whole-head EPI inputs
     so foreground extent matches anatomy_mask and hybrid dewarping succeeds cleanly."""

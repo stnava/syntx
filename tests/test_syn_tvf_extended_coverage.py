@@ -144,6 +144,7 @@ def test_tvf_model_advanced_options():
     assert inv_warp.shape == (1, 16, 16, 2)
 
 
+@pytest.mark.slow
 @pytest.mark.skipif(not HAS_JAX, reason="JAX not installed")
 def test_syn_jax_and_tvf_jax_advanced():
     import jax.numpy as jnp

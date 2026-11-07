@@ -55,6 +55,7 @@ def test_in_loop_inv_interval_zero_degradation():
     assert timings[10] < timings[1], f"Expected interval 10 ({timings[10]:.3f}s) to be faster than interval 1 ({timings[1]:.3f}s)"
 
 
+@pytest.mark.slow
 def test_in_loop_inv_interval_multires_pyramid():
     """Verify zero degradation in multi-resolution pyramid registration."""
     torch.manual_seed(42)
@@ -161,6 +162,7 @@ def test_final_epoch_inverse_update_multires_pyramid():
         solver_mod.update_inverse_field_nd_anderson = orig_update
 
 
+@pytest.mark.slow
 def test_inverse_field_accuracy_across_intervals():
     """Verify final inverse field accuracy across intervals with and without post refinement."""
     torch.manual_seed(42)
@@ -211,6 +213,7 @@ def test_zero_points_and_empty_inputs_validation():
         model.fit()
 
 
+@pytest.mark.slow
 def test_small_point_clouds_2d_and_3d():
     """Stress test minimal point clouds (N=1, 2, 3) in 2D and 3D."""
     for d in [2, 3]:

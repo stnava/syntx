@@ -70,6 +70,7 @@ def test_render_input_pair_figure_3d(tmp_path):
     fig = render_input_pair_figure(fi, mi, output_path=out_png, show_figure=False)
 
 
+@pytest.mark.slow
 def test_non_identity_header_rendering_2d_and_3d(tmp_path):
     """Verifies Figure 1 and Figure 2 rendering with non-identity direction, spacing, and origin headers."""
     # 2D non-identity image
@@ -160,6 +161,7 @@ def test_create_registration_report(tmp_path):
     assert "Figure 3: Displacement Flow Dynamics & Regularity on Target Anatomy" in html_text
 
 
+@pytest.mark.slow
 def test_create_registration_report_with_segmentation_overlays(tmp_path):
     """Verifies that create_registration_report generates both flow on anatomy and segmentation overlap figures."""
     fi = ants.image_read(ants.get_data("r16"))

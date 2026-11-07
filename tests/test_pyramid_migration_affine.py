@@ -109,7 +109,7 @@ def _blob_pair(dim, shift_mm=4.0, spacing=1.5):
     return (ants.from_numpy(blob(c0), spacing=(spacing,) * dim), ants.from_numpy(blob(c1), spacing=(spacing,) * dim))
 
 
-@pytest.mark.parametrize("dim", [2, 3])
+@pytest.mark.parametrize("dim", [2, pytest.param(3, marks=pytest.mark.slow)])
 def test_smooth_sigma_per_level_goes_through_the_central_smoother_and_still_registers(dim):
     """``smooth_sigma_per_level`` > 0 (replicate-padded central Gaussian, per-axis sigma; the zero-padded blob kernel and the 2-D conv
     kernel are gone) runs in 2-D and 3-D and recovers a known shift about as well as sigma 0."""
@@ -118,7 +118,7 @@ def test_smooth_sigma_per_level_goes_through_the_central_smoother_and_still_regi
     fi, mi = _blob_pair(dim)
     errs = {}
     for sig in (0.0, 1.0):
-        res = robust_affine(fi, mi, preset="fast", smooth_sigma_per_level=sig, multi_start=False, verbose=False)
+        res = robust_affine(fi, mi, preset="fast", device="cpu", smooth_sigma_per_level=sig, multi_start=False, verbose=False)
         assert res["status"] == "SUCCESS"
         tx = ants.read_transform(res["fwdtransforms"][0])
         c = (20.0 * 1.5,) * dim                                                       # the fixed blob centre maps to the moving blob centre

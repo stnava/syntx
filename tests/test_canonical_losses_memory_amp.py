@@ -42,6 +42,7 @@ def _get_device_and_amp_types():
     return device, amp_types
 
 
+@pytest.mark.slow
 def test_canonical_mattes_mi_3d_peak_memory():
     """Verify peak transient memory <= 100 MB for CanonicalMattesMIFunction on 176x256x256 volume."""
     N = 176 * 256 * 256  # 11,534,336 voxels (~44 MB per float32 volume)
@@ -80,6 +81,7 @@ def test_canonical_mattes_mi_3d_peak_memory():
         assert torch.isfinite(loss_mps)
 
 
+@pytest.mark.slow
 def test_box_lncc_3d_peak_memory():
     """Verify peak transient memory <= 100 MB for BoxLNCCLoss on 176x256x256 volume."""
     shape = (1, 1, 176, 256, 256)

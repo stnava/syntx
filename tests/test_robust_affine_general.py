@@ -114,6 +114,7 @@ def test_compute_salient_gradient_correlation():
     assert abs(c - 1.0) < 1e-4, f"Salient correlation for identical images should be 1.0; got {c}"
 
 
+@pytest.mark.slow
 def test_robust_affine_tournament_synthetic_3d():
     """Verify robust_affine with tournament=True executes end-to-end on synthetic 3D pair."""
     # Create fixed image with a distinct off-center ellipsoid

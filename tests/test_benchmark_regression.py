@@ -263,9 +263,10 @@ class TestFastMultiModelNonRegression:
         reg = syntx.syn(
             fixed=fi,
             moving=mi,
+            initial_transform="identity",
             regularizer="sobolev",
             sobolev_alpha=1.5,
-            reg_iterations=[15, 10],
+            reg_iterations=[12, 8],
             device="cpu",
         )
 
@@ -292,11 +293,12 @@ class TestFastMultiModelNonRegression:
         reg = syntx.syngs(
             fixed=fi,
             moving=mi,
+            initial_transform="identity",
             alpha=syngs_cfg["alpha"],
             max_step_norm=syngs_cfg["max_step_norm"],
             regularizer=syngs_cfg["regularizer"],
             optimizer_lr=syngs_cfg["optimizer_lr"],
-            reg_iterations=[10, 5],
+            reg_iterations=[8, 4],
             device="cpu",
             verbose=False,
         )
@@ -306,6 +308,7 @@ class TestFastMultiModelNonRegression:
         final_dice = 2.0 * np.sum(mask1 & w_mask) / (np.sum(mask1) + np.sum(w_mask))
         assert final_dice > init_dice, f"SyNGS Final Dice {final_dice} <= Initial Dice {init_dice}"
 
+    @pytest.mark.slow
     def test_fast_tvf_convergence(self):
         torch.manual_seed(42)
         np.random.seed(42)
@@ -322,11 +325,12 @@ class TestFastMultiModelNonRegression:
         reg = syntx.tvf(
             fixed=fi,
             moving=mi,
+            initial_transform="identity",
             regularizer=tvf_cfg["regularizer"],
             alpha=tvf_cfg["alpha"],
             grad_step=tvf_cfg["grad_step"],
             energy_weight=tvf_cfg["energy_weight"],
-            reg_iterations=[10, 5],
+            reg_iterations=[8, 4],
             device="cpu",
             verbose=False,
         )

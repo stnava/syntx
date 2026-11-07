@@ -20,6 +20,7 @@ def _params(reg):
     return np.asarray(ants.read_transform(reg["fwdtransforms"][0]).parameters)
 
 
+@pytest.mark.slow
 @pytest.mark.parametrize("r, label", [(1, "P1"), (4, "DEFAULT_EQUIV")])
 def test_default_equals_equivalent_builder_cpu(r, label):
     """isotropic default = voxel pooling (P1); anisotropic default = the millimetre pyramid for the fixed image, pooling for an isotropic moving image: the same transforms (float rounding)."""

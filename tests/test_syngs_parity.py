@@ -34,6 +34,7 @@ def test_syngs_model_initialization():
     assert model_jax.velocity_0.shape == (1, 32, 32, 32, 3)
 
 
+@pytest.mark.slow
 def test_syngs_parity_fast():
     img1, img2 = generate_synthetic_pair_3d(shape=(32, 32, 32), seed=123)
     shape = (32, 32, 32)

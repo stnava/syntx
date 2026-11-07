@@ -67,6 +67,7 @@ def test_adjoint_rk4_gradient_parity(dim, shape, v_scale):
     assert grad_diff < 1e-4, f"RK4 gradient mismatch: {grad_diff}"
 
 
+@pytest.mark.slow
 def test_tvf_registration_adjoint_euler_and_rk4_2d():
     """Verify end-to-end registration pipeline execution with adjoint solvers in 2D."""
     fi = ants.image_read(ants.get_ants_data('r16')).resample_image((32, 32), use_voxels=True)
@@ -99,6 +100,7 @@ def test_tvf_registration_adjoint_euler_and_rk4_2d():
     assert reg_rk4['provenance']['adjoint'] is True
 
 
+@pytest.mark.slow
 def test_tvf_registration_adjoint_3d():
     """Verify end-to-end registration pipeline execution with adjoint solver in 3D."""
     arr_fi = np.zeros((16, 16, 16), dtype=np.float32)

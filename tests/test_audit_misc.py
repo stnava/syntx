@@ -207,6 +207,7 @@ def test_assert_manifest_complete_requires_diff_text_for_dirty_checkout():
     assert_manifest_complete(man, require_calls=False)
 
 
+@pytest.mark.slow
 def test_environment_does_not_import_heavy_packages():
     import subprocess
     code = ("import sys, syntx.provenance as p; [sys.modules.pop(m, None) for m in ('jax', 'antstorch')];"
@@ -1397,6 +1398,7 @@ def test_benchmark_grid_config_applies_regularizer_and_params():
     assert get_model_config('regadam_greedy') == get_model_config('greedy')
 
 
+@pytest.mark.slow
 def test_benchmark_worker_exit_code_and_runner_keeps_worker_error(tmp_path, monkeypatch):
     import json, sys, subprocess
     task = {'task_id': 't', 'dataset': 'c', 'config': {'id': 'x', 'model': 'syn', 'params': {}}}

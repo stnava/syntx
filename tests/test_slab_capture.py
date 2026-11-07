@@ -84,7 +84,7 @@ def test_strategy_arguments_are_validated(slab):
 
 def test_default_setting_is_the_default_path():
     """setting='default' is the unchanged solver: same transform as not passing the argument."""
-    iso = _phantom()
+    iso = ants.crop_indices(_phantom(), (24, 24, 20), (56, 56, 52))
     mov = ants.apply_transforms(fixed=iso, moving=iso, transformlist=[], interpolator="linear")
     a = syntx.robust_affine(iso, mov, mode="pytorch", dof="rigid", device="cpu", preset="fast", seed=3)
     b = syntx.robust_affine(iso, mov, mode="pytorch", dof="rigid", device="cpu", preset="fast", seed=3, setting="default")
@@ -229,6 +229,19 @@ def test_native_scorer_prefers_truth_and_applies_the_valid_margin(slab):
 
 
 # ------------------------------------------------------------------------------------------------------ end to end (real solver)
+def test_slab_capture_real_solver_fast_smoke():
+    """Fast real-solver smoke test of SC.run_slab_capture on a compact 3D slab."""
+    iso = ants.crop_indices(_phantom(), (24, 24, 20), (56, 56, 52))
+    tx = ants.create_ants_transform(transform_type="Euler3DTransform", dimension=3,
+                                    center=SC._fov_center(iso).tolist(), translation=[1.5, -1.0, 2.0])
+    slab_fixed = ants.resample_image(iso, (1.0, 1.0, 3.0), use_voxels=False, interp_type=0)
+    mov = ants.apply_ants_transform_to_image(tx.invert(), iso, reference=iso)
+    reg = SC.run_slab_capture(slab_fixed, mov, device="cpu", include_default_start=False, n_starts=2, seed=42)
+    assert reg["solver"] == "pytorch" and reg["setting"] == "intermodality_slab"
+    assert _tre(reg, tx) < 1.5
+
+
+@pytest.mark.slow
 def test_translation_stage_captures_a_large_offset():
     """The T1 is cropped at one end so its centre of mass (the start of every default candidate) is several millimetres off along z;
     the translation-first stage must bring the pose to < 1.5 mm of the known rigid transform."""
@@ -241,6 +254,7 @@ def test_translation_stage_captures_a_large_offset():
     assert abs(np.linalg.norm(reg["slab_capture"]["translation_mm"])) > 0
 
 
+@pytest.mark.slow
 def test_thin_slab_6to1_pose_a_is_solved_by_the_intermodality_slab_setting():
     """The one default-path synthetic failure (strict xfail in test_robust_affine_anisotropy.py: 4.4 mm): the capture setting solves it."""
     fixed, mov, tx = _slab_pair(6)

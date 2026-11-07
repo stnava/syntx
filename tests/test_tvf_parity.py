@@ -38,6 +38,7 @@ def generate_synthetic_pair_3d(shape=(32, 32, 32), seed=42):
     return img1, img2
 
 
+@pytest.mark.slow
 def test_tvf_forward_loss_parity():
     """Verify initial forward pass loss parity between PyTorch and JAX TVF models."""
     img1, img2 = generate_synthetic_pair_3d(shape=(32, 32, 32))
@@ -112,6 +113,7 @@ def test_tvf_integrate_warp_parity():
     assert max_diff < 0.15, f"Warp field mismatch exceeds threshold: {max_diff}"
 
 
+@pytest.mark.slow
 def test_tvf_optimization_parity():
     """Verify end-of-fit registration optimization parity across PyTorch and JAX backends."""
     img1, img2 = generate_synthetic_pair_3d(shape=(32, 32, 32), seed=777)
@@ -163,6 +165,7 @@ def test_tvf_optimization_parity():
     assert max_warp_diff < 5.0, f"Warp delta exceeds threshold: {max_warp_diff}"
 
 
+@pytest.mark.slow
 def test_tvf_multipoint_loss_parity():
     """Verify PyTorch and JAX loss parity for custom multipoint_loss timepoints: [0.5], [0.0, 0.5, 1.0], and [0.0, 0.25, 0.5, 0.75, 1.0]."""
     img1, img2 = generate_synthetic_pair_3d(shape=(32, 32, 32), seed=999)

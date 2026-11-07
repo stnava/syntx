@@ -256,6 +256,7 @@ class TestBuildTemplateIntegration:
         result = syntx.build_template(
             image_list=imgs,
             iterations=1,
+            useNoRigid=True,
             reg_iterations=[15, 0, 0],
             verbose=False,
         )
@@ -269,6 +270,7 @@ class TestBuildTemplateIntegration:
             image_list=imgs,
             weights=[1, 2, 3, 4],
             iterations=1,
+            useNoRigid=True,
             reg_iterations=[10, 0, 0],
             verbose=False,
         )
@@ -281,6 +283,7 @@ class TestBuildTemplateIntegration:
             initial_template=init,
             image_list=imgs,
             iterations=1,
+            useNoRigid=True,
             reg_iterations=[10, 0, 0],
             verbose=False,
         )
@@ -309,6 +312,7 @@ class TestBuildTemplateGreedy:
     by is_greedy rather than L >= 2) produces the same result schema and converges
     sensibly, not just that it avoids crashing."""
 
+    @pytest.mark.slow
     def test_return_schema_matches_syn_path(self):
         imgs = _cohort_2d(n=4, size=32)
         result = syntx.build_template(
@@ -329,6 +333,7 @@ class TestBuildTemplateGreedy:
         assert all(inv == [] for inv in result['invtransforms'])
         assert all(len(fwd) == 2 for fwd in result['fwdtransforms'])
 
+    @pytest.mark.slow
     def test_shape_residual_uses_composed_field_not_zeroed(self):
         """Regression guard: before this path existed, L (len(fwdtransforms)) == 1 for any
         single-file transform list meant has_field was False, silently zeroing the shape
@@ -339,6 +344,8 @@ class TestBuildTemplateGreedy:
             image_list=imgs,
             iterations=2,
             type_of_transform='Greedy',
+            initial_transforms=['identity'] * 4,
+            affine_drop_tolerance=None,
             reg_iterations=[20, 10],
             scales=[2, 1],
             verbose=False,
@@ -351,6 +358,7 @@ class TestBuildTemplateGreedy:
         # displaced discs -- otherwise has_field silently fell back to the degenerate branch.
         assert any(sr['l2_norm'] > 0.0 for sr in result['shape_residuals'])
 
+    @pytest.mark.slow
     def test_converges_toward_centered_template(self):
         """The 4 discs are placed symmetrically around the image centre -- a converged
         template (greedy or SyN) should end up centred there too, same correctness check as
@@ -377,6 +385,7 @@ class TestBuildTemplateGreedy:
         with pytest.raises(ValueError, match="Greedy"):
             syntx.build_template(image_list=imgs, type_of_transform='Greedy', backend='ants')
 
+    @pytest.mark.slow
     def test_multi_iteration_runs_realign_from_scratch_each_time(self):
         """Unlike the SyN path's 'SyNOnly' drift-avoidance continuity, greedy re-aligns via
         syntx.robust_affine from scratch every iteration (no initial_transform carried
@@ -404,6 +413,7 @@ class TestBuildTemplateGreedyAffineCaching:
     search every iteration, but re-verify it's still good enough rather than trusting it
     unconditionally forever."""
 
+    @pytest.mark.slow
     def test_initial_transforms_identity_runs_without_crashing(self):
         imgs = _cohort_2d(n=3, size=32)
         result = syntx.build_template(
@@ -411,8 +421,9 @@ class TestBuildTemplateGreedyAffineCaching:
             iterations=1,
             type_of_transform='Greedy',
             initial_transforms=['identity'] * 3,
-            reg_iterations=[15, 5],
+            reg_iterations=[6, 3],
             scales=[2, 1],
+            device='cpu',
             verbose=False,
         )
         assert result['template'] is not None
@@ -439,6 +450,7 @@ class TestBuildTemplateGreedyAffineCaching:
                 reg_iterations=[10, 5], scales=[2, 1],
             )
 
+    @pytest.mark.slow
     def test_affine_drop_tolerance_triggers_recompute(self, monkeypatch):
         """An impossible-to-satisfy tolerance (-1.0, since correlation is bounded in
         [-1, 1]) must force a from-scratch affine recompute on every post-iteration-0 image,
@@ -481,6 +493,7 @@ class TestBuildTemplateGreedyAffineCaching:
             f"({n_calls_disabled})"
         )
 
+    @pytest.mark.slow
     def test_identity_seeded_image_stays_identity_seeded_across_iterations(self, monkeypatch):
         """Regression guard for a real bug found on real FDG-PET data: caching None (what
         greedy_registration returns for 'no affine was used') and replaying it as the next

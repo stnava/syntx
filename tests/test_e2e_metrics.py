@@ -88,13 +88,33 @@ def get_real_or_synthetic_images_3d():  # pragma: no cover
         f, m = get_synthetic_images_3d(16)  # pragma: no cover
         return f, m, m  # pragma: no cover
 
+_EXTRACTOR_CACHE = {}
+
+
+def _cached_extractor(kind):
+    ext = _EXTRACTOR_CACHE.get(kind)
+    if ext is None:
+        from syntx.features import VGG19Extractor, ResNet10Extractor, SwinUNETRExtractor
+        if kind == "vgg19_4":
+            ext = VGG19Extractor(feature_layers=[4])
+        elif kind == "resnet10_3d_2":
+            ext = ResNet10Extractor(dim=3, feature_layers=[2], weights_path="random")
+        elif kind == "swin_4":
+            ext = SwinUNETRExtractor(feature_layers=[4], weights_path="random")
+        elif kind == "swin_1234":
+            ext = SwinUNETRExtractor(feature_layers=[1, 2, 3, 4], weights_path="random")
+        else:
+            raise ValueError(f"Unknown cached extractor kind: {kind}")
+        _EXTRACTOR_CACHE[kind] = ext
+    return ext
+
+
 # ==========================================
 # Tier 1: Feature Coverage (10 Test Cases)
 # ==========================================
 
 def test_swin_unetr_extractor_init():
-    from syntx.features import SwinUNETRExtractor
-    ext = SwinUNETRExtractor(feature_layers=[4], weights_path="random")
+    ext = _cached_extractor("swin_4")
     assert ext.is_3d
     assert ext.in_channels == 1
     assert ext.feature_layers == [4]
@@ -123,19 +143,17 @@ def test_swin_unetr_extractor_lazy_load_monai():
         sys.modules['monai.networks.nets'] = monai_networks_nets
 
 def test_swin_unetr_extractor_shapes():
-    from syntx.features import SwinUNETRExtractor
-    ext = SwinUNETRExtractor(feature_layers=[1, 2, 3, 4], weights_path="random")
+    ext = _cached_extractor("swin_1234")
     x = torch.randn(1, 1, 96, 96, 96)
     feats = ext.extract(ext.normalize(x))
     assert len(feats) == 4
     assert feats[0].shape == (1, 96, 24, 24, 24)
-    assert feats[1].shape == (1, 192, 12, 12, 12)
+    assert feats[1].shape == (1, 96 * 2, 12, 12, 12)
     assert feats[2].shape == (1, 384, 6, 6, 6)
     assert feats[3].shape == (1, 384, 3, 3, 3)
 
 def test_swin_unetr_extractor_normalization():
-    from syntx.features import SwinUNETRExtractor
-    ext = SwinUNETRExtractor(feature_layers=[4], weights_path="random")
+    ext = _cached_extractor("swin_4")
     x = torch.randn(1, 1, 32, 32, 32)
     x_norm = ext.normalize(x)
     assert torch.allclose(x, x_norm)
@@ -151,9 +169,9 @@ def test_dlpack_tensor_sharing_roundtrip():
     assert jax.numpy.allclose(x_jax, x_back)  # pragma: no cover
 
 def test_dlpack_loss_forward():
-    from syntx.features import FeatureSpaceLoss, ResNet10Extractor
+    from syntx.features import FeatureSpaceLoss
     from syntx.syn_jax import make_pytorch_loss_jax
-    ext = ResNet10Extractor(dim=3, feature_layers=[2], weights_path="random")  # pragma: no cover
+    ext = _cached_extractor("resnet10_3d_2")  # pragma: no cover
     loss_fn = FeatureSpaceLoss(extractor=ext, mode='lncc_3d')  # pragma: no cover
     jax_loss = make_pytorch_loss_jax(loss_fn)  # pragma: no cover
     
@@ -164,9 +182,9 @@ def test_dlpack_loss_forward():
     assert val.ndim == 0  # pragma: no cover
 
 def test_dlpack_loss_backward():
-    from syntx.features import FeatureSpaceLoss, ResNet10Extractor
+    from syntx.features import FeatureSpaceLoss
     from syntx.syn_jax import make_pytorch_loss_jax
-    ext = ResNet10Extractor(dim=3, feature_layers=[2], weights_path="random")  # pragma: no cover
+    ext = _cached_extractor("resnet10_3d_2")  # pragma: no cover
     loss_fn = FeatureSpaceLoss(extractor=ext, mode='lncc_3d')  # pragma: no cover
     jax_loss = make_pytorch_loss_jax(loss_fn)  # pragma: no cover
     
@@ -188,9 +206,9 @@ def test_dlpack_bridge_gradient_sharing():
     assert jax.numpy.allclose(grads, jax.numpy.array([2.0, 4.0]))  # pragma: no cover
 
 def test_vgg_3d_lncc_layer4_jax():
-    from syntx.features import FeatureSpaceLoss, VGG19Extractor
+    from syntx.features import FeatureSpaceLoss
     from syntx.syn_jax import make_pytorch_loss_jax
-    vgg_ext = VGG19Extractor(feature_layers=[4])  # pragma: no cover
+    vgg_ext = _cached_extractor("vgg19_4")  # pragma: no cover
     loss_fn = FeatureSpaceLoss(extractor=vgg_ext, mode='lncc_3d')  # pragma: no cover
     jax_loss = make_pytorch_loss_jax(loss_fn)  # pragma: no cover
     m = jax.numpy.ones((1, 1, 8, 8, 8), dtype=jax.numpy.float32)  # pragma: no cover
@@ -199,9 +217,9 @@ def test_vgg_3d_lncc_layer4_jax():
     assert val.ndim == 0  # pragma: no cover
 
 def test_dlpack_multi_level_compatibility():
-    from syntx.features import FeatureSpaceLoss, ResNet10Extractor
+    from syntx.features import FeatureSpaceLoss
     from syntx.syn_jax import make_pytorch_loss_jax
-    ext = ResNet10Extractor(dim=3, feature_layers=[2], weights_path="random")  # pragma: no cover
+    ext = _cached_extractor("resnet10_3d_2")  # pragma: no cover
     loss_fn = FeatureSpaceLoss(extractor=ext, mode='lncc_3d')  # pragma: no cover
     jax_loss = make_pytorch_loss_jax(loss_fn)  # pragma: no cover
     
@@ -216,8 +234,8 @@ def test_dlpack_multi_level_compatibility():
 # ==========================================
 
 def test_swin_unetr_invalid_input_dim():
-    from syntx.features import SwinUNETRExtractor, FeatureSpaceLoss
-    ext = SwinUNETRExtractor(feature_layers=[4], weights_path="random")
+    from syntx.features import FeatureSpaceLoss
+    ext = _cached_extractor("swin_4")
     loss_fn = FeatureSpaceLoss(extractor=ext, mode='lncc_3d')
     with pytest.raises(ValueError):
         loss_fn(torch.randn(1, 1, 32, 32), torch.randn(1, 1, 32, 32))
@@ -260,8 +278,7 @@ def test_dlpack_empty_tensors():
         jax_loss(jax.numpy.array([], dtype=jax.numpy.float32), jax.numpy.array([], dtype=jax.numpy.float32))  # pragma: no cover
 
 def test_swin_unetr_batch_sizes():
-    from syntx.features import SwinUNETRExtractor
-    ext = SwinUNETRExtractor(feature_layers=[4], weights_path="random")
+    ext = _cached_extractor("swin_4")
     x2 = torch.randn(2, 1, 32, 32, 32)
     feats = ext.extract(ext.normalize(x2))
     assert feats[0].shape[0] == 2
@@ -314,10 +331,11 @@ def test_swin_unetr_weights_are_never_downloaded_ad_hoc(monkeypatch, tmp_path):
         SwinUNETRExtractor(feature_layers=[4])
 
 
+@pytest.mark.slow
 def test_syn_jax_step_with_swin_unetr_loss():
-    from syntx.features import SwinUNETRExtractor, FeatureSpaceLoss
+    from syntx.features import FeatureSpaceLoss
     from syntx.syn_jax import SyNTo, dlpack_feature_loss
-    ext = SwinUNETRExtractor(feature_layers=[4], weights_path="random")  # pragma: no cover
+    ext = _cached_extractor("swin_4")  # pragma: no cover
     loss_fn = FeatureSpaceLoss(extractor=ext, mode='lncc_3d')  # pragma: no cover
     
     model = SyNTo(dim=3, grid_shape=(16, 16, 16))  # pragma: no cover
@@ -332,10 +350,11 @@ def test_syn_jax_step_with_swin_unetr_loss():
     )  # pragma: no cover
     assert len(model.syn_losses) == 1  # pragma: no cover
 
+@pytest.mark.slow
 def test_multimetric_syn_jax_registration():
-    from syntx.features import FeatureSpaceLoss, VGG19Extractor
+    from syntx.features import FeatureSpaceLoss
     from syntx.syn_jax import SyNTo, dlpack_feature_loss, make_pytorch_loss_jax
-    vgg_ext = VGG19Extractor(feature_layers=[4])  # pragma: no cover
+    vgg_ext = _cached_extractor("vgg19_4")  # pragma: no cover
     vgg_loss = FeatureSpaceLoss(extractor=vgg_ext, mode='lncc_3d')  # pragma: no cover
     
     def combined_loss(m, f):  # pragma: no cover
@@ -361,12 +380,13 @@ def test_multimetric_syn_jax_registration():
 # Tier 4: Real-World Application Scenarios (5 Test Cases)
 # ==========================================
 
+@pytest.mark.slow
 def test_real_t1w_to_b0_registration_swin_unetr():
     from syntx.syn_jax import dlpack_feature_loss
     t1, b0, _ = get_real_or_synthetic_images_3d()  # pragma: no cover
     from syntx import registration  # pragma: no cover
-    from syntx.features import SwinUNETRExtractor, FeatureSpaceLoss  # pragma: no cover
-    ext = SwinUNETRExtractor(feature_layers=[4], weights_path="random")  # pragma: no cover
+    from syntx.features import FeatureSpaceLoss  # pragma: no cover
+    ext = _cached_extractor("swin_4")  # pragma: no cover
     loss_fn = FeatureSpaceLoss(extractor=ext, mode='lncc_3d')  # pragma: no cover
     
     res = registration(  # pragma: no cover
@@ -381,12 +401,13 @@ def test_real_t1w_to_b0_registration_swin_unetr():
     )  # pragma: no cover
     assert 'warpedmovout' in res  # pragma: no cover
 
+@pytest.mark.slow
 def test_real_t1w_to_dwi_registration_vgg3d():
     from syntx.syn_jax import dlpack_feature_loss
     t1, _, dwi = get_real_or_synthetic_images_3d()  # pragma: no cover
     from syntx import registration  # pragma: no cover
-    from syntx.features import VGG19Extractor, FeatureSpaceLoss  # pragma: no cover
-    vgg_ext = VGG19Extractor(feature_layers=[4])  # pragma: no cover
+    from syntx.features import FeatureSpaceLoss  # pragma: no cover
+    vgg_ext = _cached_extractor("vgg19_4")  # pragma: no cover
     loss_fn = FeatureSpaceLoss(extractor=vgg_ext, mode='lncc_3d')  # pragma: no cover
     
     res = registration(  # pragma: no cover
@@ -409,15 +430,22 @@ def test_registration_folding_constraint():
     folding_rate = float(np.mean(jac <= 0.0))
     assert folding_rate <= 0.0001
 
+@pytest.mark.slow
 def test_comparative_metrics_script_execution(tmp_path):
-    import subprocess
+    import importlib.util
     repo_root = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
     script_path = os.path.join(repo_root, "examples", "benchmarks", "evaluate_all_metrics.py")
-    cmd = [sys.executable, script_path]
-    res = subprocess.run(cmd, cwd=str(tmp_path), capture_output=True, text=True)
-    assert res.returncode == 0, res.stderr
+    spec = importlib.util.spec_from_file_location("evaluate_all_metrics", script_path)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    extractors = {
+        "VGG19": _cached_extractor("vgg19_4"),
+        "SwinUNETR": _cached_extractor("swin_4"),
+    }
+    mod.main(out_dir=str(tmp_path), extractors=extractors)
     assert (tmp_path / "outputs_comparison" / "final_feature_metrics_results.csv").exists()
 
+@pytest.mark.slow
 def test_cortical_label_registration_accuracy():
     from syntx.syn_jax import dlpack_feature_loss
     fixed_np = np.zeros((16, 16, 16), dtype=np.float32)  # pragma: no cover
@@ -458,8 +486,8 @@ def test_cortical_label_registration_accuracy():
         
     dice_lncc = dice(fixed_label, warped_lncc)  # pragma: no cover
     
-    from syntx.features import VGG19Extractor, FeatureSpaceLoss  # pragma: no cover
-    vgg_ext = VGG19Extractor(feature_layers=[4])  # pragma: no cover
+    from syntx.features import FeatureSpaceLoss  # pragma: no cover
+    vgg_ext = _cached_extractor("vgg19_4")  # pragma: no cover
     loss_fn = FeatureSpaceLoss(extractor=vgg_ext, mode='lncc_3d')  # pragma: no cover
     
     res_vgg = registration(  # pragma: no cover

@@ -37,6 +37,7 @@ from syntx.landmarks import (
 from syntx.landmarks import spatial as S
 
 DECATHLON_DIR = "/Users/stnava/data/decathlon"
+pytestmark = pytest.mark.slow
 
 def _task_path(task_name: str) -> str:
     return os.path.join(DECATHLON_DIR, task_name)

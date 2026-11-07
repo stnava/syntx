@@ -15,15 +15,16 @@ import torch
 import syntx
 from syntx import RobustAffineSolverError
 
+from tests.conftest import get_cached_procedural_brain_array
+
 DEV = "mps" if torch.backends.mps.is_available() else "cpu"
 RA = importlib.import_module("syntx.robust_affine")
 
+_SLAB_CACHE = {}
+
 
 def _phantom():
-    import siq
-    from scipy.ndimage import gaussian_filter
-    np.random.seed(1234)
-    arr = gaussian_filter(siq.simulate_brain_procedural((96, 104, 88)).numpy().astype(np.float32), 1.0)
+    arr = get_cached_procedural_brain_array((96, 104, 88), seed=1234, sigma=1.0)
     return ants.from_numpy(arr, origin=(-48.0, -52.0, -44.0), spacing=(1.0, 1.0, 1.0))
 
 
@@ -31,21 +32,27 @@ def _slab_pair(r, inplane=0.75, fov=54.0):
     """Cross-modal thin slab: fixed = intensity-inverted phantom sampled on a (inplane, inplane,
     inplane*r) slab through a KNOWN rigid transform (box-averaged through each thick slice); moving =
     the 1 mm phantom. Returns (fixed, moving, true fixed->moving transform)."""
-    mov = _phantom()
-    a = mov.numpy(); a = (a - a.min()) / (a.max() - a.min())
-    cmap = mov.new_image_like((1.0 - a ** 0.8).astype(np.float32))
-    a1, a2 = np.deg2rad(6.0), np.deg2rad(-4.0)
-    Rz = np.array([[np.cos(a1), -np.sin(a1), 0], [np.sin(a1), np.cos(a1), 0], [0, 0, 1]])
-    Rx = np.array([[1, 0, 0], [0, np.cos(a2), -np.sin(a2)], [0, np.sin(a2), np.cos(a2)]])
-    tx = ants.create_ants_transform(transform_type="AffineTransform", dimension=3)
-    tx.set_parameters(np.concatenate([(Rz @ Rx).ravel(), [4.0, -3.0, 5.0]])); tx.set_fixed_parameters(np.zeros(3))
-    n = int(round(fov / inplane)); nz = int(round(fov / (inplane * r)))
-    grid = ants.make_image((n, n, nz * r), spacing=(inplane,) * 3, origin=(-fov / 2,) * 3)
-    fine = ants.apply_ants_transform_to_image(tx, cmap, grid, interpolation="linear")
-    fa = fine.numpy().reshape(n, n, nz, r).mean(axis=3)
-    fixed = ants.from_numpy(fa.astype(np.float32), origin=(-fov / 2, -fov / 2, -fov / 2 + (r - 1) * inplane / 2),
-                            spacing=(inplane, inplane, inplane * r))
-    return fixed, mov, tx
+    key = (int(r), float(inplane), float(fov))
+    cached = _SLAB_CACHE.get(key)
+    if cached is None:
+        mov = _phantom()
+        a = mov.numpy(); a = (a - a.min()) / (a.max() - a.min())
+        cmap = mov.new_image_like((1.0 - a ** 0.8).astype(np.float32))
+        a1, a2 = np.deg2rad(6.0), np.deg2rad(-4.0)
+        Rz = np.array([[np.cos(a1), -np.sin(a1), 0], [np.sin(a1), np.cos(a1), 0], [0, 0, 1]])
+        Rx = np.array([[1, 0, 0], [0, np.cos(a2), -np.sin(a2)], [0, np.sin(a2), np.cos(a2)]])
+        tx = ants.create_ants_transform(transform_type="AffineTransform", dimension=3)
+        tx.set_parameters(np.concatenate([(Rz @ Rx).ravel(), [4.0, -3.0, 5.0]])); tx.set_fixed_parameters(np.zeros(3))
+        n = int(round(fov / inplane)); nz = int(round(fov / (inplane * r)))
+        grid = ants.make_image((n, n, nz * r), spacing=(inplane,) * 3, origin=(-fov / 2,) * 3)
+        fine = ants.apply_ants_transform_to_image(tx, cmap, grid, interpolation="linear")
+        fa = fine.numpy().reshape(n, n, nz, r).mean(axis=3)
+        fixed = ants.from_numpy(fa.astype(np.float32), origin=(-fov / 2, -fov / 2, -fov / 2 + (r - 1) * inplane / 2),
+                                spacing=(inplane, inplane, inplane * r))
+        cached = (fixed, mov, tx)
+        _SLAB_CACHE[key] = cached
+    fixed, mov, tx = cached
+    return fixed.clone(), mov.clone(), tx
 
 
 def _tre(reg, tx):
@@ -56,7 +63,11 @@ def _tre(reg, tx):
                           for p in pts]))
 
 
-@pytest.mark.parametrize("r", [1, 2, 4, 6, 8, 10])
+@pytest.mark.slow
+@pytest.mark.parametrize(
+    "r",
+    [1, 2, 4, 6, 8, 10],
+)
 def test_thin_slab_cross_modal_known_rigid(r):
     """Default path (mm pyramid for both images + one-slice valid margin): known-rigid TRE < 1.5 mm at every thin-slab ratio. Ratio 6 (pose A) ended at ~4.4 mm up to 6.15.0 (documented as a capture limit); with the metric sampled off the voxel centres and the L-BFGS final stage it is solved by default (0.135 mm, 2026-10-21)."""
     fixed, mov, tx = _slab_pair(r)
@@ -65,6 +76,7 @@ def test_thin_slab_cross_modal_known_rigid(r):
     assert _tre(reg, tx) < 1.5
 
 
+@pytest.mark.slow
 def test_thin_slab_6to1_pose_a_is_solved_by_the_opt_in_translation_scan():
     fixed, mov, tx = _slab_pair(6)
     reg = syntx.robust_affine(fixed, mov, mode="auto", dof="rigid", device=DEV, seed=42, translation_scan_steps=2)
@@ -79,6 +91,7 @@ def test_margin_and_scan_parameters_are_validated(name, value):
         syntx.robust_affine(img, img, mode="auto", device="cpu", **{name: value})
 
 
+@pytest.mark.slow
 def test_valid_margin_is_a_noop_for_an_isotropic_fixed_image_and_changes_an_anisotropic_one():
     iso = _phantom()
     mov = ants.apply_transforms(fixed=iso, moving=iso, transformlist=[], interpolator="linear")
@@ -121,6 +134,7 @@ def test_solver_key_present():
     assert syntx.robust_affine(a, a, mode="auto", device="cpu")["solver"] == "pytorch"
 
 
+@pytest.mark.slow
 def test_self_check_raises_when_pose_is_worse_than_doing_nothing(monkeypatch):
     """Sabotage the optimiser's result: a final pose worse than both trivial baselines must raise."""
     a = _phantom()
@@ -140,6 +154,7 @@ _D = "/Users/stnava/data/nm_registration_debug/subjects"
 _SUBJECTS = [f"sub-{i:02d}" for i in range(1, 11)]
 
 
+@pytest.mark.slow
 @pytest.mark.parametrize("sub", _SUBJECTS)
 def test_real_nm_t1_pose_within_2mm_of_ants(sub):
     """Ten real ds001242 neuromelanin-slab / T1 pairs (local data): the DEFAULT path lands within 2 mm of the ANTs rigid reference."""

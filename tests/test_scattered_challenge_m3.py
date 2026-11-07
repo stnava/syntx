@@ -471,6 +471,7 @@ def run_empirical_challenge_suite() -> Dict[str, Any]:
 # Pytest Test Cases Asserting Mathematical Guarantees
 # ==============================================================================
 
+@pytest.mark.slow
 def test_m3_challenge_crescent_2d_guarantees():
     """Verify 2D Crescent satisfies both inverse consistency < 1e-3 and folding < 0.1%."""
     pts_fix, feats_fix = generate_crescent_2d(n_points=500, seed=42)
@@ -502,6 +503,7 @@ def test_m3_challenge_crescent_2d_guarantees():
     assert jac['min_jacobian'] > -1e-4, f"Severe negative folding: min det(J) = {jac['min_jacobian']}"
 
 
+@pytest.mark.slow
 def test_m3_challenge_spiral_2d_guarantees():
     """Verify 2D Spiral satisfies both inverse consistency < 1e-3 and folding < 0.1%."""
     pts_fix, feats_fix = generate_spiral_2d(n_points=600, seed=101)
@@ -562,6 +564,7 @@ def test_m3_challenge_ellipsoid_shell_3d_guarantees():
     assert jac['min_jacobian'] > -1e-4, f"Severe negative folding: min det(J) = {jac['min_jacobian']}"
 
 
+@pytest.mark.slow
 def test_m3_challenge_cfl_sensitivity_comparison():
     """Verify that CFL bounding (0.25 vs 1.0) preserves diffeomorphic regularity."""
     pts_fix, feats_fix = generate_crescent_2d(n_points=400, seed=999)

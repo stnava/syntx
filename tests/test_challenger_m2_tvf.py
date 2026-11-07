@@ -157,6 +157,7 @@ def test_tvf_cfl_cache_data_sub_flaw_reproduction():
     assert v_fresh > 0.0, "Proper in-place update did not compute fresh velocity max"
 
 
+@pytest.mark.slow
 def test_tvf_deformation_regularity_and_folding_2d():
     """Verify TVF registration preserves deformation regularity (min det(J) > 0, 0.0% folding)."""
     fi_np = np.zeros((32, 32), dtype=np.float32)

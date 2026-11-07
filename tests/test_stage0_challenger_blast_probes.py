@@ -15,6 +15,19 @@ from syntx.motion_design import make_design, motion_correct_design, Design
 from syntx.motion_reference import level_adjacency, offset_identifiable
 
 
+@pytest.fixture(scope="module")
+def _breacher_bold_bundle():
+    bpath = Path("/Users/stnava/data/blast_cohorts/BIDS/breacher/sub-0102/ses-initial-day2/func")
+    bold_nii = bpath / "sub-0102_ses-initial-day2_task-rest_run-01_bold.nii.gz"
+    bold_json = bpath / "sub-0102_ses-initial-day2_task-rest_run-01_bold.json"
+    if not bold_nii.exists():
+        pytest.skip(f"BOLD file missing: {bold_nii}")
+    sidecar = json.loads(bold_json.read_text()) if bold_json.exists() else None
+    bold_img = ants.image_read(str(bold_nii))
+    return bold_img, sidecar
+
+
+@pytest.mark.slow
 def test_blast_cohort_fpa_dwi_probe():
     """Empirically test FPA/sub-BLAST070/ses-01 DWI dir-AP probe."""
     dpath = Path("/Users/stnava/data/blast_cohorts/BIDS/FPA/sub-BLAST070/ses-01/dwi")
@@ -23,7 +36,8 @@ def test_blast_cohort_fpa_dwi_probe():
     dwi_bvec = dpath / "sub-BLAST070_ses-01_run-001_dir-AP_dwi.bvec"
     dwi_json = dpath / "sub-BLAST070_ses-01_run-001_dir-AP_dwi.json"
 
-    assert dwi_nii.exists(), f"DWI file missing: {dwi_nii}"
+    if not dwi_nii.exists():
+        pytest.skip(f"DWI file missing: {dwi_nii}")
     bvals = np.loadtxt(dwi_bval)[:25]
     bvecs = np.loadtxt(dwi_bvec)[:, :25].T
     sidecar = json.loads(dwi_json.read_text()) if dwi_json.exists() else None
@@ -73,16 +87,10 @@ def test_blast_cohort_fpa_dwi_probe():
     assert not np.isnan(corrected.numpy()).any(), "NaN found in corrected image"
 
 
-def test_blast_cohort_breacher_bold_probe_default():
+@pytest.mark.slow
+def test_blast_cohort_breacher_bold_probe_default(_breacher_bold_bundle):
     """Empirically test breacher/sub-0102/ses-initial-day2 BOLD probe under default debias_pe_pseudomotion=False."""
-    bpath = Path("/Users/stnava/data/blast_cohorts/BIDS/breacher/sub-0102/ses-initial-day2/func")
-    bold_nii = bpath / "sub-0102_ses-initial-day2_task-rest_run-01_bold.nii.gz"
-    bold_json = bpath / "sub-0102_ses-initial-day2_task-rest_run-01_bold.json"
-
-    assert bold_nii.exists(), f"BOLD file missing: {bold_nii}"
-    sidecar = json.loads(bold_json.read_text()) if bold_json.exists() else None
-
-    bold_img = ants.image_read(str(bold_nii))
+    bold_img, sidecar = _breacher_bold_bundle
     n_frames = 30
     bold_sub = ants.from_numpy(
         bold_img.numpy()[..., :n_frames],
@@ -124,14 +132,12 @@ def test_blast_cohort_breacher_bold_probe_default():
     assert not np.isnan(corrected.numpy()).any(), "NaN found in corrected image"
 
 
-def test_blast_cohort_breacher_bold_probe_optin_debias_success():
+@pytest.mark.slow
+def test_blast_cohort_breacher_bold_probe_optin_debias_success(_breacher_bold_bundle):
     """Empirically verify that opt-in debias_pe_pseudomotion=True in separate_bold_pe_pseudomotion runs cleanly without NameError."""
-    bpath = Path("/Users/stnava/data/blast_cohorts/BIDS/breacher/sub-0102/ses-initial-day2/func")
-    bold_nii = bpath / "sub-0102_ses-initial-day2_task-rest_run-01_bold.nii.gz"
-    bold_json = bpath / "sub-0102_ses-initial-day2_task-rest_run-01_bold.json"
-
-    sidecar = json.loads(bold_json.read_text())
-    bold_img = ants.image_read(str(bold_nii))
+    bold_img, sidecar = _breacher_bold_bundle
+    if sidecar is None:
+        pytest.skip("BOLD JSON sidecar missing")
     n_frames = 25
     bold_sub = ants.from_numpy(
         bold_img.numpy()[..., :n_frames],
@@ -158,6 +164,7 @@ def test_blast_cohort_breacher_bold_probe_optin_debias_success():
     assert res["pe_pseudomotion_debias"] is not None
 
 
+@pytest.mark.slow
 def test_blast_cohort_expart_asl_probe():
     """Empirically test ExpArt/sub-EAS024/ses-01 ASL probe."""
     asl_path = Path("/Users/stnava/data/blast_cohorts/BIDS/ExpArt/sub-EAS024/ses-01/asl")
@@ -165,8 +172,8 @@ def test_blast_cohort_expart_asl_probe():
     asl_ctx = asl_path / "sub-EAS024_ses-01_run-001_dir-PA_aslcontext.tsv"
     asl_json = asl_path / "sub-EAS024_ses-01_run-001_dir-PA_asl.json"
 
-    assert asl_nii.exists(), f"ASL file missing: {asl_nii}"
-    assert asl_ctx.exists(), f"aslcontext missing: {asl_ctx}"
+    if not (asl_nii.exists() and asl_ctx.exists()):
+        pytest.skip(f"ASL files missing under {asl_path}")
 
     lines = [line.strip() for line in asl_ctx.read_text().splitlines() if line.strip()]
     header = lines[0]

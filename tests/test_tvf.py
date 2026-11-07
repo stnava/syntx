@@ -127,6 +127,7 @@ def test_tvf_velocity_gradient_smoothing_isotropic():
         f"Anisotropic smoothing detected in JAX: val_z={val_z_j}, val_y={val_y_j}, val_x={val_x_j}"
 
 
+@pytest.mark.slow
 def test_tvf_model_fit_2d_and_3d():
     """
     Test fit() multi-resolution optimization on synthetic 2D and 3D images for PyTorch and JAX models.
@@ -205,6 +206,7 @@ def test_tvf_model_fit_2d_and_3d():
     assert warp_3d_jax.shape == (1, 16, 16, 16, 3)
 
 
+@pytest.mark.slow
 def test_tvf_pytorch_jax_parity():
     """
     Verify PyTorch <=> JAX parity for TVF models:
@@ -260,6 +262,7 @@ def test_tvf_pytorch_jax_parity():
     assert inv_diff_max <= 0.05, f"Inverse displacement warp mismatch PyTorch vs JAX: max_diff={inv_diff_max:.6f}"
 
 
+@pytest.mark.slow
 def test_tvf_lars_optimizer_integration():
     device = torch.device('cpu')
     shape = (16, 16, 16)

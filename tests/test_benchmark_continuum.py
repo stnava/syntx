@@ -76,6 +76,7 @@ def test_tune_search_space_continuum_params():
     assert not beta_param.active({"regularizer": "navier"})
 
 
+@pytest.mark.slow
 def test_twod_evaluator_navier_smoke():
     """Verify that twod_evaluator runs cleanly on 2D with Navier regularizer."""
     spec = METHODS["syn"]

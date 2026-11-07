@@ -40,15 +40,26 @@ def test_cli_register_missing_files(tmp_path):
     assert ret == 1
 
 
-def test_cli_register_syn_2d(tmp_path):
+_CLI_PAIR_CACHE = {}
+
+
+def _write_small_r16_r64(tmp_path):
+    if "pair" not in _CLI_PAIR_CACHE:
+        r16 = ants.resample_image(ants.image_read(ants.get_ants_data('r16')), (64, 64), use_voxels=True, interp_type=0)
+        r64 = ants.resample_image(ants.image_read(ants.get_ants_data('r64')), (64, 64), use_voxels=True, interp_type=0)
+        _CLI_PAIR_CACHE["pair"] = (r16, r64)
+    r16, r64 = _CLI_PAIR_CACHE["pair"]
     r16_path = str(tmp_path / "r16.nii.gz")
     r64_path = str(tmp_path / "r64.nii.gz")
-    out_dir = str(tmp_path / "syn_out")
-
-    r16 = ants.image_read(ants.get_ants_data('r16'))
-    r64 = ants.image_read(ants.get_ants_data('r64'))
     ants.image_write(r16, r16_path)
     ants.image_write(r64, r64_path)
+    return r16_path, r64_path
+
+
+@pytest.mark.slow
+def test_cli_register_syn_2d(tmp_path):
+    r16_path, r64_path = _write_small_r16_r64(tmp_path)
+    out_dir = str(tmp_path / "syn_out")
 
     test_args = [
         "syntx", "register",
@@ -57,7 +68,7 @@ def test_cli_register_syn_2d(tmp_path):
         "-o", out_dir,
         "-p", "test_syn_",
         "--model", "syn",
-        "-i", "20x10",
+        "-i", "4x2",
         "--report"
     ]
     sys.argv = test_args
@@ -80,15 +91,10 @@ def test_cli_register_syn_2d(tmp_path):
     assert metrics["jacobian_folding_pct"] == 0.0
 
 
+@pytest.mark.slow
 def test_cli_register_tvf_2d(tmp_path):
-    r16_path = str(tmp_path / "r16.nii.gz")
-    r64_path = str(tmp_path / "r64.nii.gz")
+    r16_path, r64_path = _write_small_r16_r64(tmp_path)
     out_dir = str(tmp_path / "tvf_out")
-
-    r16 = ants.image_read(ants.get_ants_data('r16'))
-    r64 = ants.image_read(ants.get_ants_data('r64'))
-    ants.image_write(r16, r16_path)
-    ants.image_write(r64, r64_path)
 
     test_args = [
         "syntx", "register",
@@ -97,7 +103,7 @@ def test_cli_register_tvf_2d(tmp_path):
         "-o", out_dir,
         "-p", "test_tvf_",
         "--model", "tvf",
-        "-i", "20x10",
+        "-i", "4x2",
         "--no-report"
     ]
     sys.argv = test_args
@@ -108,15 +114,10 @@ def test_cli_register_tvf_2d(tmp_path):
     assert os.path.exists(os.path.join(out_dir, "test_tvf_metrics.json"))
 
 
+@pytest.mark.slow
 def test_cli_register_guided_sulcal_2d(tmp_path):
-    r16_path = str(tmp_path / "r16.nii.gz")
-    r64_path = str(tmp_path / "r64.nii.gz")
+    r16_path, r64_path = _write_small_r16_r64(tmp_path)
     out_dir = str(tmp_path / "guided_out")
-
-    r16 = ants.image_read(ants.get_ants_data('r16'))
-    r64 = ants.image_read(ants.get_ants_data('r64'))
-    ants.image_write(r16, r16_path)
-    ants.image_write(r64, r64_path)
 
     test_args = [
         "syntx", "register",
@@ -125,7 +126,7 @@ def test_cli_register_guided_sulcal_2d(tmp_path):
         "-o", out_dir,
         "-p", "test_guided_",
         "--model", "syn",
-        "-i", "20x10",
+        "-i", "4x2",
         "--guided", "sulcal",
         "--cohort-type", "inter",
         "--no-report"

@@ -13,6 +13,7 @@ from syntx.syn_jax import SyNTo as SyNToJax
 from syntx.features import VGG19Extractor
 from syntx import registration
 
+@pytest.mark.slow
 def test_deep_feature_degeneracy_trigger_pytorch():
     # Setup inputs with shape < 32
     fixed_np = np.random.rand(1, 1, 16, 16).astype(np.float32)
@@ -67,6 +68,7 @@ def test_deep_feature_degeneracy_trigger_pytorch():
     assert call_count_large > 0, "Expected VGG19Extractor to be called for shape >= 32."
 
 
+@pytest.mark.slow
 def test_deep_feature_degeneracy_trigger_jax():
     # Setup inputs with shape < 32
     fixed_np = np.random.rand(1, 1, 16, 16).astype(np.float32)
@@ -122,6 +124,7 @@ def test_deep_feature_degeneracy_trigger_jax():
     assert call_count_large > 0, "Expected VGG19Extractor to be called for shape >= 32 under JAX."
 
 
+@pytest.mark.slow
 def test_displacement_export_and_non_folding():
     # Load 2D phantoms
     fi = ants.image_read(ants.get_data('r16'))
@@ -200,6 +203,7 @@ def test_displacement_export_and_non_folding():
                 pass
 
 
+@pytest.mark.slow
 def test_parameter_tuning_dice_parity():
     # Load 2D phantoms
     fi = ants.image_read(ants.get_data('r16'))

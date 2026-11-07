@@ -16,16 +16,16 @@ import syntx
 def small_pair_2d():
     """Lightweight 2D pair for rapid interface testing."""
     np.random.seed(42)
-    # 64x64 phantom with a centered circle
-    shape = (64, 64)
+    # 32x32 phantom with a centered circle
+    shape = (32, 32)
     y, x = np.ogrid[:shape[0], :shape[1]]
-    center = (32, 32)
-    mask1 = ((x - center[1]) ** 2 + (y - center[0]) ** 2) < 16 ** 2
+    center = (16, 16)
+    mask1 = ((x - center[1]) ** 2 + (y - center[0]) ** 2) < 8 ** 2
     img1 = mask1.astype(np.float32)
 
     # Shifted and slightly scaled circle
-    center2 = (35, 30)
-    mask2 = ((x - center2[1]) ** 2 / 1.1 + (y - center2[0]) ** 2 * 1.1) < 16 ** 2
+    center2 = (18, 15)
+    mask2 = ((x - center2[1]) ** 2 / 1.1 + (y - center2[0]) ** 2 * 1.1) < 8 ** 2
     img2 = mask2.astype(np.float32)
 
     fi = ants.from_numpy(img1, spacing=(1.0, 1.0), origin=(0.0, 0.0))
@@ -37,29 +37,29 @@ def test_robust_affine_levels_and_iterations(small_pair_2d):
     fi, mi = small_pair_2d
 
     # 1. Custom levels and iterations
-    aff = syntx.robust_affine(fi, mi, levels=[4, 2], iterations=[15, 10], verbose=False)
+    aff = syntx.robust_affine(fi, mi, levels=[4, 2], iterations=[3, 2], device='cpu', verbose=False)
     assert 'fwdtransforms' in aff
     assert 'warpedmovout' in aff
     assert len(aff['fwdtransforms']) == 1
 
     # 2. reg_iterations alias in robust_affine
-    aff_alias = syntx.robust_affine(fi, mi, levels=[4, 2], reg_iterations=[10, 5], verbose=False)
+    aff_alias = syntx.robust_affine(fi, mi, levels=[4, 2], reg_iterations=[3, 2], device='cpu', verbose=False)
     assert 'fwdtransforms' in aff_alias
 
     # 3. Rigid dof with custom levels
-    aff_rigid = syntx.robust_affine(fi, mi, levels=[4, 2], iterations=[10, 5], dof='rigid', verbose=False)
+    aff_rigid = syntx.robust_affine(fi, mi, levels=[4, 2], iterations=[3, 2], dof='rigid', device='cpu', verbose=False)
     assert 'fwdtransforms' in aff_rigid
 
 
 def test_syn_iterations_alias(small_pair_2d):
     fi, mi = small_pair_2d
     # 1. Test syn with iterations alias (instead of reg_iterations)
-    res = syntx.syn(fi, mi, levels=[4, 2], iterations=[5, 2], verbose=False)
+    res = syntx.syn(fi, mi, levels=[4, 2], iterations=[1, 1], initial_transform='identity', device='cpu', verbose=False)
     assert 'warpedmovout' in res
     assert 'fwdtransforms' in res
 
     # 2. Test syn with reg_iterations
-    res2 = syntx.syn(fi, mi, levels=[4, 2], reg_iterations=[5, 2], verbose=False)
+    res2 = syntx.syn(fi, mi, levels=[4, 2], reg_iterations=[1, 1], initial_transform='identity', device='cpu', verbose=False)
     assert 'warpedmovout' in res2
     assert 'fwdtransforms' in res2
 
@@ -67,12 +67,12 @@ def test_syn_iterations_alias(small_pair_2d):
 def test_tvf_iterations_alias(small_pair_2d):
     fi, mi = small_pair_2d
     # 1. Test tvf with iterations alias and custom levels
-    res = syntx.tvf(fi, mi, levels=[4, 2], iterations=[5, 2], n_time_steps=1, verbose=False)
+    res = syntx.tvf(fi, mi, levels=[4, 2], iterations=[1, 1], n_time_steps=1, initial_transform='identity', device='cpu', verbose=False)
     assert 'warpedmovout' in res
     assert 'fwdtransforms' in res
 
     # 2. Test tvf with reg_iterations and custom levels
-    res2 = syntx.tvf(fi, mi, levels=[4, 2], reg_iterations=[5, 2], n_time_steps=1, verbose=False)
+    res2 = syntx.tvf(fi, mi, levels=[4, 2], reg_iterations=[1, 1], n_time_steps=1, initial_transform='identity', device='cpu', verbose=False)
     assert 'warpedmovout' in res2
     assert 'fwdtransforms' in res2
 
@@ -80,12 +80,12 @@ def test_tvf_iterations_alias(small_pair_2d):
 def test_syngs_iterations_alias(small_pair_2d):
     fi, mi = small_pair_2d
     # 1. Test syngs with iterations alias and custom levels
-    res = syntx.syngs(fi, mi, levels=[4, 2], iterations=[5, 2], verbose=False)
+    res = syntx.syngs(fi, mi, levels=[4, 2], iterations=[1, 1], initial_transform='identity', device='cpu', verbose=False)
     assert 'warpedmovout' in res
     assert 'fwdtransforms' in res
 
     # 2. Test syngs with reg_iterations and custom levels
-    res2 = syntx.syngs(fi, mi, levels=[4, 2], reg_iterations=[5, 2], verbose=False)
+    res2 = syntx.syngs(fi, mi, levels=[4, 2], reg_iterations=[1, 1], initial_transform='identity', device='cpu', verbose=False)
     assert 'warpedmovout' in res2
     assert 'fwdtransforms' in res2
 
@@ -93,16 +93,17 @@ def test_syngs_iterations_alias(small_pair_2d):
 def test_greedy_iterations_alias(small_pair_2d):
     fi, mi = small_pair_2d
     # 1. Test greedy with levels and iterations alias
-    res = syntx.greedy(fi, mi, levels=[4, 2], iterations=[5, 2], verbose=False)
+    res = syntx.greedy(fi, mi, levels=[4, 2], iterations=[1, 1], initial_transform=False, device='cpu', verbose=False)
     assert 'warpedmovout' in res
     assert 'fwdtransforms' in res
 
     # 2. Test greedy with levels and reg_iterations
-    res2 = syntx.greedy(fi, mi, levels=[4, 2], reg_iterations=[5, 2], verbose=False)
+    res2 = syntx.greedy(fi, mi, levels=[4, 2], reg_iterations=[1, 1], initial_transform=False, device='cpu', verbose=False)
     assert 'warpedmovout' in res2
     assert 'fwdtransforms' in res2
 
 
+@pytest.mark.slow
 def test_auto_reg_consistency(small_pair_2d):
     fi, mi = small_pair_2d
 
@@ -112,12 +113,12 @@ def test_auto_reg_consistency(small_pair_2d):
     assert 'fwdtransforms' in res_aff
 
     # 2. auto_reg with type_of_transform='SyN' and custom levels + reg_iterations
-    res_syn = syntx.auto_reg(fi, mi, type_of_transform='SyN', levels=[4, 2], reg_iterations=[5, 2], diagnose=False)
+    res_syn = syntx.auto_reg(fi, mi, type_of_transform='SyN', levels=[4, 2], reg_iterations=[5, 2], initial_transform='identity', diagnose=False)
     assert 'warpedmovout' in res_syn
     assert 'fwdtransforms' in res_syn
 
     # 3. auto_reg with type_of_transform='TVF' and custom levels + iterations
-    res_tvf = syntx.auto_reg(fi, mi, type_of_transform='TVF', levels=[4, 2], iterations=[5, 2], n_time_steps=1, diagnose=False)
+    res_tvf = syntx.auto_reg(fi, mi, type_of_transform='TVF', levels=[4, 2], iterations=[5, 2], n_time_steps=1, initial_transform='identity', diagnose=False)
     assert 'warpedmovout' in res_tvf
     assert 'fwdtransforms' in res_tvf
 

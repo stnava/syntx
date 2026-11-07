@@ -41,6 +41,28 @@ def brain_3d_pair():
         
     return fixed, moving
 
+@pytest.mark.slow
+def test_gpu_timing_breakdown_contract_fast():
+    """Fast 24^3 smoke test verifying timing breakdown keys and memory helper in default suite."""
+    np.random.seed(42)
+    z, y, x = np.ogrid[:24, :24, :24]
+    mask = ((z - 12)**2 / 7**2 + (y - 12)**2 / 8**2 + (x - 12)**2 / 8**2) <= 1.0
+    fi_data = np.zeros((24, 24, 24), dtype=np.float32)
+    fi_data[mask] = 1.0 + 0.1 * np.random.randn(*mask.shape)[mask]
+    mi_data = np.roll(fi_data, shift=(1, 1, 1), axis=(0, 1, 2))
+    fixed = ants.from_numpy(fi_data, origin=(0.0, 0.0, 0.0), spacing=(1.0, 1.0, 1.0), direction=np.eye(3))
+    moving = ants.from_numpy(mi_data, origin=(0.0, 0.0, 0.0), spacing=(1.0, 1.0, 1.0), direction=np.eye(3))
+    device = 'mps' if torch.backends.mps.is_available() else ('cuda' if torch.cuda.is_available() else 'cpu')
+    res = benchmark_3d_subject_pair(
+        fixed, moving, backend='pytorch', device=device,
+        reg_iterations=[2, 1], levels=[2, 1]
+    )
+    assert get_peak_memory_mb() >= 0.0
+    assert res['total_time_seconds'] >= 0.0
+    assert {'time_affine_seconds', 'time_syn_seconds', 'time_grid_eval_seconds', 'time_resampling_seconds'} <= set(res)
+
+
+@pytest.mark.slow
 def test_gpu_3d_registration_sub_10s(brain_3d_pair):
     """Asserts end-to-end 3D registration executes in < 10.0 seconds per 3D subject pair."""
     fixed, moving = brain_3d_pair
@@ -71,6 +93,7 @@ def test_gpu_3d_registration_sub_10s(brain_3d_pair):
     assert len(res['fwdtransforms']) > 0
     assert res['warpedmovout'].shape == fixed.shape
 
+@pytest.mark.slow
 def test_gpu_memory_leak_free(brain_3d_pair):
     """Profiles memory usage across multiple registrations and asserts zero memory leaks."""
     fixed, moving = brain_3d_pair
@@ -111,6 +134,7 @@ def test_gpu_memory_leak_free(brain_3d_pair):
     memory_growth = rss_samples[2] - rss_samples[1]
     assert memory_growth < 150.0, f"Detected potential memory leak: RSS grew by {memory_growth:.1f} MB between iterations!"
 
+@pytest.mark.slow
 def test_gpu_timing_breakdown(brain_3d_pair):
     """Asserts detailed timing breakdown reporting across registration phases."""
     fixed, moving = brain_3d_pair

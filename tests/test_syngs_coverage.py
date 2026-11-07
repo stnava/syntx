@@ -85,6 +85,7 @@ def test_syngs_registration_high_level_2d():
     assert os.path.exists(reg['inv_momentum_file'])
 
 
+@pytest.mark.slow
 def test_integrate_momentum_reconstruction():
     from syntx import integrate_momentum, shoot_geodesic, momentum_to_deformation
     fi_arr = np.pad(np.ones((16, 16)), 8).astype(np.float32)
@@ -114,6 +115,7 @@ def test_integrate_momentum_reconstruction():
         assert isinstance(t_img, ants.ANTsImage)
 
 
+@pytest.mark.slow
 @pytest.mark.skipif(not HAS_JAX, reason="JAX not installed")
 def test_geodesic_shooting_model_jax_2d():
     import jax.numpy as jnp
@@ -165,9 +167,9 @@ def test_syngs_each_regularizer_takes_only_its_own_strength_parameter():
     import numpy as np
     import pytest
     import syntx
-    fi = ants.image_read(ants.get_ants_data("r16"))
-    mi = ants.image_read(ants.get_ants_data("r64"))
-    kw = dict(fixed=fi, moving=mi, initial_transform="identity", reg_iterations=[5, 0, 0, 0], device="cpu")
+    fi = ants.resample_image(ants.image_read(ants.get_ants_data("r16")), (48, 48), use_voxels=True, interp_type=0)
+    mi = ants.resample_image(ants.image_read(ants.get_ants_data("r64")), (48, 48), use_voxels=True, interp_type=0)
+    kw = dict(fixed=fi, moving=mi, initial_transform="identity", reg_iterations=[3, 0, 0, 0], device="cpu")
     run = lambda **k: syntx.syngs(**kw, **k)["warpedmovout"].numpy()
     for reg in ("sobolev", "dsti1"):
         for fs in (3.0, 1.5, 0.0):

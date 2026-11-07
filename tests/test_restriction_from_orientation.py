@@ -108,4 +108,4 @@ def test_result_composes_directly_with_syn(tmp_path):
     fixed = ants.from_numpy(base)
     moving = ants.from_numpy(np.roll(base, shift=2, axis=1))
     # smoke test only: must not raise, regardless of convergence quality
-    syntx.syn(fixed, moving, type_of_transform="SyNOnly", reg_iterations=[5, 5], restrict_transformation=w, verbose=False)
+    syntx.syn(fixed, moving, type_of_transform="SyNOnly", initial_transform="identity", device="cpu", reg_iterations=[1], restrict_transformation=w, verbose=False)

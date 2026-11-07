@@ -133,7 +133,7 @@ def test_robust_affine_modes():
     assert 'warpedmovout' in res_pt
 
     # Mode: 'auto' with multi_start=True
-    res_auto = robust_affine(fi, mi, mode='auto', multi_start=True, low_res_spacing=2.0, verbose=False)
+    res_auto = robust_affine(fi, mi, mode='auto', device='cpu', preset='fast', multi_start=True, low_res_spacing=2.0, verbose=False)
     assert 'warpedmovout' in res_auto
 
     # Mode: 'ants_fast' with multi_start=False
@@ -141,6 +141,7 @@ def test_robust_affine_modes():
     assert 'warpedmovout' in res_ants
 
 
+@pytest.mark.slow
 def test_pytorch_affine_convergence_and_parity():
     """Verifies physical space alignment, convergence accuracy, and parse_ants_affine parity for PyTorch Affine."""
     from syntx.syn import parse_ants_affine

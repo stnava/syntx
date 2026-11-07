@@ -55,6 +55,7 @@ def test_ants_component_ordering_3d():
     assert peak_idx_z[2] == 21, f"Expected shift along X (axis 2), got peak at {peak_idx_z}"
 
 
+@pytest.mark.slow
 def test_registration_versus_transform_export_3d(tmp_path):
     fixed_data = np.zeros((16, 24, 32), dtype=np.float32)
     moving_data = np.zeros((16, 24, 32), dtype=np.float32)

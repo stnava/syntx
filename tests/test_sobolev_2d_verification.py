@@ -107,20 +107,25 @@ def test_sobolev_2d_jax_stability(alpha):
     assert jnp.isfinite(v_out_gs).all()
 
 
-@pytest.mark.parametrize('alpha', [0.1, 1.0, 10.0, 50.0])
-@pytest.mark.parametrize('mname', ['syn', 'tvf'])
+_B2D_INIT_CACHE = {}
+
+
+@pytest.mark.slow
+@pytest.mark.parametrize('mname,alpha', [('syn', 0.1), ('syn', 1.0), ('syn', 10.0), ('syn', 50.0), ('tvf', 0.1), ('tvf', 1.0), ('tvf', 10.0), ('tvf', 50.0)])
 def test_sobolev_2d_registration_fit_extreme_alphas(mname, alpha):
     import ants
     from syntx.viz.reports import _compute_jacobian_stats
-    bdata = syntx.benchmark_data('2d')
-    fixed = bdata['fixed']
-    moving = bdata['moving']
+    if "bundle" not in _B2D_INIT_CACHE:
+        bdata = syntx.benchmark_data('2d')
+        init_tx = syntx.robust_affine(bdata['fixed'], bdata['moving'], mode='pytorch', device='cpu', preset='fast', seed=42)['fwdtransforms'][0]
+        _B2D_INIT_CACHE["bundle"] = (bdata['fixed'], bdata['moving'], init_tx)
+    fixed, moving, init_tx = _B2D_INIT_CACHE["bundle"]
     
     reg_fn = getattr(syntx, mname)
     if mname == 'syn':
-        res = reg_fn(fixed, moving, type_of_transform='SyNTo', regularizer='sobolev', sobolev_alpha=alpha, reg_iterations=[20, 20, 10], verbose=False)
+        res = reg_fn(fixed, moving, type_of_transform='SyNTo', regularizer='sobolev', sobolev_alpha=alpha, reg_iterations=[8, 6, 4], device='cpu', initial_transform=init_tx, verbose=False)
     else:
-        res = reg_fn(fixed, moving, regularizer='sobolev', alpha=alpha, optimizer='lars', optimizer_lr=0.60, reg_iterations=[50, 50, 20], verbose=False)
+        res = reg_fn(fixed, moving, regularizer='sobolev', alpha=alpha, optimizer='lars', optimizer_lr=0.60, reg_iterations=[50, 50, 20], initial_transform=init_tx, verbose=False)
 
     warped = res['warpedmovout']
     warped_np = warped.numpy() if hasattr(warped, 'numpy') else np.asarray(warped)

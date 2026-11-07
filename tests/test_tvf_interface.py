@@ -56,6 +56,7 @@ def test_tvf_accepts_every_declared_advanced_option_name():
     assert syntx.tvf is tvf_registration
 
 
+@pytest.mark.slow
 def test_tvf_defaults_on_2d_pair():
     """Regression guard for the 2026-09-30 study: TVF defaults on r16 -> r64 are diffeomorphic by
     the exact (Liouville) determinant with bounded compression, beat SyN's Dice there (0.783),
@@ -83,6 +84,7 @@ def test_tvf_defaults_on_2d_pair():
     assert np.linalg.norm(v, axis=-1).max() / np.linalg.norm(disp, axis=-1).max() < 1.6
 
 
+@pytest.mark.slow
 def test_liouville_jacobian_is_exact_where_smooth_and_positive_everywhere():
     """TVFModel.jacobian_determinant (Liouville: exp int div v dt along the flow) agrees with a
     finite-difference Jacobian of the exported map where that is reliable, and is > 0 everywhere."""

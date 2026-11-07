@@ -24,31 +24,40 @@ def compute_pearson_correlation(x, y):
     y_flat = y.ravel()
     return float(np.corrcoef(x_flat, y_flat)[0, 1])
 
+_CACHED_JAX_2D = None
+_CACHED_JAX_3D = None
+
+
 def get_test_image_2d():
-    if siq is not None:
-        return siq.simulate_image(shaper=[64, 64], n_levels=8)
-    else:
-        vol = np.zeros((64, 64), dtype=float)
-        y, x = np.ogrid[:64, :64]
-        mask1 = (x - 32)**2 + (y - 32)**2 < 15**2
-        mask2 = (x - 20)**2 + (y - 20)**2 < 8**2
-        vol[mask1] = 10
-        vol[mask2] = 20
-        img = ants.from_numpy(vol, spacing=(1, 1), origin=(0, 0))
-        img = ants.smooth_image(img, 1.5)
-        return img
+    global _CACHED_JAX_2D
+    if _CACHED_JAX_2D is None:
+        if siq is not None:
+            _CACHED_JAX_2D = siq.simulate_image(shaper=[64, 64], n_levels=8)
+        else:
+            vol = np.zeros((64, 64), dtype=float)
+            y, x = np.ogrid[:64, :64]
+            mask1 = (x - 32)**2 + (y - 32)**2 < 15**2
+            mask2 = (x - 20)**2 + (y - 20)**2 < 8**2
+            vol[mask1] = 10
+            vol[mask2] = 20
+            img = ants.from_numpy(vol, spacing=(1, 1), origin=(0, 0))
+            _CACHED_JAX_2D = ants.smooth_image(img, 1.5)
+    return _CACHED_JAX_2D.clone()
+
 
 def get_test_image_3d():
-    if siq is not None:
-        return siq.simulate_image(shaper=[32, 32, 32], n_levels=6)
-    else:
-        vol = np.zeros((32, 32, 32), dtype=float)
-        z, y, x = np.ogrid[:32, :32, :32]
-        mask1 = (x - 16)**2 + (y - 16)**2 + (z - 16)**2 < 8**2
-        vol[mask1] = 15
-        img = ants.from_numpy(vol, spacing=(1, 1, 1), origin=(0, 0, 0))
-        img = ants.smooth_image(img, 1.0)
-        return img
+    global _CACHED_JAX_3D
+    if _CACHED_JAX_3D is None:
+        if siq is not None:
+            _CACHED_JAX_3D = siq.simulate_image(shaper=[32, 32, 32], n_levels=6)
+        else:
+            vol = np.zeros((32, 32, 32), dtype=float)
+            z, y, x = np.ogrid[:32, :32, :32]
+            mask1 = (x - 16)**2 + (y - 16)**2 + (z - 16)**2 < 8**2
+            vol[mask1] = 15
+            img = ants.from_numpy(vol, spacing=(1, 1, 1), origin=(0, 0, 0))
+            _CACHED_JAX_3D = ants.smooth_image(img, 1.0)
+    return _CACHED_JAX_3D.clone()
 
 def run_test_2d(similarity_metric):
     print(f"\n--- Running JAX 2D test with metric: {similarity_metric} ---")
@@ -171,9 +180,11 @@ def run_test_3d(similarity_metric):
     assert corr_py > 0.60
     assert min_jac > 0.0
 
+@pytest.mark.slow
 def test_jax_syn_2d_lncc():
     run_test_2d('lncc')
 
+@pytest.mark.slow
 def test_jax_syn_2d_mattes_mi():
     run_test_2d('mattes_mi')
 
@@ -185,6 +196,7 @@ def test_jax_syn_3d_lncc():
 def test_jax_syn_3d_mattes_mi():
     run_test_3d('mattes_mi')
 
+@pytest.mark.slow
 def test_high_level_registration_jax():
     fixed = get_test_image_2d()
     moving = get_test_image_2d()
@@ -196,6 +208,7 @@ def test_high_level_registration_jax():
         moving=moving,
         type_of_transform='SyNTo',
         backend='jax',
+        initial_transform='identity',
         reg_iterations=[10, 5],
         levels=[2, 1]
     )
@@ -401,6 +414,7 @@ def test_synto_jax_forward_inverse():
     assert warped.shape == (1, 1, 8, 8)
     assert warped_inv.shape == (1, 1, 8, 8)
 
+@pytest.mark.slow
 def test_ants_parity_2d_jax():
     import ants
     from syntx.syn import registration
@@ -434,6 +448,7 @@ def test_ants_parity_2d_jax():
     # Verify that we achieve high quality registration alignment (DICE >= 0.55)
     assert dice >= 0.55
 
+@pytest.mark.slow
 def test_registration_with_smoothing_sigmas_jax():
     import ants
     from syntx.syn import registration
@@ -451,6 +466,7 @@ def test_registration_with_smoothing_sigmas_jax():
     )
     assert 'warpedmovout' in res
 
+@pytest.mark.slow
 def test_registration_with_mse_jax():
     import ants
     from syntx.syn import registration
@@ -483,6 +499,7 @@ def test_synto_jax_forward_with_jax_array():
     assert warped_inv.shape == (1, 1, 16, 16)
 
 
+@pytest.mark.slow
 def test_synto_jax_high_iteration_fold_free():
     import torch
     import numpy as np

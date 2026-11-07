@@ -46,6 +46,7 @@ def test_vgg_3d_mode_layer4_configuration():
     assert not torch.isnan(val).item()
 
 
+@pytest.mark.slow
 def test_image_compare_standardized_returns():
     """Enforce GEMINI.md rule: image_compare metrics return standardized scores (lower is better)."""
     r16 = ants.image_read(ants.get_ants_data('r16'))
@@ -61,6 +62,7 @@ def test_image_compare_standardized_returns():
     assert val_same_vgg < val_diff_vgg
 
 
+@pytest.mark.slow
 def test_milestone_4_deep_metrics_benchmark_execution(tmp_path):
     """
     Executes Milestone 4 benchmark suite and asserts:

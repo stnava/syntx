@@ -16,17 +16,14 @@ from syntx.landmarks import (
     extract_mind_at_points, match_landmarks, ransac_filter,
 )
 from syntx.landmarks import spatial as S
+from tests.conftest import get_cached_procedural_brain_array
 from tests.test_landmarks_spatial import reframe  # noqa: F401  (fixture helper)
 
 
 @pytest.fixture(scope="module")
 def phantom():
-    import siq
-    from scipy.ndimage import gaussian_filter
     rng = np.random.default_rng(0)
-    np.random.seed(1234)                      # siq draws from the global numpy RNG
-    ph = siq.simulate_brain_procedural((96, 104, 88))
-    arr = gaussian_filter(ph.numpy().astype(np.float32), 1.0)
+    arr = get_cached_procedural_brain_array((96, 104, 88), seed=1234, sigma=1.0)
     arr = arr + rng.normal(0, 0.02, arr.shape).astype(np.float32) * (arr > 0)
     return ants.from_numpy(arr, origin=(-40.0, -55.0, -30.0), spacing=(1.0, 1.0, 1.0), direction=np.eye(3))
 
@@ -108,6 +105,7 @@ def test_sift3d_descriptors_robust_to_anisotropic_resampling(frames, sift_ref):
     assert np.abs(M[:3, 3]).max() < 2.0
 
 
+@pytest.mark.slow
 def test_mind_frame_invariant(frames, sift_ref):
     pts = sift_ref[0][:, :3]
     mA = extract_mind_at_points(frames["identity"], pts, device="cpu")
@@ -117,6 +115,7 @@ def test_mind_frame_invariant(frames, sift_ref):
         assert np.abs(mA - mB).max() < 1e-3, name     # float32 trilinear sampling noise
 
 
+@pytest.mark.slow
 def test_mind_channel_semantics_via_direct_indexing(frames):
     """Sampling the dense MIND volume at voxel centres equals direct indexing."""
     from syntx.landmarks.mind import compute_mind
@@ -174,7 +173,8 @@ def test_nonrigid_correspondences(frames, sift_ref):
     assert np.median(err) < 4.0
 
 
-def test_rotation_invariant_descriptor_survives_60_degrees(frames):
+@pytest.fixture(scope="module")
+def rot60_bundle(frames):
     A = frames["identity"]
     ctr = np.array(ants.get_center_of_mass(A))
     axis = np.array([0.2, 0.3, 1.0]); axis /= np.linalg.norm(axis); a = np.deg2rad(60.0)
@@ -184,6 +184,11 @@ def test_rotation_invariant_descriptor_survives_60_degrees(frames):
     tx = ants.create_ants_transform(transform_type="AffineTransform", dimension=3)
     tx.set_parameters(np.concatenate([R.ravel(), t])); tx.set_fixed_parameters(ctr)
     B = tx.apply_to_image(A, A)
+    return A, B, R, t, ctr
+
+
+def test_rotation_invariant_descriptor_survives_60_degrees(rot60_bundle):
+    A, B, R, t, ctr = rot60_bundle
     kw = dict(preprocess=False, max_keypoints=400, n_scales=8, sigma_min=1.0)
     cA, dA = detect_sift3d(A, rotation_invariant=True, **kw)
     cB, dB = detect_sift3d(B, rotation_invariant=True, **kw)
@@ -211,18 +216,11 @@ def test_border_ops_match_cpu_on_mps_large_slices():
     assert float((_gradient_axes(v) - _gradient_axes(v.to("mps")).cpu()).abs().max()) < 1e-5
 
 
-def test_rotation_search_recovers_60_degrees(frames):
+@pytest.mark.slow
+def test_rotation_search_recovers_60_degrees(rot60_bundle):
     from syntx.landmarks import match_sift3d_with_rotation_search
     from syntx.landmarks.orient import rotation_geodesic_deg
-    A = frames["identity"]
-    ctr = np.array(ants.get_center_of_mass(A))
-    axis = np.array([0.2, 0.3, 1.0]); axis /= np.linalg.norm(axis); a = np.deg2rad(60.0)
-    Kx = np.array([[0, -axis[2], axis[1]], [axis[2], 0, -axis[0]], [-axis[1], axis[0], 0]])
-    R = np.eye(3) + np.sin(a) * Kx + (1 - np.cos(a)) * Kx @ Kx
-    t = np.array([3.0, -2.0, 1.0])
-    tx = ants.create_ants_transform(transform_type="AffineTransform", dimension=3)
-    tx.set_parameters(np.concatenate([R.ravel(), t])); tx.set_fixed_parameters(ctr)
-    B = tx.apply_to_image(A, A)                      # B(x) = A(T x): fixed->moving directions = R^-1
+    A, B, R, t, ctr = rot60_bundle
     res = match_sift3d_with_rotation_search(A, B, ransac_model="rigid", inlier_thresh_mm=3.0, ratio_thresh=0.9,
                                             max_keypoints=400, n_scales=8, sigma_min=1.0)
     assert res["used_rotation"]

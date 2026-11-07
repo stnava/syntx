@@ -25,6 +25,7 @@ def test_bold_preset_contents():
     assert cfg == {"backend": "pytorch_batched", "seed_mode": "narrow", "sample_fraction": 0.15, "convergence_tol_vox": 0.05, "max_extend_factor": 4}
 
 
+@pytest.mark.slow
 def test_bold_preset_recovers_known_shifts():
     shifts = [(0, 0, 0), (1.5, -1.0, 0.5), (-1.0, 1.0, 1.0), (0.5, 1.5, -1.0), (0.0, 0.0, 0.0)]
     res = motion_correction(_series(shifts), reference="mean", preset="bold", device="cpu")

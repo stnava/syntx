@@ -82,6 +82,7 @@ def test_image_compare_mattes_aliases():
     assert isinstance(mi_val4, float)
 
 
+@pytest.mark.slow
 def test_syntx_syn_with_mattes_mi():
     """Test 2D SyN registration using similarity_metric='mattes_mi'."""
     r16 = ants.image_read(ants.get_ants_data('r16'))
@@ -100,6 +101,7 @@ def test_syntx_syn_with_mattes_mi():
     assert reg['warpedmovout'] is not None
 
 
+@pytest.mark.slow
 def test_syntx_tvf_with_mattes_mi():
     """Test 2D TVF registration using similarity_metric='mattes_mi'."""
     r16 = ants.image_read(ants.get_ants_data('r16'))
@@ -154,8 +156,9 @@ def test_mattes_multichannel_fixed_weights_raises():
 
 def test_syntx_syn_two_channel_mattes():
     rng = np.random.default_rng(0)
-    mk = lambda: ants.from_numpy(rng.random((24, 24, 20)).astype("float32"))
+    mk = lambda: ants.from_numpy(rng.random((16, 16, 16)).astype("float32"))
     f1, f2, m = mk(), mk(), mk()
     r = syntx.syn(fixed=[f1, f2], moving=[m, m], type_of_transform="SyNOnly",
-                  syn_metric="mattes", levels=[2, 1], reg_iterations=[3, 2])
+                  initial_transform="Identity", device="cpu",
+                  syn_metric="mattes", levels=[2, 1], reg_iterations=[2, 1])
     assert len(r["fwdtransforms"]) > 0

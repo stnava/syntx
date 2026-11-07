@@ -147,6 +147,7 @@ def test_batched_geometry_primitives_and_edge_cases():
     assert not can_batch_open_match({"unknown_kwarg": 1})
 
 
+@pytest.mark.slow
 def test_motion_correct_grouped_forwards_device_to_low_motion_reference():
     """Verify motion_correct_grouped forwards explicit device= to build_low_motion_reference."""
     import syntx.motion_reference as mr

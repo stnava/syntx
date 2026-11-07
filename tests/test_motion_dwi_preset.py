@@ -63,6 +63,7 @@ class TestPresetPlumbing:
             get_motion_preset("nope")
 
 
+@pytest.mark.slow
 def test_dwi_preset_recovers_known_shifts_on_direction_dependent_contrast():
     """Small synthetic DWI: 2 b0 + 12 diffusion volumes with direction-dependent contrast, displaced by known sub-voxel
     shifts; the preset must recover the relative shifts and return the series FD in acquisition order."""
@@ -83,6 +84,7 @@ def test_dwi_preset_recovers_known_shifts_on_direction_dependent_contrast():
     assert err.max() < 0.5
 
 
+@pytest.mark.slow
 def test_dwi_preset_cross_registration_uses_the_corrected_group_means():
     """The b0 <-> diffusion registration is computed once, between the means of the corrected frames of each group."""
     frames = [_blob()] * 3 + [_blob(shift=(1.0, 0.0, 0.0), scale=0.6)] * 4
@@ -98,6 +100,7 @@ def test_shell_groups_labels_b0_zero_and_shells_ascending():
     assert shell_groups(np.array([0, 5, 1000, 1000])).tolist() == [0, 0, 1, 1]  # b <= 50 counts as b0
 
 
+@pytest.mark.slow
 def test_three_groups_chain_their_cross_registrations_and_return_full_chains():
     """b0, a 'b1000'-like and a 'b3000'-like group (different contrast, 1 and 2 voxel shifts): the chain composes."""
     frames = [_blob()] * 3 + [_blob(shift=(1.0, 0, 0), scale=0.6)] * 3 + [_blob(shift=(2.0, 0, 0), scale=0.3)] * 3

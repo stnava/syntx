@@ -375,6 +375,7 @@ def test_extract_rigid_parameters_gimbal_lock_and_errors():
     assert np.isclose(rot[1], np.pi / 2.0)
 
 
+@pytest.mark.slow
 def test_motion_correction_2d_mean_reference():
     """Test 2D+t motion correction with temporal mean reference."""
     img, shifts = _create_2d_phantom(num_frames=3)
@@ -452,6 +453,7 @@ def test_motion_correction_2d_frame_reference():
     assert result["fd_jenkinson"][1] > 0.0
 
 
+@pytest.mark.slow
 def test_motion_correction_3d_phantom():
     """Test 3D+t motion correction with 6-DOF parameter extraction."""
     img, shifts = _create_3d_phantom(num_frames=3)
@@ -484,6 +486,7 @@ def test_motion_correction_3d_phantom():
     assert result.fd[1] > 0.0
 
 
+@pytest.mark.slow
 def test_motion_correction_explicit_reference():
     """Test providing an explicit ANTsImage reference volume."""
     img, _ = _create_2d_phantom(num_frames=3)
@@ -500,6 +503,7 @@ def test_motion_correction_explicit_reference():
     assert result["summary"]["temporal_variance_post"] < result["summary"]["temporal_variance_pre"]
 
 
+@pytest.mark.slow
 def test_motion_correction_two_pass():
     """Test two-pass motion correction refinement."""
     img, _ = _create_2d_phantom(num_frames=3)

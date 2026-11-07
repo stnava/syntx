@@ -117,6 +117,7 @@ def test_evaluate_registration_qc_folding():
     assert report.recommended_remedy == 'increase_fluid_smoothing'
 
 
+@pytest.mark.slow
 def test_evaluate_registration_qc_syn_integration():
     import syntx
     from syntx.viz import registration_qc_section, render_standard_4panel
@@ -125,7 +126,7 @@ def test_evaluate_registration_qc_syn_integration():
     fi = ants.image_read(ants.get_ants_data('r16')).resample_image((2, 2), 0, 0)
     mi = ants.image_read(ants.get_ants_data('r64')).resample_image((2, 2), 0, 0)
 
-    reg = syntx.syn(fi, mi, flow_sigma=3.0, total_sigma=0.0, reg_iterations=[10, 5], device='cpu')
+    reg = syntx.syn(fi, mi, initial_transform='identity', flow_sigma=3.0, total_sigma=0.0, reg_iterations=[6, 3], device='cpu')
     report = evaluate_registration_qc(fixed=fi, moving=mi, registration_result=reg)
 
     assert report.status in ('pass', 'not_assessable')

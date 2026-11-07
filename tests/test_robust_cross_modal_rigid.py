@@ -11,12 +11,13 @@ implementation.
 """
 
 import numpy as np
+import pytest
 import ants
 
 from syntx.robust_affine import robust_cross_modal_rigid
 
 
-def _synthetic_sphere_pair(dim=24, offset=(1.5, -1.0, 0.5)):
+def _synthetic_sphere_pair(dim=16, offset=(1.5, -1.0, 0.5)):
     grid = np.linspace(-1, 1, dim)
     zz, yy, xx = np.meshgrid(grid, grid, grid, indexing="ij")
     r = np.sqrt(xx**2 + yy**2 + zz**2)
@@ -34,8 +35,8 @@ def test_robust_cross_modal_rigid_recovers_known_offset():
     mask = ants.threshold_image(moving, 0.1, 2.0)
 
     res = robust_cross_modal_rigid(
-        fixed=fixed, moving=moving, moving_mask=mask, seed=42,
-        aff_sampling=32, aff_random_sampling_rate=0.2, verbose=False,
+        fixed=fixed, moving=moving, moving_mask=mask, seed=42, device="cpu",
+        aff_sampling=32, aff_random_sampling_rate=0.2, aff_iterations=(50, 20), verbose=False,
     )
 
     assert "fwdtransforms" in res and len(res["fwdtransforms"]) > 0
@@ -53,6 +54,7 @@ def test_robust_cross_modal_rigid_recovers_known_offset():
     assert corr > 0.8, f"expected strong correlation after registration, got {corr:.3f}"
 
 
+@pytest.mark.slow
 def test_robust_cross_modal_rigid_without_mask_falls_back_to_otsu():
     """moving_mask=None should not raise -- falls back to an Otsu foreground mask."""
     fixed, moving = _synthetic_sphere_pair()

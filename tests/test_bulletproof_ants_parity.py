@@ -42,6 +42,7 @@ def create_anisotropic_3d_pair():
     return fi, mi
 
 
+@pytest.mark.slow
 def test_2d_bulletproof_ants_parity():
     """Fast 2D ANTsPy parity test on r16 / r64 benchmark data."""
     fi = ants.image_read(ants.get_ants_data('r16'))
@@ -99,6 +100,7 @@ def test_2d_bulletproof_ants_parity():
     assert diff_max < 1e-4, f"2D ANTsPy apply_transforms image warping difference too high: {diff_max:.6e}"
 
 
+@pytest.mark.slow
 def test_3d_anisotropic_bulletproof_ants_parity():
     """Fast 3D ANTsPy parity test on anisotropic mbhard-style headers."""
     fi, mi = create_anisotropic_3d_pair()

@@ -112,8 +112,8 @@ def test_2d_grid_folding_pytorch(synthetic_2d_circles):
     # We test deformable registration and check the folding rate
     res = registration(
         fixed=fi, moving=mi, type_of_transform='SyN',
-        backend='pytorch', syn_metric='mattes_mi',
-        initial_transform='identity', reg_iterations=[20, 0, 0],
+        backend='pytorch', device='cpu', syn_metric='mattes_mi',
+        initial_transform='identity', reg_iterations=[12, 0, 0],
         grad_step=0.7 # Aggressive step that caused folding
     )
     
@@ -127,6 +127,7 @@ def test_2d_grid_folding_pytorch(synthetic_2d_circles):
     folding_rate = np.mean(jac_arr <= 0)
     assert folding_rate < 0.001, f"Severe folding detected in 2D PyTorch SyN: {folding_rate*100}%"
 
+@pytest.mark.slow
 def test_2d_vgg_lncc_regression(synthetic_2d_circles):
     fi, mi, fl, ml = synthetic_2d_circles
     

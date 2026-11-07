@@ -7,6 +7,7 @@ import pytest
 from syntx.syn import TriPlanarVGG3DLoss
 
 
+@pytest.mark.slow
 def test_vgg_feature_loss_nd_3d_modes():
     # Test vgg_mode='lncc_3d' in 3D
     vgg_loss_3d = TriPlanarVGG3DLoss(dim=3, mode='lncc_3d', feature_layers=[4])

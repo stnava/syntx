@@ -47,11 +47,31 @@ monai_networks_nets.SwinViT = MockSwinViT
 monai_networks.nets = monai_networks_nets
 monai_module.networks = monai_networks
 
-sys.modules['monai'] = monai_module
-sys.modules['monai.networks'] = monai_networks
-sys.modules['monai.networks.nets'] = monai_networks_nets
+def _install_mock_monai():
+    saved = {k: sys.modules.get(k) for k in ('monai', 'monai.networks', 'monai.networks.nets')}
+    sys.modules['monai'] = monai_module
+    sys.modules['monai.networks'] = monai_networks
+    sys.modules['monai.networks.nets'] = monai_networks_nets
+    return saved
 
-def main():
+
+def _restore_mock_monai(saved):
+    for k, v in saved.items():
+        if v is None:
+            sys.modules.pop(k, None)
+        else:
+            sys.modules[k] = v
+
+
+def main(out_dir=None, extractors=None):
+    saved_monai = _install_mock_monai()
+    try:
+        return _run_main(out_dir=out_dir, extractors=extractors)
+    finally:
+        _restore_mock_monai(saved_monai)
+
+
+def _run_main(out_dir=None, extractors=None):
     print("=== Running Multi-modal Perceptual Similarity Benchmark ===")
     
     # Check dataset existence
@@ -80,12 +100,13 @@ def main():
     dwi_2d = ants.from_numpy(dwi_3d.numpy()[:, :, 8])
 
     # Extractors
-    extractors = {
-        'VGG19': VGG19Extractor(feature_layers=[4]),
-        'DINOv2_vits14': DINOv2Extractor(version='vits14', feature_layers=[2]),
-        'ResNet10_3D': ResNet10Extractor(dim=3, feature_layers=[2], weights_path="random"),  # no registered 3-D checkpoint
-        'SwinUNETR': SwinUNETRExtractor(feature_layers=[4], weights_path='random')  # mocked monai: no checkpoint
-    }
+    if extractors is None:
+        extractors = {
+            'VGG19': VGG19Extractor(feature_layers=[4]),
+            'DINOv2_vits14': DINOv2Extractor(version='vits14', feature_layers=[2]),
+            'ResNet10_3D': ResNet10Extractor(dim=3, feature_layers=[2], weights_path="random"),  # no registered 3-D checkpoint
+            'SwinUNETR': SwinUNETRExtractor(feature_layers=[4], weights_path='random')  # mocked monai: no checkpoint
+        }
     
     results = []
     
@@ -134,10 +155,14 @@ def main():
         })
         print(f"[{task_name} | {ext_name}] Completed in {elapsed:.3f}s. Folding Rate: {folding_rate:.4f}%")
         
-    os.makedirs("outputs_comparison", exist_ok=True)
+    base_dir = out_dir if out_dir is not None else os.getcwd()
+    out_cmp = os.path.join(base_dir, "outputs_comparison")
+    os.makedirs(out_cmp, exist_ok=True)
     df = pd.DataFrame(results)
-    df.to_csv("outputs_comparison/final_feature_metrics_results.csv", index=False)
-    print("Results saved to outputs_comparison/final_feature_metrics_results.csv")
+    csv_path = os.path.join(out_cmp, "final_feature_metrics_results.csv")
+    df.to_csv(csv_path, index=False)
+    print(f"Results saved to {csv_path}")
+    return df
 
 if __name__ == '__main__':
     main()

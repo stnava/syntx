@@ -88,6 +88,8 @@ class TestAdversarialM4AnisotropicGeometry:
         reg = syntx.syn(
             fixed=fixed_img,
             moving=moving_img,
+            initial_transform='identity',
+            device='cpu',
             reg_iterations=[10, 5],
             grad_step=0.2,
             verbose=False,
@@ -136,6 +138,8 @@ class TestAdversarialM4JacobianFoldingRegularity:
         reg = syntx.syn(
             fixed=fixed_img,
             moving=moving_img,
+            initial_transform='identity',
+            device='cpu',
             reg_iterations=[15, 10],
             grad_step=0.15,
             flow_sigma=2.0,

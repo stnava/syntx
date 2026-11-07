@@ -96,6 +96,7 @@ class TestChallengerSyNGSInvariance:
         assert fwd_max < 20.0, f"Unbounded forward displacement: {fwd_max}"
         assert inv_max < 20.0, f"Unbounded inverse displacement: {inv_max}"
 
+    @pytest.mark.slow
     def test_syngs_pytorch_jax_anisotropic_parity(self):
         """
         Challenge: SyNGS forward loss parity between PyTorch and JAX backends
@@ -135,6 +136,7 @@ class TestChallengerSyNGSInvariance:
         delta = abs(l_pt - l_jax)
         assert delta < 0.015, f"Anisotropic SyNGS PT-JAX loss discrepancy too large: PT={l_pt:.6f}, JAX={l_jax:.6f}, delta={delta:.6e}"
 
+    @pytest.mark.slow
     def test_syngs_seed_reproducibility_consecutive(self):
         """
         Challenge: Execute 3 consecutive SyNGS registrations with seed=1234
@@ -212,6 +214,7 @@ class TestChallengerScatteredInvariance:
         assert not torch.isnan(res.warp_inv).any(), "NaN in inverse warp"
         assert res.folding_percentage <= 0.05, f"Fold percentage too high: {res.folding_percentage}%"
 
+    @pytest.mark.slow
     def test_scattered_in_loop_inv_interval_stability(self):
         """
         Challenge: Verify that in_loop_inv_interval (1 vs 2 vs 5) maintains
@@ -251,6 +254,7 @@ class TestChallengerScatteredInvariance:
         # Inversion cadence check: all intervals yield stable and bounded inverse identity error
         assert max(inv_errors) < 0.08
 
+    @pytest.mark.slow
     def test_scattered_planar_embedding_in_3d(self):
         """
         Challenge: 3D point cloud where all points lie on a degenerate 2D plane (Z=0.0).
@@ -383,6 +387,7 @@ class TestChallengerTVFInvariance:
 class TestChallengerMultiRunDeterminism:
     """Stress-tests exact bitwise reproducibility across multiple runs with identical seeds."""
 
+    @pytest.mark.slow
     def test_fast_reproducibility_five_run_sweep(self):
         """
         Challenge: Run 5 consecutive 2D SyN registrations with seed=777 and verify
@@ -402,6 +407,8 @@ class TestChallengerMultiRunDeterminism:
                 fixed=f_img,
                 moving=m_img,
                 reg_iterations=[6, 4],
+                initial_transform="identity",
+                device="cpu",
                 verbose=False,
                 in_memory=True,
             )

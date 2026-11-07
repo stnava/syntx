@@ -332,6 +332,7 @@ def test_adversarial_64_threads_distinct_entries_and_eviction_storm():
 # Challenge 3: Memory Allocation & Leak Tracking
 # ==============================================================================
 
+@pytest.mark.slow
 def test_adversarial_memory_leak_tracking_5000_iterations():
     """
     Challenge: Execute 5,000 successive smoothing calls on a stationary geometry.

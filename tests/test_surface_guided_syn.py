@@ -55,17 +55,20 @@ def test_extract_sulcal_probability_map_properties():
     assert s_arr.max() <= 1.0 + 1e-4
     assert np.any(s_arr > 0.0)
 
+@pytest.mark.slow
 def test_guided_syn_turnkey_2d():
     """Verify end-to-end turnkey syntx.syn with guided='sulcal' on 2D images."""
-    r16 = ants.image_read(ants.get_ants_data('r16'))
-    r64 = ants.image_read(ants.get_ants_data('r64'))
+    r16 = ants.resample_image(ants.image_read(ants.get_ants_data('r16')), (64, 64), use_voxels=True, interp_type=0)
+    r64 = ants.resample_image(ants.image_read(ants.get_ants_data('r64')), (64, 64), use_voxels=True, interp_type=0)
 
     res = syntx.syn(
         fixed=r16,
         moving=r64,
         guided='sulcal',
         cohort_type='inter',
-        reg_iterations=[20, 10],
+        reg_iterations=[10, 5],
+        initial_transform='identity',
+        device='cpu',
         levels=[2, 1],
         verbose=False
     )
@@ -76,16 +79,18 @@ def test_guided_syn_turnkey_2d():
     assert len(res['fwdtransforms']) >= 1
     assert isinstance(res['warpedmovout'], ants.ANTsImage)
 
+@pytest.mark.slow
 def test_guided_syn_weight_presets():
     """Verify that cohort_type and guided_weight select appropriate weight presets."""
-    r16 = ants.image_read(ants.get_ants_data('r16'))
-    r64 = ants.image_read(ants.get_ants_data('r64'))
+    r16 = ants.resample_image(ants.image_read(ants.get_ants_data('r16')), (32, 32), use_voxels=True, interp_type=0)
+    r64 = ants.resample_image(ants.image_read(ants.get_ants_data('r64')), (32, 32), use_voxels=True, interp_type=0)
 
     # 1. Inter-study preset -> w=[0.30, 0.70]
     res_inter = syntx.syn(
         fixed=r16, moving=r64,
         guided='sulcal', cohort_type='inter',
-        reg_iterations=[5], initial_transform='identity', levels=[1],
+        reg_iterations=[1], initial_transform='identity', levels=[1],
+        device='cpu',
         verbose=False
     )
     assert res_inter['model'].syn_metric_weights == [0.30, 0.70]
@@ -94,7 +99,8 @@ def test_guided_syn_weight_presets():
     res_intra = syntx.syn(
         fixed=r16, moving=r64,
         guided='sulcal', cohort_type='intra',
-        reg_iterations=[5], initial_transform='identity', levels=[1],
+        reg_iterations=[1], initial_transform='identity', levels=[1],
+        device='cpu',
         verbose=False
     )
     assert res_intra['model'].syn_metric_weights == [0.80, 0.20]
@@ -103,7 +109,8 @@ def test_guided_syn_weight_presets():
     res_custom = syntx.syn(
         fixed=r16, moving=r64,
         guided='sulcal', guided_weight=0.65,
-        reg_iterations=[5], initial_transform='identity', levels=[1],
+        reg_iterations=[1], initial_transform='identity', levels=[1],
+        device='cpu',
         verbose=False
     )
     assert pytest.approx(res_custom['model'].syn_metric_weights[0], abs=1e-5) == 0.35

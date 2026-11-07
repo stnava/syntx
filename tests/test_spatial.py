@@ -32,7 +32,7 @@ from syntx.spatial import (
 # ═══════════════════════════════════════════════════════════════════════════════
 
 
-@pytest.fixture
+@pytest.fixture(scope="module")
 def r16_r64_registration():
     """2D SyN registration of r16 ↔ r64 ANTsPy test images."""
     fi = ants.image_read(ants.get_data("r16"))
@@ -41,17 +41,23 @@ def r16_r64_registration():
     return fi, mi, reg
 
 
-@pytest.fixture
+@pytest.fixture(scope="module")
 def r16_r64_syntx():
     """2D syntx.syn registration of r16 ↔ r64."""
     from syntx import registration
 
-    fi = ants.image_read(ants.get_data("r16"))
-    mi = ants.image_read(ants.get_data("r64"))
+    fi = ants.resample_image(ants.image_read(ants.get_data("r16")), (64, 64), use_voxels=True)
+    mi = ants.resample_image(ants.image_read(ants.get_data("r64")), (64, 64), use_voxels=True)
     fi_norm = (fi - fi.min()) / (fi.max() - fi.min() + 1e-8)
     mi_norm = (mi - mi.min()) / (mi.max() - mi.min() + 1e-8)
     reg = registration(
-        fixed=fi_norm, moving=mi_norm, type_of_transform="SyN", verbose=False
+        fixed=fi_norm,
+        moving=mi_norm,
+        type_of_transform="SyN",
+        reg_iterations=[6, 3, 0],
+        initial_transform="identity",
+        device="cpu",
+        verbose=False,
     )
     return fi_norm, mi_norm, reg
 

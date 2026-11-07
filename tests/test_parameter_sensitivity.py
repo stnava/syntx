@@ -15,22 +15,50 @@ import torch
 import ants
 
 
+_R16_CACHE = {}
+_R16_SMALL_CACHE = {}
+_TVF_BASE_WARP_CACHE = {}
+
+
 def _get_r16_images():
-    """Get the r16/r64 benchmark pair as ANTsImages."""
-    import syntx
-    res = syntx.benchmark_data('r16_r64')
-    return res['fixed'], res['moving'], res['fixed_label'], res['moving_label']
+    """Get the r16/r64 benchmark pair as ANTsImages (cached with canonical initial affine)."""
+    if "bundle" not in _R16_CACHE:
+        import syntx
+        res = syntx.benchmark_data('r16_r64')
+        init_tx = syntx.robust_affine(res['fixed'], res['moving'], mode="pytorch", seed=42)["fwdtransforms"][0]
+        _R16_CACHE["bundle"] = (res['fixed'], res['moving'], res['fixed_label'], res['moving_label'], init_tx)
+    fi, mi, fl, ml, _ = _R16_CACHE["bundle"]
+    return fi, mi, fl, ml
+
+
+def _get_small_r16_images():
+    """64x64 resampled r16/r64 pair for fast parameter-plumbing sensitivity checks."""
+    if "pair" not in _R16_SMALL_CACHE:
+        fi = ants.image_read(ants.get_ants_data("r16"))
+        mi = ants.image_read(ants.get_ants_data("r64"))
+        fi_s = ants.resample_image(fi, (64, 64), use_voxels=True, interp_type=0)
+        mi_s = ants.resample_image(mi, (64, 64), use_voxels=True, interp_type=0)
+        _R16_SMALL_CACHE["pair"] = (fi_s, mi_s)
+    return _R16_SMALL_CACHE["pair"]
 
 
 def _quick_syn(fixed, moving, **kwargs):
     """Run a minimal syntx.syn and return the registration result dict."""
     import syntx
+    if "initial_transform" not in kwargs:
+        _get_r16_images()
+        init_tx = _R16_CACHE["bundle"][4]
+    else:
+        init_tx = kwargs["initial_transform"]
     defaults = dict(
         flow_sigma=3.0,
         grad_step=0.25,
         total_sigma=0.0,
         reg_iterations=[10],
         syn_sampling=2,
+        initial_transform=init_tx,
+        device="cpu",
+        verbose=False,
     )
     defaults.update(kwargs)
     return syntx.syn(fixed, moving, **defaults)
@@ -85,6 +113,7 @@ def _assert_different_dice(dice_a, dice_b, param_name, val_a, val_b, engine="syn
 # =============================================================================
 # SyN Parameter Sensitivity Tests
 # =============================================================================
+@pytest.mark.slow
 class TestSyNParameterSensitivity:
     """Verify that changing key parameters produces measurably different outputs
     for syntx.syn (SyN registration).
@@ -210,14 +239,18 @@ _TVF_REJECTED = [
 class TestTVFParameterSensitivity:
     """syntx.tvf: a parameter it accepts must change the result; one it would ignore must raise."""
 
-    @pytest.fixture(autouse=True, scope="class")
-    def images(self, request):
-        request.cls.fi, request.cls.mi, request.cls.fl, request.cls.ml = _get_r16_images()
+    @pytest.fixture(autouse=True)
+    def images(self):
+        self.fi, self.mi = _get_small_r16_images()
 
+    @pytest.mark.slow
     @pytest.mark.parametrize("base,param,value", _TVF_EFFECTIVE,
                              ids=[f"{p}={v}|{b}" for b, p, v in _TVF_EFFECTIVE])
     def test_parameter_changes_result(self, base, param, value):
-        warp_a = _get_warp(_quick_tvf(self.fi, self.mi, **base))
+        key = tuple(sorted(base.items()))
+        if key not in _TVF_BASE_WARP_CACHE:
+            _TVF_BASE_WARP_CACHE[key] = _get_warp(_quick_tvf(self.fi, self.mi, **base))
+        warp_a = _TVF_BASE_WARP_CACHE[key]
         warp_b = _get_warp(_quick_tvf(self.fi, self.mi, **{**base, param: value}))
         _assert_different_field(warp_a, warp_b, param, base.get(param, "default"), value, "tvf")
 
@@ -237,10 +270,11 @@ class TestCrossEngineDifference:
 
     @pytest.fixture(autouse=True)
     def setup_images(self):
-        self.fi, self.mi, self.fl, self.ml = _get_r16_images()
+        self.fi, self.mi = _get_small_r16_images()
 
+    @pytest.mark.slow
     def test_syn_vs_tvf_different(self):
         """SyN and TVF must produce different displacement fields."""
-        warp_syn = _get_warp(_quick_syn(self.fi, self.mi))
+        warp_syn = _get_warp(_quick_syn(self.fi, self.mi, initial_transform="identity", device="cpu"))
         warp_tvf = _get_warp(_quick_tvf(self.fi, self.mi))
         _assert_different_field(warp_syn, warp_tvf, "engine", "syn", "tvf", "cross")

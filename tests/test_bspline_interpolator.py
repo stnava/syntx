@@ -86,6 +86,18 @@ def test_derivative_smoothing_bspline_vs_linear():
     assert bsp_std2 < lin_std2, "B-spline 2nd derivative std (fluctuation) should be smaller than linear"
 
 
+def test_registration_interpolator_parameter_propagation_fast_pytorch():
+    """Fast 2D PyTorch smoke check of interpolator='linear' vs interpolator='bspline' propagation."""
+    rng = np.random.default_rng(42)
+    fixed = ants.from_numpy(rng.standard_normal((24, 24)).astype(np.float32))
+    moving = ants.from_numpy(rng.standard_normal((24, 24)).astype(np.float32))
+    res_lin = registration(fixed, moving, backend='pytorch', device='cpu', interpolator='linear', levels=[1], reg_iterations=[1], initial_transform='identity')
+    res_bsp = registration(fixed, moving, backend='pytorch', device='cpu', interpolator='bspline', levels=[1], reg_iterations=[1], initial_transform='identity')
+    assert res_lin['warpedmovout'].shape == fixed.shape
+    assert res_bsp['warpedmovout'].shape == fixed.shape
+
+
+@pytest.mark.slow
 def test_registration_bspline_pytorch_jax_dice_parity():
     """Verify PyTorch and JAX bspline registration Dice parity (<= 0.015 Dice gap)."""
     shape = (32, 32, 32)
@@ -104,12 +116,12 @@ def test_registration_bspline_pytorch_jax_dice_parity():
     
     res_pt = registration(
         fixed, moving, backend='pytorch', interpolator='bspline',
-        reg_iterations=[10, 5], verbose=False
+        reg_iterations=[10, 5], initial_transform='identity', verbose=False
     )
 
     res_jx = registration(
         fixed, moving, backend='jax', interpolator='bspline',
-        reg_iterations=[10, 5], verbose=False
+        reg_iterations=[10, 5], initial_transform='identity', verbose=False
     )
     
     fixed_mask = ants.from_numpy((arr_f > 0.5).astype(np.uint8))
@@ -127,6 +139,7 @@ def test_registration_bspline_pytorch_jax_dice_parity():
     assert dice_gap <= 0.015, f"PyTorch and JAX Dice gap ({dice_gap:.4f}) exceeds threshold 0.015"
 
 
+@pytest.mark.slow
 def test_registration_interpolator_parameter_propagation():
     """Verify interpolator='linear' vs interpolator='bspline' propagation in registration."""
     shape = (24, 24, 24)
@@ -137,12 +150,12 @@ def test_registration_interpolator_parameter_propagation():
     moving = ants.from_numpy(arr_m)
     
     # Test linear
-    res_lin_pt = registration(fixed, moving, backend='pytorch', interpolator='linear', reg_iterations=[2, 2])
-    res_lin_jx = registration(fixed, moving, backend='jax', interpolator='linear', reg_iterations=[2, 2])
+    res_lin_pt = registration(fixed, moving, backend='pytorch', interpolator='linear', reg_iterations=[2, 2], initial_transform='identity')
+    res_lin_jx = registration(fixed, moving, backend='jax', interpolator='linear', reg_iterations=[2, 2], initial_transform='identity')
 
     # Test bspline
-    res_bsp_pt = registration(fixed, moving, backend='pytorch', interpolator='bspline', reg_iterations=[2, 2])
-    res_bsp_jx = registration(fixed, moving, backend='jax', interpolator='bspline', reg_iterations=[2, 2])
+    res_bsp_pt = registration(fixed, moving, backend='pytorch', interpolator='bspline', reg_iterations=[2, 2], initial_transform='identity')
+    res_bsp_jx = registration(fixed, moving, backend='jax', interpolator='bspline', reg_iterations=[2, 2], initial_transform='identity')
     
     assert res_lin_pt['warpedmovout'].shape == fixed.shape
     assert res_lin_jx['warpedmovout'].shape == fixed.shape

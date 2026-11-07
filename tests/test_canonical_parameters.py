@@ -93,9 +93,9 @@ def mock_mindboggle(tmp_path_factory):
     for s in ("S1", "S2"):
         d = data_dir / "OASIS_volumes" / s
         d.mkdir(parents=True)
-        ants.image_write(ants.from_numpy((rng.random((32, 32, 32)) * 100).astype(np.float32)),
+        ants.image_write(ants.from_numpy((rng.random((16, 16, 16)) * 100).astype(np.float32)),
                          str(d / "t1weighted_brain.nii.gz"))
-        ants.image_write(ants.from_numpy(rng.integers(1, 4, (32, 32, 32)).astype(np.uint32)),
+        ants.image_write(ants.from_numpy(rng.integers(1, 4, (16, 16, 16)).astype(np.uint32)),
                          str(d / "labels.DKT31.manual.nii.gz"))
     csv = tmp / "pairs.csv"
     pd.DataFrame([{"cohort1": "OASIS", "subject1": "S1", "cohort2": "OASIS",
@@ -103,6 +103,7 @@ def mock_mindboggle(tmp_path_factory):
     return tmp, data_dir, csv
 
 
+@pytest.mark.slow
 @pytest.mark.parametrize("method", CANONICAL_METHODS)
 def test_evaluator_path_calls_method_with_its_defaults(method, mock_mindboggle, monkeypatch):
     from syntx.benchmark.evaluate import evaluate_mindboggle_pair

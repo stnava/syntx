@@ -3,12 +3,12 @@ import ants
 import numpy as np
 import syntx
 
+@pytest.mark.slow
 def test_auto_reg_zero_effort_2d():
-    fi = ants.image_read(ants.get_data('r16'))
-    mi = ants.image_read(ants.get_data('r64'))
+    fi, mi = _small_r16_r64()
 
     # Zero-effort invocation
-    res = syntx.auto_reg(fixed=fi, moving=mi, reg_iterations=[20, 10], verbose=True)
+    res = syntx.auto_reg(fixed=fi, moving=mi, reg_iterations=[10, 5], device='cpu', verbose=True)
 
     print("fwdtransforms:", res['fwdtransforms'])
     print("metrics:", res['metrics'])
@@ -37,9 +37,21 @@ def test_auto_reg_zero_effort_2d():
     # Folding percentage should be very small (allow up to 0.1% for MPS non-determinism)
     assert metrics['folding_pct'] < 0.1
 
+_AUTO_REG_SMALL_2D = {}
+
+
+def _small_r16_r64():
+    if "pair" not in _AUTO_REG_SMALL_2D:
+        fi = ants.resample_image(ants.image_read(ants.get_data('r16')), (64, 64), use_voxels=True, interp_type=0)
+        mi = ants.resample_image(ants.image_read(ants.get_data('r64')), (64, 64), use_voxels=True, interp_type=0)
+        _AUTO_REG_SMALL_2D["pair"] = (fi, mi)
+    fi, mi = _AUTO_REG_SMALL_2D["pair"]
+    return fi.clone(), mi.clone()
+
+
+@pytest.mark.slow
 def test_auto_reg_syn_transform_2d():
-    fi = ants.image_read(ants.get_data('r16'))
-    mi = ants.image_read(ants.get_data('r64'))
+    fi, mi = _small_r16_r64()
 
     res = syntx.auto_reg(fixed=fi, moving=mi, type_of_transform='SyNTo', reg_iterations=[20, 10], verbose=False)
 
@@ -58,9 +70,9 @@ def test_auto_reg_docstring_explicit_defaults():
     assert "metrics" in doc
 
 
+@pytest.mark.slow
 def test_auto_reg_guided_sulcal_2d():
-    fi = ants.image_read(ants.get_data('r16'))
-    mi = ants.image_read(ants.get_data('r64'))
+    fi, mi = _small_r16_r64()
 
     res = syntx.auto_reg(
         fixed=fi,
@@ -78,9 +90,9 @@ def test_auto_reg_guided_sulcal_2d():
     assert res['metrics']['folding_pct'] < 0.1
 
 
+@pytest.mark.slow
 def test_auto_reg_with_labels_2d():
-    fi = ants.image_read(ants.get_data('r16'))
-    mi = ants.image_read(ants.get_data('r64'))
+    fi, mi = _small_r16_r64()
     fl = ants.threshold_image(fi, "Otsu", 3).threshold_image(2, 2)
     ml = ants.threshold_image(mi, "Otsu", 3).threshold_image(2, 2)
 
@@ -101,9 +113,9 @@ def test_auto_reg_with_labels_2d():
     assert 0.0 < metrics['dice_sym'] <= 1.0
 
 
+@pytest.mark.slow
 def test_auto_reg_robust_affine_toggle_2d():
-    fi = ants.image_read(ants.get_data('r16'))
-    mi = ants.image_read(ants.get_data('r64'))
+    fi, mi = _small_r16_r64()
 
     res = syntx.auto_reg(
         fixed=fi,
@@ -118,6 +130,7 @@ def test_auto_reg_robust_affine_toggle_2d():
     assert len(res['fwdtransforms']) >= 1
 
 
+@pytest.mark.slow
 def test_auto_reg_3d_turnkey_robust_affine():
     arr_f = np.zeros((24, 24, 24), dtype=np.float32)
     arr_f[6:18, 6:18, 6:18] = 1.0

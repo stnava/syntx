@@ -25,6 +25,7 @@ except ImportError:
     HAS_JAX = False
 
 
+@pytest.mark.slow
 def test_tvf_registration_full_coverage(tmp_path):
     fi_arr = np.pad(np.ones((16, 16)), 8).astype(np.float32)
     mi_arr = np.pad(np.ones((16, 16)), 8).astype(np.float32)
@@ -52,6 +53,7 @@ def test_tvf_registration_full_coverage(tmp_path):
         fast_smooth=True,
         winsorize_quantiles=(0.05, 0.95),
         backend='pytorch',
+        device='cpu',
         verbose=False
     )
     assert 'warpedmovout' in reg_pt
@@ -109,6 +111,7 @@ def test_syn_registration_advanced_options(tmp_path):
         winsorize_quantiles=(0.01, 0.99),
         outprefix=str(tmp_path / "syn_out"),
         backend='pytorch',
+        device='cpu',
         verbose=False
     )
     assert 'warpedmovout' in reg_syn
@@ -144,9 +147,11 @@ def test_syngs_registration_advanced(tmp_path):
     reg_syngs = syngs(
         fixed=fi,
         moving=mi,
+        initial_transform='identity',
         reg_iterations=[2],
         syn_metric='lncc',
         backend='pytorch',
+        device='cpu',
         verbose=False
     )
     assert 'warpedmovout' in reg_syngs

@@ -3,7 +3,12 @@
 import ants
 import numpy as np
 import pytest
+import torch
 import syntx
+
+DEV = "mps" if torch.backends.mps.is_available() else "cpu"
+_SHIFTED_PHANTOM_CACHE = {}
+_NOISY_MULTILABEL_CACHE = {}
 
 
 def test_joint_label_fusion_basic():
@@ -148,20 +153,26 @@ def test_joint_label_fusion_2d_beats_majority_vote():
 
 def _shifted_phantom(shape, shift, dim):
     """Textured blob target plus atlases that are the target rolled by +-shift along each axis."""
-    rng = np.random.default_rng(0)
-    tex = ants.smooth_image(ants.from_numpy(rng.normal(0, 1, shape).astype(np.float32)), 1.5).numpy()
-    tex = (tex - tex.min()) / (tex.max() - tex.min())
-    grids = np.mgrid[tuple(slice(0, n) for n in shape)]
-    blob = sum((g - n // 2) ** 2 for g, n in zip(grids, shape)) < (min(shape) // 4) ** 2
-    t_np = (0.5 * tex + 0.5 * blob).astype(np.float32)
-    kw = dict(spacing=(1.0, 1.5, 2.0)[:dim])
-    target = ants.from_numpy(t_np, **kw)
-    atlases, labels = [], []
-    for ax in range(dim):
-        for sgn in (1, -1):
-            atlases.append(ants.from_numpy(np.roll(t_np, sgn * shift, axis=ax), **kw))
-            labels.append(ants.from_numpy(np.roll(blob, sgn * shift, axis=ax).astype(np.uint32), **kw))
-    return target, atlases, labels, blob.astype(np.uint32)
+    key = (tuple(shape), int(shift), int(dim))
+    cached = _SHIFTED_PHANTOM_CACHE.get(key)
+    if cached is None:
+        rng = np.random.default_rng(0)
+        tex = ants.smooth_image(ants.from_numpy(rng.normal(0, 1, shape).astype(np.float32)), 1.5).numpy()
+        tex = (tex - tex.min()) / (tex.max() - tex.min())
+        grids = np.mgrid[tuple(slice(0, n) for n in shape)]
+        blob = sum((g - n // 2) ** 2 for g, n in zip(grids, shape)) < (min(shape) // 4) ** 2
+        t_np = (0.5 * tex + 0.5 * blob).astype(np.float32)
+        kw = dict(spacing=(1.0, 1.5, 2.0)[:dim])
+        target = ants.from_numpy(t_np, **kw)
+        atlases, labels = [], []
+        for ax in range(dim):
+            for sgn in (1, -1):
+                atlases.append(ants.from_numpy(np.roll(t_np, sgn * shift, axis=ax), **kw))
+                labels.append(ants.from_numpy(np.roll(blob, sgn * shift, axis=ax).astype(np.uint32), **kw))
+        cached = (target, atlases, labels, blob.astype(np.uint32))
+        _SHIFTED_PHANTOM_CACHE[key] = cached
+    target, atlases, labels, gt = cached
+    return target.clone(), [a.clone() for a in atlases], [l.clone() for l in labels], gt.copy()
 
 
 def _dice1(pred, gt):
@@ -203,20 +214,26 @@ def test_r_search_deterministic_and_validated():
 
 def _noisy_multilabel(shape=(48, 48), k=5, seed=3):
     """Target with 3 classes and k atlases whose labels carry independent boundary errors."""
-    rng = np.random.default_rng(seed)
-    base = np.zeros(shape, dtype=np.uint32)
-    base[8:24, 8:40] = 1
-    base[28:42, 10:38] = 2
-    t_np = (20 + 40 * (base == 1) + 80 * (base == 2) + rng.normal(0, 3, shape)).astype(np.float32)
-    target = ants.from_numpy(t_np)
-    atlases, labels = [], []
-    for _ in range(k):
-        dy, dx = rng.integers(-2, 3, 2)
-        lab = np.roll(base, (int(dy), int(dx)), axis=(0, 1))
-        img = (20 + 40 * (lab == 1) + 80 * (lab == 2) + rng.normal(0, 3, shape)).astype(np.float32)
-        atlases.append(ants.from_numpy(img))
-        labels.append(ants.from_numpy(lab))
-    return target, atlases, labels, base
+    key = (tuple(shape), int(k), int(seed))
+    cached = _NOISY_MULTILABEL_CACHE.get(key)
+    if cached is None:
+        rng = np.random.default_rng(seed)
+        base = np.zeros(shape, dtype=np.uint32)
+        base[8:24, 8:40] = 1
+        base[28:42, 10:38] = 2
+        t_np = (20 + 40 * (base == 1) + 80 * (base == 2) + rng.normal(0, 3, shape)).astype(np.float32)
+        target = ants.from_numpy(t_np)
+        atlases, labels = [], []
+        for _ in range(k):
+            dy, dx = rng.integers(-2, 3, 2)
+            lab = np.roll(base, (int(dy), int(dx)), axis=(0, 1))
+            img = (20 + 40 * (lab == 1) + 80 * (lab == 2) + rng.normal(0, 3, shape)).astype(np.float32)
+            atlases.append(ants.from_numpy(img))
+            labels.append(ants.from_numpy(lab))
+        cached = (target, atlases, labels, base)
+        _NOISY_MULTILABEL_CACHE[key] = cached
+    target, atlases, labels, base = cached
+    return target.clone(), [a.clone() for a in atlases], [l.clone() for l in labels], base.copy()
 
 
 @pytest.mark.parametrize("mode", ["patch", "joint"])
@@ -365,11 +382,12 @@ def test_joint_is_not_fooled_by_noise_only_in_one_atlas():
             if i == 0:
                 l[0:4, 0:4, 0:4] = 1
             lab.append(ants.from_numpy(l))
-        seg = syntx.joint_label_fusion(target, atl, lab, mode="joint", rad=2, device="cpu")["segmentation"].numpy()
+        seg = syntx.joint_label_fusion(target, atl, lab, mode="joint", rad=2, device=DEV)["segmentation"].numpy()
         flipped += int(seg[0:4, 0:4, 0:4].sum())
     assert flipped == 0
 
 
+@pytest.mark.slow
 @pytest.mark.parametrize("mode", ["patch", "joint"])
 def test_search_skip_consensus_matches_dense_reference_on_shifted_atlases(mode):
     target, atlases, labels, gt = _shifted_phantom((28, 28, 28), 2, 3)

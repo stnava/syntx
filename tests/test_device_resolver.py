@@ -142,8 +142,8 @@ def test_motion_correction_forwards_device(monkeypatch):
 
     monkeypatch.setattr(MB, "batched_rigid_register_pass", spy)
     rng = np.random.default_rng(0)
-    vol = ants.from_numpy(rng.random((16, 16, 12, 3)).astype("float32"))
-    res = syntx.motion_correction(vol, backend="pytorch_batched", device="cpu")
+    vol = ants.from_numpy(rng.random((12, 12, 10, 2)).astype("float32"))
+    res = syntx.motion_correction(vol, backend="pytorch_batched", reference=0, seed_mode="narrow", device="cpu")
     assert seen["device"] == "cpu"
     assert res["summary"]["device"] == "cpu"
     with pytest.raises(D.DeviceUnavailableError):

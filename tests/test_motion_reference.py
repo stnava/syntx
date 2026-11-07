@@ -28,7 +28,7 @@ class TestBuildLowMotionReference:
 
     def test_fewer_frames_than_n_low_motion_uses_all(self):
         imgs = [_phantom_frame(shift=s) for s in [(0, 0, 0), (0.3, 0.1, -0.2), (0.5, -0.4, 0.3)]]
-        ref = build_low_motion_reference(imgs, n_low_motion=10, verbose=False)
+        ref = build_low_motion_reference(imgs, n_low_motion=10, verbose=False, device="cpu")
         assert ref.shape == imgs[0].shape
         # sharpened reference should correlate well with any single well-aligned frame
         corr = np.corrcoef(ref.numpy().ravel(), imgs[0].numpy().ravel())[0, 1]
@@ -39,10 +39,10 @@ class TestBuildLowMotionReference:
         the built reference should resemble the low-motion frames much more than the
         outliers (i.e. selection is actually doing something, not just averaging
         everything blindly)."""
-        low_motion = [_phantom_frame(shift=(0.0, 0.0, 0.0)) for _ in range(8)]
-        outliers = [_phantom_frame(shift=(6.0, 5.0, -6.0)) for _ in range(4)]
+        low_motion = [_phantom_frame(shift=(0.0, 0.0, 0.0)) for _ in range(6)]
+        outliers = [_phantom_frame(shift=(6.0, 5.0, -6.0)) for _ in range(3)]
         imgs = low_motion + outliers
-        ref = build_low_motion_reference(imgs, n_low_motion=8, verbose=False)
+        ref = build_low_motion_reference(imgs, n_low_motion=6, verbose=False, device="cpu")
 
         corr_low = np.corrcoef(ref.numpy().ravel(), low_motion[0].numpy().ravel())[0, 1]
         corr_outlier = np.corrcoef(ref.numpy().ravel(), outliers[0].numpy().ravel())[0, 1]
@@ -64,12 +64,12 @@ class TestMotionCorrectGrouped:
     docs/ADAPTIVE_MOTION_CORRECTION_AND_RECOVERY.html)."""
 
     def test_basic_contract(self):
-        frames = [_phantom_frame(shift=s) for s in
+        frames = [_phantom_frame(nx=14, ny=14, nz=14, shift=s) for s in
                   [(0, 0, 0), (0.1, 0, 0), (2.0, -1.5, 1.0), (1.8, -1.2, 0.9), (2.2, -1.6, 1.1)]]
-        img4d = ants.list_to_ndimage(ants.from_numpy(np.zeros((20, 20, 20, 5), dtype=np.float32)), frames)
+        img4d = ants.list_to_ndimage(ants.from_numpy(np.zeros((14, 14, 14, 5), dtype=np.float32)), frames)
         group_is_reference = np.array([True, True, False, False, False])
 
-        out = motion_correct_grouped(img4d, group_is_reference, n_low_motion=10, verbose=False)
+        out = motion_correct_grouped(img4d, group_is_reference, n_low_motion=10, verbose=False, device="cpu")
         assert out.motion_corrected.shape == img4d.shape
         assert len(out.fd) == 5
         # The grouped-specific artifacts should all be present (not just the generic
@@ -78,6 +78,7 @@ class TestMotionCorrectGrouped:
             assert key in out
         assert len(out["group_results"]) == 2 and len(out["cross_registrations"]) == 1
 
+    @pytest.mark.slow
     def test_both_groups_dvars_normalized_against_group_a_mean(self):
         """Real bug found 2026-10-06 (antsxmm cohort review): two groups (e.g. DWI's b0
         and diffusion-weighted volumes) normally differ substantially in raw signal
@@ -107,7 +108,7 @@ class TestMotionCorrectGrouped:
         # (inside the function body), so the patch target is syntx.motion's own name,
         # not an attribute of the motion_reference module.
         with patch.object(motion_module, "motion_correction", side_effect=_spy):
-            motion_correct_grouped(img4d, group_is_reference, n_low_motion=10, verbose=False)
+            motion_correct_grouped(img4d, group_is_reference, n_low_motion=10, verbose=False, device="cpu")
 
         assert len(captured_kwargs) == 2
         assert captured_kwargs[0] is not None
@@ -130,6 +131,7 @@ class TestMotionCorrectGrouped:
         with pytest.raises(ValueError):
             motion_correct_grouped(img4d, np.array([True, True, True, True]))
 
+    @pytest.mark.slow
     def test_preserves_real_physical_space_not_default_header(self):
         """Real bug found 2026-10-06 (real ds005134 DWI data): the two-mean design built
         its internal per-group 4D containers AND the final motion_corrected output via
@@ -147,7 +149,7 @@ class TestMotionCorrectGrouped:
         direction = np.array([[1.0, 0.0, 0.0], [0.0, -1.0, 0.0], [0.0, 0.0, 1.0]])
 
         def _real_space_frame(shift=(0.0, 0.0, 0.0)):
-            f = _phantom_frame(shift=shift)
+            f = _phantom_frame(nx=14, ny=14, nz=14, shift=shift)
             f.set_spacing(spacing)
             f.set_origin(origin)
             f.set_direction(direction)
@@ -168,7 +170,7 @@ class TestMotionCorrectGrouped:
         )
         group_is_reference = np.array([True, True, False, False, False])
 
-        out = motion_correct_grouped(img4d, group_is_reference, n_low_motion=10, verbose=False)
+        out = motion_correct_grouped(img4d, group_is_reference, n_low_motion=10, verbose=False, device="cpu")
         result3d = ants.slice_image(out.motion_corrected, axis=3, idx=0)
 
         assert np.allclose(ants.get_spacing(result3d), spacing)
@@ -177,6 +179,7 @@ class TestMotionCorrectGrouped:
 
 
 class TestGroupedTransformFilesAreDistinctPerGroup:
+    @pytest.mark.slow
     def test_outprefix_does_not_collide_across_groups(self, tmp_path):
         """Real bug (sub-BLAST079 3-shell DWI, 2026-10-20): with an ``outprefix`` every group wrote its frame-t transform
         to the same ``{outprefix}batch_{t:04d}.mat``; the last group overwrote the others. The per-frame chains are read
@@ -190,7 +193,7 @@ class TestGroupedTransformFilesAreDistinctPerGroup:
         img4d = ants.list_to_ndimage(ants.from_numpy(np.zeros((20, 20, 20, 6), dtype=np.float32)), frames)
         groups = np.array([0, 1, 1, 0, 1, 0])
 
-        out = motion_correct_grouped(img4d, groups, n_low_motion=10, verbose=False, outprefix=str(tmp_path / "mc_"))
+        out = motion_correct_grouped(img4d, groups, n_low_motion=10, verbose=False, outprefix=str(tmp_path / "mc_"), device="cpu")
 
         own_files = [chain[-1] for chain in out.fwdtransforms]  # the frame's own transform is the last in its chain
         assert len(set(own_files)) == len(own_files), own_files
@@ -202,6 +205,7 @@ class TestGroupedTransformFilesAreDistinctPerGroup:
 
 
 class TestGroupedNuisanceRegression:
+    @pytest.mark.slow
     def test_nuisance_translation_removed_from_fd_but_kept_in_applied_transforms(self, tmp_path):
         """DWI eddy currents translate each volume along phase encode by an amount linear in the gradient vector; the rigid
         fit absorbs it and FD counts it as motion (sub-BLAST079, 2026-10-20). With ``nuisance_covariates`` + ``nuisance_axis``
@@ -229,7 +233,7 @@ class TestGroupedNuisanceRegression:
         groups = np.array([0, 0] + [1] * (n - 2))
 
         out = motion_correct_grouped(img4d, groups, n_low_motion=10, verbose=False, outprefix=str(tmp_path / "mc_"),
-                                     nuisance_covariates=cov, nuisance_axis=(0.0, 1.0, 0.0))
+                                     nuisance_covariates=cov, nuisance_axis=(0.0, 1.0, 0.0), device="cpu")
         assert out.nuisance["coefficients"][0] is None and out.nuisance["r2"][0] is None  # b0-like group: no fit
         assert out.nuisance["r2"][1] > 0.95
         np.testing.assert_allclose(out.nuisance["coefficients"][1], [0.0, B_Y, 0.0], atol=0.1)
@@ -242,6 +246,33 @@ class TestGroupedNuisanceRegression:
 
 
 class TestGroupedEddyPEAffine:
+    @pytest.mark.slow
+    def test_tied_pe_affine_fast_contract(self, tmp_path):
+        rng = np.random.default_rng(1)
+        n, N = 6, 18
+        g = np.zeros((n, 3))
+        g[2:] = rng.normal(size=(n - 2, 3))
+        g[2:] /= np.linalg.norm(g[2:], axis=1, keepdims=True)
+        p = np.array([0.0, 1.0, 0.0])
+        gx, gy, gz = np.ogrid[-N // 2:N // 2, -N // 2:N // 2, -N // 2:N // 2]
+        base = ants.from_numpy(np.exp(-(gx ** 2 + gy ** 2 + gz ** 2) / 18.0).astype(np.float32), spacing=(2.0, 2.0, 2.0))
+        img4d = ants.list_to_ndimage(ants.from_numpy(np.zeros((N, N, N, n), dtype=np.float32)), [base] * n)
+        out = motion_correct_grouped(
+            img4d,
+            np.array([0, 0] + [1] * (n - 2)),
+            n_low_motion=2,
+            verbose=False,
+            outprefix=str(tmp_path / "mc_fast_"),
+            backend="pytorch_batched",
+            pe_affine_covariates=g,
+            pe_axis=p,
+            seed_mode="narrow",
+            device="cpu",
+        )
+        assert out.pe_affine is not None and out.pe_affine["coefficients_by_group"][0] is None
+        assert np.asarray(out.pe_affine["coefficients_by_group"][1]).shape == (4, 3)
+
+    @pytest.mark.slow
     @pytest.mark.parametrize("direction", ["forward", "backward"])
     def test_tied_pe_affine_recovers_imposed_eddy_and_leaves_fd_to_motion(self, tmp_path, direction):
         """Eddy-current model: per frame a translation + shears + scale along the phase-encode axis, tied across the group's
@@ -279,7 +310,8 @@ class TestGroupedEddyPEAffine:
         groups = np.array([0, 0] + [1] * (n - 2))
 
         out = motion_correct_grouped(img4d, groups, n_low_motion=10, verbose=False, outprefix=str(tmp_path / "mc_"),
-                                     backend="pytorch_batched", pe_affine_covariates=g, pe_axis=p, registration_direction=direction)
+                                     backend="pytorch_batched", pe_affine_covariates=g, pe_axis=p,
+                                     registration_direction=direction, device="cpu")
         pe = out.pe_affine
         assert pe is not None and pe["coefficients_by_group"][0] is None
         C = np.asarray(pe["coefficients_by_group"][1])  # (4, 3): rows a0, a1, a2, a3; columns g_x, g_y, g_z
@@ -313,6 +345,7 @@ def _blob_frame(weights, shift=(0.0, 0.0, 0.0), N=40):
 
 
 class TestPerFrameReferences:
+    @pytest.mark.slow
     def test_contrast_matched_references_recover_shifts_the_mean_reference_cannot(self, tmp_path):
         """Frames whose contrast differs strongly from frame to frame (the weights of the three blobs change), each
         rigidly shifted by a known amount. Registered to the mean of the frames' own (unshifted) patterns the pose is
@@ -330,25 +363,27 @@ class TestPerFrameReferences:
         mean_ref = ants.from_numpy(np.mean([r.numpy() for r in refs], axis=0).astype(np.float32), spacing=(1.0, 1.0, 1.0))
 
         per = motion_correction(img4d, reference=refs, backend="pytorch_batched", verbose=False, seed_mode="narrow",
-                                outprefix=str(tmp_path / "per_"))
+                                outprefix=str(tmp_path / "per_"), device="cpu")
         shared = motion_correction(img4d, reference=mean_ref, backend="pytorch_batched", verbose=False, seed_mode="narrow",
-                                   outprefix=str(tmp_path / "mean_"))
+                                   outprefix=str(tmp_path / "mean_"), device="cpu")
         err_per = np.linalg.norm(np.asarray(per.motion_parameters.translations) - np.asarray(shifts), axis=1)
         err_mean = np.linalg.norm(np.asarray(shared.motion_parameters.translations) - np.asarray(shifts), axis=1)
         assert per.summary["reference_type"] == "per_frame"
         assert err_per.max() < 0.25, err_per
         assert err_mean.mean() > 2 * err_per.mean(), (err_mean, err_per)
 
+    @pytest.mark.slow
     def test_identical_per_frame_references_match_the_shared_reference(self, tmp_path):
         from syntx.motion import motion_correction
 
         frames = [_blob_frame((1, 0.7, 0.5), s) for s in [(0, 0, 0), (0.8, -0.4, 0.3), (-0.5, 0.6, -0.9)]]
         img4d = ants.list_to_ndimage(ants.from_numpy(np.zeros((40, 40, 40, 3), dtype=np.float32)), frames)
         ref = _blob_frame((1, 0.7, 0.5))
-        a = motion_correction(img4d, reference=ref, backend="pytorch_batched", verbose=False, seed_mode="narrow")
-        b = motion_correction(img4d, reference=[ref, ref, ref], backend="pytorch_batched", verbose=False, seed_mode="narrow")
+        a = motion_correction(img4d, reference=ref, backend="pytorch_batched", verbose=False, seed_mode="narrow", device="cpu")
+        b = motion_correction(img4d, reference=[ref, ref, ref], backend="pytorch_batched", verbose=False, seed_mode="narrow", device="cpu")
         np.testing.assert_allclose(np.asarray(a.motion_parameters.translations), np.asarray(b.motion_parameters.translations), atol=0.05)
 
+    @pytest.mark.slow
     def test_grouped_reference_predictor_hook(self, tmp_path):
         """The predictor is called with the group's corrected frames; None keeps the mean; a list re-registers the group
         to per-frame references for the requested iterations and reference_modes reports it."""
@@ -365,12 +400,13 @@ class TestPerFrameReferences:
         groups = np.array([0, 0, 1, 1, 1])
         out = motion_correct_grouped(img4d, groups, n_low_motion=10, verbose=False, backend="pytorch_batched",
                                      outprefix=str(tmp_path / "mc_"), reference_predictor=predictor, reference_iterations=2,
-                                     seed_mode="narrow")
+                                     seed_mode="narrow", device="cpu")
         assert out.reference_modes == ["mean", "predicted (iteration 2)"]
         assert [c[0] for c in calls] == [0, 1, 1] and calls[1][1] == 3 and calls[1][2] == [2, 3, 4]
         assert out.motion_corrected.shape == img4d.shape and len(out.fd) == 5
 
 
+@pytest.mark.slow
 class TestSampleMaskAndBiasCovariates:
     def test_sample_mask_restricts_the_metric_and_bias_is_removed_from_written_poses(self, tmp_path):
         """A frame whose contrast differs from the reference only INSIDE a region biases the pose; with the metric
@@ -389,8 +425,8 @@ class TestSampleMaskAndBiasCovariates:
         outer = ((gx ** 2 + gy ** 2 + gz ** 2) > 11 ** 2).astype(np.float32)  # exclude the direction-dependent centre
         mask = ants.from_numpy(outer, spacing=(1.0, 1.0, 1.0))
 
-        plain = motion_correction(img4d, reference=ref, backend="pytorch_batched", verbose=False, seed_mode="narrow")
-        masked = motion_correction(img4d, reference=ref, backend="pytorch_batched", verbose=False, seed_mode="narrow", sample_mask=mask)
+        plain = motion_correction(img4d, reference=ref, backend="pytorch_batched", verbose=False, seed_mode="narrow", device="cpu")
+        masked = motion_correction(img4d, reference=ref, backend="pytorch_batched", verbose=False, seed_mode="narrow", sample_mask=mask, device="cpu")
         e_plain = np.linalg.norm(np.asarray(plain.motion_parameters.translations) - np.asarray(shifts), axis=1)
         e_mask = np.linalg.norm(np.asarray(masked.motion_parameters.translations) - np.asarray(shifts), axis=1)
         assert e_mask.max() < 0.35, e_mask   # was 0.3: the new default finisher/jitter lands at 0.33 worst-case on this 40^3 phantom
@@ -406,7 +442,7 @@ class TestSampleMaskAndBiasCovariates:
         B = np.array([[0.8, 0.0, 0.0], [0.0, -0.6, 0.0]])  # mm per unit covariate
         biased = [_blob_frame((0.65, 0.7, 0.5), tuple(np.asarray(s) + cov[k] @ B)) for k, s in enumerate(shifts)]
         img_b = ants.list_to_ndimage(ants.from_numpy(np.zeros((40, 40, 40, n), dtype=np.float32)), biased)
-        res = motion_correction(img_b, reference=ref, backend="pytorch_batched", verbose=False, seed_mode="narrow", bias_covariates=cov)
+        res = motion_correction(img_b, reference=ref, backend="pytorch_batched", verbose=False, seed_mode="narrow", bias_covariates=cov, device="cpu")
         e_bias = np.linalg.norm(np.asarray(res.motion_parameters.translations) - np.asarray(shifts), axis=1)
         assert res["bias"] is not None and res["bias"]["n_covariates"] == 2
         np.testing.assert_allclose(np.asarray(res["bias"]["coefficients"])[:, :3], B, atol=0.3)
@@ -414,6 +450,7 @@ class TestSampleMaskAndBiasCovariates:
         assert e_bias.mean() < 0.4 * imposed.mean(), (e_bias.mean(), imposed.mean())
 
 
+@pytest.mark.slow
 class TestBackwardRegistration:
     def test_backward_recovers_known_shifts_and_matches_forward_convention(self, tmp_path):
         """registration_direction='backward' (the mean onto each frame) returns transforms in the forward convention:
@@ -425,7 +462,7 @@ class TestBackwardRegistration:
         img4d = ants.list_to_ndimage(ants.from_numpy(np.zeros((40, 40, 40, n), dtype=np.float32)), frames)
         groups = np.array([0, 0] + [1] * (n - 2))
         out = motion_correct_grouped(img4d, groups, n_low_motion=10, verbose=False, backend="pytorch_batched", seed_mode="narrow",
-                                     outprefix=str(tmp_path / "mc_"), registration_direction="backward", metric_smoothing_mm=1.0)
+                                     outprefix=str(tmp_path / "mc_"), registration_direction="backward", metric_smoothing_mm=1.0, device="cpu")
         tr = np.array([r.motion_parameters.translations for r in out.group_results][1])
         err = np.linalg.norm(tr - np.asarray(shifts[2:]) + np.mean(np.asarray(shifts[2:]), axis=0) * 0, axis=1)
         # poses are relative to the group's (low-motion) mean: compare pairwise differences, which are reference-free

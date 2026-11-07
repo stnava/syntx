@@ -73,6 +73,7 @@ class TestMbhardBenchmarkParity:
         unique_labels = np.unique(fl_np)
         assert len(unique_labels) > 1, "Label map must contain non-trivial segmentation labels"
 
+    @pytest.mark.slow
     def test_mbhard_pipeline_fast_multilevel(self):
         """
         Fast multi-level schedule verifying the complete registration pipeline end-to-end:

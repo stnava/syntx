@@ -230,6 +230,7 @@ def test_cache_reused_across_commits_with_identical_registration_code(tmp_path):
     assert len(calls3) > 0   # registration code changed: re-evaluated
 
 
+@pytest.mark.slow
 def test_registration_code_fingerprint_ignores_tuner_files_and_version(tmp_path):
     import subprocess
     from syntx.benchmark.tune import registration_code_fingerprint

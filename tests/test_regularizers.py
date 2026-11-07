@@ -487,6 +487,7 @@ def test_all_continuum_paradigms_in_registry():
 # -----------------------------------------------------------------------------
 # 15. Benchmark Call Parameter Collision Invariance Test
 # -----------------------------------------------------------------------------
+@pytest.mark.slow
 def test_syn_benchmark_parameter_collision_invariance():
     """
     Verify that the exact user benchmark signature:
@@ -528,6 +529,8 @@ def test_syn_benchmark_parameter_collision_invariance():
             reg_iterations=[2, 1],
             regularizer=reg_name,
             initial_transform='identity',
+            device='cpu',
+            in_memory=True,
             verbose=False,
             **extra_kw
         )

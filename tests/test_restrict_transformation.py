@@ -59,7 +59,8 @@ REG_KWARGS = dict(
     # pure-shift pair completely: the deformation field is then ~0 and the test measures nothing
     # about the restriction. (This, not the step size, is why the field was 0.01-0.02.)
     initial_transform="identity",
-    reg_iterations=[30, 20],
+    reg_iterations=[6, 3],
+    device="cpu",
     verbose=False,
     seed=42,
 )
@@ -90,6 +91,7 @@ def test_restriction_forbidding_the_needed_axis_fails_to_correct():
     assert mag[1] < 1e-3, f"Y (restricted) should stay ~0 even though it's needed, got {mag}"
 
 
+@pytest.mark.slow
 def test_no_restriction_is_unaffected_backward_compatible():
     """restrict_transformation=None (default) must reproduce prior (unrestricted)
     behaviour: real deformation along the shifted axis, not suppressed."""
@@ -120,6 +122,7 @@ def test_jax_backend_raises_rather_than_silently_ignoring():
         syntx.syn(fixed, moving, restrict_transformation=(0.0, 1.0, 0.0), backend="jax", **REG_KWARGS)
 
 
+@pytest.mark.slow
 def test_restriction_applies_under_the_adam_optimizer_branch_too():
     """The Adam/RegAdam optimizer path (u_reg_l/u_reg_r) is a separate injection point
     from the default 'cfl' path and is not exercised by the tests above; verify it
@@ -141,8 +144,9 @@ def test_greedy_restriction_confines_deformation():
         fixed, moving,
         restrict_transformation=(0.0, 1.0, 0.0),
         initial_transform=False,
-        reg_iterations=[20, 10],
+        reg_iterations=[10, 5],
         scales=[2, 1],
+        device="cpu",
     )
     mag = _field_component_magnitudes(reg, fixed)
     assert mag[1] > 0.02, f"Y (allowed axis in greedy) should show real deformation, got {mag}"

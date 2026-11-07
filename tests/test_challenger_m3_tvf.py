@@ -70,6 +70,7 @@ def test_tvf_velocity_sub_inplace_increments_version_and_invalidates_cache():
     assert model._get_v_max_voxel(model.velocity, target_shape) == v_max_1
 
 
+@pytest.mark.slow
 @pytest.mark.parametrize("cfl_momentum", [0.0, 0.5, 0.9])
 def test_tvf_fit_cfl_version_tracking_across_epochs(cfl_momentum):
     """
@@ -121,7 +122,7 @@ def test_tvf_fit_adam_version_tracking():
     fixed_np[8:16, 8:16] = 1.0
     moving_np[10:18, 8:16] = 1.0
 
-    device = torch.device('mps' if torch.backends.mps.is_available() else 'cpu')
+    device = torch.device('cpu')
     fi_t = torch.tensor(fixed_np, device=device).unsqueeze(0).unsqueeze(0)
     mi_t = torch.tensor(moving_np, device=device).unsqueeze(0).unsqueeze(0)
 
@@ -370,6 +371,7 @@ def _create_synthetic_sphere_pair_3d(shape=(24, 24, 24)):
     return fixed, moving
 
 
+@pytest.mark.slow
 def test_tvf_e2e_regularity_and_inverse_consistency_2d():
     """
     End-to-end 2D TVF registration test verifying:
@@ -429,6 +431,7 @@ def test_tvf_e2e_regularity_and_inverse_consistency_2d():
     assert final_dice >= initial_dice, f"Final DICE {final_dice} should be >= initial DICE {initial_dice}"
 
 
+@pytest.mark.slow
 def test_tvf_e2e_regularity_and_inverse_consistency_3d():
     """
     End-to-end 3D TVF registration test verifying:
@@ -467,6 +470,7 @@ def test_tvf_e2e_regularity_and_inverse_consistency_3d():
     assert mean_err < 0.25, f"3D TVF mean inverse error too high: {mean_err:.4f} mm"
 
 
+@pytest.mark.slow
 def test_syn_e2e_regularity_and_inverse_consistency_3d():
     """
     End-to-end 3D SyN registration test verifying:

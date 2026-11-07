@@ -10,11 +10,11 @@ import ants
 import syntx
 
 
-@pytest.fixture
+@pytest.fixture(scope="module")
 def sample_2d_images():
-    """Load standard 2D test pair r16 / r64."""
-    fi = ants.image_read(ants.get_ants_data('r16'))
-    mi = ants.image_read(ants.get_ants_data('r64'))
+    """Load standard 2D test pair r16 / r64 downsampled to 64x64 for fast unit tests."""
+    fi = ants.resample_image(ants.image_read(ants.get_ants_data('r16')), (64, 64), use_voxels=True)
+    mi = ants.resample_image(ants.image_read(ants.get_ants_data('r64')), (64, 64), use_voxels=True)
     return fi, mi
 
 
@@ -48,9 +48,10 @@ def test_greedy_2d_basic(sample_2d_images):
     res = syntx.greedy(
         fixed=fi,
         moving=mi,
-        reg_iterations=[25, 15],
+        reg_iterations=[15, 10],
         scales=[2, 1],
         learning_rate=0.4,
+        device="cpu",
         verbose=False,
     )
 
@@ -88,10 +89,11 @@ def test_greedy_3d_synthetic(sample_3d_images):
     res = syntx.greedy(
         fixed=fi,
         moving=mi,
-        reg_iterations=[15, 10],
+        reg_iterations=[10, 5],
         scales=[2, 1],
         learning_rate=0.4,
         initial_transform=False,  # Test identity initial transform
+        device="cpu",
         verbose=False,
     )
 
@@ -110,8 +112,10 @@ def test_greedy_delegation_via_syn(sample_2d_images):
         fixed=fi,
         moving=mi,
         type_of_transform='greedy',
-        reg_iterations=[10, 5],
+        initial_transform='identity',
+        reg_iterations=[6, 4],
         scales=[2, 1],
+        device="cpu",
         verbose=False,
     )
 
@@ -119,6 +123,7 @@ def test_greedy_delegation_via_syn(sample_2d_images):
     assert res['provenance']['algorithm'] == 'syntx.greedy'
 
 
+@pytest.mark.slow
 def test_greedy_user_initial_transform(sample_2d_images):
     """Test passing an explicit initial transform to syntx.greedy."""
     fi, mi = sample_2d_images
@@ -140,6 +145,7 @@ def test_greedy_user_initial_transform(sample_2d_images):
     assert res['provenance']['runtime_affine_sec'] >= 0.0
 
 
+@pytest.mark.slow
 def test_greedy_non_linear_initial_transform_raises_clearly(sample_2d_images):
     """A non-linear initial_transform (e.g. a displacement field) must raise a clear
     NotImplementedError pointing at the real gap (no dense-initial-grid support in
@@ -166,6 +172,7 @@ def test_greedy_non_linear_initial_transform_raises_clearly(sample_2d_images):
         )
 
 
+@pytest.mark.slow
 def test_greedy_anderson_projection(sample_2d_images):
     """Test greedy with Anderson-accelerated fixed-point projection."""
     fi, mi = sample_2d_images
@@ -187,6 +194,7 @@ def test_greedy_anderson_projection(sample_2d_images):
     assert res['provenance']['anderson_freq'] == 'per_scale'
 
 
+@pytest.mark.slow
 def test_greedy_anderson_posthoc(sample_2d_images):
     """Test greedy with post-hoc Anderson projection."""
     fi, mi = sample_2d_images
@@ -207,6 +215,7 @@ def test_greedy_anderson_posthoc(sample_2d_images):
     assert res['provenance']['anderson_freq'] == 'posthoc'
 
 
+@pytest.mark.slow
 def test_greedy_return_inverse(sample_2d_images):
     """Test greedy with physical inverse displacement field export."""
     fi, mi = sample_2d_images
@@ -266,6 +275,7 @@ def test_greedy_return_inverse(sample_2d_images):
     assert os.path.exists(res_noaff['invtransforms'][0])
 
 
+@pytest.mark.slow
 def test_greedy_regadam_2d(sample_2d_images):
     """Test 2D greedy registration with RegAdam optimizer."""
     fi, mi = sample_2d_images
@@ -292,6 +302,7 @@ def test_greedy_regadam_2d(sample_2d_images):
     assert final_mse < initial_mse, f"Expected MSE improvement with RegAdam, got initial={initial_mse:.4f}, final={final_mse:.4f}"
 
 
+@pytest.mark.slow
 def test_greedy_regadam_3d(sample_3d_images):
     """Test 3D greedy registration with RegAdam optimizer."""
     fi, mi = sample_3d_images
@@ -316,6 +327,7 @@ def test_greedy_regadam_3d(sample_3d_images):
     assert res['provenance']['optimizer'] == 'regadam'
 
 
+@pytest.mark.slow
 def test_greedy_mattes_mi(sample_3d_images):
     """Test 3D greedy registration with Mattes Mutual Information similarity metric."""
     fi, mi = sample_3d_images
@@ -348,19 +360,19 @@ def test_greedy_mattes_bin_aliases(sample_2d_images):
     fi, mi = sample_2d_images
 
     # 1. num_bins
-    r1 = syntx.greedy(fi, mi, similarity_metric='mattes', num_bins=16, reg_iterations=[2, 1], initial_transform=False)
+    r1 = syntx.greedy(fi, mi, similarity_metric='mattes', num_bins=16, reg_iterations=[1], scales=[1], initial_transform=False, device="cpu")
     assert r1['model'].num_bins == 16
 
     # 2. mattes_bins
-    r2 = syntx.greedy(fi, mi, similarity_metric='mattes', mattes_bins=64, reg_iterations=[2, 1], initial_transform=False)
+    r2 = syntx.greedy(fi, mi, similarity_metric='mattes', mattes_bins=64, reg_iterations=[1], scales=[1], initial_transform=False, device="cpu")
     assert r2['model'].num_bins == 64
 
     # 3. syn_sampling (ANTsPy convention)
-    r3 = syntx.greedy(fi, mi, similarity_metric='mattes', syn_sampling=32, reg_iterations=[2, 1], initial_transform=False)
+    r3 = syntx.greedy(fi, mi, similarity_metric='mattes', syn_sampling=32, reg_iterations=[1], scales=[1], initial_transform=False, device="cpu")
     assert r3['model'].num_bins == 32
 
     # 4. metric string encoding (e.g. 'mattes_48')
-    r4 = syntx.greedy(fi, mi, similarity_metric='mattes_48', reg_iterations=[2, 1], initial_transform=False)
+    r4 = syntx.greedy(fi, mi, similarity_metric='mattes_48', reg_iterations=[1], scales=[1], initial_transform=False, device="cpu")
     assert r4['model'].num_bins == 48
     assert r4['model'].similarity_metric == 'mattes'
 

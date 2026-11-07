@@ -125,13 +125,16 @@ def test_syn_with_dt_metric():
         fixed=img_f,
         moving=img_m,
         similarity_metric='dt',
-        reg_iterations=[10, 5],
+        initial_transform='identity',
+        device='cpu',
+        reg_iterations=[6, 3],
         fast_smooth=True,
     )
     assert res['warpedmovout'] is not None
     assert isinstance(res['warpedmovout'], ants.ANTsImage)
 
 
+@pytest.mark.slow
 def test_scattered_syn_with_dt_tau():
     """Verify syn_scattered with native distance_transform_tau on 3D sphere mesh."""
     theta = torch.linspace(0, 2 * np.pi, 8)

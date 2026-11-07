@@ -90,6 +90,7 @@ def test_gradcheck_box_lncc_loss_2d(squared):
     )
 
 
+@pytest.mark.slow
 @pytest.mark.parametrize("squared", [True, False])
 def test_gradcheck_box_lncc_loss_3d(squared):
     """Verify float64 gradcheck for BoxLNCCLoss and box_lncc_loss_nd in 3D."""

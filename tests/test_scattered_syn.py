@@ -253,6 +253,7 @@ def test_scattered_syn_identity_2d():
     assert res.folding_percentage == 0.0, f"Identity produced non-zero folding: {res.folding_percentage}%"
 
 
+@pytest.mark.slow
 def test_scattered_syn_identity_3d():
     """Verify 3D identity registration produces zero displacement and zero folding."""
     points, feats = generate_synthetic_ellipsoid_3d(n_points=400, seed=42)
@@ -313,6 +314,7 @@ def test_scattered_syn_recover_affine_2d():
     assert res.folding_percentage < 0.1, f"Folding {res.folding_percentage}% >= 0.1%"
 
 
+@pytest.mark.slow
 def test_scattered_syn_recover_nonrigid_sinusoidal_2d():
     """Verify recovery of known non-rigid diffeomorphic sinusoidal warp."""
     X_fix, F_fix = generate_synthetic_c_shape_2d(n_points=500, seed=1234)
@@ -470,6 +472,7 @@ def test_scattered_syn_diffeomorphic_folding_bound_2d():
     assert min_jac > -1e-4, f"Pathological fold detected: min det(J) = {min_jac:.4f}"
 
 
+@pytest.mark.slow
 def test_scattered_syn_diffeomorphic_folding_bound_3d():
     """Verify physical det(J) > 0 on >= 99.9% voxels (folding < 0.1%) in 3D."""
     X_fix, F_fix = generate_synthetic_ellipsoid_3d(n_points=400, seed=123)
@@ -484,6 +487,7 @@ def test_scattered_syn_diffeomorphic_folding_bound_3d():
     assert min_jac > -1e-4, f"3D pathological fold detected: min det(J) = {min_jac:.4f}"
 
 
+@pytest.mark.slow
 def test_scattered_syn_cfl_bounding_prevents_folding():
     """Ablation test demonstrating CFL step bounding actively prevents grid folding."""
     X_fix, F_fix = generate_synthetic_c_shape_2d(n_points=400, seed=42)
@@ -577,6 +581,7 @@ def test_scattered_syn_autograd_gradcheck_single_step():
     assert torch.autograd.gradcheck(func, (pts_mov, feats_mov), eps=1e-5, atol=1e-3, rtol=1e-3)
 
 
+@pytest.mark.slow
 def test_scattered_syn_small_and_sparse_point_sets():
     """Verify solver handles sparse point clouds (N=5 and N=30) without dimension crash or NaNs."""
     for n_pts in (5, 30):
@@ -594,6 +599,7 @@ def test_scattered_syn_small_and_sparse_point_sets():
         assert res.warped_moving_points.shape == (n_pts, 2)
 
 
+@pytest.mark.slow
 def test_scattered_syn_edge_cases_and_robustness():
     """Verify out-of-bounds coords, multi-channel features, float64 dtype, and empty input handling."""
     # 1. Empty point cloud raises ValueError

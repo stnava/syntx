@@ -39,7 +39,7 @@ def _pair(rot_xyz_deg, origin=(0.0, 0.0, 0.0), seed=0):
 
 
 @pytest.mark.parametrize("rot,expected", [((8, 0, 0), "Rotation_pitch_+8deg"), ((0, 0, 12), "Rotation_yaw_+12deg")])
-@pytest.mark.parametrize("origin", [(0.0, 0.0, 0.0), (-90.0, -110.0, -70.0)])
+@pytest.mark.parametrize("origin", [(0.0, 0.0, 0.0), pytest.param((-90.0, -110.0, -70.0), marks=pytest.mark.slow)])
 def test_rotation_candidate_selected_and_recovered(rot, expected, origin):
     fixed, moving, pts, true = _pair(rot, origin)
     buf = io.StringIO()

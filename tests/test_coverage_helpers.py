@@ -79,6 +79,7 @@ def test_get_rotation_matrix_jax():
         get_rotation_matrix_jax(jnp.zeros(4), 4)
 
 
+@pytest.mark.slow
 def test_triplanar_vgg3d_loss():
     img_in = torch.randn(1, 1, 16, 16, 16)
     img_tg = torch.randn(1, 1, 16, 16, 16)
@@ -324,6 +325,7 @@ def test_check_convergence():
     assert check_convergence([1.0] * 20, window_size=5, slope_threshold=1e-3)
 
 
+@pytest.mark.slow
 def test_registration_options(tmp_path):
     import os
     fixed = get_test_image_2d()
@@ -391,6 +393,7 @@ def test_registration_options(tmp_path):
     assert 'fwdtransforms' in res_init_single
 
 
+@pytest.mark.slow
 def test_registration_options_jax(tmp_path):
     import os
     fixed = get_test_image_2d()

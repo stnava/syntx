@@ -94,6 +94,8 @@ class TestBSplineRegistrationIntegration:
             fixed=fixed,
             moving=moving,
             reg_iterations=[2, 2],
+            initial_transform='identity',
+            device='cpu',
             regularizer='bspline',
             mesh_size=4,
         )
@@ -107,6 +109,8 @@ class TestBSplineRegistrationIntegration:
             fixed=fixed,
             moving=moving,
             reg_iterations=[2, 2],
+            initial_transform='identity',
+            device='cpu',
             type_of_transform='BSplineSyN',
             spline_distance=15.0,
         )
@@ -119,18 +123,23 @@ class TestBSplineRegistrationIntegration:
             fixed=fixed,
             moving=moving,
             reg_iterations=[2, 2],
+            initial_transform='identity',
+            device='cpu',
             regularizer='bspline',
             mesh_size=4,
         )
         assert 'warpedmovout' in reg
         assert reg['warpedmovout'].shape == fixed.shape
 
+    @pytest.mark.slow
     def test_tvf_regularizer_bspline_2d(self, image_pair_2d):
         fixed, moving = image_pair_2d
         reg = syntx.tvf(
             fixed=fixed,
             moving=moving,
             reg_iterations=[2, 2],
+            initial_transform='identity',
+            device='cpu',
             regularizer='bspline',
             mesh_size=4,
         )

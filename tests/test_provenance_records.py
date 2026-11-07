@@ -95,6 +95,7 @@ def manifests():
     return [man, copy.deepcopy(man)]
 
 
+@pytest.mark.slow
 def test_record_result_single_and_multi_arm(tmp_path, manifests):
     path = str(tmp_path / "best.json")
     with open(path, "w") as f:

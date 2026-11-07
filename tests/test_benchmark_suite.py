@@ -61,6 +61,7 @@ def test_grid_definitions():
     assert len(phase2_tasks) == 30, f"Expected 30 Phase 2 tasks, got {len(phase2_tasks)}"
 
 
+@pytest.mark.slow
 def test_isolated_worker_execution():
     # A 2-D grid task: the worker's evaluator scores Mindboggle pairs only, so the task fails
     # loudly (it used to register Mindboggle pair 0 under the 2-D name, on the GPU).

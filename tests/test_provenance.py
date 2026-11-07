@@ -73,11 +73,11 @@ def test_code_state_records_tracked_diff_and_untracked_package_sources(tmp_path)
 # call capture
 # ----------------------------------------------------------------------------------------
 def test_capture_records_explicit_and_resolved_syn_parameters():
-    f, m = _pair()
+    f, m = _pair(16)
     orig_syn, orig_fit = syntx.syn, syntx.SyNTo.fit
     with capture_registration_calls() as cap:
-        syntx.syn(fixed=f, moving=m, initial_transform="identity", reg_iterations=[2, 1, 1],
-                  device="cpu", fast_smooth=True)
+        syntx.syn(fixed=f, moving=m, initial_transform="identity", reg_iterations=[1],
+                  device="cpu", fast_smooth=True, in_memory=True)
     assert syntx.syn is orig_syn and syntx.SyNTo.fit is orig_fit  # restored
 
     man = build_manifest(calls=cap.calls, run={"test": True})
@@ -107,6 +107,7 @@ def test_capture_records_ants_registration_and_restores_on_error():
     assert cap.calls[0]["kwargs"]["type_of_transform"] == "Translation"
 
 
+@pytest.mark.slow
 def test_with_provenance_decorator_attaches_manifest():
     f, m = _pair(16)
 
@@ -142,7 +143,7 @@ def one_manifest():
     f, m = _pair(16)
     with capture_registration_calls() as cap:
         syntx.syn(fixed=f, moving=m, initial_transform="identity", reg_iterations=[1, 1, 1],
-                  device="cpu")
+                  device="cpu", in_memory=True)
     return build_manifest(calls=cap.calls, run={}, include_diff=True)
 
 
@@ -165,12 +166,13 @@ def test_cohort_provenance_rejects_mixed_code_or_parameters(one_manifest):
         cohort_provenance([one_manifest, other_params])
 
 
+@pytest.mark.slow
 def test_manifest_uses_start_state_and_flags_changes_during_run(monkeypatch):
     import syntx.provenance as prov
     f, m = _pair(16)
     with capture_registration_calls() as cap:
         syntx.syn(fixed=f, moving=m, initial_transform="identity", reg_iterations=[1, 1, 1],
-                  device="cpu")
+                  device="cpu", in_memory=True)
     start = cap.start_state
     unchanged = build_manifest(calls=cap.calls, run={}, start=start)
     assert unchanged["changed_during_run"] is False

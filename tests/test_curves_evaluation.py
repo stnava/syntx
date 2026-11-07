@@ -468,7 +468,15 @@ def _cyc_err(a, b):
     return np.minimum(d, 1.0 - d).max()
 
 
-@pytest.mark.parametrize("roll_frac,rot_deg", [(0.25, 30.0), (0.575, 90.0), (0.5, 180.0), (0.1, 10.0)])
+@pytest.mark.parametrize(
+    "roll_frac,rot_deg",
+    [
+        (0.25, 30.0),
+        pytest.param(0.575, 90.0, marks=pytest.mark.slow),
+        pytest.param(0.5, 180.0, marks=pytest.mark.slow),
+        pytest.param(0.1, 10.0, marks=pytest.mark.slow),
+    ],
+)
 def test_closed_rigid_unknown_cyclic_start(roll_frac, rot_deg):
     """Sulceye-port regression: unknown cyclic start + rigid pose, recovered (was 0.27-0.38 error)."""
     P, Q, gP, gQ = _rolled_rigid_case(roll_frac, rot_deg)
@@ -515,6 +523,7 @@ def test_offset_costs_diagnostics_and_fixed_offset():
         match_curves(P, Q, mode="closed", fixed_offset_fraction=0.1, fixed_reversed=True, both_orientations=False)
 
 
+@pytest.mark.slow
 def test_closed_runtime_budget():
     """Closed-curve matching at N=200 stays well under the previous ~5 s (loose CPU budget)."""
     import time

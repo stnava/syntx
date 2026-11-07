@@ -178,6 +178,7 @@ def test_stress_transport_scattered_direct_vs_bridge_fidelity():
     assert r_3d > 0.99, f"3D Direct vs Bridge transport failed: r = {r_3d:.5f} <= 0.99"
 
 
+@pytest.mark.slow
 def test_stress_memory_safety_large_n_auto_chunking():
     """Stress Test 5: Verify memory safety with large point counts (N=10,000+)."""
     torch.manual_seed(42)

@@ -26,7 +26,15 @@ def _run(method, fi, mi):
     return fn(**kw)
 
 
-@pytest.mark.parametrize("method", ["tvf", "syngs", "syn", "greedy"])
+@pytest.mark.parametrize(
+    "method",
+    [
+        pytest.param("tvf", marks=pytest.mark.slow),
+        pytest.param("syngs", marks=pytest.mark.slow),
+        pytest.param("syn", marks=pytest.mark.slow),
+        "greedy",
+    ],
+)
 def test_determinant_agrees_with_finite_differences_where_smooth(method, pair):
     fi, mi = pair
     r = _run(method, fi, mi)
@@ -46,7 +54,7 @@ def test_determinant_agrees_with_finite_differences_where_smooth(method, pair):
 
 def test_method_is_detected_and_validated(pair):
     fi, mi = pair
-    r = _run("tvf", fi, mi)
+    r = syntx.tvf(fixed=fi, moving=mi, initial_transform="identity", reg_iterations=[1], n_time_steps=2, device="cpu", verbose=False)
     assert syntx.liouville_determinant(r, fi, return_details=True)[1]["method"] == "tvf"
     with pytest.raises(ValueError, match="method must be one of"):
         syntx.liouville_determinant(r, fi, method="ants")

@@ -10,15 +10,13 @@ import ants
 import torch
 
 from syntx.robust_affine import robust_affine
+from tests.conftest import get_cached_procedural_brain_array
 
 DEV = "mps" if torch.backends.mps.is_available() else "cpu"
 
 
 def _phantom3d():
-    import siq
-    from scipy.ndimage import gaussian_filter
-    np.random.seed(1234)
-    arr = gaussian_filter(siq.simulate_brain_procedural((96, 104, 88)).numpy().astype(np.float32), 1.0)
+    arr = get_cached_procedural_brain_array((96, 104, 88), seed=1234, sigma=1.0)
     return ants.from_numpy(arr, origin=(-40.0, -55.0, -30.0), spacing=(1.0, 1.0, 1.0), direction=np.diag([1.0, -1.0, 1.0]))
 
 
@@ -44,6 +42,7 @@ def _tre(fwd_mat, fixed, A, t, ctr):
     return float(np.linalg.norm(pred - truth, axis=1).mean())
 
 
+@pytest.mark.slow
 def test_recover_known_affine_3d():
     fixed = _phantom3d()
     a1, a2 = np.deg2rad(7.0), np.deg2rad(-4.0)
@@ -57,6 +56,7 @@ def test_recover_known_affine_3d():
         assert tre < 0.75, f"preset {preset}: mean TRE {tre:.2f} mm"
 
 
+@pytest.mark.slow
 def test_initial_transform_is_used_as_candidate_3d():
     """A 60-degree yaw is outside the +-24 degree cone search; a correct initial transform must rescue it."""
     fixed = _phantom3d()

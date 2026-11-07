@@ -66,6 +66,7 @@ def test_mbhard_display_consistency(ds):
             assert sl[view].shape == (spec["n_v"], spec["n_u"])
 
 
+@pytest.mark.slow
 def test_mbhard_keypoints_inside_brain(ds):
     for im in (ds["fixed"], ds["moving"]):
         kp = detect_blobs_dog(im, max_keypoints=64, preprocess=False)
@@ -75,6 +76,7 @@ def test_mbhard_keypoints_inside_brain(ds):
         assert (im.numpy()[tuple(idx.T)] > 0).all()
 
 
+@pytest.mark.slow
 def test_mbhard_sift3d_matches_are_anatomically_plausible(ds):
     fi, mi = ds["fixed"], ds["moving"]
     cf, df = detect_sift3d(fi, max_keypoints=200, preprocess=False)

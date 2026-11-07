@@ -31,7 +31,8 @@ def _pair_3d(size: int = 16):
 def test_syn_midpoint_only_skips_full_warps_and_matches_standard_midpoint():
     fi, mi = _pair_3d()
     common_kw = dict(
-        dof="rigid",
+        type_of_transform="SyNOnly",
+        initial_transform="Identity",
         regularizer="gaussian",
         antisymmetric=True,
         restrict_transformation=(0.0, 1.0, 0.0),

@@ -125,6 +125,7 @@ class TestChallengerAutogradPhysicalScaling:
 # Challenge 2: Topological Regularity & Grid Folding Bounds (det(J) <= 0)
 # ==============================================================================
 
+@pytest.mark.slow
 class TestChallengerDeformationRegularity:
     """Stress-tests deformation regularity under high-shear and complex non-linear registration."""
 
@@ -156,6 +157,8 @@ class TestChallengerDeformationRegularity:
             fixed=fixed_img,
             moving=moving_img,
             type_of_transform='SyNOnly',
+            initial_transform='identity',
+            device='cpu',
             reg_iterations=[10, 5],
             grad_step=0.2,
             flow_sigma=2.0,
@@ -201,6 +204,8 @@ class TestChallengerDeformationRegularity:
             fixed=fixed_img,
             moving=moving_img,
             type_of_transform='SyNOnly',
+            initial_transform='identity',
+            device='cpu',
             reg_iterations=[12, 6],
             grad_step=0.2,
             flow_sigma=2.5,

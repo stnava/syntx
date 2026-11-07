@@ -49,7 +49,7 @@ test:
 test-fast: test
 
 test-slow:
-	CUDA_VISIBLE_DEVICES="" PYTORCH_ENABLE_MPS_FALLBACK=1 $(PYTEST) -m "slow" -v
+	CUDA_VISIBLE_DEVICES="" PYTORCH_ENABLE_MPS_FALLBACK=1 $(PYTEST) --runslow -m "slow" -v
 
 test-all: test-strict
 
@@ -57,7 +57,7 @@ test-cov:
 	CUDA_VISIBLE_DEVICES="" PYTORCH_ENABLE_MPS_FALLBACK=1 $(PYTEST) -m "not slow" --cov=syntx --cov-report=term-missing
 
 test-strict:
-	CUDA_VISIBLE_DEVICES="" PYTORCH_ENABLE_MPS_FALLBACK=1 $(PYTEST) -v
+	CUDA_VISIBLE_DEVICES="" PYTORCH_ENABLE_MPS_FALLBACK=1 $(PYTEST) --runslow -v
 
 lint:
 	$(RUFF) check $(PKG) tests

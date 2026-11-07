@@ -21,6 +21,7 @@ def _linear_tx(paths):
     return out
 
 
+@pytest.mark.slow
 def test_syngs_jax_backend_runs():
     import syntx
     f, m = _pair()
@@ -28,6 +29,7 @@ def test_syngs_jax_backend_runs():
     assert np.isfinite(r["warpedmovout"].numpy()).all()
 
 
+@pytest.mark.slow
 def test_syn_jax_synonly_does_not_optimise_an_affine():
     """SyNOnly: the JAX fit must not run its own affine stage, so its linear transform is the
     same (centre-of-mass) one PyTorch exports."""
@@ -58,6 +60,7 @@ def test_get_affine_matrix_jax_respects_transform_type():
         get_affine_matrix_jax(p, 2, 'SyN')
 
 
+@pytest.mark.slow
 @pytest.mark.parametrize("weights", [[0.5, 0.5], [[1.0, 0.0], [0.5, 0.5]]])
 def test_syn_jax_multichannel_metrics(weights):
     """Two channels / two metrics (flat or per-level weights) run on the JAX backend (crashed in
@@ -79,6 +82,7 @@ def test_syn_jax_analytic_gradients_need_one_channel():
                   use_analytical_gradients=True)
 
 
+@pytest.mark.slow
 def test_syn_jax_divergence_retry_reruns_with_halved_step(capsys):
     """A metric whose value is MSE but whose gradient ascends it makes every level diverge: the
     level is rerun up to twice, each time from the checkpoint with half the CFL step."""
@@ -159,7 +163,16 @@ def test_jax_velocity_integration_matches_torch(physical, solver):
         integrate_time_varying_velocity_field_jax([jnp.array(x) for x in v], mode='bwd', **geo)
 
 
-@pytest.mark.parametrize("opt", ["cfl", "sgd", "adam", "rprop"])
+@pytest.mark.slow
+@pytest.mark.parametrize(
+    "opt",
+    [
+        "cfl",
+        "sgd",
+        "adam",
+        "rprop",
+    ],
+)
 def test_syn_jax_optimizers_run(opt):
     import jax.numpy as jnp
     from syntx.syn_jax import SyNTo
@@ -182,6 +195,7 @@ def test_syn_jax_constructor_fails_loudly():
         SyNTo(dim=2, grid_shape=(8, 8), transform_type='SyN')
 
 
+@pytest.mark.slow
 def test_syn_jax_lbfgs_inverts_on_the_fixed_grid(monkeypatch):
     """Both half fields live on the fixed (midpoint) grid: the L-BFGS objective inverted the r2l
     field with the MOVING geometry."""
@@ -204,6 +218,20 @@ def test_syn_jax_lbfgs_inverts_on_the_fixed_grid(monkeypatch):
     assert seen and all(sp in ((1.0, 1.0), ()) for sp in seen), sorted(set(seen))
 
 
+def test_jax_soft_dice_loss_unit_matches_torch():
+    import torch
+    import jax.numpy as jnp
+    from syntx.syn_jax import soft_dice_loss_nd_jax
+    from syntx.core.losses import soft_dice_loss_nd
+    rng = np.random.default_rng(0)
+    a, b = (rng.random((1, 2, 9, 11)).astype('float32') for _ in range(2))
+    msk = (rng.random((1, 1, 9, 11)) > 0.3).astype('float32')
+    vj = float(soft_dice_loss_nd_jax(jnp.array(a), jnp.array(b), jnp.array(msk)))
+    vt = float(soft_dice_loss_nd(torch.tensor(a), torch.tensor(b), mask=torch.tensor(msk)))
+    assert abs(vj - vt) < 1e-6
+
+
+@pytest.mark.slow
 def test_jax_soft_dice_matches_torch_and_registers():
     import torch
     import jax
@@ -339,6 +367,7 @@ def test_jax_green_operators_match_torch_with_anisotropic_spacing(op):
 
 
 
+@pytest.mark.slow
 def test_syngs_jax_fails_loudly_for_what_it_does_not_implement():
     import syntx
     f, m = _pair()
@@ -390,6 +419,7 @@ def test_level_spacing_itk_pairs_reversed_shapes():
     assert level_spacing_itk([1.0, 2.0], (11, 21), (6, 11)) == [1.0 * 20 / 10, 2.0 * 10 / 5]
 
 
+@pytest.mark.slow
 def test_syngs_jax_nonsymmetric_inverse_is_minus_v0(monkeypatch):
     """Not symmetric: the loss must shoot the inverse from -v0 (fit passed +v0)."""
     import jax
@@ -441,6 +471,7 @@ def test_tvf_jax_green_operators_match_torch_with_anisotropic_spacing(op):
     np.testing.assert_allclose(np.asarray(vj), vt.numpy(), atol=1e-4)
 
 
+@pytest.mark.slow
 def test_tvf_jax_metric_and_fail_loud():
     import syntx
     import jax.numpy as jnp
@@ -467,6 +498,7 @@ def test_tvf_jax_metric_and_fail_loud():
                 affine_epochs=0, max_step_norm=1.0)
 
 
+@pytest.mark.slow
 def test_tvf_registration_jax_is_syntx_tvf_jax():
     import syntx
     from syntx.tvf_jax import tvf_registration_jax
@@ -479,6 +511,7 @@ def test_tvf_registration_jax_is_syntx_tvf_jax():
         tvf_registration_jax(f, m, reg_iterations=[2], affine_iterations=10)
 
 
+@pytest.mark.slow
 def test_tvf_jax_convergence_loss_uses_training_settings(monkeypatch):
     import jax.numpy as jnp
     from syntx.tvf_jax import TVFModelJAX
@@ -526,6 +559,7 @@ def test_jax_image_gradient_no_wraparound_matches_torch():
     np.testing.assert_allclose(g_j, g_t, atol=1e-6)
 
 
+@pytest.mark.slow
 def test_syngs_jax_gradient_at_zero_velocity_is_finite_and_fit_moves_the_field():
     """Regression: ``jnp.linalg.norm`` in ``shoot`` has a NaN gradient at v = 0 (the initial velocity), so every gradient was NaN,
     the CFL guard ``max > 1e-8`` was False and ``fit`` left ``velocity_0_fwd`` exactly 0. The CFL momentum (carried across

@@ -141,6 +141,7 @@ class TestRobustAffineConvergence:
         assert np.max(np.abs(out[0] - out[1])) < 0.2, out
 
 
+@pytest.mark.slow
 class TestMotionCorrectionReportsConvergence:
     def test_result_carries_per_frame_convergence(self):
         base = _texture(n=32)
@@ -226,41 +227,48 @@ def _check_record(conv, n_levels):
 
 class TestEveryDeformableMethodReportsTheSameRecord:
     def test_greedy(self):
-        res = syntx.greedy_registration(_blob2d(), _blob2d((1.5, -1.0)), reg_iterations=[40, 40], scales=[2, 1], device="cpu",
+        res = syntx.greedy_registration(_blob2d(), _blob2d((1.5, -1.0)), reg_iterations=[12, 8], scales=[2, 1], device="cpu",
                                         initial_transform="identity", verbose=False)
         _check_record(res["convergence"], 2)
         loose = syntx.greedy_registration(_blob2d(), _blob2d((1.5, -1.0)), reg_iterations=[100], scales=[1], device="cpu",
                                           initial_transform="identity", verbose=False, convergence_slope=1.0)
         assert loose["convergence"]["levels"][0]["converged"] and loose["convergence"]["levels"][0]["iterations"] < 100
-        off = syntx.greedy_registration(_blob2d(), _blob2d((1.5, -1.0)), reg_iterations=[30], scales=[1], device="cpu",
+        off = syntx.greedy_registration(_blob2d(), _blob2d((1.5, -1.0)), reg_iterations=[10], scales=[1], device="cpu",
                                         initial_transform="identity", verbose=False, convergence_slope=None)
-        assert off["convergence"]["levels"][0]["iterations"] == 30 and off["convergence"]["capped_levels"] == [0]
+        assert off["convergence"]["levels"][0]["iterations"] == 10 and off["convergence"]["capped_levels"] == [0]
 
     def test_syn(self):
-        res = syntx.registration(_blob2d(), _blob2d((1.5, -1.0)), type_of_transform="SyN", reg_iterations=[30, 20], device="cpu", verbose=False)
+        res = syntx.registration(_blob2d(), _blob2d((1.5, -1.0)), type_of_transform="SyN", reg_iterations=[12, 8],
+                                 initial_transform="identity", device="cpu", verbose=False)
         _check_record(res["convergence"], 2)
 
     def test_tvf(self):
-        res = syntx.tvf(_blob2d(), _blob2d((1.5, -1.0)), reg_iterations=[30, 20], device="cpu", verbose=False)
+        res = syntx.tvf(_blob2d(), _blob2d((1.5, -1.0)), reg_iterations=[12, 8],
+                        initial_transform="identity", device="cpu", verbose=False)
         _check_record(res["convergence"], 2)
 
     def test_syngs(self):
-        res = syntx.syngs(_blob2d(), _blob2d((1.5, -1.0)), reg_iterations=[30, 20], device="cpu", verbose=False)
+        res = syntx.syngs(_blob2d(), _blob2d((1.5, -1.0)), reg_iterations=[12, 8],
+                          initial_transform="identity", device="cpu", verbose=False)
         _check_record(res["convergence"], 2)
 
 
+@pytest.mark.slow
 class TestJaxBackendsReportTheSameRecord:
     def test_syn_jax(self):
         pytest.importorskip("jax")
-        res = syntx.registration(_blob2d(), _blob2d((1.5, -1.0)), type_of_transform="SyN", reg_iterations=[30, 20], backend="jax", verbose=False)
+        res = syntx.registration(_blob2d(), _blob2d((1.5, -1.0)), type_of_transform="SyN", reg_iterations=[30, 20],
+                                 initial_transform="identity", backend="jax", verbose=False)
         _check_record(res["convergence"], 2)
 
     def test_tvf_jax(self):
         pytest.importorskip("jax")
-        res = syntx.tvf(_blob2d(), _blob2d((1.5, -1.0)), reg_iterations=[30, 20], backend="jax", regularizer="gaussian", verbose=False)
+        res = syntx.tvf(_blob2d(), _blob2d((1.5, -1.0)), reg_iterations=[30, 20],
+                        initial_transform="identity", backend="jax", regularizer="gaussian", verbose=False)
         _check_record(res["convergence"], 2)
 
     def test_syngs_jax(self):
         pytest.importorskip("jax")
-        res = syntx.syngs(_blob2d(), _blob2d((1.5, -1.0)), reg_iterations=[30, 20], backend="jax", optimizer="cfl", verbose=False)
+        res = syntx.syngs(_blob2d(), _blob2d((1.5, -1.0)), reg_iterations=[30, 20],
+                          initial_transform="identity", backend="jax", optimizer="cfl", verbose=False)
         _check_record(res["convergence"], 2)

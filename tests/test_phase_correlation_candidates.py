@@ -101,7 +101,7 @@ class TestPhaseCorrelationCandidates:
         fixed = _synthetic_blob_image()
         moving = _translate_image(fixed, np.array([4.0, -3.0, 2.0]))
         result = robust_affine(fixed=fixed, moving=moving, mode='auto',
-                                dof='rigid', verbose=False)
+                                dof='rigid', device='cpu', preset='fast', verbose=False)
         assert 'fwdtransforms' in result and len(result['fwdtransforms']) == 1
         tx = ants.read_transform(result['fwdtransforms'][0])
         params = np.array(tx.parameters)
@@ -109,6 +109,7 @@ class TestPhaseCorrelationCandidates:
         assert np.isclose(np.linalg.det(A), 1.0, atol=1e-4), \
             "dof='rigid' must keep det(A) == 1 regardless of candidate source"
 
+    @pytest.mark.slow
     def test_large_translation_recovered(self):
         """The motivating case: a translation large enough to meaningfully stress
         CoM-based initialization should still be recovered via the phase-correlation
@@ -161,6 +162,7 @@ class TestPhaseCorrelationDifferentlyShapedImages:
             assert np.asarray(c).shape == (3,)
             assert np.all(np.isfinite(c))
 
+    @pytest.mark.slow
     def test_differently_shaped_images_registration_is_reproducible(self):
         """The actual symptom that surfaced this bug: cross-process non-determinism in
         the final registered transform, caused by the degraded candidate pool."""
@@ -178,6 +180,7 @@ class TestPhaseCorrelationDifferentlyShapedImages:
             "regression of the differently-shaped-images fix"
         )
 
+    @pytest.mark.slow
     def test_differently_shaped_images_dof_rigid_still_gives_det_one(self):
         fixed = _synthetic_blob_image(shape=(64, 64, 24), spacing=(1.875, 1.875, 4.0))
         moving = _synthetic_blob_image(shape=(96, 112, 128), spacing=(1.0, 1.0, 1.0))

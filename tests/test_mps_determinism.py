@@ -137,6 +137,7 @@ def _r16_r64():
     return ants.image_read(ants.get_ants_data("r16")), ants.image_read(ants.get_ants_data("r64"))
 
 
+@pytest.mark.slow
 @needs_mps
 def test_syngs_repeats_exactly_on_mps():
     fi, mi = _r16_r64()
@@ -147,6 +148,7 @@ def test_syngs_repeats_exactly_on_mps():
     assert np.array_equal(outs[0], outs[1])
 
 
+@pytest.mark.slow
 @needs_mps
 def test_tvf_repeats_exactly_on_mps():
     fi, mi = _r16_r64()

@@ -80,6 +80,7 @@ def test_create_registration_report_2d(temp_report_dir):
     assert report["provenance"]["fit_time"] == 1.25
 
 
+@pytest.mark.slow
 def test_create_registration_report_3d_ants(temp_report_dir):
     fi_arr = np.zeros((30, 30, 30), dtype=np.float32)
     fi_arr[10:20, 10:20, 10:20] = 1.0
@@ -134,7 +135,7 @@ def test_engine_provided_provenance(temp_report_dir):
     fi = ants.from_numpy(np.pad(np.ones((20, 20), dtype=np.float32), 5))
     mi = ants.from_numpy(np.pad(np.ones((20, 20), dtype=np.float32), 5))
 
-    reg = syntx.syn(fixed=fi, moving=mi, reg_iterations=[5, 2], backend='pytorch')
+    reg = syntx.syn(fixed=fi, moving=mi, initial_transform="identity", device="cpu", reg_iterations=[1], backend='pytorch')
 
     assert "provenance" in reg
     assert reg["provenance"]["algorithm"] == "syntx.syn"

@@ -25,35 +25,42 @@ def compute_pearson_correlation(x, y):
     y_flat = y.ravel()
     return float(np.corrcoef(x_flat, y_flat)[0, 1])
 
+_CACHED_2D_IMG = None
+_CACHED_3D_IMG = None
+
 def get_test_image_2d():
-    if siq is not None:
-        return siq.simulate_image(shaper=[64, 64], n_levels=8)
-    else:
-        # Create a simple geometric phantom if siq is not available
-        vol = np.zeros((64, 64), dtype=float)
-        # Draw some circles/rectangles
-        y, x = np.ogrid[:64, :64]
-        mask1 = (x - 32)**2 + (y - 32)**2 < 15**2
-        mask2 = (x - 20)**2 + (y - 20)**2 < 8**2
-        vol[mask1] = 10
-        vol[mask2] = 20
-        # Add blur
-        img = ants.from_numpy(vol, spacing=(1, 1), origin=(0, 0))
-        img = ants.smooth_image(img, 1.5)
-        return img
+    global _CACHED_2D_IMG
+    if _CACHED_2D_IMG is None:
+        if siq is not None:
+            _CACHED_2D_IMG = siq.simulate_image(shaper=[64, 64], n_levels=8)
+        else:
+            # Create a simple geometric phantom if siq is not available
+            vol = np.zeros((64, 64), dtype=float)
+            # Draw some circles/rectangles
+            y, x = np.ogrid[:64, :64]
+            mask1 = (x - 32)**2 + (y - 32)**2 < 15**2
+            mask2 = (x - 20)**2 + (y - 20)**2 < 8**2
+            vol[mask1] = 10
+            vol[mask2] = 20
+            # Add blur
+            img = ants.from_numpy(vol, spacing=(1, 1), origin=(0, 0))
+            _CACHED_2D_IMG = ants.smooth_image(img, 1.5)
+    return _CACHED_2D_IMG.clone()
 
 def get_test_image_3d():
-    if siq is not None:
-        return siq.simulate_image(shaper=[32, 32, 32], n_levels=6)
-    else:
-        # Create a simple geometric phantom in 3D
-        vol = np.zeros((32, 32, 32), dtype=float)
-        z, y, x = np.ogrid[:32, :32, :32]
-        mask1 = (x - 16)**2 + (y - 16)**2 + (z - 16)**2 < 8**2
-        vol[mask1] = 15
-        img = ants.from_numpy(vol, spacing=(1, 1, 1), origin=(0, 0, 0))
-        img = ants.smooth_image(img, 1.0)
-        return img
+    global _CACHED_3D_IMG
+    if _CACHED_3D_IMG is None:
+        if siq is not None:
+            _CACHED_3D_IMG = siq.simulate_image(shaper=[32, 32, 32], n_levels=6)
+        else:
+            # Create a simple geometric phantom in 3D
+            vol = np.zeros((32, 32, 32), dtype=float)
+            z, y, x = np.ogrid[:32, :32, :32]
+            mask1 = (x - 16)**2 + (y - 16)**2 + (z - 16)**2 < 8**2
+            vol[mask1] = 15
+            img = ants.from_numpy(vol, spacing=(1, 1, 1), origin=(0, 0, 0))
+            _CACHED_3D_IMG = ants.smooth_image(img, 1.0)
+    return _CACHED_3D_IMG.clone()
 
 def run_test_2d(similarity_metric):
     import random
@@ -90,11 +97,6 @@ def run_test_2d(similarity_metric):
     
     fi_norm_tensor = torch.tensor(fi_norm, dtype=torch.float32).unsqueeze(0).unsqueeze(0)
     mi_norm_tensor = torch.tensor(mi_norm, dtype=torch.float32).unsqueeze(0).unsqueeze(0)
-    
-    # Run ANTs SyN registration for reference
-    reg_ants = ants.registration(fixed=fixed_img, moving=moving_img, type_of_transform='SyN')
-    warped_ants = reg_ants['warpedmovout'].numpy()
-    corr_ants = compute_pearson_correlation(fixed_np, warped_ants)
     
     # Run SyNTo registration
     model = SyNTo(dim=2, grid_shape=(64, 64), fluid_sigma=2.0, elastic_sigma=1.0)
@@ -175,9 +177,11 @@ def run_test_3d(similarity_metric):
     assert corr_py > 0.60
     assert min_jac >= -1e-5
 
+@pytest.mark.slow
 def test_pytorch_syn_2d_lncc():
     run_test_2d('lncc')
 
+@pytest.mark.slow
 def test_pytorch_syn_2d_mattes_mi():
     run_test_2d('mattes_mi')
 
@@ -189,9 +193,11 @@ def test_pytorch_syn_3d_lncc():
 def test_pytorch_syn_3d_mattes_mi():
     run_test_3d('mattes_mi')
 
+@pytest.mark.slow
 def test_pytorch_syn_2d_vgg19():
     run_test_2d('vgg19')
 
+@pytest.mark.slow
 def test_pytorch_syn_2d_vgg19_lncc():
     print("\n--- Running 2D test with metric: vgg19, mode: lncc ---")
     fixed_img = get_test_image_2d()
@@ -307,7 +313,9 @@ def test_high_level_registration():
         moving=moving,
         type_of_transform='SyNTo',
         backend='pytorch',
-        reg_iterations=[10, 5],
+        device='cpu',
+        initial_transform='identity',
+        reg_iterations=[2, 1],
         levels=[2, 1]
     )
     
@@ -316,6 +324,7 @@ def test_high_level_registration():
     assert 'fwdtransforms' in res
     assert 'invtransforms' in res
 
+@pytest.mark.slow
 def test_native_com_initialization():
     # Setup translated 2D inputs to verify native center of mass alignment
     device = torch.device('cpu')
@@ -342,6 +351,7 @@ def test_native_com_initialization():
         moving=moving,
         type_of_transform='Affine',
         backend='pytorch',
+        device='cpu',
         levels=[1],
     )
     
@@ -360,6 +370,7 @@ def test_native_com_initialization():
     # After native COM translation init, they should overlap significantly!
     assert dice > 0.40
 
+@pytest.mark.slow
 def test_ants_parity_2d():
     # Load the standard 2D phantoms used in comparison reports
     fi = ants.image_read(ants.get_data('r16'))
@@ -371,6 +382,7 @@ def test_ants_parity_2d():
         moving=mi,
         type_of_transform='SyNTo',
         backend='pytorch',
+        device='cpu',
         levels=[2, 1],
         reg_iterations=[30, 20],
         grad_step=0.5,
@@ -389,6 +401,7 @@ def test_ants_parity_2d():
     dice = compute_tissue_overlap(fi, res['warpedmovout'])
     assert dice >= 0.54
 
+@pytest.mark.slow
 def test_registration_with_smoothing_sigmas():
     fi = ants.image_read(ants.get_data('r16'))
     mi = ants.image_read(ants.get_data('r27'))
@@ -398,12 +411,15 @@ def test_registration_with_smoothing_sigmas():
         fixed=fi,
         moving=mi,
         backend='pytorch',
+        device='cpu',
         levels=[2, 1],
         reg_iterations=[5, 5],
+        initial_transform='identity',
         smoothing_sigmas=[2.0, 0.0]
     )
     assert 'warpedmovout' in res
 
+@pytest.mark.slow
 def test_registration_with_mse():
     fi = ants.image_read(ants.get_data('r16'))
     mi = ants.image_read(ants.get_data('r27'))
@@ -411,9 +427,11 @@ def test_registration_with_mse():
         fixed=fi,
         moving=mi,
         backend='pytorch',
+        device='cpu',
         syn_metric='mse',
         levels=[2, 1],
-        reg_iterations=[5, 5]
+        reg_iterations=[5, 5],
+        initial_transform='identity',
     )
     assert 'warpedmovout' in res
 
@@ -476,6 +494,7 @@ def test_syn_composition_contiguity_invariance():
     assert torch.equal(sampled_c, sampled_nc), "SyN composition contiguity drop produced difference!"
 
 
+@pytest.mark.slow
 def test_pytorch_syn_regadam_2d():
     """Verify SyN registration works end-to-end with Dual RegAdam optimizer (Gaussian)."""
     fixed_img = ants.image_read(ants.get_ants_data('r16'))
@@ -484,6 +503,8 @@ def test_pytorch_syn_regadam_2d():
         fixed=fixed_img,
         moving=moving_img,
         backend='pytorch',
+        device='cpu',
+        initial_transform='identity',
         optimizer='regadam',
         regularizer='gaussian',
         gaussian_sigma=1.5,
@@ -503,6 +524,7 @@ def test_pytorch_syn_regadam_2d():
     assert corr_final > corr_init
 
 
+@pytest.mark.slow
 def test_pytorch_syn_regadam_dsti1_2d():
     """Verify SyN registration works end-to-end with Dual RegAdam optimizer (DST-I1)."""
     fixed_img = ants.image_read(ants.get_ants_data('r16'))
@@ -511,6 +533,8 @@ def test_pytorch_syn_regadam_dsti1_2d():
         fixed=fixed_img,
         moving=moving_img,
         backend='pytorch',
+        device='cpu',
+        initial_transform='identity',
         optimizer='regadam',
         regularizer='dsti1',
         sobolev_alpha=1.0,

@@ -183,7 +183,7 @@ def test_syn_moving_image_has_its_own_level_grid_and_spacing():
 def test_tvf_level_spacing_is_the_actual_velocity_grid_spacing():
     """tvf normalised the CFL step with ``sp * level`` while the velocity grid has spacing ``sp (N - 1) / (n - 1)``."""
     from syntx.tvf import TVFModel
-    shape = (48, 48, 48); sp = [1.0, 1.0, 1.0]
+    shape = (24, 24, 24); sp = [1.0, 1.0, 1.0]
     f, m = _syn_pair(shape)
     model = TVFModel(dim=3, image_shape=shape, velocity_shape=shape, spacing=sp, moving_shape=shape, moving_spacing=sp)
     model.fit(f, m, levels=[4, 2, 1], epochs_per_level=[1, 1, 1])
@@ -274,6 +274,7 @@ def test_resize_velocity_jax_is_align_corners_not_half_pixel():
     assert float(jnp.abs(half[3, 3] - expect).max()) > 0.4                           # the old convention is off by ~0.5 voxel at the ends
 
 
+@pytest.mark.slow
 def test_syn_jax_moving_image_has_its_own_level_grid():
     pytest.importorskip("jax")
     from syntx.syn_jax import SyNTo as SyNToJax
@@ -286,6 +287,7 @@ def test_syn_jax_moving_image_has_its_own_level_grid():
     assert model.pyramid_info[0]['moving_shape'] != model.pyramid_info[0]['fixed_shape']       # was resampled onto the FIXED level grid
 
 
+@pytest.mark.slow
 @pytest.mark.parametrize("which", ["syngs", "tvf"])
 def test_jax_models_build_level_images_through_the_central_pyramid(which, monkeypatch):
     pytest.importorskip("jax")

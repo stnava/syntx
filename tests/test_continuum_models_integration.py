@@ -57,6 +57,7 @@ def test_syn_with_continuum_regularizers(phantom_pair_2d, reg_name):
         'scales': [2, 1],
         'regularizer': reg_name,
         'initial_transform': 'identity',
+        'device': 'cpu',
         'verbose': False,
     }
     if reg_name == 'masked_incompressible':
@@ -88,6 +89,7 @@ def test_syngs_with_continuum_regularizers(phantom_pair_2d, reg_name):
         n_steps=2,
         regularizer=reg_name,
         initial_transform='identity',
+        device='cpu',
         verbose=False,
     )
     assert 'warpedmovout' in res
@@ -114,6 +116,7 @@ def test_tvf_with_continuum_regularizers(phantom_pair_2d, reg_name):
         n_time_steps=2,
         regularizer=reg_name,
         initial_transform='identity',
+        device='cpu',
         verbose=False,
     )
     assert 'warpedmovout' in res
@@ -140,6 +143,7 @@ def test_greedy_with_continuum_regularizers(phantom_pair_2d, reg_name):
         scales=[2, 1],
         regularizer=reg_name,
         initial_transform='identity',
+        device='cpu',
         fixed_mask=mask if reg_name == 'poroelastic' else None,
         verbose=False,
     )

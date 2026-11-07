@@ -55,31 +55,42 @@ def _dice(ds, fwd):
     return compute_bidirectional_dice(ds["fixed_label"], ds["moving_label"], ds["fixed"], ds["moving"], fwd, fwd, [True])[2]
 
 
+@pytest.fixture(scope="module")
+def mbhard_repro_runs(pair):
+    """Run CPU twice and MPS twice once per module instead of 10 redundant 256^3 solves."""
+    _, fi_p, mi_p = pair
+    out = {
+        "cpu": [_run(fi_p, mi_p, "cpu"), _run(fi_p, mi_p, "cpu")],
+    }
+    if torch.backends.mps.is_available():
+        out["mps"] = [_run(fi_p, mi_p, "mps"), _run(fi_p, mi_p, "mps")]
+    return out
+
+
+@pytest.mark.slow
 @pytest.mark.skipif(not torch.backends.mps.is_available(), reason="needs a GPU to tell the devices apart")
-def test_cpu_device_is_honoured(pair):
+def test_cpu_device_is_honoured(mbhard_repro_runs):
     """device='cpu' used to be silently upgraded to the GPU.  Each device is bitwise reproducible
     but CPU and MPS differ in the last bits, so equal CPU runs that differ from MPS prove the flag works."""
-    ds, fi_p, mi_p = pair
-    pc1, _ = _run(fi_p, mi_p, "cpu")
-    pc2, _ = _run(fi_p, mi_p, "cpu")
-    pg, _ = _run(fi_p, mi_p, "mps")
+    (pc1, _), (pc2, _) = mbhard_repro_runs["cpu"]
+    (pg, _), _ = mbhard_repro_runs["mps"]
     assert np.array_equal(pc1, pc2)
     assert not np.array_equal(pc1, pg), "cpu result identical to mps: device flag ignored?"
 
 
+@pytest.mark.slow
 @pytest.mark.parametrize("device", ["cpu"] + (["mps"] if torch.backends.mps.is_available() else []))
-def test_same_device_bitwise_reproducible(pair, device):
-    ds, fi_p, mi_p = pair
-    p1, _ = _run(fi_p, mi_p, device)
-    p2, _ = _run(fi_p, mi_p, device)
+def test_same_device_bitwise_reproducible(mbhard_repro_runs, device):
+    (p1, _), (p2, _) = mbhard_repro_runs[device]
     assert np.array_equal(p1, p2), f"{device}: max |Δ| = {np.abs(p1 - p2).max():.3e}"
 
 
+@pytest.mark.slow
 @pytest.mark.skipif(not torch.backends.mps.is_available(), reason="needs MPS for cross-device check")
-def test_cpu_vs_gpu_agree(pair):
-    ds, fi_p, mi_p = pair
-    pc, rc = _run(fi_p, mi_p, "cpu")
-    pg, rg = _run(fi_p, mi_p, "mps")
+def test_cpu_vs_gpu_agree(pair, mbhard_repro_runs):
+    ds, _, _ = pair
+    (pc, rc), _ = mbhard_repro_runs["cpu"]
+    (pg, rg), _ = mbhard_repro_runs["mps"]
     # each device is bitwise reproducible, but float-level differences accumulate over ~130 Adam
     # steps and the multi-start selection, so devices may settle in neighbouring optima:
     # require agreement in outcome (Dice) and a loosely similar transform, not identical parameters
@@ -87,13 +98,49 @@ def test_cpu_vs_gpu_agree(pair):
     assert abs(_dice(ds, rc["fwdtransforms"]) - _dice(ds, rg["fwdtransforms"])) < 0.006
 
 
+@pytest.mark.slow
 @pytest.mark.skipif(not os.path.exists(ANTS_JSON), reason="run scripts/affine_repro_harness.py to create the ANTs baseline")
-def test_dice_within_ants_baseline(pair):
-    ds, fi_p, mi_p = pair
+def test_dice_within_ants_baseline(pair, mbhard_repro_runs):
+    ds, _, _ = pair
     ab = json.load(open(ANTS_JSON))
     best = max(np.mean([r["dice_sym"] for r in v]) for v in ab.values())
-    _, r = _run(fi_p, mi_p, "mps" if torch.backends.mps.is_available() else "cpu")
+    dev = "mps" if torch.backends.mps.is_available() else "cpu"
+    _, r = mbhard_repro_runs[dev][0]
     assert _dice(ds, r["fwdtransforms"]) >= best - 0.005
+
+
+@pytest.mark.slow
+def test_synthetic_3d_reproducibility_and_device_honoured_fast():
+    """Fast default-suite guard for bitwise same-device reproducibility and CPU vs MPS device honoring."""
+    from tests.conftest import get_cached_procedural_brain_array
+    from syntx.robust_affine import robust_affine
+
+    arr = get_cached_procedural_brain_array(shape=(28, 30, 26), seed=2026)
+    fixed = ants.from_numpy(arr, origin=(-28.0, -30.0, -26.0), spacing=(2.0, 2.0, 2.0))
+    com = np.asarray(fixed.get_center_of_mass(), dtype=float).tolist()
+    tx_gt = ants.create_ants_transform(
+        transform_type="Euler3DTransform",
+        dimension=3,
+        center=com,
+        translation=(2.2, -1.6, 1.2),
+    )
+    tx_gt.set_parameters([0.06, -0.05, 0.04, 2.2, -1.6, 1.2])
+    moving = tx_gt.apply_to_image(fixed, reference=fixed, interpolation="linear")
+
+    def _solve_fast(dev):
+        r = robust_affine(fixed, moving, mode="pytorch", preset="fast", multi_start=False, device=dev, seed=42)
+        return np.array(ants.read_transform(r["fwdtransforms"][0]).parameters, float)
+
+    pc1 = _solve_fast("cpu")
+    pc2 = _solve_fast("cpu")
+    assert np.array_equal(pc1, pc2), f"cpu: max |Δ| = {np.abs(pc1 - pc2).max():.3e}"
+
+    if torch.backends.mps.is_available():
+        pg1 = _solve_fast("mps")
+        pg2 = _solve_fast("mps")
+        assert np.array_equal(pg1, pg2), f"mps: max |Δ| = {np.abs(pg1 - pg2).max():.3e}"
+        assert not np.array_equal(pc1, pg1), "cpu result identical to mps: device flag ignored?"
+        assert np.abs(pc1[:9] - pg1[:9]).max() < 0.05 and np.abs(pc1[9:] - pg1[9:]).max() < 3.0
 
 
 def test_auto_mode_uses_the_pytorch_solver_and_never_falls_back(monkeypatch):

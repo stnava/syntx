@@ -26,6 +26,8 @@ def test_pytorch_optimizers(optimizer_type):
         reg_iterations=[5],
         initial_transform='identity',
         backend='pytorch',
+        device='cpu',
+        in_memory=True,
         optimizer=optimizer_type,
         optimizer_lr=1e-2 if optimizer_type != "lbfgs" else 1.0
     )
@@ -34,6 +36,7 @@ def test_pytorch_optimizers(optimizer_type):
     assert 'warpedmovout' in res
     assert 'fwdtransforms' in res
 
+@pytest.mark.slow
 @pytest.mark.parametrize("optimizer_type", ["cfl", "adam", "sgd", "rprop", "lbfgs"])
 def test_jax_optimizers(optimizer_type):
     fixed_img, moving_img = get_dummy_images()

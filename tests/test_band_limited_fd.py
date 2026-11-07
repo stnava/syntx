@@ -61,6 +61,7 @@ def test_short_series_and_bad_tr():
         band_limited_fd(np.zeros((20, 3)), np.zeros((20, 3)), 0.0)
 
 
+@pytest.mark.slow
 def test_keys_attach_through_motion_correction_and_the_design_engines():
     """The 4-D time spacing is the TR; every engine's result carries ``fd_bandlimited`` and ``fd_band``."""
     import syntx

@@ -23,10 +23,11 @@ from syntx.motion_simulation import (
 )
 
 
+@pytest.mark.slow
 def test_simulation_conventions_recover_pure_head_motion():
     """No systematic noise: the plain single-reference estimate matches the true trajectory (sign, centre, gauge)."""
     sim = simulate_asl_series(16, seed=1, perfusion=0.0)
-    ev = evaluate_motion_estimate(motion_correction(sim.image, preset="bold")["fwdtransforms"], sim)
+    ev = evaluate_motion_estimate(motion_correction(sim.image, preset="bold", device="cpu")["fwdtransforms"], sim)
     assert ev["translation_rms_mm"] < 0.05
     assert ev["pose_error_mm"] < 0.25
     assert all(0.8 < r < 1.2 for r in ev["jump_recovery"])
@@ -59,11 +60,12 @@ def test_integer_state_labels_are_categorical():
     assert build_encoding_covariates(encoding_covariates=np.array([1.0, -1.0] * 8))["K_eff"] == 1
 
 
+@pytest.mark.slow
 def test_asl_tag_control_bias_removed_by_encoding_projection():
     """Contrast-driven tag/control bias: the projection on s_t brings the head error to the no-perfusion floor."""
     sim = simulate_asl_series(24, seed=0, perfusion=0.10)
-    base = evaluate_motion_estimate(motion_correction(sim.image, preset="bold")["fwdtransforms"], sim)
-    res = motion_correction(sim.image, preset="asl", encoding_covariates=sim.encoding_covariates)
+    base = evaluate_motion_estimate(motion_correction(sim.image, preset="bold", device="cpu")["fwdtransforms"], sim)
+    res = motion_correction(sim.image, preset="asl", encoding_covariates=sim.encoding_covariates, device="cpu")
     ev = evaluate_motion_estimate(res["fwdtransforms"], sim)
     assert base["translation_rms_mm"] > 0.08            # the bias is there without the projection
     assert ev["translation_rms_mm"] < 0.4 * base["translation_rms_mm"]
@@ -73,28 +75,30 @@ def test_asl_tag_control_bias_removed_by_encoding_projection():
     assert res["encoding_pose_bias_mm_rad"]["delta_Y_mm_rad"].shape == (24, 6)
 
 
+@pytest.mark.slow
 def test_slowflow_state_locked_offsets_removed_by_preset():
     """[b0, +X, +Y, +Z] with flow-encoding contrast and a state-locked eddy shift: the slowflow preset (state-matched
     references + projection on the categorical state labels) keeps the eddy shift out of the head trajectory."""
     sim = simulate_slowflow_series(6, seed=0, eddy_mm=0.4)
-    base = evaluate_motion_estimate(motion_correction(sim.image, preset="bold")["fwdtransforms"], sim)
+    base = evaluate_motion_estimate(motion_correction(sim.image, preset="bold", device="cpu")["fwdtransforms"], sim)
     ev = evaluate_motion_estimate(
-        motion_correction(sim.image, preset="slowflow", encoding_covariates=sim.state_labels)["fwdtransforms"], sim)
+        motion_correction(sim.image, preset="slowflow", encoding_covariates=sim.state_labels, device="cpu")["fwdtransforms"], sim)
     assert base["translation_rms_mm"] > 0.15
     assert ev["translation_rms_mm"] < 0.08
     assert ev["fd_error_mm"] < 0.5 * base["fd_error_mm"]
     assert all(0.75 < r < 1.3 for r in ev["jump_recovery"])
 
 
+@pytest.mark.slow
 def test_dwi_grouped_eddy_applied_and_head_motion_recovered():
     """DWI: the eddy displacement (odd in g) is modelled and applied (pe_affine), the head trajectory is recovered in
     the anchor space through the composed chain (crosses + cross-group correction + own rigid)."""
     sim = simulate_dwi_series(24, seed=0, eddy_mm_per_unit=0.6)
     bv, bvec = sim.extra["bvals"], sim.extra["bvecs"]
     res = motion_correct_grouped(sim.image, shell_groups(bv), preset="dwi", pe_affine_covariates=bvec * (bv[:, None] / 1000.0),
-                                 pe_axis=sim.pe_axis, cross_group_debias=True)
+                                 pe_axis=sim.pe_axis, cross_group_debias=True, device="cpu")
     ev = evaluate_motion_estimate(res["fwdtransforms"], sim)
-    single = evaluate_motion_estimate(motion_correction(sim.image, preset="bold")["fwdtransforms"], sim)
+    single = evaluate_motion_estimate(motion_correction(sim.image, preset="bold", device="cpu")["fwdtransforms"], sim)
     assert ev["translation_rms_mm"] < 0.12
     assert ev["translation_rms_mm"] < 0.5 * single["translation_rms_mm"]   # the single reference absorbs the eddy shift
     eddy_err = float(np.sqrt(np.mean((np.asarray(res["pe_affine"]["a"])[:, 0] - sim.eddy[:, 0]) ** 2)))
@@ -102,12 +106,13 @@ def test_dwi_grouped_eddy_applied_and_head_motion_recovered():
     assert res["cross_group_offset"] is not None
 
 
+@pytest.mark.slow
 def test_bold_respiratory_pe_shift_separated_without_touching_nodding():
     """Respiratory B0 shift along PE (real displacement): opt-in separation from the REPORTED head motion; the real
     nodding (z translation + pitch) and every rotation are left exactly as registered."""
     sim = simulate_bold_series(48, seed=0, resp_mm=0.4, nod_mm=0.5, nod_deg=0.5)
-    res0 = motion_correction(sim.image, preset="bold")
-    res1 = motion_correction(sim.image, preset="bold", pe_axis=sim.pe_axis, debias_pe_pseudomotion=True, slice_axis=2)
+    res0 = motion_correction(sim.image, preset="bold", device="cpu")
+    res1 = motion_correction(sim.image, preset="bold", pe_axis=sim.pe_axis, debias_pe_pseudomotion=True, slice_axis=2, device="cpu")
     mp0 = np.asarray(res0["motion_parameters"], dtype=float)
     mp1 = np.asarray(res1["motion_parameters"], dtype=float)
     true_pe = sim.head_pose[:, :3] @ sim.pe_axis

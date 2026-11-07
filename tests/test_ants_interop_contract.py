@@ -262,8 +262,8 @@ def _distinct_header_reg():
         fi = img((34, 28, 24), (1.1, 1.3, 1.5), (4.0, -6.0, 3.0), np.diag([1.0, -1.0, 1.0]), (0, 0, 0))
         mi = img((30, 32, 26), (1.2, 1.1, 1.4), (6.0, -4.0, 1.5), np.diag([1.0, -1.0, 1.0]), (1.0, -1.0, 0.5))
         torch.manual_seed(0)
-        reg = syntx.syn(fixed=fi, moving=mi, reg_iterations=[20, 10, 5], device="cpu",
-                        verbose=False)
+        reg = syntx.syn(fixed=fi, moving=mi, reg_iterations=[4, 2, 0],
+                        initial_transform="identity", device="cpu", verbose=False)
         _CACHE[key] = (fi, mi, reg)
     return _CACHE[key]
 

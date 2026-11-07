@@ -72,6 +72,7 @@ class TestBuildEncodingCovariates:
         np.testing.assert_allclose(cov_sf["psi"].sum(axis=1), np.ones(24), atol=1e-6)
 
 
+@pytest.mark.slow
 class TestOverlappingWindowASL:
     def test_asl_alternating_control_label_debiasing(self):
         """ASL series with alternating control/label contrast shift + smooth drift + single spike."""
@@ -105,6 +106,7 @@ class TestOverlappingWindowASL:
             template4d,
             preset="bold",
             encoding_covariates=None,
+            device="cpu",
             verbose=False,
         )
         # With overlapping-window encoding_covariates=s_t, the alternating sawtooth is removed from head motion
@@ -113,6 +115,7 @@ class TestOverlappingWindowASL:
             preset="bold",
             encoding_covariates=s_t,
             window_size=8,
+            device="cpu",
             verbose=False,
         )
 
@@ -127,6 +130,7 @@ class TestOverlappingWindowASL:
         assert res_debiased["encoding_pose_bias_mm_rad"]["delta_Y_mm_rad"].shape == (n_frames, 6)
 
 
+@pytest.mark.slow
 class TestOverlappingWindowSlowFlow:
     def test_slowflow_cycling_states_and_shared_center(self, tmp_path):
         """SlowFlow cycling [b0, +X, +Y, +Z] with CSF contrast modulation + encoding-locked shift + shared c_0."""
@@ -168,6 +172,7 @@ class TestOverlappingWindowSlowFlow:
             encoding_covariates=E_sf,
             window_size=8,
             outprefix=outprefix,
+            device="cpu",
             verbose=False,
         )
 
@@ -193,6 +198,7 @@ class TestOverlappingWindowSlowFlow:
             np.testing.assert_allclose(c, fixed_centers[0], atol=1e-5)
 
 
+@pytest.mark.slow
 class TestOverlappingWindowDWI:
     def test_dwi_multishell_grouped_overlapping_window(self):
         """Multi-shell DWI (b=0, 1000) with gradient-correlated PE shift + smooth head drift."""
@@ -231,6 +237,7 @@ class TestOverlappingWindowDWI:
             pe_affine_covariates=pe_cov,
             pe_axis=(0.0, 1.0, 0.0),
             window_size=8,
+            device="cpu",
             verbose=False,
         )
         fd_clean = np.asarray(res_dwi["fd"], dtype=np.float64)
@@ -239,6 +246,7 @@ class TestOverlappingWindowDWI:
         assert res_dwi["encoding_pose_bias_mm_rad"] is not None
 
 
+@pytest.mark.slow
 class TestOverlappingWindowBOLD:
     def test_bold_pe_respiratory_pseudomotion_separation(self):
         """BOLD EPI series with respiratory B0 oscillation along PE axis + smooth head drift + 3D head jerk."""
@@ -269,6 +277,7 @@ class TestOverlappingWindowBOLD:
             window_size=6,
             debias_pe_pseudomotion=True,
             slice_axis=2,
+            device="cpu",
             verbose=False,
         )
         fd_clean = np.asarray(res_bold["fd"], dtype=np.float64)
@@ -293,10 +302,10 @@ class TestOverlappingWindowBOLD:
                   for t in range(n_frames)]
         template4d = ants.from_numpy(np.stack([f.numpy() for f in frames], axis=-1),
                                      origin=(*base_img.origin, 0.0), spacing=(*base_img.spacing, 1.0))
-        res = motion_correction(template4d, preset="bold", pe_axis=(0.0, 1.0, 0.0), window_size=6, verbose=False)
+        res = motion_correction(template4d, preset="bold", pe_axis=(0.0, 1.0, 0.0), window_size=6, device="cpu", verbose=False)
         assert res.get("pe_pseudomotion_debias") is None and res.get("fd_raw") is None
         res_opt = motion_correction(template4d, preset="bold", pe_axis=(0.0, 1.0, 0.0), window_size=6,
-                                    debias_pe_pseudomotion=True, slice_axis=2, verbose=False)
+                                    debias_pe_pseudomotion=True, slice_axis=2, device="cpu", verbose=False)
         mp = np.asarray(res["motion_parameters"], dtype=np.float64)
         mp_opt = np.asarray(res_opt["motion_parameters"], dtype=np.float64)
         # tz (index 2) and the three rotations are identical; only ty (PE) may differ
@@ -328,7 +337,7 @@ class TestOverlappingWindowBOLD:
         )
         # default: the PE separation only; slice translation and pitch are never shrunk (real jitter alternates too)
         res_def = motion_correction(template4d, preset="bold", pe_axis=(0.0, 1.0, 0.0), window_size=8,
-                                    debias_pe_pseudomotion=True, slice_axis=2, verbose=False)
+                                    debias_pe_pseudomotion=True, slice_axis=2, device="cpu", verbose=False)
         meta_def = res_def["pe_pseudomotion_debias"]
         assert meta_def is None or meta_def["wiener_shrinkage_eta"][1:] == [0.0, 0.0]
         res_opt = motion_correction(
@@ -339,6 +348,7 @@ class TestOverlappingWindowBOLD:
             debias_pe_pseudomotion=True,
             slice_axis=2,
             debias_sagittal_nyquist=True,
+            device="cpu",
             verbose=False,
         )
         meta = res_opt["pe_pseudomotion_debias"]
@@ -350,6 +360,7 @@ class TestOverlappingWindowBOLD:
         assert float(np.mean(res_opt["fd"][1:])) < 0.40 * float(np.mean(res_opt["fd_raw"][1:]))
 
 
+@pytest.mark.slow
 class TestEncodingBiasInOptimizer:
     def test_written_pose_plus_offset_is_the_optimised_total(self, tmp_path):
         """B_win is a live optimisation variable: head (written) + E_psi . B_win reproduces the encoding-locked shift."""
@@ -365,7 +376,7 @@ class TestEncodingBiasInOptimizer:
         template4d = ants.from_numpy(np.stack([f.numpy() for f in frames], axis=-1),
                                      origin=(*base_img.origin, 0.0), spacing=(*base_img.spacing, 1.0))
         res = motion_correction(template4d, preset="asl", encoding_covariates=s_t, window_size=8,
-                                outprefix=str(tmp_path / "asl_"), verbose=False)
+                                outprefix=str(tmp_path / "asl_"), device="cpu", verbose=False)
         enc = res["encoding_pose_bias_mm_rad"]
         dY = np.asarray(enc["delta_Y_mm_rad"])
         assert dY.shape == (n_frames, 6)

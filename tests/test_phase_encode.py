@@ -418,7 +418,8 @@ def test_syn_with_resolved_restriction_confines_displacement_to_the_pe_axis_on_a
     moving = ants.from_numpy(np.roll(arr, 2, axis=1), spacing=(2.0, 2.0, 2.0), direction=D)  # shift along voxel j
     w = restrict_for_image(fixed, sidecar={"PhaseEncodingDirection": "j"})
     assert w == (1.0, 0.0, 0.0)  # voxel j is physical x on this grid
-    res = syntx.syn(fixed, moving, type_of_transform="SyNOnly", reg_iterations=[20, 10], restrict_transformation=w,
+    res = syntx.syn(fixed, moving, type_of_transform="SyNOnly", initial_transform="identity", device="cpu",
+                    reg_iterations=[8, 4], restrict_transformation=w,
                     outprefix=str(tmp_path / "pe_"), verbose=False)
     warp = next(p for p in res["fwdtransforms"] if str(p).endswith(".nii.gz"))
     f = ants.image_read(warp).numpy().reshape(-1, 3)

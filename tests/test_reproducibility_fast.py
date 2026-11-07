@@ -30,15 +30,16 @@ def create_synthetic_data_3d(shape=(24, 24, 24)):
     m = ants.from_numpy(img2, origin=(0.0, 0.0, 0.0), spacing=(1.0, 1.0, 1.0))
     return f, m
 
+@pytest.mark.slow
 def test_fast_reproducibility_2d():
     """Verify exact bitwise/float reproducibility of 2D SyN registration across consecutive runs."""
     f, m = create_synthetic_data_2d()
     
     t0 = time.time()
     torch.manual_seed(42)
-    res1 = syntx.syn(fixed=f, moving=m, reg_iterations=[10, 10], initial_transform='identity', verbose=False)
+    res1 = syntx.syn(fixed=f, moving=m, reg_iterations=[10, 10], initial_transform='identity', device='cpu', verbose=False)
     torch.manual_seed(42)
-    res2 = syntx.syn(fixed=f, moving=m, reg_iterations=[10, 10], initial_transform='identity', verbose=False)
+    res2 = syntx.syn(fixed=f, moving=m, reg_iterations=[10, 10], initial_transform='identity', device='cpu', verbose=False)
     dt = time.time() - t0
     
     # 1. Check warped images match exactly
@@ -50,6 +51,7 @@ def test_fast_reproducibility_2d():
     # 2. Check execution speed (< 10.0s with coverage overhead)
     assert dt < 10.0, f"2D reproducibility test took too long: {dt:.2f}s"
 
+@pytest.mark.slow
 def test_fast_reproducibility_3d():
     """Verify exact bitwise/float reproducibility of 3D SyN registration across consecutive runs."""
     f, m = create_synthetic_data_3d()
@@ -71,6 +73,7 @@ def test_fast_reproducibility_3d():
     assert dt < 10.0, f"3D reproducibility test took too long: {dt:.2f}s"
 
 
+@pytest.mark.slow
 def test_syngs_reproducibility():
     """Verify bitwise/exact reproducibility of SyNGS with bootstrap_mode='none' and optional 'antithetic'.
 
@@ -88,10 +91,11 @@ def test_syngs_reproducibility():
     The bootstrap_mode='none' determinism property itself is unchanged and still verified here.
     """
     f, m = create_synthetic_data_2d()
+    init_mat = syntx.robust_affine(f, m, seed=7, device='cpu', verbose=False)['fwdtransforms'][0]
 
     # 1. Under bootstrap_mode='none', runs are bit-for-bit identical regardless of seed
-    res1 = syntx.syngs(fixed=f, moving=m, levels=[2, 1], reg_iterations=[5, 5], affine_seed=7, seed=42, device='cpu', verbose=False, bootstrap_mode='none')
-    res2 = syntx.syngs(fixed=f, moving=m, levels=[2, 1], reg_iterations=[5, 5], affine_seed=7, seed=99, device='cpu', verbose=False, bootstrap_mode='none')
+    res1 = syntx.syngs(fixed=f, moving=m, levels=[2, 1], reg_iterations=[5, 5], initial_transform=init_mat, seed=42, device='cpu', verbose=False, bootstrap_mode='none')
+    res2 = syntx.syngs(fixed=f, moving=m, levels=[2, 1], reg_iterations=[5, 5], initial_transform=init_mat, seed=99, device='cpu', verbose=False, bootstrap_mode='none')
 
     w1 = res1['warpedmovout'].numpy()
     w2 = res2['warpedmovout'].numpy()
@@ -99,20 +103,21 @@ def test_syngs_reproducibility():
     assert diff == 0.0, f"SyNGS default warped images differ across runs: {diff:.6e}"
 
     # 2. Under bootstrap_mode='antithetic', identical seeds produce bit-for-bit identical results
-    res_a1 = syntx.syngs(fixed=f, moving=m, levels=[2, 1], reg_iterations=[5, 5], affine_seed=7,
+    res_a1 = syntx.syngs(fixed=f, moving=m, levels=[2, 1], reg_iterations=[5, 5], initial_transform=init_mat,
                          bootstrap_mode='antithetic', seed=42, device='cpu', verbose=False)
-    res_a2 = syntx.syngs(fixed=f, moving=m, levels=[2, 1], reg_iterations=[5, 5], affine_seed=7,
+    res_a2 = syntx.syngs(fixed=f, moving=m, levels=[2, 1], reg_iterations=[5, 5], initial_transform=init_mat,
                          bootstrap_mode='antithetic', seed=42, device='cpu', verbose=False)
     diff_a = np.max(np.abs(res_a1['warpedmovout'].numpy() - res_a2['warpedmovout'].numpy()))
     assert diff_a == 0.0, f"SyNGS antithetic warped images differ across identical seeds: {diff_a:.6e}"
 
     # 3. Under bootstrap_mode='antithetic', different seeds explore different paths
-    res_a3 = syntx.syngs(fixed=f, moving=m, levels=[2, 1], reg_iterations=[5, 5], affine_seed=7,
+    res_a3 = syntx.syngs(fixed=f, moving=m, levels=[2, 1], reg_iterations=[5, 5], initial_transform=init_mat,
                          bootstrap_mode='antithetic', seed=99, device='cpu', verbose=False)
     seed_diff = np.max(np.abs(res_a1['warpedmovout'].numpy() - res_a3['warpedmovout'].numpy()))
     assert seed_diff > 0.0, "SyNGS antithetic different seeds should produce different exploration paths"
 
 
+@pytest.mark.slow
 def test_syn_antithetic_reproducibility():
     """Verify bitwise/exact reproducibility of SyN with seeded Antithetic Bootstrapping."""
     f, m = create_synthetic_data_2d()

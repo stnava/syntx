@@ -105,6 +105,7 @@ def uncached_baseline_dsti(m, fluid_sigma=3.0, alpha=None, spacing=None, s=2.0):
     return curr.to(dtype=dtype).movedim(1, -1)
 
 
+@pytest.mark.slow
 def test_m1_adversarial_syn_2d_cache_hit_rate_and_regularity():
     """Verify 2D SyN with regularizer='dsti' achieves > 95% cache hit rate and min det(J) > 0."""
     clear_dst_cache()
@@ -149,6 +150,7 @@ def test_m1_adversarial_syn_2d_cache_hit_rate_and_regularity():
     assert 'phi_1' in inv_errs or len(inv_errs) > 0, "Inverse identity errors must be recorded"
 
 
+@pytest.mark.slow
 def test_m1_adversarial_syn_3d_dsti1_hit_rate_and_invariance():
     """Verify 3D SyN with regularizer='dsti1' achieves > 95% hit rate and min det(J) > 0."""
     clear_dst_cache()
@@ -183,6 +185,7 @@ def test_m1_adversarial_syn_3d_dsti1_hit_rate_and_invariance():
     assert folding_pct == 0.0, f"Folding detected in 3D: {folding_pct}%"
 
 
+@pytest.mark.slow
 def test_m1_adversarial_tvf_3d_hit_rate():
     """Verify 3D TVF solver with regularizer_mode='dsti' achieves > 95% cache hit rate."""
     clear_dst_cache()

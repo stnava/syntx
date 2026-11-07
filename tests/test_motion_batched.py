@@ -46,7 +46,7 @@ class TestMotionCorrectionPytorchBatched:
         MIN_VOXELS_PER_AXIS clamp; this is the case that would break without it."""
         img, shifts = _create_3d_phantom(num_frames=3)
         res = motion_correction(img, reference=0, type_of_transform="Rigid",
-                                 backend="pytorch_batched", verbose=False)
+                                 backend="pytorch_batched", device="cpu", verbose=False)
         mp = res.motion_parameters
         for t in (1, 2):
             trans_err = np.linalg.norm(mp.translations[t] - np.array(shifts[t]))
@@ -57,16 +57,17 @@ class TestMotionCorrectionPytorchBatched:
         as backend='pytorch'/'ants'."""
         img, _ = _create_3d_phantom(num_frames=3)
         res = motion_correction(img, reference=0, type_of_transform="Rigid",
-                                 backend="pytorch_batched", verbose=False)
+                                 backend="pytorch_batched", device="cpu", verbose=False)
         assert np.allclose(res.motion_parameters[0], 0.0, atol=1e-6)
 
+    @pytest.mark.slow
     def test_two_pass_mean_reference(self):
         """reference='mean', two_pass=True is the default/recommended configuration and
         must work with this backend too."""
         img, shifts = _create_3d_phantom(
             num_frames=4, shifts=[(0.0, 0.0, 0.0), (0.8, -0.6, 0.5), (1.5, -1.2, 1.0), (0.5, 0.3, -0.4)])
         res = motion_correction(img, reference="mean", two_pass=True, type_of_transform="Rigid",
-                                 backend="pytorch_batched", verbose=False)
+                                 backend="pytorch_batched", device="cpu", verbose=False)
         assert res.motion_corrected.shape == img.shape
         assert len(res.fwdtransforms) == 4
 
@@ -120,7 +121,7 @@ class TestMotionCorrectionPytorchBatchedTemporal:
             shifts=[(0.0, 0.0, 0.0), (0.3, -0.2, 0.1), (1.2, -0.8, 0.6), (0.1, 0.1, -0.1)],
         )
         res = motion_correction(img, reference=0, type_of_transform="Rigid",
-                                 backend="pytorch_batched_temporal", verbose=False)
+                                 backend="pytorch_batched_temporal", device="cpu", verbose=False)
         trans_err = np.linalg.norm(res.motion_parameters.translations[2] - np.array(shifts[2]))
         assert trans_err < 0.5, f"translation error {trans_err:.3f}mm too large"
         assert res.motion_corrected.shape == img.shape
@@ -129,7 +130,7 @@ class TestMotionCorrectionPytorchBatchedTemporal:
     def test_matches_reference_frame_with_identity(self):
         img, _ = _create_3d_phantom(num_frames=3)
         res = motion_correction(img, reference=0, type_of_transform="Rigid",
-                                 backend="pytorch_batched_temporal", verbose=False)
+                                 backend="pytorch_batched_temporal", device="cpu", verbose=False)
         assert np.allclose(res.motion_parameters[0], 0.0, atol=1e-6)
 
     def test_disallowed_kwarg_raises_typeerror(self):
@@ -140,7 +141,7 @@ class TestMotionCorrectionPytorchBatchedTemporal:
     def test_allowed_kwargs_accepted(self):
         img, _ = _create_3d_phantom(num_frames=3)
         res = motion_correction(img, reference=0, type_of_transform="Rigid",
-                                 backend="pytorch_batched_temporal", verbose=False,
+                                 backend="pytorch_batched_temporal", device="cpu", verbose=False,
                                  resolution_cap_mm=None, motion_gate_threshold=None, num_bins=24)
         assert res.motion_corrected.shape == img.shape
 
@@ -161,13 +162,14 @@ class TestMotionCorrectionPytorchBatchedTemporal:
         with pytest.raises(NotImplementedError):
             motion_correction(img, backend="pytorch_batched_temporal", type_of_transform="Rigid")
 
+    @pytest.mark.slow
     def test_auto_never_selects_temporal_backend(self):
         """'auto' must keep selecting 'pytorch_batched' (full precision/capture range) --
         the temporal fast path trades those off for speed and must stay strictly opt-in."""
         img, shifts = _create_3d_phantom(num_frames=3)
-        res_auto = motion_correction(img, reference=0, type_of_transform="Rigid", verbose=False)
+        res_auto = motion_correction(img, reference=0, type_of_transform="Rigid", device="cpu", verbose=False)
         res_wide = motion_correction(img, reference=0, type_of_transform="Rigid",
-                                      backend="pytorch_batched", verbose=False)
+                                      backend="pytorch_batched", device="cpu", verbose=False)
         assert np.allclose(res_auto.motion_parameters.translations,
                             res_wide.motion_parameters.translations, atol=1e-5)
 
@@ -179,7 +181,7 @@ class TestMotionCorrectionAutoBackend:
 
     def test_default_backend_is_auto_and_eligible_case_succeeds(self):
         img, shifts = _create_3d_phantom(num_frames=3)
-        res = motion_correction(img, reference=0, type_of_transform="Rigid", verbose=False)
+        res = motion_correction(img, reference=0, type_of_transform="Rigid", device="cpu", verbose=False)
         mp = res.motion_parameters
         for t in (1, 2):
             trans_err = np.linalg.norm(mp.translations[t] - np.array(shifts[t]))
@@ -194,12 +196,13 @@ class TestMotionCorrectionAutoBackend:
     def test_auto_falls_back_to_pytorch_for_2d(self):
         data = np.random.rand(16, 16, 3).astype(np.float32)
         img2d = ants.from_numpy(data, spacing=(1.0, 1.0, 1.0))
-        res = motion_correction(img2d, reference=0, type_of_transform="Rigid", verbose=False)
+        res = motion_correction(img2d, reference=0, type_of_transform="Rigid", device="cpu", verbose=False)
         assert res.motion_corrected.shape == img2d.shape
 
+    @pytest.mark.slow
     def test_auto_falls_back_to_pytorch_for_affine(self):
         img, _ = _create_3d_phantom(num_frames=3)
-        res = motion_correction(img, reference=0, type_of_transform="Affine", verbose=False)
+        res = motion_correction(img, reference=0, type_of_transform="Affine", device="cpu", verbose=False)
         assert res.motion_corrected.shape == img.shape
 
     def test_invalid_backend_string_raises(self):
@@ -218,14 +221,14 @@ class TestBatchedRigidRegisterPassChunking:
     not bit-identical parameters (each chunk's LBFGS history is independent of the others,
     so chunking can converge to a very slightly different, equally valid solution)."""
 
+    @pytest.mark.slow
     def test_chunked_recovers_known_shifts_as_well_as_unchunked(self):
-        shifts = [(0.0, 0.0, 0.0), (0.8, -0.6, 0.5), (1.5, -1.2, 1.0),
-                  (0.6, 0.9, -0.7), (-1.0, 0.5, 0.8), (1.2, -0.8, -0.5)]
-        img, _ = _create_3d_phantom(num_frames=6, nx=16, ny=16, nz=16, shifts=shifts)
+        shifts = [(0.0, 0.0, 0.0), (0.8, -0.6, 0.5), (1.5, -1.2, 1.0), (0.6, 0.9, -0.7)]
+        img, _ = _create_3d_phantom(num_frames=4, nx=14, ny=14, nz=14, shifts=shifts)
         ref_np = img.numpy()[..., 0]
         ref = ants.from_numpy(ref_np, spacing=(1.0, 1.0, 1.0))
         moving_imgs = [ants.from_numpy(img.numpy()[..., t], spacing=(1.0, 1.0, 1.0))
-                       for t in range(6)]
+                       for t in range(4)]
 
         def resample_error(fwd, t):
             """Apply the recovered forward transform and compare the resampled frame back
@@ -238,21 +241,22 @@ class TestBatchedRigidRegisterPassChunking:
             return float(np.mean((warped.numpy() - ref_np) ** 2))
 
         fwd_unchunked, _, _ = batched_rigid_register_pass(
-            ref, moving_imgs, verbose=False, max_batch_frames=None,
+            ref, moving_imgs, verbose=False, max_batch_frames=None, seed_mode="narrow", device="cpu",
         )
         fwd_chunked, _, _ = batched_rigid_register_pass(
-            ref, moving_imgs, verbose=False, max_batch_frames=2,
+            ref, moving_imgs, verbose=False, max_batch_frames=2, seed_mode="narrow", device="cpu",
         )
 
-        assert len(fwd_chunked) == len(fwd_unchunked) == 6
+        assert len(fwd_chunked) == len(fwd_unchunked) == 4
         # Baseline: residual if no correction were applied at all (raw moving vs reference).
-        raw_mse = [float(np.mean((moving_imgs[t].numpy() - ref_np) ** 2)) for t in range(1, 6)]
-        for i, t in enumerate(range(1, 6)):
+        raw_mse = [float(np.mean((moving_imgs[t].numpy() - ref_np) ** 2)) for t in range(1, 4)]
+        for i, t in enumerate(range(1, 4)):
             mse_u = resample_error(fwd_unchunked, t)
             mse_c = resample_error(fwd_chunked, t)
             assert mse_u < raw_mse[i] * 0.5, f"frame {t}: unchunked correction didn't improve alignment"
             assert mse_c < raw_mse[i] * 0.5, f"frame {t}: chunked correction didn't improve alignment"
 
+    @pytest.mark.slow
     def test_auto_chunk_size_splits_large_series_without_crashing(self):
         """auto_chunk is computed from _MAX_BATCH_TENSOR_ELEMENTS // volume_numel -- on a
         tiny phantom that's a huge number of frames, so force a tiny max_batch_frames
@@ -260,16 +264,16 @@ class TestBatchedRigidRegisterPassChunking:
         above with a small series that never splits; this confirms the splitting
         mechanics -- multiple chunks, correct concatenation order -- work for a series
         longer than one chunk)."""
-        img, _ = _create_3d_phantom(num_frames=9, nx=12, ny=12, nz=12,
-                                     shifts=[(0.5 * t, -0.3 * t, 0.4 * t) for t in range(9)])
+        img, _ = _create_3d_phantom(num_frames=5, nx=12, ny=12, nz=12,
+                                     shifts=[(0.5 * t, -0.3 * t, 0.4 * t) for t in range(5)])
         ref = ants.from_numpy(img.numpy()[..., 0], spacing=(1.0, 1.0, 1.0))
         moving_imgs = [ants.from_numpy(img.numpy()[..., t], spacing=(1.0, 1.0, 1.0))
-                       for t in range(9)]
+                       for t in range(5)]
 
         fwd, inv, elapsed = batched_rigid_register_pass(
-            ref, moving_imgs, verbose=False, max_batch_frames=4,
+            ref, moving_imgs, verbose=False, max_batch_frames=2, seed_mode="narrow", device="cpu",
         )
-        assert len(fwd) == len(inv) == 9
+        assert len(fwd) == len(inv) == 5
         assert elapsed >= 0.0
 
     def test_empty_moving_imgs_returns_immediately(self):
@@ -298,7 +302,7 @@ class TestBatchedRigidRegisterPassTemporal:
                        for t in range(4)]
 
         fwd, inv, elapsed = batched_rigid_register_pass_temporal(
-            ref, moving_imgs, verbose=False, resolution_cap_mm=None, motion_gate_threshold=0.999,
+            ref, moving_imgs, verbose=False, resolution_cap_mm=None, motion_gate_threshold=0.999, device="cpu",
         )
         assert len(fwd) == len(inv) == 4
         assert elapsed >= 0.0
@@ -317,7 +321,7 @@ class TestBatchedRigidRegisterPassTemporal:
         moving_imgs = [ants.from_numpy(img.numpy()[..., t], spacing=(1.0, 1.0, 1.0))
                        for t in range(2)]
         fwd, inv, _ = batched_rigid_register_pass_temporal(
-            ref, moving_imgs, verbose=False, resolution_cap_mm=None, motion_gate_threshold=None,
+            ref, moving_imgs, verbose=False, resolution_cap_mm=None, motion_gate_threshold=None, device="cpu",
         )
         assert len(fwd) == 2
 
@@ -349,7 +353,7 @@ class TestMotionCorrectionPytorchBatchedAdaptive:
         moving_imgs = [ants.from_numpy(img.numpy()[..., t], spacing=(1.0, 1.0, 1.0)) for t in range(2)]
 
         fwd, inv, elapsed = batched_rigid_register_pass_adaptive(
-            ref, moving_imgs, verbose=False, coarse_resolution_cap_mm=None, fine_resolution_cap_mm=None,
+            ref, moving_imgs, verbose=False, coarse_resolution_cap_mm=None, fine_resolution_cap_mm=None, device="cpu",
         )
         assert len(fwd) == len(inv) == 2
         assert elapsed >= 0.0
@@ -376,7 +380,7 @@ class TestMotionCorrectionPytorchBatchedAdaptive:
         moving_imgs = [ants.from_numpy(img.numpy()[..., t], spacing=(1.0, 1.0, 1.0)) for t in range(2)]
 
         fwd, inv, _ = batched_rigid_register_pass_adaptive(
-            ref, moving_imgs, verbose=False, gate_fd_threshold_mm=0.4,
+            ref, moving_imgs, verbose=False, gate_fd_threshold_mm=0.4, device="cpu",
         )
         assert len(fwd) == 2
 
@@ -389,7 +393,7 @@ class TestMotionCorrectionPytorchBatchedAdaptive:
     def test_public_api_accepts_adaptive_backend(self):
         shifts = [(0.0, 0.0, 0.0), (0.8, -0.6, 0.5), (1.5, -1.2, 1.0)]
         img, _ = _create_3d_phantom(num_frames=3, nx=20, ny=20, nz=20, shifts=shifts)
-        mc = motion_correction(img, reference=0, backend="pytorch_batched_adaptive", verbose=False)
+        mc = motion_correction(img, reference=0, backend="pytorch_batched_adaptive", device="cpu", verbose=False)
         assert mc.motion_corrected.shape == img.shape
         assert len(mc.fd) == 3
 
@@ -405,17 +409,18 @@ class TestMotionCorrectionPytorchBatchedHuber:
         """``metric='huber'`` (syntx.core.losses.huber_loss_nd on the pointwise residual, same-contrast series) recovers the
         same known shifts as Mattes MI on the phantom; an unknown metric is a named error, not a silent fallback."""
         img, shifts = _create_3d_phantom(num_frames=3)
-        res = motion_correction(img, reference=0, type_of_transform="Rigid", backend="pytorch_batched", verbose=False,
+        res = motion_correction(img, reference=0, type_of_transform="Rigid", backend="pytorch_batched", device="cpu", verbose=False,
                                 metric="huber", huber_delta=0.1)
         mp = res.motion_parameters
         for t in (1, 2):
             trans_err = np.linalg.norm(mp.translations[t] - np.array(shifts[t]))
             assert trans_err < 0.5, f"frame {t}: translation error {trans_err:.3f}mm too large"
         with pytest.raises(ValueError, match="metric"):
-            motion_correction(img, reference=0, type_of_transform="Rigid", backend="pytorch_batched", verbose=False, metric="mse")
+            motion_correction(img, reference=0, type_of_transform="Rigid", backend="pytorch_batched", device="cpu", verbose=False, metric="mse")
 
 
 class TestSampleFraction:
+    @pytest.mark.slow
     def test_sample_fraction_is_explicit_recorded_and_dense_is_not_worse(self):
         """The metric sampling rate was a hidden constant; it is now an argument recorded in the result. A known shift
         is recovered at least as well with every voxel (1.0) as with the previous 15 %, and the record says what ran."""
@@ -460,6 +465,7 @@ class TestSamplePointsOffVoxelCentres:
         h = _extract_rigid_parameters(ants.read_transform(paths[0]), 3)[2]
         return float(jenkinson_framewise_displacement([np.eye(4), h], 50.0, np.zeros(3))[1])
 
+    @pytest.mark.slow
     def test_still_noisy_pair_stays_put(self, tmp_path):
         errs_alone = []
         for seed in range(3):
@@ -707,6 +713,7 @@ class TestLbfgsRigidPreconditioningAndGuards:
         max_rot3_deg = float(torch.rad2deg(omega.detach()[3].abs()).max())
         assert max_rot3_deg < 5.0
 
+    @pytest.mark.slow
     def test_joint_multishell_refine_converges_without_rotational_runaway(self):
         import ants
         import syntx

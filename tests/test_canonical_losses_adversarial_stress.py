@@ -402,6 +402,7 @@ def test_non_contiguous_strided_tensor_parity_3d():
 # 5. Edge-Case Shapes and Float64 Gradcheck
 # ==============================================================================
 
+@pytest.mark.slow
 @pytest.mark.parametrize(
     "shape",
     [
@@ -425,6 +426,7 @@ def test_gradcheck_edge_shapes_local_ncc(shape):
     )
 
 
+@pytest.mark.slow
 @pytest.mark.parametrize(
     "shape",
     [

@@ -199,6 +199,7 @@ def test_classical_and_spatial_metrics_3d():
         assert score_identical <= score_diff + 1e-5
 
 
+@pytest.mark.slow
 def test_deep_feature_metrics_2d():
     # VGG19, DINOv2, ResNet10, SwinUNETR
     x = np.linspace(-1, 1, 16)
@@ -223,6 +224,7 @@ def test_deep_feature_metrics_2d():
         assert score_identical <= score_diff + 1e-5
 
 
+@pytest.mark.slow
 def test_deep_feature_metrics_3d():
     # VGG19, DINOv2, ResNet10, SwinUNETR in 3D
     x = np.linspace(-1, 1, 16)
@@ -250,6 +252,7 @@ def test_deep_feature_metrics_3d():
         assert score_identical <= score_diff + 1e-5
 
 
+@pytest.mark.slow
 def test_all_88_configurations_runnable_2d():
     # Verify that all 88 metrics run without throwing errors
     img_a = np.random.rand(16, 16).astype(np.float32)
@@ -267,6 +270,7 @@ def test_all_88_configurations_runnable_2d():
             assert isinstance(val, float)
 
 
+@pytest.mark.slow
 def test_all_88_configurations_runnable_3d():
     img_a = np.random.rand(16, 16, 16).astype(np.float32)
     img_b = np.random.rand(16, 16, 16).astype(np.float32)

@@ -125,6 +125,7 @@ def test_compute_bidirectional_dice_precision():
     assert isinstance(sym, float)
 
 
+@pytest.mark.slow
 def test_evaluate_mindboggle_pair_mock(tmp_path, monkeypatch):
     """Test evaluate_mindboggle_pair end-to-end with a fast small volume."""
     monkeypatch.chdir(tmp_path)     # the affine cache (results/canonical_affines) is cwd-relative
@@ -135,10 +136,10 @@ def test_evaluate_mindboggle_pair_mock(tmp_path, monkeypatch):
     c2_dir.mkdir(parents=True)
 
     np.random.seed(42)
-    img1_arr = (np.random.rand(48, 48, 48) * 100).astype(np.float32)
-    img2_arr = (np.random.rand(48, 48, 48) * 100).astype(np.float32)
-    lab1_arr = np.random.randint(1, 4, (48, 48, 48)).astype(np.uint32)
-    lab2_arr = np.random.randint(1, 4, (48, 48, 48)).astype(np.uint32)
+    img1_arr = (np.random.rand(24, 24, 24) * 100).astype(np.float32)
+    img2_arr = (np.random.rand(24, 24, 24) * 100).astype(np.float32)
+    lab1_arr = np.random.randint(1, 4, (24, 24, 24)).astype(np.uint32)
+    lab2_arr = np.random.randint(1, 4, (24, 24, 24)).astype(np.uint32)
 
     ants.image_write(ants.from_numpy(img1_arr), str(c1_dir / "t1weighted_brain.nii.gz"))
     ants.image_write(ants.from_numpy(lab1_arr), str(c1_dir / "labels.DKT31.manual.nii.gz"))
@@ -155,6 +156,7 @@ def test_evaluate_mindboggle_pair_mock(tmp_path, monkeypatch):
         pair_idx=0,
         model="sobolev",
         device="cpu",
+        reg_iterations=[2, 1, 1],
         pairs_csv=str(csv_file),
         data_dir=str(data_dir),
         ants_baseline_dir=str(tmp_path),

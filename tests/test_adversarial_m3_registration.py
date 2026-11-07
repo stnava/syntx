@@ -182,6 +182,7 @@ class TestRobustAffineAnisotropic:
         assert np.allclose(warped.direction, fixed.direction)
         assert not np.isnan(warped.numpy()).any()
 
+    @pytest.mark.slow
     def test_robust_affine_3d_anisotropic_non_cubic(self):
         fixed, moving = create_synthetic_3d_pair(shape=(20, 28, 24), spacing=(1.2, 0.9, 1.5), origin=(-10.0, 15.0, 25.0))
         reg = syntx.robust_affine(
@@ -213,7 +214,9 @@ class TestSyNAnisotropic:
         fixed, moving = create_synthetic_2d_pair(shape=(48, 64), spacing=(1.5, 0.8), origin=(12.3, -4.5))
         reg = syntx.syn(
             fixed=fixed, moving=moving,
-            reg_iterations=[8, 4],
+            reg_iterations=[4, 2],
+            initial_transform='identity',
+            device='cpu',
             verbose=False
         )
         assert 'fwdtransforms' in reg
@@ -251,11 +254,14 @@ class TestSyNAnisotropic:
         assert np.allclose(warped_inv.spacing, moving.spacing, atol=1e-5)
         assert not np.isnan(warped_inv.numpy()).any()
 
+    @pytest.mark.slow
     def test_syn_3d_anisotropic_non_cubic(self):
         fixed, moving = create_synthetic_3d_pair(shape=(16, 24, 20), spacing=(1.2, 0.9, 1.5), origin=(-10.0, 15.0, 25.0))
         reg = syntx.syn(
             fixed=fixed, moving=moving,
             reg_iterations=[4, 2],
+            initial_transform='identity',
+            device='cpu',
             verbose=False
         )
         assert 'fwdtransforms' in reg
@@ -287,6 +293,8 @@ class TestTVFAnisotropic:
         reg = syntx.tvf(
             fixed=fixed, moving=moving,
             reg_iterations=[4, 2],
+            initial_transform='identity',
+            device='cpu',
             verbose=False
         )
         assert 'fwdtransforms' in reg
@@ -308,11 +316,14 @@ class TestTVFAnisotropic:
         assert warped_fwd.shape == fixed.shape
         assert not np.isnan(warped_fwd.numpy()).any()
 
+    @pytest.mark.slow
     def test_tvf_3d_anisotropic_non_cubic(self):
         fixed, moving = create_synthetic_3d_pair(shape=(16, 20, 18), spacing=(1.3, 1.0, 1.2), origin=(0.0, 5.0, 10.0))
         reg = syntx.tvf(
             fixed=fixed, moving=moving,
             reg_iterations=[3, 1],
+            initial_transform='identity',
+            device='cpu',
             verbose=False
         )
         assert 'fwdtransforms' in reg
@@ -342,6 +353,8 @@ class TestSyNGSAnisotropic:
         reg = syntx.syngs(
             fixed=fixed, moving=moving,
             reg_iterations=[4, 2],
+            initial_transform='identity',
+            device='cpu',
             verbose=False
         )
         assert 'fwdtransforms' in reg
@@ -362,12 +375,15 @@ class TestSyNGSAnisotropic:
         assert warped_fwd.shape == fixed.shape
         assert not np.isnan(warped_fwd.numpy()).any()
 
+    @pytest.mark.slow
     def test_syngs_3d_anisotropic_non_cubic(self):
         """Stress test 3D syngs registration (reveals image_to_tensor 3D tensor dimensionality bug)."""
         fixed, moving = create_synthetic_3d_pair(shape=(16, 20, 18), spacing=(1.3, 1.0, 1.2), origin=(0.0, 5.0, 10.0))
         reg = syntx.syngs(
             fixed=fixed, moving=moving,
             reg_iterations=[3, 1],
+            initial_transform='identity',
+            device='cpu',
             verbose=False
         )
         assert 'fwdtransforms' in reg
@@ -403,6 +419,8 @@ class TestObliqueDirectionParity:
         reg = syntx.syn(
             fixed=fixed, moving=moving,
             reg_iterations=[4, 2],
+            initial_transform='identity',
+            device='cpu',
             verbose=False
         )
         fwd_warp = ants.image_read(reg['fwdtransforms'][0])
