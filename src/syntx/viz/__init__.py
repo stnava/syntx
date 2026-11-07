@@ -68,6 +68,7 @@ from .metric_sections import (
 )
 from .modality_report import (
     kpi_card,
+    table_html,
     equation_figure,
     equations_figure,
     provenance_table_rows,
@@ -122,6 +123,7 @@ __all__ = [
     "segmentation_qc_section",
     "ai_model_qc_section",
     "kpi_card",
+    "table_html",
     "equation_figure",
     "equations_figure",
     "provenance_table_rows",

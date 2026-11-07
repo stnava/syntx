@@ -330,6 +330,11 @@ def provenance_table_rows(provenance: list[Any]) -> list[dict[str, Any]]:
     return rows
 
 
+def table_html(rows: list[dict[str, Any]], columns: list[str]) -> str:
+    """Public name of the report table renderer (used by study report builders outside syntx)."""
+    return _table(rows, columns)
+
+
 def write_modality_report(
     output_path: str,
     modality_title: str,
