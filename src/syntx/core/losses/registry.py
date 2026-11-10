@@ -41,6 +41,7 @@ class SimilarityLossConfig:
     delta: float = 0.1  # Huber transition point (intensity units of the normalised images)
     auto_mask: bool | None = None
     feature_layers: Sequence[int] | None = None
+    metric_chunks: int = 1
 
 
 def parse_similarity_metric(
@@ -74,6 +75,7 @@ def parse_similarity_metric(
             "delta": metric_spec.delta,
             "auto_mask": metric_spec.auto_mask,
             "feature_layers": metric_spec.feature_layers,
+            "metric_chunks": metric_spec.metric_chunks,
         }
         for k, v in kwargs.items():
             if k in current_dict and v is not None:
@@ -112,6 +114,9 @@ def parse_similarity_metric(
     auto_mask = kwargs.get("auto_mask", None)
     feature_layers = kwargs.get("feature_layers", None)
     num_bins = kwargs.get("num_bins", kwargs.get("mattes_bins", 32))
+    metric_chunks = int(kwargs.get("metric_chunks", 1) or 1)
+    if metric_chunks < 1:
+        raise ValueError(f"metric_chunks must be >= 1, got {metric_chunks}")
 
     canonical_metric = m_lower
 
@@ -190,6 +195,7 @@ def parse_similarity_metric(
         delta=delta,
         auto_mask=auto_mask,
         feature_layers=feature_layers,
+        metric_chunks=metric_chunks,
     )
 
 
@@ -268,6 +274,7 @@ class SimilarityLossWrapper(nn.Module):
                 window_size=self.config.window_size,
                 squared=self.config.squared,
                 use_ants_pseudo_gradient=self.config.use_analytical_gradients,
+                metric_chunks=self.config.metric_chunks,
             )
 
         elif m == "mattes_mi":

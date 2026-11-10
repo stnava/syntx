@@ -1,12 +1,24 @@
 # Tracking Summary
-current phase: v6.34.2 (11.59x single-process pytest speedup from ~2,760 s to 238.16 s without parallelization via session phantom/extractor caching, deformable unit-test affine/MPS overhead elimination, and tiered @pytest.mark.slow gating)
+current phase: v6.34.2+ (microCT-scale SyN GPU memory housekeeping, slab-chunked LNCC `metric_chunks`, MPS 5-D reduction fix, and 256^3 GPU transform-cache cap: 18 um 241M/459M-voxel SyN fits in 23.26 GiB MPS peak; 36 um SyN drops from 19.53 GiB to 8.65 GiB; 36 um Anderson MPS crash resolved)
 next WP: per-run synthetic calibration of the clock thresholds (single-subject plan, Stage 1 step 3); fix the opt-in engine='projected' motion regression (xfail, bisected to 59513a9 and e066990)
 blockers: none
-active work: R29 (done)
+active work: R30 (done)
 device: Apple Silicon MPS / CPU (macOS arm64)
-last updated: 2026-11-06
+last updated: 2026-11-10
 
 ---
+
+## R30 (MicroCT-Scale SyN GPU Memory Housekeeping, Slab-Chunked LNCC & MPS 5-D Reduction Fix; 2026-11-10)
+- **Motivation & Scope**: Audited `ANTsX/ANTsTorch#91` (*"GPU memory for SyN at microCT scale: 18 µm registration fits in 29 GiB (from >95 GiB)"*) against `syntx` without modifying `antstorch`. Uncovered both the shared tensor-lifetime issues and three `syntx`-specific bottlenecks (`SyNTo.__init__` full-res GPU placeholder fields, PyTorch 2.13 MPS 4-axis 5-D reduction corruption in `update_inverse_field_nd`, and unbounded global GPU displacement caches in `transforms.py`).
+- **Measured MPS Peak Memory, Speed & Parity (Apple M2 Ultra, isolated single-process MPS; `docs/reports/syn_microct_memory_profile_2026-11-10.{html,json}`)**:
+  - **18 µm mouse embryo microCT scale (`477×856×591` = 241.3M fixed voxels, `594×1046×738` = 458.7M moving voxels, `levels=[8, 4, 2]`, `inverse_method='fixed_point'`, `metric_chunks=8`)**: Peak MPS allocation **23.26 GiB** (fits 24–32 GiB GPUs; down from >57 GiB in post-loop composition alone), `5.49 GiB` live post-fit (`midpoint_warp_*` auto-offloaded to CPU, `warp_l2r_inv`/`warp_r2l_inv` tied to `warp_r2l`/`warp_l2r`), `0.10 GiB` retained after `del model`, `11.11 s` runtime.
+  - **36 µm SyN (`239×428×296 -> 297×523×369`, `fixed_point`, `[6, 6, 3]`)**: Peak MPS memory reduced from **19.53 GiB to 8.65 GiB** (**-55.7%, 2.26x reduction**), retained GPU cache leak reduced from **8.72 GiB to 0.10 GiB** (**-98.9%**), with identical `pearson_r = 0.888015` and `mean_ic_error = 0.00050 vox`.
+  - **36 µm SyN & Batched Inverse (`anderson`)**: Fixed Metal `00000005:kIOGPUCommandBufferCallbackErrorInnocentVictim` + `LinAlgError: Singular matrix` crash caused by 4-axis `dim=(1, 2, 3, 4)` reductions on 5-D MPS tensors; `B=2` Anderson peak dropped from **21.23 GiB (CRASH) to 14.24 GiB (OK, `mean_ic = 1e-5 vox`)**, and 36 µm SyN Anderson completes cleanly (`18.22 GiB` peak, `pearson_r = 0.891810`, `mean_ic = 0.00017 vox`).
+  - **72 µm SyN (`120×214×148 -> 149×262×185`, `anderson`, `[8, 8, 4]`)**: Peak MPS memory reduced from **4.84 GiB to 2.34 GiB** (**-51.5%**), wall-clock sped up from **14.98 s to 9.21 s** (**1.63x faster**), with exact `pearson_r = 0.897296`, `mean_ic = 0.00177 vox`, and `mean |Δu| = 1.21e-7 mm` vs baseline (`warped_pearson_r_vs_baseline = 0.9999999993`).
+  - **Slab-Chunked LNCC (`metric_chunks=8` vs `1` on 36 µm 30.3M voxels)**: Transient autograd peak dropped from **2.14 GiB to 0.58 GiB** (**-72.9%, 3.69x reduction**) with 9-digit identical loss and gradient norm (`< 1e-13` float64 max error across 24 2D/3D/masked/squared/pseudo combinations).
+- **Code & Test Changes (`src/syntx/core/inverse.py`, `src/syntx/core/losses/cross_correlation.py`, `src/syntx/core/losses/registry.py`, `src/syntx/core/grid.py`, `src/syntx/syn.py`, `src/syntx/transforms.py`, `tests/test_syn_microct_memory.py`)**:
+  - Focused verification: `176 passed` across `test_syn_microct_memory.py`, `test_implementation_standards.py`, `test_core_inverse.py`, `test_core_grid.py`, `test_audit_core_geometry.py`, `test_canonical_losses_memory_amp.py`, `test_canonical_losses_gradcheck.py`, `test_syn.py`, `test_syn_midpoint_and_resample_fastpath.py`, `test_transforms.py`, and `test_transform_chain_order.py`.
+  - Architectural lint: `python3 -m antsxqc.lint src/syntx` -> `0 finding(s)`, zero `.antsxqc-allow` exceptions.
 
 ## R29 (>10x Single-Process Pytest Speedup & Test-Suite Defect Repairs; v6.34.2, 2026-11-06)
 - **Measured Single-Process Speedup**: Reduced isolated single-process sequential `pytest` wall-clock runtime from **~2,760 s (~46 min)** in `R28` (`v6.34.0`) to **238.16 s (3 min 58 s)** (**11.59x faster**, 37.84 s faster than the 276.00 s 10.00x budget ceiling) with zero `pytest-xdist` parallel workers (`2,409 passed, 402 skipped, 0 failed` out of `2,811` total tests).

@@ -623,7 +623,9 @@ def prepare_mid_images_and_gradients_torch(
     M_phys, t_phys, initial_grid_level,
     interpolator='linear',
     grad_I_curr=None, grad_J_curr=None,
-    use_analytical_gradients=True
+    use_analytical_gradients=True,
+    precomputed_grad_I_vox=None,
+    precomputed_grad_J_vox=None,
 ):
     """
     Warp the fixed and moving images to the SyN midpoint and (optionally) sample their
@@ -679,25 +681,38 @@ def prepare_mid_images_and_gradients_torch(
     coords_norm = physical_to_normalized_torch_cached(
         phi_l2r_phys, fixed_shape_t, fixed_spacing_t, fixed_origin_t, fixed_direction_t
     )
-    I_mid = grid_sample_nd(I_curr, coords_norm, padding_mode='border', align_corners=True, interpolator=interpolator, use_analytical_gradients=use_analytical_gradients)
-    
+    del phi_l2r_phys
+    I_mid = grid_sample_nd(
+        I_curr, coords_norm, padding_mode='border', align_corners=True,
+        interpolator=interpolator, use_analytical_gradients=use_analytical_gradients,
+        precomputed_grad_I=precomputed_grad_I_vox,
+    )
+
     phi_r2l_phys = X_phys + warp_r2l
     y_phys = phi_r2l_phys @ M_phys.t() + t_phys
+    del phi_r2l_phys
     if initial_grid_level is not None:
         y_norm_fixed = physical_to_normalized_torch_cached(
             y_phys, fixed_shape_t, fixed_spacing_t, fixed_origin_t, fixed_direction_t
         )
+        del y_phys
         y_norm = compose_grids(initial_grid_level, y_norm_fixed)
+        del y_norm_fixed
     else:
         y_norm = physical_to_normalized_torch_cached(
             y_phys, moving_shape_t, moving_spacing_t, moving_origin_t, moving_direction_t
         )
-        
-    J_mid = grid_sample_nd(J_curr, y_norm, padding_mode='border', align_corners=True, interpolator=interpolator, use_analytical_gradients=use_analytical_gradients)
-    
+        del y_phys
+
+    J_mid = grid_sample_nd(
+        J_curr, y_norm, padding_mode='border', align_corners=True,
+        interpolator=interpolator, use_analytical_gradients=use_analytical_gradients,
+        precomputed_grad_I=precomputed_grad_J_vox,
+    )
+
     grad_I_mid_sampled = None
     grad_J_mid_sampled = None
-    if use_analytical_gradients:
+    if use_analytical_gradients or (grad_I_curr is not None and grad_J_curr is not None):
         if I_curr.shape[1] != 1 or J_curr.shape[1] != 1:
             raise ValueError("analytical gradients need single-channel images, got "
                              f"{I_curr.shape[1]} / {J_curr.shape[1]} channels")
@@ -709,27 +724,41 @@ def prepare_mid_images_and_gradients_torch(
             grad_J_curr = _spatial_jacobian_nd(J_curr.movedim(1, -1), physical_spacing=tuple(reversed(moving_spacing)))
             if J_curr.shape[1] == 1:
                 grad_J_curr = grad_J_curr.squeeze(-2)
-        
+
         # per-axis derivatives (x, y, z) -> tensor order; physical gradient = g @ inv(D)
         # (p = origin + D S i, so g = D^T grad_p)
-        grad_I_mid_sampled = grid_sample_nd(grad_I_curr.movedim(-1, 1), coords_norm, padding_mode='border', align_corners=True, interpolator=interpolator, use_analytical_gradients=use_analytical_gradients).movedim(1, -1)
+        grad_I_mid_sampled = grid_sample_nd(
+            grad_I_curr.movedim(-1, 1), coords_norm, padding_mode='border',
+            align_corners=True, interpolator=interpolator,
+            use_analytical_gradients=use_analytical_gradients,
+        ).movedim(1, -1)
         grad_I_mid_sampled = torch.matmul(torch.flip(grad_I_mid_sampled, dims=[-1]),
                                           torch.linalg.inv(fixed_direction_t.to(grad_I_mid_sampled.dtype)))
 
-        grad_J_mid_sampled = grid_sample_nd(grad_J_curr.movedim(-1, 1), y_norm, padding_mode='border', align_corners=True, interpolator=interpolator, use_analytical_gradients=use_analytical_gradients).movedim(1, -1)
+        grad_J_mid_sampled = grid_sample_nd(
+            grad_J_curr.movedim(-1, 1), y_norm, padding_mode='border',
+            align_corners=True, interpolator=interpolator,
+            use_analytical_gradients=use_analytical_gradients,
+        ).movedim(1, -1)
         grad_J_mid_sampled = torch.matmul(torch.flip(grad_J_mid_sampled, dims=[-1]),
                                           torch.linalg.inv(moving_direction_t.to(grad_J_mid_sampled.dtype)))
         grad_J_mid_sampled = torch.matmul(grad_J_mid_sampled, M_phys.to(grad_J_mid_sampled.dtype))
 
-    dim = coords_norm.shape[-1]
-    mask_I = (coords_norm[..., 0] >= -1.0) & (coords_norm[..., 0] <= 1.0)
+    coords_det = coords_norm.detach()
+    y_det = y_norm.detach()
+    del coords_norm, y_norm
+    dim = coords_det.shape[-1]
+    mask_I = (coords_det[..., 0] >= -1.0) & (coords_det[..., 0] <= 1.0)
     for d in range(1, dim):
-        mask_I = mask_I & (coords_norm[..., d] >= -1.0) & (coords_norm[..., d] <= 1.0)
-        
-    mask_J = (y_norm[..., 0] >= -1.0) & (y_norm[..., 0] <= 1.0)
+        mask_I = mask_I & (coords_det[..., d] >= -1.0) & (coords_det[..., d] <= 1.0)
+    del coords_det
+
+    mask_J = (y_det[..., 0] >= -1.0) & (y_det[..., 0] <= 1.0)
     for d in range(1, dim):
-        mask_J = mask_J & (y_norm[..., d] >= -1.0) & (y_norm[..., d] <= 1.0)
-        
+        mask_J = mask_J & (y_det[..., d] >= -1.0) & (y_det[..., d] <= 1.0)
+    del y_det
+
     in_bounds_mask = (mask_I & mask_J).unsqueeze(1).to(dtype=I_mid.dtype)
-    
+    del mask_I, mask_J
+
     return I_mid, J_mid, grad_I_mid_sampled, grad_J_mid_sampled, in_bounds_mask

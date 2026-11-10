@@ -651,6 +651,16 @@ class SyNTo(nn.Module):
                 except (StopIteration, AttributeError):
                     fit_device = getattr(self, 'device', 'cpu')
 
+        # Release full-resolution placeholder parameter fields during fit() so they do not sit
+        # idle on GPU alongside pyramid and midpoint fields; composition restores them at the end.
+        self.warp_l2r = None
+        self.warp_r2l = None
+        self.warp_l2r_inv = None
+        self.warp_r2l_inv = None
+        for _mid_attr in ('midpoint_warp_l2r', 'midpoint_warp_r2l', 'midpoint_warp_l2r_inv'):
+            if hasattr(self, _mid_attr):
+                delattr(self, _mid_attr)
+
         if not isinstance(fixed_image, torch.Tensor):
             if hasattr(fixed_image, 'numpy'):
                 fixed_image = torch.from_numpy(fixed_image.numpy().astype(np.float32)).to(fit_device)
@@ -673,13 +683,14 @@ class SyNTo(nn.Module):
             moving_image = moving_image.unsqueeze(0)
 
         lncc_window_size = 2 * lncc_radius + 1
-        for c in range(fixed_image.shape[1]):
-            i_min, i_max = torch.min(fixed_image[:, c]), torch.max(fixed_image[:, c])
-            if i_max > i_min + 1e-6:
-                fixed_image[:, c] = (fixed_image[:, c] - i_min) / (i_max - i_min)
-            j_min, j_max = torch.min(moving_image[:, c]), torch.max(moving_image[:, c])
-            if j_max > j_min + 1e-6:
-                moving_image[:, c] = (moving_image[:, c] - j_min) / (j_max - j_min)
+        with torch.no_grad():
+            for c in range(fixed_image.shape[1]):
+                i_min, i_max = torch.min(fixed_image[:, c]), torch.max(fixed_image[:, c])
+                if i_max > i_min + 1e-6:
+                    fixed_image[:, c].sub_(i_min).div_(i_max - i_min)
+                j_min, j_max = torch.min(moving_image[:, c]), torch.max(moving_image[:, c])
+                if j_max > j_min + 1e-6:
+                    moving_image[:, c].sub_(j_min).div_(j_max - j_min)
         
         device = fixed_image.device
         dtype = fixed_image.dtype
@@ -752,53 +763,55 @@ class SyNTo(nn.Module):
                 t_fov = com_moving_fov - com_fixed_fov
                 
                 if init_M_phys is None:
-                    # 2. Compute Foreground (intensity-weighted) centers on channel 0
-                    fixed_pos = torch.clamp(fixed_image[:, 0], min=0.0)
-                    moving_pos = torch.clamp(moving_image[:, 0], min=0.0)
+                    # 2. Compute Foreground (intensity-weighted) centers on channel 0 via 1-D marginals
+                    fixed_pos = torch.clamp(fixed_image[0, 0], min=0.0)
+                    moving_pos = torch.clamp(moving_image[0, 0], min=0.0)
                     sum_fixed = fixed_pos.sum()
                     sum_moving = moving_pos.sum()
-                    
+
                     if sum_fixed > 1e-5 and sum_moving > 1e-5:
-                        grids_f = [torch.arange(s, device=device, dtype=dtype) for s in fixed_image.shape[2:]]
-                        meshgrid_f = torch.meshgrid(*grids_f, indexing='ij')
-                        idxs_f = torch.stack(list(reversed(meshgrid_f)), dim=-1)
-                        
-                        grids_m = [torch.arange(s, device=device, dtype=dtype) for s in moving_image.shape[2:]]
-                        meshgrid_m = torch.meshgrid(*grids_m, indexing='ij')
-                        idxs_m = torch.stack(list(reversed(meshgrid_m)), dim=-1)
-                        
-                        com_fixed_voxel = torch.sum(fixed_pos.squeeze(0).unsqueeze(-1) * idxs_f, dim=list(range(dim))) / sum_fixed
-                        com_moving_voxel = torch.sum(moving_pos.squeeze(0).unsqueeze(-1) * idxs_m, dim=list(range(dim))) / sum_moving
-                        
+                        def _com_voxel_xyz(vol_pos: torch.Tensor, total_w: torch.Tensor) -> torch.Tensor:
+                            coords_zyx = []
+                            for ax in range(dim):
+                                other_axes = [i for i in range(dim) if i != ax]
+                                marg = vol_pos.sum(dim=other_axes) if other_axes else vol_pos
+                                coords_zyx.append(
+                                    torch.dot(marg, torch.arange(vol_pos.shape[ax], device=device, dtype=dtype)) / total_w
+                                )
+                            return torch.stack(coords_zyx[::-1])
+
+                        com_fixed_voxel = _com_voxel_xyz(fixed_pos, sum_fixed)
+                        com_moving_voxel = _com_voxel_xyz(moving_pos, sum_moving)
                         com_fixed_fg = Dx_t @ (Sx_t * com_fixed_voxel) + Ox_t
                         com_moving_fg = Dy_t @ (Sy_t * com_moving_voxel) + Oy_t
-                        
                         t_fg = com_moving_fg - com_fixed_fg
                     else:
                         t_fg = t_fov
-                    
+                    del fixed_pos, moving_pos
+
                     down_shape = tuple(max(8, s // 4) for s in fixed_image.shape[2:])
                     I_down = F.interpolate(fixed_image[:, 0:1], size=down_shape, mode='trilinear' if dim == 3 else 'bilinear', align_corners=True)
                     J_down = F.interpolate(moving_image[:, 0:1], size=down_shape, mode='trilinear' if dim == 3 else 'bilinear', align_corners=True)
                     down_spacing = _level_spacing(fixed_spacing, fixed_image.shape[2:], down_shape)
                     X_down = get_physical_grid_torch(down_shape, down_spacing, fixed_origin, fixed_direction, device=device, dtype=dtype)
-                    
+
                     com_loss_fn = get_similarity_loss('lncc', window_size=5).to(device=device)
 
                     def eval_translation(t_candidate):
                         t_candidate_zyx = reverse_components(t_candidate)
                         y_phys = X_down + t_candidate_zyx
-                        y_norm = physical_to_normalized_torch(y_phys, moving_image.shape[2:], moving_spacing, moving_origin, moving_direction)
+                        y_norm = physical_to_normalized_torch(y_phys, self.moving_shape, moving_spacing, moving_origin, moving_direction)
                         J_warped = grid_sample_nd(J_down, y_norm, padding_mode='zeros', align_corners=True, interpolator='linear')
-                        
+
                         return com_loss_fn(I_down, J_warped).item()
-                    
+
                     loss_fov = eval_translation(t_fov)
                     loss_fg = eval_translation(t_fg)
+                    del I_down, J_down, X_down, com_loss_fn
                     if verbose >= 2:
                         print(f"[CoM Init] t_fov: {t_fov.data.cpu().numpy()}, loss_fov: {loss_fov:.4f}")
                         print(f"[CoM Init] t_fg: {t_fg.data.cpu().numpy()}, loss_fg: {loss_fg:.4f}")
-                    
+
                     best_t = t_fov if loss_fov < loss_fg else t_fg
                 else:
                     best_t = None
@@ -939,6 +952,7 @@ class SyNTo(nn.Module):
         # --- 0. Construct Image Pyramids (the central 'deformable' plan; each image on its own grid) ---
         I_lv = build_pyramid(fixed_image, fixed_spacing, levels, 'deformable', sigma=sigmas)
         J_lv = build_pyramid(moving_image, moving_spacing, levels, 'deformable', sigma=sigmas, reference_spacing=fixed_spacing)
+        del fixed_image, moving_image
         I_pyr = [lv.tensor for lv in I_lv]
         J_pyr = [lv.tensor for lv in J_lv]
         finest_spacing_fixed = _level_spacing(fixed_spacing, spatial_shape, I_pyr[-1].shape[2:])
@@ -959,17 +973,15 @@ class SyNTo(nn.Module):
             curr_spatial = I_curr.shape[2:]
             
             if level_idx > 0:
-                warp_l2r = F.interpolate(torch.movedim(warp_l2r, -1, 1), size=curr_spatial, mode='bilinear' if dim==2 else 'trilinear', align_corners=True)
-                warp_l2r = torch.movedim(warp_l2r, 1, -1)
-                
-                warp_r2l = F.interpolate(torch.movedim(warp_r2l, -1, 1), size=curr_spatial, mode='bilinear' if dim==2 else 'trilinear', align_corners=True)
-                warp_r2l = torch.movedim(warp_r2l, 1, -1)
-                
-                warp_l2r_inv = F.interpolate(torch.movedim(warp_l2r_inv, -1, 1), size=curr_spatial, mode='bilinear' if dim==2 else 'trilinear', align_corners=True)
-                warp_l2r_inv = torch.movedim(warp_l2r_inv, 1, -1)
-                
-                warp_r2l_inv = F.interpolate(torch.movedim(warp_r2l_inv, -1, 1), size=curr_spatial, mode='bilinear' if dim==2 else 'trilinear', align_corners=True)
-                warp_r2l_inv = torch.movedim(warp_r2l_inv, 1, -1)
+                interp_mode_lvl = 'bilinear' if dim == 2 else 'trilinear'
+                warp_l2r = F.interpolate(torch.movedim(warp_l2r, -1, 1), size=curr_spatial, mode=interp_mode_lvl, align_corners=True).movedim(1, -1)
+                warp_r2l = F.interpolate(torch.movedim(warp_r2l, -1, 1), size=curr_spatial, mode=interp_mode_lvl, align_corners=True).movedim(1, -1)
+                w_l_inv_old, w_r_inv_old = warp_l2r_inv, warp_r2l_inv
+                del warp_l2r_inv, warp_r2l_inv
+                warp_l2r_inv = F.interpolate(torch.movedim(w_l_inv_old, -1, 1), size=curr_spatial, mode=interp_mode_lvl, align_corners=True).movedim(1, -1)
+                del w_l_inv_old
+                warp_r2l_inv = F.interpolate(torch.movedim(w_r_inv_old, -1, 1), size=curr_spatial, mode=interp_mode_lvl, align_corners=True).movedim(1, -1)
+                del w_r_inv_old
                 
             warp_l2r.requires_grad_(True)
             warp_r2l.requires_grad_(True)
@@ -984,7 +996,7 @@ class SyNTo(nn.Module):
                     M_phys, t_phys = grid_to_physical_affine_torch(
                         T_grid,
                         spatial_shape, fixed_spacing, fixed_origin, fixed_direction,
-                        moving_image.shape[2:], moving_spacing, moving_origin, moving_direction
+                        self.moving_shape, moving_spacing, moving_origin, moving_direction
                     )
                     
                     self.init_M_phys = None
@@ -1039,7 +1051,8 @@ class SyNTo(nn.Module):
                     fallback_fn = get_similarity_loss(
                         'lncc',
                         window_size=lncc_window_size,
-                        use_analytical_gradients=use_analytical_gradients
+                        use_analytical_gradients=use_analytical_gradients,
+                        metric_chunks=kwargs.get('metric_chunks', 1),
                     ).to(device=device)
                     active_loss_functions.append(fallback_fn)
                     active_metric_names.append('lncc_fallback')
@@ -1078,13 +1091,22 @@ class SyNTo(nn.Module):
                 self._adam_t = 0
                 
             level_syn_losses = []
+            dual_gradient_level = bool(kwargs.get('dual_gradient', getattr(self, 'dual_gradient', False)))
+            need_level_grad = bool(use_analytical_gradients or dual_gradient_level)
             with torch.no_grad():
-                grad_I_curr_level = _spatial_jacobian_nd(I_curr.movedim(1, -1), physical_spacing=tuple(reversed(curr_spacing_fixed))).squeeze(-2)
-                grad_J_curr_level = _spatial_jacobian_nd(J_curr.movedim(1, -1), physical_spacing=tuple(reversed(curr_spacing_moving))).squeeze(-2)
-            
-            # Checkpoint warp state at level start for divergence retry
-            max_syn_retries = 2
-            syn_retry_count = 0
+                if need_level_grad and I_curr.shape[1] == 1 and J_curr.shape[1] == 1:
+                    grad_I_curr_level = _spatial_jacobian_nd(I_curr.movedim(1, -1), physical_spacing=tuple(reversed(curr_spacing_fixed))).squeeze(-2)
+                    grad_J_curr_level = _spatial_jacobian_nd(J_curr.movedim(1, -1), physical_spacing=tuple(reversed(curr_spacing_moving))).squeeze(-2)
+                else:
+                    grad_I_curr_level = None
+                    grad_J_curr_level = None
+                if use_analytical_gradients:
+                    grad_I_vox_level = _image_spatial_gradient(I_curr)
+                    grad_J_vox_level = _image_spatial_gradient(J_curr)
+                else:
+                    grad_I_vox_level = None
+                    grad_J_vox_level = None
+
             # Multi-resolution CFL step scaling.
             # The raw shrink_ratio = curr_res / full_res (e.g. 0.25 at 4× downsampling)
             # enforces constant physical step but is very conservative at coarse levels.
@@ -1096,10 +1118,6 @@ class SyNTo(nn.Module):
             self.pyramid_info.append(dict(level=scale, fixed_shape=tuple(curr_spatial), moving_shape=tuple(J_curr.shape[2:]),
                                           fixed_spacing=tuple(curr_spacing_fixed), moving_spacing=tuple(curr_spacing_moving),
                                           shrink_ratio=shrink_ratio, cfl_voxels=level_cfl_voxels))
-            warp_l2r_checkpoint = warp_l2r.detach().clone()
-            warp_r2l_checkpoint = warp_r2l.detach().clone()
-            warp_l2r_inv_checkpoint = warp_l2r_inv.detach().clone()
-            warp_r2l_inv_checkpoint = warp_r2l_inv.detach().clone()
             # Loss and best-state bookkeeping stay on the device; the host reads the loss history
             # every ``loss_sync_every`` epochs (and on the last one) in a single transfer. The
             # convergence and collapse tests therefore lag by at most ``loss_sync_every - 1`` epochs.
@@ -1123,19 +1141,23 @@ class SyNTo(nn.Module):
                 tol_kw = (dict(max_error_threshold=self.inv_tolerance, mean_error_threshold=self.inv_tolerance * 0.01)
                           if use_tol else {})
                 stats = {}
+                fwd_pair = torch.cat([fwd_l.detach(), fwd_r.detach()])
+                init_pair = torch.cat([init_l.detach(), init_r.detach()])
+                del init_l, init_r
                 out = update_inverse_field_nd(
-                    torch.cat([fwd_l, fwd_r]), torch.cat([init_l.detach(), init_r.detach()]),
+                    fwd_pair, init_pair,
                     steps=in_loop_inv_steps, method=self.inverse_method,
                     spacing=curr_spacing_fixed, origin=fixed_origin, direction=fixed_direction, X_phys=X_phys_arg,
                     check_after=self._inv_step_hint.get(key), stats=stats, **tol_kw)
+                del fwd_pair, init_pair
                 if 'steps' in stats:
                     self._inv_step_hint[key] = stats['steps']
                 return out[0:1], out[1:2]
             
             stop.start_level(level_idx, curr_syn_epochs)
             for epoch in range(curr_syn_epochs):
-                if warp_l2r.grad is not None: warp_l2r.grad.zero_()
-                if warp_r2l.grad is not None: warp_r2l.grad.zero_()
+                warp_l2r.grad = None
+                warp_r2l.grad = None
                 
                 # Real SyN: Pull both images to the midpoint domain
                 I_mid, J_mid, grad_I_mid_sampled, grad_J_mid_sampled, in_bounds_mask = prepare_mid_images_and_gradients_torch(
@@ -1147,7 +1169,9 @@ class SyNTo(nn.Module):
                     M_phys, t_phys, initial_grid_level,
                     interpolator=self.interpolator,
                     grad_I_curr=grad_I_curr_level, grad_J_curr=grad_J_curr_level,
-                    use_analytical_gradients=use_analytical_gradients
+                    use_analytical_gradients=use_analytical_gradients,
+                    precomputed_grad_I_vox=grad_I_vox_level,
+                    precomputed_grad_J_vox=grad_J_vox_level,
                 )
 
                 if verbose >= 2:
@@ -1228,6 +1252,8 @@ class SyNTo(nn.Module):
                     with torch.no_grad():
                         warp_l2r.grad = (1.0 - dual_w) * grad_l_analytic + dual_w * grad_l_autograd
                         warp_r2l.grad = (1.0 - dual_w) * grad_r_analytic + dual_w * grad_r_autograd
+                    del I_mid_det, J_mid_det, g_im, g_jm
+                    del grad_l_analytic, grad_r_analytic, grad_l_autograd, grad_r_autograd
 
                     self.syn_losses.append(loss_t)
                     level_syn_losses.append(loss_t)
@@ -1282,6 +1308,7 @@ class SyNTo(nn.Module):
 
                         grad_r_raw = (g_jm.movedim(1, -1) * grad_J_mid_sampled).contiguous()
                         warp_r2l.grad = grad_r_raw
+                    del I_mid_det, J_mid_det, g_im, g_jm, grad_l_raw, grad_r_raw
 
                 else:
                     loss = 0.0
@@ -1417,6 +1444,8 @@ class SyNTo(nn.Module):
                         torch.where(improved, warp_r2l_inv.detach(), best_warp_r2l_inv, out=best_warp_r2l_inv)
                     have_best = True
 
+                del I_mid, J_mid, grad_I_mid_sampled, grad_J_mid_sampled, in_bounds_mask
+
                 if isinstance(self.fluid_sigma, (list, tuple)):
                     curr_fluid_var = self.fluid_sigma[min(level_idx, len(self.fluid_sigma) - 1)]
                 else:
@@ -1511,6 +1540,8 @@ class SyNTo(nn.Module):
                             # Spatial Gaussian: separable convolution filter
                             grad_l = separable_gaussian_filter(warp_l2r.grad * b_mask, curr_fluid_sig, kernel_type=kernel_type)
                             grad_r = separable_gaussian_filter(warp_r2l.grad * b_mask, curr_fluid_sig, kernel_type=kernel_type)
+                    warp_l2r.grad = None
+                    warp_r2l.grad = None
 
                     # Deformed-space smoothing: warp gradient to deformed config,
                     # smooth there, warp back. This bounds ∇_y δ (gradient in deformed
@@ -1523,24 +1554,30 @@ class SyNTo(nn.Module):
                             coords_def_norm = physical_to_normalized_torch_cached(
                                 coords_def, fixed_shape_t, fixed_spacing_t, fixed_origin_t, fixed_direction_t
                             )
+                            del coords_def
                             # Map gradient to deformed space
                             grad_def = F.grid_sample(
                                 grad_field.movedim(-1, 1).contiguous(),
                                 coords_def_norm.contiguous(),
                                 padding_mode='border', align_corners=True
                             ).movedim(1, -1).contiguous()
+                            del coords_def_norm
                             # Smooth in deformed space (bounds ∇_y δ)
                             grad_def_smooth = separable_gaussian_filter(grad_def, curr_fluid_sig * 0.5)
+                            del grad_def
                             # Map back to reference via inverse warp
                             coords_ref = X_phys + warp_inv
                             coords_ref_norm = physical_to_normalized_torch_cached(
                                 coords_ref, fixed_shape_t, fixed_spacing_t, fixed_origin_t, fixed_direction_t
                             )
-                            return F.grid_sample(
+                            del coords_ref
+                            out_smooth = F.grid_sample(
                                 grad_def_smooth.movedim(-1, 1).contiguous(),
                                 coords_ref_norm.contiguous(),
                                 padding_mode='border', align_corners=True
                             ).movedim(1, -1).contiguous()
+                            del grad_def_smooth, coords_ref_norm
+                            return out_smooth
                         grad_l = _deformed_smooth(grad_l, warp_l2r, warp_l2r_inv)
                         grad_r = _deformed_smooth(grad_r, warp_r2l, warp_r2l_inv)
 
@@ -1550,9 +1587,11 @@ class SyNTo(nn.Module):
                         grad_r = grad_r * restrict_mask
 
                     grad_l_voxel = grad_l / curr_spacing_fixed_xyz  # convert to voxel units
-                    grad_r_voxel = grad_r / curr_spacing_fixed_xyz
                     max_norm_l = torch.sqrt(torch.sum(grad_l_voxel**2, dim=-1)).max()
+                    del grad_l_voxel
+                    grad_r_voxel = grad_r / curr_spacing_fixed_xyz
                     max_norm_r = torch.sqrt(torch.sum(grad_r_voxel**2, dim=-1)).max()
+                    del grad_r_voxel
                     
                     if verbose >= 2:
                         print(f"DEBUG PyTorch L{level_idx} E{epoch} max_norm_l: {float(max_norm_l)}, max_norm_r: {float(max_norm_r)}")
@@ -1570,9 +1609,8 @@ class SyNTo(nn.Module):
                                               torch.zeros_like(max_norm_l)) * grad_l
                         delta_r = torch.where(max_norm_r > 1e-12, effective_cfl / max_norm_r_safe,
                                               torch.zeros_like(max_norm_r)) * grad_r
+                        del grad_l, grad_r
 
-
-                        
                         # Antisymmetric velocity projection: remove common-mode drift
                         # to anchor the geodesic midpoint at the Fréchet mean.
                         # Decomposes (δ_l, δ_r) into antisymmetric (geodesic) and
@@ -1581,6 +1619,7 @@ class SyNTo(nn.Module):
                             e0 = delta_l + delta_r
                             delta_l = delta_l - 0.5 * e0
                             delta_r = delta_r - 0.5 * e0
+                            del e0
 
                         # syntx default is now lagrangian due to fundamental PyTorch
                         # coordinate-frame smoothing limitations in the Eulerian formulation
@@ -1593,18 +1632,24 @@ class SyNTo(nn.Module):
                             coords_norm_l = physical_to_normalized_torch_cached(
                                 coords_phys_l, fixed_shape_t, fixed_spacing_t, fixed_origin_t, fixed_direction_t
                             )
+                            del coords_phys_l
                             # Pull back the velocity field u (delta_l) to the current configuration
                             delta_l_pb = F.grid_sample(delta_l.movedim(-1, 1), coords_norm_l, padding_mode='border', align_corners=True).movedim(1, -1)
+                            del coords_norm_l, delta_l
+                            with torch.no_grad():
+                                warp_l2r.sub_(delta_l_pb)
+                            del delta_l_pb
                             
                             coords_phys_r = X_phys + warp_r2l
                             coords_norm_r = physical_to_normalized_torch_cached(
                                 coords_phys_r, fixed_shape_t, fixed_spacing_t, fixed_origin_t, fixed_direction_t
                             )
+                            del coords_phys_r
                             delta_r_pb = F.grid_sample(delta_r.movedim(-1, 1), coords_norm_r, padding_mode='border', align_corners=True).movedim(1, -1)
-                            
+                            del coords_norm_r, delta_r
                             with torch.no_grad():
-                                warp_l2r.sub_(delta_l_pb)
                                 warp_r2l.sub_(delta_r_pb)
+                            del delta_r_pb
                         else:
                             # SyN composition (Eulerian right-composition): φ_new = φ_old ∘ (Id - δ) - δ
                             # Note: PyTorch fixed-space smoothing bounds ∇_x δ, not ∇_y δ,
@@ -1613,17 +1658,22 @@ class SyNTo(nn.Module):
                             coords_norm_l = physical_to_normalized_torch_cached(
                                 coords_phys_l, fixed_shape_t, fixed_spacing_t, fixed_origin_t, fixed_direction_t
                             )
+                            del coords_phys_l
                             warp_l2r_sampled = F.grid_sample(warp_l2r.movedim(-1, 1), coords_norm_l, padding_mode='border', align_corners=True).movedim(1, -1)
+                            del coords_norm_l
                             warp_l2r.copy_(warp_l2r_sampled - delta_l)
+                            del warp_l2r_sampled, delta_l
                             
                             coords_phys_r = X_phys - delta_r
                             coords_norm_r = physical_to_normalized_torch_cached(
                                 coords_phys_r, fixed_shape_t, fixed_spacing_t, fixed_origin_t, fixed_direction_t
                             )
+                            del coords_phys_r
                             warp_r2l_sampled = F.grid_sample(warp_r2l.movedim(-1, 1), coords_norm_r, padding_mode='border', align_corners=True).movedim(1, -1)
+                            del coords_norm_r
                             warp_r2l.copy_(warp_r2l_sampled - delta_r)
+                            del warp_r2l_sampled, delta_r
 
-                        
                         # Removed ITK-standard Dirichlet zero boundary enforcement after composition
                         # to prevent massive gradient-exploding discontinuities at the boundary.
                         
@@ -1648,13 +1698,13 @@ class SyNTo(nn.Module):
                             return update, step_new, grad_new
                             
                         update_l, self._rprop_step_l, self._rprop_prev_grad_l = rprop_update(grad_l, self._rprop_prev_grad_l, self._rprop_step_l)
+                        del grad_l
                         update_r, self._rprop_step_r, self._rprop_prev_grad_r = rprop_update(grad_r, self._rprop_prev_grad_r, self._rprop_step_r)
+                        del grad_r
                         
-                        warp_l2r.copy_(warp_l2r + update_l)
-                        warp_r2l.copy_(warp_r2l + update_r)
-                        
-                        
-                        
+                        warp_l2r.add_(update_l)
+                        warp_r2l.add_(update_r)
+                        del update_l, update_r
                         
                         if self.elastic_sigma > 0.0:
                             elastic_sig_val = float(self.elastic_sigma)
@@ -1672,6 +1722,7 @@ class SyNTo(nn.Module):
                                 warp_l2r_inv, warp_r2l_inv, warp_l2r, warp_r2l, 'proj', use_tol=True)
                             warp_l2r.copy_(proj_l)
                             warp_r2l.copy_(proj_r)
+                            del proj_l, proj_r
                         
                     elif optimizer_type in ['adam', 'reg_adam', 'regadam', 'sobolev_adam', 'gaussian_adam', 'dsti_adam']:
                         self._adam_t += 1
@@ -1686,10 +1737,12 @@ class SyNTo(nn.Module):
                         
                         self._adam_m_l.mul_(beta1).add_(grad_l, alpha=1.0 - beta1)
                         self._adam_v_l.mul_(beta2).addcmul_(grad_l, grad_l, value=1.0 - beta2)
+                        del grad_l
                         u_raw_l = (self._adam_m_l * step_size).div_(self._adam_v_l.sqrt().add_(eps_scaled))
                         
                         self._adam_m_r.mul_(beta1).add_(grad_r, alpha=1.0 - beta1)
                         self._adam_v_r.mul_(beta2).addcmul_(grad_r, grad_r, value=1.0 - beta2)
+                        del grad_r
                         u_raw_r = (self._adam_m_r * step_size).div_(self._adam_v_r.sqrt().add_(eps_scaled))
                         
                         # Spatial pre-smoothing of Adam quotient for RegAdam
@@ -1739,9 +1792,11 @@ class SyNTo(nn.Module):
                                 g_sig = kwargs.get('gaussian_sigma', 1.5)
                                 u_reg_l = separable_gaussian_filter(u_raw_l, g_sig)
                                 u_reg_r = separable_gaussian_filter(u_raw_r, g_sig)
+                            del u_raw_l, u_raw_r
                         else:
                             u_reg_l = u_raw_l
                             u_reg_r = u_raw_r
+                            del u_raw_l, u_raw_r
 
                         restrict_mask = self._get_restrict_mask(u_reg_l.device, u_reg_l.dtype)
                         if restrict_mask is not None:
@@ -1753,20 +1808,24 @@ class SyNTo(nn.Module):
                         lr_effective = float(optimizer_lr)
                         spatial_dims = tuple(range(1, u_reg_l.dim() - 1))
                         norm_l = torch.norm(u_reg_l, dim=-1)
-                        norm_r = torch.norm(u_reg_r, dim=-1)
                         max_l = torch.amax(norm_l, dim=spatial_dims)
+                        del norm_l
+                        norm_r = torch.norm(u_reg_r, dim=-1)
                         max_r = torch.amax(norm_r, dim=spatial_dims)
+                        del norm_r
                         max_u = torch.maximum(max_l, max_r).clamp_min(1e-4)
                         cfl_scale = (effective_cfl / max_u).clamp_max(1.0)
                         cfl_scale = cfl_scale.view(-1, *([1] * (u_reg_l.dim() - 1)))
                         delta_l = (cfl_scale * lr_effective) * u_reg_l
                         delta_r = (cfl_scale * lr_effective) * u_reg_r
+                        del u_reg_l, u_reg_r
                         
                         # Antisymmetric velocity projection
                         if getattr(self, 'antisymmetric', True):
                             e0 = delta_l + delta_r
                             delta_l = delta_l - 0.5 * e0
                             delta_r = delta_r - 0.5 * e0
+                            del e0
                             
                         # Eulerian or Lagrangian pullback composition
                         if getattr(self, 'formulation', 'lagrangian') == 'lagrangian':
@@ -1774,31 +1833,43 @@ class SyNTo(nn.Module):
                             coords_norm_l = physical_to_normalized_torch_cached(
                                 coords_phys_l, fixed_shape_t, fixed_spacing_t, fixed_origin_t, fixed_direction_t
                             )
+                            del coords_phys_l
                             delta_l_pb = F.grid_sample(delta_l.movedim(-1, 1), coords_norm_l, padding_mode='border', align_corners=True).movedim(1, -1)
+                            del coords_norm_l, delta_l
+                            with torch.no_grad():
+                                warp_l2r.sub_(delta_l_pb)
+                            del delta_l_pb
                             
                             coords_phys_r = X_phys + warp_r2l
                             coords_norm_r = physical_to_normalized_torch_cached(
                                 coords_phys_r, fixed_shape_t, fixed_spacing_t, fixed_origin_t, fixed_direction_t
                             )
+                            del coords_phys_r
                             delta_r_pb = F.grid_sample(delta_r.movedim(-1, 1), coords_norm_r, padding_mode='border', align_corners=True).movedim(1, -1)
-                            
+                            del coords_norm_r, delta_r
                             with torch.no_grad():
-                                warp_l2r.sub_(delta_l_pb)
                                 warp_r2l.sub_(delta_r_pb)
+                            del delta_r_pb
                         else:
                             coords_phys_l = X_phys - delta_l
                             coords_norm_l = physical_to_normalized_torch_cached(
                                 coords_phys_l, fixed_shape_t, fixed_spacing_t, fixed_origin_t, fixed_direction_t
                             )
+                            del coords_phys_l
                             warp_l2r_sampled = F.grid_sample(warp_l2r.movedim(-1, 1), coords_norm_l, padding_mode='border', align_corners=True).movedim(1, -1)
+                            del coords_norm_l
                             warp_l2r.copy_(warp_l2r_sampled - delta_l)
+                            del warp_l2r_sampled, delta_l
                             
                             coords_phys_r = X_phys - delta_r
                             coords_norm_r = physical_to_normalized_torch_cached(
                                 coords_phys_r, fixed_shape_t, fixed_spacing_t, fixed_origin_t, fixed_direction_t
                             )
+                            del coords_phys_r
                             warp_r2l_sampled = F.grid_sample(warp_r2l.movedim(-1, 1), coords_norm_r, padding_mode='border', align_corners=True).movedim(1, -1)
+                            del coords_norm_r
                             warp_r2l.copy_(warp_r2l_sampled - delta_r)
+                            del warp_r2l_sampled, delta_r
                             
                         if self.elastic_sigma > 0.0:
                             elastic_sig_val = float(self.elastic_sigma)
@@ -1815,12 +1886,11 @@ class SyNTo(nn.Module):
                     elif optimizer_type == 'sgd':
                         update_l = -optimizer_lr * grad_l
                         update_r = -optimizer_lr * grad_r
+                        del grad_l, grad_r
                         
-                        warp_l2r.copy_(warp_l2r + update_l)
-                        warp_r2l.copy_(warp_r2l + update_r)
-                        
-                        
-                        
+                        warp_l2r.add_(update_l)
+                        warp_r2l.add_(update_r)
+                        del update_l, update_r
                         
                         if self.elastic_sigma > 0.0:
                             warp_l2r.copy_(separable_gaussian_filter(warp_l2r, self.elastic_sigma))
@@ -1833,6 +1903,7 @@ class SyNTo(nn.Module):
                                 warp_l2r_inv, warp_r2l_inv, warp_l2r, warp_r2l, 'proj', use_tol=True)
                             warp_l2r.copy_(proj_l)
                             warp_r2l.copy_(proj_r)
+                            del proj_l, proj_r
                     
                     # ITK/ANTs EnforceStationaryBoundary: zero displacement on every face.
                     if self.stationary_boundary:
@@ -1895,85 +1966,142 @@ class SyNTo(nn.Module):
                     with torch.no_grad():
                         warp_l2r.data.copy_(best_warp_l2r)
                         warp_r2l.data.copy_(best_warp_r2l)
-                        warp_l2r_inv = best_warp_l2r_inv.clone()
-                        warp_r2l_inv = best_warp_r2l_inv.clone()
+                        warp_l2r_inv = best_warp_l2r_inv
+                        warp_r2l_inv = best_warp_r2l_inv
 
             warp_l2r.requires_grad_(False)
             warp_r2l.requires_grad_(False)
-            
+            del best_warp_l2r, best_warp_r2l, best_warp_l2r_inv, best_warp_r2l_inv
+            del I_curr, J_curr, grad_I_curr_level, grad_J_curr_level, grad_I_vox_level, grad_J_vox_level
+            del X_phys, b_mask, initial_grid_level
+            I_pyr[level_idx] = None
+            J_pyr[level_idx] = None
+            I_lv[level_idx] = None
+            J_lv[level_idx] = None
+            for _opt_attr in (
+                '_rprop_step_l', '_rprop_step_r', '_rprop_prev_grad_l', '_rprop_prev_grad_r',
+                '_adam_m_l', '_adam_m_r', '_adam_v_l', '_adam_v_r',
+            ):
+                if hasattr(self, _opt_attr):
+                    delattr(self, _opt_attr)
+
+        del I_pyr, J_pyr, I_lv, J_lv
         with torch.no_grad():
-            # Interpolate midpoint fields to target grid resolution
-            w_l2r = F.interpolate(torch.movedim(warp_l2r, -1, 1), size=self.grid_shape, mode='bilinear' if dim==2 else 'trilinear', align_corners=True).movedim(1, -1)
-            w_r2l = F.interpolate(torch.movedim(warp_r2l, -1, 1), size=self.grid_shape, mode='bilinear' if dim==2 else 'trilinear', align_corners=True).movedim(1, -1)
-            
-            # Recompute midpoint inverses at full resolution for accurate composition
-            # Using interpolated in-loop inverses as warm-start initial guesses
-            w_l2r_inv_interp = F.interpolate(torch.movedim(warp_l2r_inv, -1, 1), size=self.grid_shape, mode='bilinear' if dim==2 else 'trilinear', align_corners=True).movedim(1, -1)
-            w_r2l_inv_interp = F.interpolate(torch.movedim(warp_r2l_inv, -1, 1), size=self.grid_shape, mode='bilinear' if dim==2 else 'trilinear', align_corners=True).movedim(1, -1)
-            midpoint_inv_steps = self.inverse_steps  # Warm-started from in-loop inverse; fewer steps needed
-            w_l2r_inv = w_l2r_inv_interp
-            w_r2l_inv = w_r2l_inv_interp
-            
-            X_phys = get_physical_grid_torch(self.grid_shape, fixed_spacing, fixed_origin, fixed_direction, device=device, dtype=dtype)
-            
+            target_grid_shape = tuple(self.grid_shape)
+            interp_mode_full = 'bilinear' if dim == 2 else 'trilinear'
+            offload_midpoints = int(np.prod(target_grid_shape)) > 16_777_216
+
+            def _upsample_or_take(field_t: torch.Tensor) -> torch.Tensor:
+                field_d = field_t.detach()
+                if tuple(field_d.shape[1:-1]) == target_grid_shape:
+                    if field_d.untyped_storage().nbytes() > field_d.numel() * field_d.element_size():
+                        return field_d.clone()
+                    return field_d
+                return F.interpolate(
+                    torch.movedim(field_d, -1, 1),
+                    size=target_grid_shape,
+                    mode=interp_mode_full,
+                    align_corners=True,
+                ).movedim(1, -1)
+
+            def _zero_boundary_inplace(field_t: torch.Tensor) -> None:
+                for _ax in range(dim):
+                    _sl_lo = [slice(None)] * field_t.ndim
+                    _sl_lo[_ax + 1] = slice(0, 1)
+                    field_t[tuple(_sl_lo)] = 0
+                    _sl_hi = [slice(None)] * field_t.ndim
+                    _sl_hi[_ax + 1] = slice(-1, None)
+                    field_t[tuple(_sl_hi)] = 0
+
+            # Interpolate midpoint fields to target grid resolution (skipping no-op when already full-res)
+            w_l2r = _upsample_or_take(warp_l2r)
+            del warp_l2r
+            w_r2l = _upsample_or_take(warp_r2l)
+            del warp_r2l
+            w_l2r_inv = _upsample_or_take(warp_l2r_inv)
+            w_r2l_inv = _upsample_or_take(warp_r2l_inv)
+            del warp_l2r_inv, warp_r2l_inv
+
+            # Preserve inverse of fixed-side half-warp for syntx.liouville_determinant;
+            # offload midpoint fields to CPU above 256^3 voxels so they do not occupy GPU memory.
+            mid_l2r_inv = w_l2r_inv.cpu() if offload_midpoints else w_l2r_inv.clone()
+            self.midpoint_warp_l2r_inv = nn.Parameter(mid_l2r_inv, requires_grad=False)
+            self.midpoint_warp_l2r_inv.is_physical = True
+            del mid_l2r_inv
+
+            X_phys = get_physical_grid_torch(
+                target_grid_shape, fixed_spacing, fixed_origin, fixed_direction, device=device, dtype=dtype
+            )
+
             # Pre-compute normalization tensors for composition
             comp_spacing_rev, comp_origin_rev, comp_direction_rev = reverse_metadata(
                 fixed_spacing, fixed_origin, fixed_direction
             )
-            comp_shape_t = torch.tensor(list(self.grid_shape), device=device, dtype=dtype)
+            comp_shape_t = torch.tensor(list(target_grid_shape), device=device, dtype=dtype)
             comp_spacing_t = torch.tensor(comp_spacing_rev, device=device, dtype=dtype)
             comp_origin_t = torch.tensor(comp_origin_rev, device=device, dtype=dtype)
             comp_direction_t = torch.tensor(comp_direction_rev, device=device, dtype=dtype)
-            
-            # Preserve uncomposed half-warp fields for midpoint image export.
-            # w_l2r maps midpoint→fixed, w_r2l maps midpoint→(affine)moving.
-            # These are destroyed by the full composition below.
-            self.midpoint_warp_l2r = nn.Parameter(w_l2r.clone(), requires_grad=False)
-            self.midpoint_warp_l2r.is_physical = True
-            self.midpoint_warp_r2l = nn.Parameter(w_r2l.clone(), requires_grad=False)
-            self.midpoint_warp_r2l.is_physical = True
-            # inverse of the fixed-side half, exactly as used in the composition below
-            # (syntx.liouville_determinant needs it: det phi(x) = det Dphi_r2l(y) / det Dphi_l2r(y),
-            # y = phi_l2r^-1(x))
-            self.midpoint_warp_l2r_inv = nn.Parameter(w_l2r_inv.clone(), requires_grad=False)
-            self.midpoint_warp_l2r_inv.is_physical = True
-            
-            # Compose midpoint fields in physical space
+
+            # Compose forward F -> M (phi_2 o phi_1^-1) in physical space
             phi_l2r_phys = X_phys + w_l2r_inv
-            coords_norm = physical_to_normalized_torch_cached(phi_l2r_phys, comp_shape_t, comp_spacing_t, comp_origin_t, comp_direction_t)
-            disp_r2l_sampled = F.grid_sample(torch.movedim(w_r2l, -1, 1), coords_norm, padding_mode='border', align_corners=True).movedim(1, -1)
-            full_l2r_phys = phi_l2r_phys + disp_r2l_sampled
-            self.warp_l2r = nn.Parameter(full_l2r_phys - X_phys)
-            self.warp_l2r.is_physical = True
-            
+            del w_l2r_inv
+            coords_norm = physical_to_normalized_torch_cached(
+                phi_l2r_phys, comp_shape_t, comp_spacing_t, comp_origin_t, comp_direction_t
+            )
+            disp_r2l_sampled = F.grid_sample(
+                torch.movedim(w_r2l, -1, 1), coords_norm, padding_mode='border', align_corners=True
+            ).movedim(1, -1)
+            del coords_norm
+            phi_l2r_phys.add_(disp_r2l_sampled).sub_(X_phys)
+            del disp_r2l_sampled
+            fwd_composed = phi_l2r_phys
+            del phi_l2r_phys
+
+            # w_r2l is no longer needed for composition; preserve as midpoint_warp_r2l and free
+            if self.stationary_boundary:
+                _zero_boundary_inplace(w_r2l)
+            mid_r2l = w_r2l.cpu() if offload_midpoints else w_r2l
+            del w_r2l
+            self.midpoint_warp_r2l = nn.Parameter(mid_r2l, requires_grad=False)
+            self.midpoint_warp_r2l.is_physical = True
+            del mid_r2l
+
+            # Compose inverse M -> F (phi_1 o phi_2^-1) once in physical space
             phi_r2l_phys = X_phys + w_r2l_inv
-            coords_norm_r = physical_to_normalized_torch_cached(phi_r2l_phys, comp_shape_t, comp_spacing_t, comp_origin_t, comp_direction_t)
-            disp_l2r_sampled = F.grid_sample(torch.movedim(w_l2r, -1, 1), coords_norm_r, padding_mode='border', align_corners=True).movedim(1, -1)
-            full_r2l_phys = phi_r2l_phys + disp_l2r_sampled
-            self.warp_r2l = nn.Parameter(full_r2l_phys - X_phys)
-            self.warp_r2l.is_physical = True
-            
-            # The mathematical inverse of F -> M (phi_2 o phi_1^-1) 
-            # is M -> F (phi_1 o phi_2^-1). We compute it algebraically for a near-perfect guess.
-            phi_r2l_phys = X_phys + w_r2l_inv
-            coords_norm_r = physical_to_normalized_torch_cached(phi_r2l_phys, comp_shape_t, comp_spacing_t, comp_origin_t, comp_direction_t)
-            disp_l2r_sampled = F.grid_sample(torch.movedim(w_l2r, -1, 1), coords_norm_r, padding_mode='border', align_corners=True).movedim(1, -1)
-            algebraic_inv = (phi_r2l_phys + disp_l2r_sampled) - X_phys
-            
-            self.warp_l2r_inv = nn.Parameter(algebraic_inv.clone())
-            self.warp_l2r_inv.is_physical = True
-            
-            self.warp_r2l = nn.Parameter(algebraic_inv.clone())
-            self.warp_r2l.is_physical = True
-            
-            self.warp_r2l_inv = nn.Parameter(self.warp_l2r.data.clone())
-            self.warp_r2l_inv.is_physical = True
+            del w_r2l_inv
+            coords_norm_r = physical_to_normalized_torch_cached(
+                phi_r2l_phys, comp_shape_t, comp_spacing_t, comp_origin_t, comp_direction_t
+            )
+            disp_l2r_sampled = F.grid_sample(
+                torch.movedim(w_l2r, -1, 1), coords_norm_r, padding_mode='border', align_corners=True
+            ).movedim(1, -1)
+            del coords_norm_r
+            phi_r2l_phys.add_(disp_l2r_sampled).sub_(X_phys)
+            del disp_l2r_sampled, X_phys
+            algebraic_inv = phi_r2l_phys
+            del phi_r2l_phys
+
+            # w_l2r is no longer needed for composition; preserve as midpoint_warp_l2r and free
+            if self.stationary_boundary:
+                _zero_boundary_inplace(w_l2r)
+            mid_l2r = w_l2r.cpu() if offload_midpoints else w_l2r
+            del w_l2r
+            self.midpoint_warp_l2r = nn.Parameter(mid_l2r, requires_grad=False)
+            self.midpoint_warp_l2r.is_physical = True
+            del mid_l2r
 
             if self.stationary_boundary:
-                full_b_mask = get_boundary_mask(self.grid_shape, device, dtype)
-                for _w in (self.warp_l2r, self.warp_r2l, self.warp_l2r_inv, self.warp_r2l_inv,
-                           self.midpoint_warp_l2r, self.midpoint_warp_r2l):
-                    _w.data.mul_(full_b_mask)
+                _zero_boundary_inplace(fwd_composed)
+                _zero_boundary_inplace(algebraic_inv)
+
+            self.warp_l2r = nn.Parameter(fwd_composed)
+            self.warp_l2r.is_physical = True
+            self.warp_r2l_inv = self.warp_l2r
+
+            self.warp_r2l = nn.Parameter(algebraic_inv)
+            self.warp_r2l.is_physical = True
+            self.warp_l2r_inv = self.warp_r2l
+            del fwd_composed, algebraic_inv
 
 
             # Convert all logged losses to floats in a single batch
@@ -2242,7 +2370,7 @@ SYN_ADVANCED_OPTIONS = frozenset({
     'alpha', 'boundary_suppression_thresh', 'cohort_type', 'device', 'dof', 'dual_gradient',
     'dual_gradient_weight', 'fixed_mask', 'formulation', 'gaussian_sigma', 'guided', 'guided_weight',
     'image_grad_clip', 'in_memory', 'initial_grid', 'inverse_method', 'inverse_steps',
-    'kernel_type', 'learning_rate', 'metric_weights', 'mind_offsets', 'mind_patch_size',
+    'kernel_type', 'learning_rate', 'metric_chunks', 'metric_weights', 'mind_offsets', 'mind_patch_size',
     'optimizer_lr', 'outprefix', 'regularizer',
     'scales', 'similarity_metric', 'smooth_in_deformed_space', 'smoothing_sigmas',
     'sobolev_alpha', 'stationary_boundary', 'syn_metric_weights', 'use_analytical_gradients',
@@ -2830,10 +2958,10 @@ def registration(
         import torch
         device = auto_detect_device(backend='pytorch', requested_device=kwargs.get('device', None))
         
-        I_tensor, J_tensor = normalize_and_tensorize(
+        _ij_tensors = list(normalize_and_tensorize(
             fixed, moving_reg, winsorize_quantiles=kwargs.get('winsorize_quantiles', None),
             backend='pytorch', device=device
-        )
+        ))
         
         model = SyNToPy(
             dim=dim, grid_shape=grid_shape_zyx, spacing=sp_ordered, origin=fixed_primary.origin, direction=direction,
@@ -2899,7 +3027,7 @@ def registration(
     if backend == 'pytorch':
         initial_grid_tensor = torch.tensor(initial_grid, dtype=torch.float32, device=device) if initial_grid is not None else None
         model.fit(
-            I_tensor, J_tensor,
+            _ij_tensors.pop(0), _ij_tensors.pop(0),
             levels=levels_to_use,
             epochs_per_level=reg_iterations,
             cfl_voxels=grad_step,
@@ -3105,9 +3233,17 @@ def registration(
         import torch
         if backend == 'pytorch':
             w_l2r = model.warp_l2r.data.cpu()
-            w_l2r_inv = model.warp_l2r_inv.data.cpu()
             w_r2l = model.warp_r2l.data.cpu()
-            w_r2l_inv = model.warp_r2l_inv.data.cpu()
+            w_l2r_inv = (
+                w_r2l
+                if model.warp_l2r_inv.data.data_ptr() == model.warp_r2l.data.data_ptr()
+                else model.warp_l2r_inv.data.cpu()
+            )
+            w_r2l_inv = (
+                w_l2r
+                if model.warp_r2l_inv.data.data_ptr() == model.warp_l2r.data.data_ptr()
+                else model.warp_r2l_inv.data.cpu()
+            )
         else:
             w_l2r = torch.from_numpy(np.array(model.warp_l2r))
             w_l2r_inv = torch.from_numpy(np.array(model.warp_l2r_inv))
@@ -3116,6 +3252,7 @@ def registration(
             
         inverse_identity_errors['phi_1'] = calculate_inverse_identity_error(w_l2r, w_l2r_inv, fixed_primary.spacing, fixed_primary.origin, fixed_primary.direction)
         inverse_identity_errors['phi_2'] = calculate_inverse_identity_error(w_r2l, w_r2l_inv, fixed_primary.spacing, fixed_primary.origin, fixed_primary.direction)
+        del w_l2r, w_l2r_inv, w_r2l, w_r2l_inv
         
     # 6. Apply transforms to generate warped output images
     if return_warped and not _skip_full_warps:

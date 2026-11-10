@@ -35,6 +35,63 @@ from .grid import (
 )
 
 
+def _batch_reduce_amax(x: torch.Tensor) -> torch.Tensor:
+    """Per-batch-item max over all spatial and channel axes.
+
+    Uses a 2-stage 1-axis reduction on 5-D+ tensors so PyTorch MPS never dispatches a
+    4-axis reduction kernel on large 3-D volumes (which corrupts outputs above ~16M elements).
+    """
+    b = x.shape[0]
+    if x.dim() >= 5:
+        return x.reshape(b, x.shape[1], -1).amax(dim=2).amax(dim=1)
+    return x.reshape(b, -1).amax(dim=1)
+
+
+def _batch_reduce_mean(x: torch.Tensor) -> torch.Tensor:
+    """Per-batch-item mean over all spatial and channel axes (2-stage safe on 5-D+ MPS)."""
+    b = x.shape[0]
+    if x.dim() >= 5:
+        return x.reshape(b, x.shape[1], -1).mean(dim=2).mean(dim=1)
+    return x.reshape(b, -1).mean(dim=1)
+
+
+def _batch_reduce_sum(x: torch.Tensor) -> torch.Tensor:
+    """Per-batch-item sum over all spatial and channel axes (2-stage safe on 5-D+ MPS)."""
+    b = x.shape[0]
+    if x.dim() >= 5:
+        return x.reshape(b, x.shape[1], -1).sum(dim=2).sum(dim=1)
+    return x.reshape(b, -1).sum(dim=1)
+
+
+def _scaled_sq_sum(error: torch.Tensor, scale: torch.Tensor, divide: bool) -> torch.Tensor:
+    """Compute ``sum_c ((error[..., c] / scale[c]) ** 2)`` (or ``* scale[c]``) as ``(B, *spatial, 1)``
+    without allocating a full multi-channel ``(B, *spatial, dim)`` squared tensor."""
+    dim = error.shape[-1]
+    if divide:
+        sq = (error[..., 0:1] / scale[0]).square_()
+        for c in range(1, dim):
+            sq.add_((error[..., c:c + 1] / scale[c]).square_())
+    else:
+        sq = (error[..., 0:1] * scale[0]).square_()
+        for c in range(1, dim):
+            sq.add_((error[..., c:c + 1] * scale[c]).square_())
+    return sq
+
+
+def _dot_1d(a: torch.Tensor, b: torch.Tensor, block_size: int = 4_194_304) -> torch.Tensor:
+    """1-D inner product preserving exact ``torch.dot`` for ``n <= block_size`` while blocking
+    very large vectors (>4M elements) to avoid MPS large-inner-dim kernel bugs and float32
+    mantissa swamping."""
+    n = a.numel()
+    if n <= block_size:
+        return torch.dot(a, b)
+    acc = torch.zeros((), device=a.device, dtype=a.dtype)
+    for start in range(0, n, block_size):
+        end = min(start + block_size, n)
+        acc = acc + torch.dot(a[start:end], b[start:end])
+    return acc
+
+
 def update_inverse_field_nd_hybrid_lm(
     W_disp: torch.Tensor, 
     W_inv_disp: torch.Tensor, 
@@ -111,12 +168,14 @@ def update_inverse_field_nd_hybrid_lm(
             
             coords_phys = X_phys + W_inv_disp
             coords_norm = physical_to_normalized_fast(coords_phys, M_norm, b_norm)
+            del coords_phys
             forward_at_inv = sample_field_cf(W_disp_cf, coords_norm)
+            del coords_norm
             error = W_inv_disp + forward_at_inv
-            
-            scaled_norm = torch.sqrt(torch.sum((error / spacing_t)**2, dim=-1, keepdim=True))
-            max_error_norm = float(scaled_norm.max())
-            mean_error_norm = float(scaled_norm.mean())
+
+            scaled_norm = _scaled_sq_sum(error, spacing_t, divide=True).sqrt_()
+            max_error_norm = float(_batch_reduce_amax(scaled_norm).max().item())
+            mean_error_norm = float(_batch_reduce_mean(scaled_norm).mean().item())
             
             # Vectorized central finite differences for spatial gradient grad_u (B, *spatial, d, d)
             grad_dims = []
@@ -440,51 +499,65 @@ def update_inverse_field_nd_anderson(
     if W_inv_disp is None:
         W_inv_disp = -W_disp.clone()
 
+    bshape = (B,) + (1,) * (W_disp.dim() - 1)
+    ones_b = torch.ones(bshape, device=device, dtype=dtype)
+
     def itk_fixed_point_step(v_curr, iteration, compute_mean: bool = True):
         if use_physical:
             coords_phys = X_phys + v_curr
             coords_norm = physical_to_normalized_fast(coords_phys, M_norm, b_norm)
+            del coords_phys
             forward_at_inv = sample_field_cf(W_disp_cf, coords_norm)
-            error = v_curr + forward_at_inv
-            scaled_norm = torch.sqrt(torch.sum((error / spacing_t)**2, dim=-1, keepdim=True))
+            del coords_norm
+            error = forward_at_inv.add_(v_curr)
+            sq_sum = _scaled_sq_sum(error, spacing_t, divide=True)
         else:
             coords = identity + v_curr
             forward_at_inv = sample_field_cf(W_disp_cf, coords)
-            error = v_curr + forward_at_inv
-            scaled_norm = torch.sqrt(torch.sum((error * voxel_scale)**2, dim=-1, keepdim=True))
+            del coords
+            error = forward_at_inv.add_(v_curr)
+            sq_sum = _scaled_sq_sum(error, voxel_scale, divide=False)
 
-        # Per-element reductions (B, 1, ..., 1) / (B,): each field in the batch is independent.
-        max_error_norm = torch.amax(scaled_norm, dim=reduce_dims, keepdim=True)
-        mean_error_norm = torch.mean(scaled_norm, dim=reduce_dims) if compute_mean else None
+        # Compute squared residual sum (B,) before turning sq_sum into scaled_norm in-place,
+        # so the 3-channel error field does not need to stay alive until the Anderson check.
+        residual_fp = _batch_reduce_sum(sq_sum)
+        scaled_norm = sq_sum.sqrt_()
+
+        # Per-element reductions (B,): each field in the batch is independent.
+        max_err = _batch_reduce_amax(scaled_norm)
+        mean_err = _batch_reduce_mean(scaled_norm) if compute_mean else None
 
         epsilon = 0.75 if iteration == 0 else 0.5
-        update = -error
-        clip_threshold = epsilon * max_error_norm
+        clip_threshold = (epsilon * max_err).reshape(bshape)
         clip_scale = torch.where(
             scaled_norm > clip_threshold,
             clip_threshold / scaled_norm.clamp(min=1e-10),
-            torch.ones_like(scaled_norm)
+            ones_b,
         )
-        update = update * clip_scale
-        v_new = v_curr + update * epsilon
+        del scaled_norm
+        error.neg_()
+        error.mul_(clip_scale)
+        del clip_scale
+        error.mul_(epsilon)
+        v_new = error.add_(v_curr)
+        del error
 
         if smoothing_sigma > 0.0:
             v_new = separable_gaussian_filter(v_new, smoothing_sigma)     # sigma in voxels
 
-        v_new = v_new * boundary_mask
-        return v_new, max_error_norm.reshape(B), mean_error_norm, error
+        v_new.mul_(boundary_mask)
+        return v_new, max_err, mean_err, residual_fp
 
-    reduce_dims = tuple(range(1, W_disp.dim()))      # spatial dims and the (size-1) component dim
     v_k = W_inv_disp.clone()
-    R_history = []
-    G_history = []
-    bshape = (B,) + (1,) * (W_disp.dim() - 1)
+    R_history: list[torch.Tensor] = []
+    G_history: list[torch.Tensor] = []
     done = torch.zeros(B, dtype=torch.bool, device=device)         # element has met the thresholds
     conv_step = torch.full((B,), steps, dtype=torch.int64, device=device)   # 0-based iteration it converged at
-    eye_reg = 1e-10 * torch.eye(m, device=device, dtype=dtype)
+    eye_reg = 1e-10 * torch.eye(max(m, 1), device=device, dtype=dtype)
     first_check = int(min(max(check_after, 1), steps)) if check_after is not None else None
     steps_taken = steps
     converged = False
+    mps_large_field = (device.type == 'mps' and v_k.numel() >= 16_777_216)
 
     for iteration in range(steps):
         checks_on = (check_interval is not None and check_interval > 0)
@@ -495,17 +568,31 @@ def update_inverse_field_nd_anderson(
                             or (checks_on and iteration + 1 > first_check
                                 and (iteration + 1 - first_check) % check_interval == 0)
                             or iteration == steps - 1)
-        g_k, max_err, mean_err, err_k = itk_fixed_point_step(v_k, iteration, compute_mean=True)
+        g_k, max_err, mean_err, residual_fp = itk_fixed_point_step(v_k, iteration, compute_mean=True)
         conv_now = (max_err <= max_error_threshold) & (mean_err <= mean_error_threshold)   # (B,)
         conv_step = torch.where(conv_now & ~done, torch.full_like(conv_step, iteration), conv_step)
+        done_next = done | conv_now
 
-        r_k = (g_k - v_k).reshape(B, -1)
-        R_history.append(r_k)
-        G_history.append(g_k.reshape(B, -1))
+        # Check convergence before allocating history/Anderson buffers: when every element in
+        # the batch is either already frozen or converging now, v_next is unused.
+        if should_check:
+            flag = torch.stack([done_next.all().to(torch.int64), conv_step.max()]).tolist()   # one sync
+            if flag[0]:
+                v_k = torch.where(done.reshape(bshape), v_k, g_k)
+                del g_k
+                converged = True
+                steps_taken = int(flag[1]) + 1
+                break
 
-        if len(R_history) > m + 1:
-            R_history.pop(0)
+        g_k_flat = g_k.reshape(B, -1)
+        if len(R_history) == m + 1:
+            r_k = R_history.pop(0)
             G_history.pop(0)
+            torch.sub(g_k_flat, v_k.reshape(B, -1), out=r_k)
+        else:
+            r_k = g_k_flat - v_k.reshape(B, -1)
+        R_history.append(r_k)
+        G_history.append(g_k_flat)
 
         m_k = len(R_history)
 
@@ -515,59 +602,75 @@ def update_inverse_field_nd_anderson(
             n_cols = m_k - 1
             r_newest = R_history[-1]
             g_newest = G_history[-1]
-            # Residual differences dR_j = r_newest - R_j, (B, N) each. The Gram matrix and
-            # right-hand side use torch.dot per element, in the same order as the unbatched
-            # reference, so the accelerated iterate keeps its float32 rounding; only the small
-            # solve is done differently (elementwise Gauss-Jordan instead of torch.linalg.solve).
-            dR_cols = [r_newest - R_history[j] for j in range(n_cols)]
+            # Compute residual differences dR_j = r_newest - R_j on the fly into reusable
+            # scratch buffers instead of materialising all m difference fields at once.
+            diff_i = torch.empty_like(r_newest)
+            diff_j = torch.empty_like(r_newest) if n_cols > 1 else None
             gram = torch.zeros(B, n_cols, n_cols, device=device, dtype=dtype)
             rhs = torch.zeros(B, n_cols, 1, device=device, dtype=dtype)
-            for b_idx in range(B):
-                for i_col in range(n_cols):
-                    rhs[b_idx, i_col, 0] = torch.dot(dR_cols[i_col][b_idx], r_newest[b_idx])
-                    for j_col in range(i_col, n_cols):
-                        val = torch.dot(dR_cols[i_col][b_idx], dR_cols[j_col][b_idx])
+            for i_col in range(n_cols):
+                torch.sub(r_newest, R_history[i_col], out=diff_i)
+                for b_idx in range(B):
+                    rhs[b_idx, i_col, 0] = _dot_1d(diff_i[b_idx], r_newest[b_idx])
+                    gram[b_idx, i_col, i_col] = _dot_1d(diff_i[b_idx], diff_i[b_idx])
+                for j_col in range(i_col + 1, n_cols):
+                    torch.sub(r_newest, R_history[j_col], out=diff_j)
+                    for b_idx in range(B):
+                        val = _dot_1d(diff_i[b_idx], diff_j[b_idx])
                         gram[b_idx, i_col, j_col] = val
                         gram[b_idx, j_col, i_col] = val
+            del diff_j
             gram = gram + eye_reg[:n_cols, :n_cols]
             gamma = _solve_small_spd(gram, rhs).squeeze(1)                    # (B, n)
             v_new_flat = g_newest.clone()
+            tmp_flat = torch.empty_like(r_newest)
             for j in range(n_cols):
-                dG_j = g_newest - G_history[j]
-                v_new_flat = v_new_flat - gamma[:, j:j + 1] * (dG_j + dR_cols[j])
+                torch.sub(r_newest, R_history[j], out=diff_i)
+                torch.sub(g_newest, G_history[j], out=tmp_flat)
+                tmp_flat.add_(diff_i)
+                tmp_flat.mul_(gamma[:, j:j + 1])
+                v_new_flat.sub_(tmp_flat)
+            del diff_i, tmp_flat
 
-            v_candidate = v_new_flat.reshape(W_inv_disp.shape) * boundary_mask
+            v_candidate = v_new_flat.reshape(W_inv_disp.shape)
+            v_candidate.mul_(boundary_mask)
 
             if use_physical:
                 coords_phys_c = X_phys + v_candidate
                 coords_norm_c = physical_to_normalized_fast(coords_phys_c, M_norm, b_norm)
+                del coords_phys_c
                 fwd_at_c = sample_field_cf(W_disp_cf, coords_norm_c)
-                error_c = v_candidate + fwd_at_c
-                residual_aa = torch.sum((error_c / spacing_t)**2, dim=reduce_dims)
-                residual_fp = torch.sum((err_k / spacing_t)**2, dim=reduce_dims)
+                del coords_norm_c
+                error_c = fwd_at_c.add_(v_candidate)
+                sq_c = _scaled_sq_sum(error_c, spacing_t, divide=True)
+                del error_c
+                residual_aa = _batch_reduce_sum(sq_c)
+                del sq_c
             else:
                 coords_c = identity + v_candidate
                 fwd_at_c = sample_field_cf(W_disp_cf, coords_c)
-                error_c = v_candidate + fwd_at_c
-                residual_aa = torch.sum((error_c * voxel_scale)**2, dim=reduce_dims)
-                residual_fp = torch.sum((err_k * voxel_scale)**2, dim=reduce_dims)
+                del coords_c
+                error_c = fwd_at_c.add_(v_candidate)
+                sq_c = _scaled_sq_sum(error_c, voxel_scale, divide=False)
+                del error_c
+                residual_aa = _batch_reduce_sum(sq_c)
+                del sq_c
 
             accept = (residual_aa <= residual_fp * 1.21).reshape(bshape)      # squared norms: 1.1**2
             v_next = torch.where(accept, v_candidate, g_k)
+            del v_candidate
 
         # Freeze: an element already converged keeps its value; one converging now takes the
         # plain step g_k (as the unbatched early exit did); the rest take v_next.
         v_k = torch.where(done.reshape(bshape), v_k,
                           torch.where(conv_now.reshape(bshape), g_k, v_next))
-        done = done | conv_now
+        del v_next, g_k
+        done = done_next
 
-        if should_check:
-            flag = torch.stack([done.all().to(torch.int64), conv_step.max()]).tolist()   # one sync
-            if flag[0]:
-                converged = True
-                steps_taken = int(flag[1]) + 1
-                break
+        if not should_check and mps_large_field and (iteration + 1) % 4 == 0:
+            torch.mps.synchronize()
 
+    del R_history, G_history
     if stats is not None:
         stats['steps'] = steps_taken
         stats['converged'] = converged
@@ -629,12 +732,12 @@ def update_inverse_field_nd(
         Precomputed physical grid (1, *spatial, dim) of that metadata, to save rebuilding it
         (the metadata is still required: ValueError without it).
     check_interval : int, default 1
-        'anderson' only: how often the stopping test runs.
+        'anderson' and 'fixed_point': how often the stopping test runs.
     check_after : int, optional
-        'anderson' only: iteration of the first stopping test (see
+        'anderson' and 'fixed_point': iteration of the first stopping test (see
         ``update_inverse_field_nd_anderson``).
     stats : dict, optional
-        'anderson' only: receives ``'steps'`` and ``'converged'``.
+        'anderson' and 'fixed_point': receives ``'steps'`` and ``'converged'``.
 
     Returns
     -------
@@ -663,13 +766,14 @@ def update_inverse_field_nd(
         )
         return torch.movedim(res, -1, 1) if channels_first else res
 
+    effective_check_interval = kwargs.get('check_interval', check_interval)
     if method == 'anderson':
         res = update_inverse_field_nd_anderson(
             W_disp, W_inv_disp, steps=steps,
             smoothing_sigma=smoothing_sigma, max_error_threshold=max_error_threshold,
             mean_error_threshold=mean_error_threshold, spacing=spacing,
             origin=origin, direction=direction, X_phys=X_phys,
-            check_interval=kwargs.get('check_interval', check_interval),
+            check_interval=effective_check_interval,
             check_after=check_after, stats=stats,
         )
         return torch.movedim(res, -1, 1) if channels_first else res
@@ -680,12 +784,13 @@ def update_inverse_field_nd(
     device = W_disp.device
     dtype = W_disp.dtype
 
-    if W_inv_disp is None:
-        W_inv_disp = -W_disp.clone()
-    
     if X_phys is not None and (spacing is None or origin is None or direction is None):
         raise ValueError("X_phys needs the spacing / origin / direction it was built from")
-    if X_phys is not None or (spacing is not None and origin is not None and direction is not None):
+
+    use_physical = (X_phys is not None or
+                    (spacing is not None and origin is not None and direction is not None))
+
+    if use_physical:
         if X_phys is None:
             X_phys = get_physical_grid_torch(spatial, spacing, origin, direction, device=device, dtype=dtype)
         boundary_mask = get_boundary_mask(spatial, device, dtype)
@@ -700,40 +805,6 @@ def update_inverse_field_nd(
         origin_t = torch.tensor(origin_rev, device=device, dtype=dtype)
         direction_t = torch.tensor(direction_rev, device=device, dtype=dtype)
         M_norm, b_norm = get_physical_to_normalized_affine(shape_t, spacing_t, origin_t, direction_t)
-        W_disp_cf = torch.movedim(W_disp, -1, 1)
-        
-        max_error_norm = float('inf')
-        mean_error_norm = float('inf')
-        
-        for iteration in range(steps):
-            if max_error_norm <= max_error_threshold and mean_error_norm <= mean_error_threshold:
-                break
-            
-            coords_phys = X_phys + W_inv_disp
-            coords_norm = physical_to_normalized_fast(coords_phys, M_norm, b_norm)
-            forward_at_inv = sample_field_cf(W_disp_cf, coords_norm)
-            error = W_inv_disp + forward_at_inv
-            scaled_norm = torch.sqrt(torch.sum((error / spacing_t)**2, dim=-1, keepdim=True))
-            max_error_norm = float(scaled_norm.max())
-            mean_error_norm = float(scaled_norm.mean())
-            
-            update = -error
-            epsilon = 0.75 if iteration == 0 else 0.5
-            clip_threshold = epsilon * max_error_norm
-            clip_scale = torch.where(
-                scaled_norm > clip_threshold,
-                clip_threshold / scaled_norm.clamp(min=1e-10),
-                torch.ones_like(scaled_norm)
-            )
-            update = update * clip_scale
-            W_inv_disp = W_inv_disp + update * (relaxation * epsilon)
-            
-            if smoothing_sigma > 0.0:
-                W_inv_disp = separable_gaussian_filter(W_inv_disp, smoothing_sigma)
-            
-            W_inv_disp = W_inv_disp * boundary_mask
-            
-        return torch.movedim(W_inv_disp, -1, 1) if channels_first else W_inv_disp
     else:
         grids = [torch.linspace(-1, 1, size, device=device, dtype=dtype) for size in spatial]
         meshgrid = torch.meshgrid(*grids, indexing='ij')
@@ -743,39 +814,90 @@ def update_inverse_field_nd(
             [float((s - 1) / 2.0) for s in reversed(spatial)],
             device=device, dtype=dtype
         )
-        W_disp_cf = torch.movedim(W_disp, -1, 1)
-        
-        max_error_norm = float('inf')
-        mean_error_norm = float('inf')
-        
-        for iteration in range(steps):
-            if max_error_norm <= max_error_threshold and mean_error_norm <= mean_error_threshold:
-                break
-            
-            coords = identity + W_inv_disp
-            forward_at_inv = sample_field_cf(W_disp_cf, coords)
-            error = W_inv_disp + forward_at_inv
-            scaled_norm = torch.sqrt(torch.sum((error * voxel_scale)**2, dim=-1, keepdim=True))
-            max_error_norm = float(scaled_norm.max())
-            mean_error_norm = float(scaled_norm.mean())
-            
-            epsilon = 0.75 if iteration == 0 else 0.5
-            update = -error
-            clip_threshold = epsilon * max_error_norm
-            clip_scale = torch.where(
-                scaled_norm > clip_threshold,
-                clip_threshold / scaled_norm.clamp(min=1e-10),
-                torch.ones_like(scaled_norm)
+
+    W_disp_cf = torch.movedim(W_disp, -1, 1)
+    v_k = -W_disp.clone() if W_inv_disp is None else W_inv_disp.clone()
+    bshape = (B,) + (1,) * (W_disp.dim() - 1)
+    ones_b = torch.ones(bshape, device=device, dtype=dtype)
+    done = torch.zeros(B, dtype=torch.bool, device=device)
+    conv_step = torch.full((B,), steps, dtype=torch.int64, device=device)
+    first_check = int(min(max(check_after, 1), steps)) if check_after is not None else None
+    steps_taken = steps
+    converged = False
+    mps_large_field = (device.type == 'mps' and v_k.numel() >= 16_777_216)
+
+    for iteration in range(steps):
+        checks_on = (effective_check_interval is not None and effective_check_interval > 0)
+        if first_check is None:
+            should_check = checks_on and (
+                (iteration + 1) % effective_check_interval == 0 or iteration == steps - 1
             )
-            update = update * clip_scale
-            W_inv_disp = W_inv_disp + update * (relaxation * epsilon)
-            
-            if smoothing_sigma > 0.0:
-                W_inv_disp = separable_gaussian_filter(W_inv_disp, smoothing_sigma)
-            
-            W_inv_disp = W_inv_disp * boundary_mask
-            
-        return torch.movedim(W_inv_disp, -1, 1) if channels_first else W_inv_disp
+        else:
+            should_check = (
+                iteration + 1 == first_check
+                or (checks_on and iteration + 1 > first_check
+                    and (iteration + 1 - first_check) % effective_check_interval == 0)
+                or iteration == steps - 1
+            )
+
+        if use_physical:
+            coords_phys = X_phys + v_k
+            coords_norm = physical_to_normalized_fast(coords_phys, M_norm, b_norm)
+            del coords_phys
+            forward_at_inv = sample_field_cf(W_disp_cf, coords_norm)
+            del coords_norm
+            error = forward_at_inv.add_(v_k)
+            scaled_norm = _scaled_sq_sum(error, spacing_t, divide=True).sqrt_()
+        else:
+            coords = identity + v_k
+            forward_at_inv = sample_field_cf(W_disp_cf, coords)
+            del coords
+            error = forward_at_inv.add_(v_k)
+            scaled_norm = _scaled_sq_sum(error, voxel_scale, divide=False).sqrt_()
+
+        max_err = _batch_reduce_amax(scaled_norm)
+        mean_err = _batch_reduce_mean(scaled_norm)
+        conv_now = (max_err <= max_error_threshold) & (mean_err <= mean_error_threshold)
+        conv_step = torch.where(conv_now & ~done, torch.full_like(conv_step, iteration), conv_step)
+        done_next = done | conv_now
+
+        epsilon = 0.75 if iteration == 0 else 0.5
+        clip_threshold = (epsilon * max_err).reshape(bshape)
+        clip_scale = torch.where(
+            scaled_norm > clip_threshold,
+            clip_threshold / scaled_norm.clamp(min=1e-10),
+            ones_b,
+        )
+        del scaled_norm
+        error.neg_()
+        error.mul_(clip_scale)
+        del clip_scale
+        error.mul_(relaxation * epsilon)
+        g_k = error.add_(v_k)
+        del error
+
+        if smoothing_sigma > 0.0:
+            g_k = separable_gaussian_filter(g_k, smoothing_sigma)
+        g_k.mul_(boundary_mask)
+
+        v_k = torch.where(done.reshape(bshape), v_k, g_k)
+        del g_k
+        done = done_next
+
+        if should_check:
+            flag = torch.stack([done.all().to(torch.int64), conv_step.max()]).tolist()
+            if flag[0]:
+                converged = True
+                steps_taken = int(flag[1]) + 1
+                break
+        elif mps_large_field and (iteration + 1) % 4 == 0:
+            torch.mps.synchronize()
+
+    if stats is not None:
+        stats['steps'] = steps_taken
+        stats['converged'] = converged
+
+    return torch.movedim(v_k, -1, 1) if channels_first else v_k
 
 
 def compute_inverse_identity_error_nd(
@@ -878,6 +1000,7 @@ def calculate_inverse_identity_error(W_disp: torch.Tensor, W_inv_disp: torch.Ten
     
     X_phys = get_physical_grid_torch(spatial, spacing, origin, direction, device=device, dtype=dtype)
     coords_phys = X_phys + W_inv_disp
+    del X_phys
     
     spacing_rev = tuple(reversed(spacing))
     origin_rev = tuple(reversed(origin))
@@ -889,21 +1012,34 @@ def calculate_inverse_identity_error(W_disp: torch.Tensor, W_inv_disp: torch.Ten
     direction_t = torch.tensor(direction_rev, device=device, dtype=dtype)
     
     coords_norm = physical_to_normalized_torch_cached(coords_phys, shape_t, spacing_t, origin_t, direction_t)
+    del coords_phys
     
     forward_at_inv = compose_grids(W_disp, coords_norm)
-    
-    error = W_inv_disp + forward_at_inv
-    
-    inside_mask = (coords_norm >= -1) & (coords_norm <= 1)
-    inside_mask = inside_mask.all(dim=-1, keepdim=True)
-    
-    boundary_mask = get_boundary_mask(spatial, device, dtype).squeeze(0).squeeze(-1)
-    valid = boundary_mask.unsqueeze(0).unsqueeze(-1) * inside_mask
-    error = error * valid
-    
-    error_norm = torch.sqrt(torch.sum(error**2, dim=-1))
+    valid_mask = ((coords_norm >= -1) & (coords_norm <= 1)).all(dim=-1)
+    del coords_norm
+    for ax in range(len(spatial)):
+        sl_lo = [slice(None)] * valid_mask.ndim
+        sl_lo[ax + 1] = slice(0, 1)
+        valid_mask[tuple(sl_lo)] = False
+        sl_hi = [slice(None)] * valid_mask.ndim
+        sl_hi[ax + 1] = slice(-1, None)
+        valid_mask[tuple(sl_hi)] = False
+
+    forward_at_inv.add_(W_inv_disp)
+    error_norm = torch.linalg.vector_norm(forward_at_inv, dim=-1)
+    del forward_at_inv
+    error_norm.masked_fill_(~valid_mask, 0.0)
+    if valid_mask.device.type == 'mps':
+        n_valid = max(float(_batch_reduce_sum(valid_mask.to(dtype)).item()), 1.0)
+        err_sum = float(_batch_reduce_sum(error_norm).item())
+        err_max = float(_batch_reduce_amax(error_norm).item())
+    else:
+        n_valid = max(float(valid_mask.sum(dtype=torch.int64).item()), 1.0)
+        err_sum = float(error_norm.sum(dtype=torch.float64).item())
+        err_max = float(error_norm.max().item())
+    del valid_mask
     return {
-        'max_error': float(error_norm.max().item()),
-        'mean_error': float(error_norm.sum().item() / max(float(valid.sum().item()), 1.0)),
-        'error_map': error_norm.squeeze(0)
+        'max_error': err_max,
+        'mean_error': err_sum / n_valid,
+        'error_map': error_norm.squeeze(0),
     }

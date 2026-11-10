@@ -352,6 +352,32 @@ class TransformChain:
             )
 
         ref_shape = tuple(int(s) for s in reference.shape[:3])
+        n_ref_vox = int(ref_shape[0]) * int(ref_shape[1]) * int(ref_shape[2])
+        max_single_shot_vox = _MAX_GPU_CACHE_VOXELS * 4
+        if str(dev) != "cpu" and mode != "bspline" and n_ref_vox > max_single_shot_vox:
+            field = ContinuousField(image, device=dev, dtype=torch.float32)
+            local_disp_cache: dict[tuple[str, float, str], ContinuousField] = {}
+            arr_out = np.empty(ref_shape, dtype=np.float32)
+            slab_x = max(1, max_single_shot_vox // max(1, int(ref_shape[1]) * int(ref_shape[2])))
+            try:
+                for s_x in range(0, ref_shape[0], slab_x):
+                    e_x = min(ref_shape[0], s_x + slab_x)
+                    pts_fixed = _reference_grid_points_lps(reference, dev, x_slice=(s_x, e_x))
+                    pts_moving = _map_points_to_moving_tensor(
+                        pts_fixed, self, dev, local_disp_cache=local_disp_cache
+                    )
+                    del pts_fixed
+                    out_slab = _sample_field_itk(field, pts_moving, mode=mode, defaultvalue=defaultvalue)
+                    del pts_moving
+                    arr_out[s_x:e_x] = (
+                        out_slab.reshape(e_x - s_x, ref_shape[1], ref_shape[2]).detach().cpu().numpy()
+                    )
+                    del out_slab
+            finally:
+                local_disp_cache.clear()
+                del local_disp_cache, field
+            return reference.new_image_like(arr_out)
+
         ref_sig = (
             ref_shape,
             tuple(float(x) for x in reference.spacing[:3]),
@@ -367,13 +393,17 @@ class TransformChain:
         if pts_moving is None:
             pts_fixed = _reference_grid_points_lps(reference, dev)
             pts_moving = _map_points_to_moving_tensor(pts_fixed, self, dev)
-            if len(_MAPPED_GRID_CACHE) >= 4:
-                _MAPPED_GRID_CACHE.pop(next(iter(_MAPPED_GRID_CACHE)))
-            _MAPPED_GRID_CACHE[cache_key] = pts_moving
+            del pts_fixed
+            if str(dev) == "cpu" or pts_moving.shape[0] <= _MAX_GPU_CACHE_VOXELS:
+                if len(_MAPPED_GRID_CACHE) >= 4:
+                    _MAPPED_GRID_CACHE.pop(next(iter(_MAPPED_GRID_CACHE)))
+                _MAPPED_GRID_CACHE[cache_key] = pts_moving
 
         field = ContinuousField(image, device=dev, dtype=torch.float32)
         out = _sample_field_itk(field, pts_moving, mode=mode, defaultvalue=defaultvalue)
+        del field, pts_moving
         arr_out = out.reshape(ref_shape).detach().cpu().numpy().astype(np.float32, copy=False)
+        del out
         return reference.new_image_like(arr_out)
 
     def compose(self, other: TransformChain) -> TransformChain:
@@ -384,6 +414,9 @@ class TransformChain:
         return [{"path": e.path, "kind": e.kind, "invert": str(e.invert)} for e in self.elements]
 
 
+# Cap GPU-resident transform caches at 256^3 voxels (~192 MiB per 3D vector field) so
+# microCT-scale volumes (>16M voxels) never retain multi-GiB GPU tensors across calls.
+_MAX_GPU_CACHE_VOXELS: int = 16_777_216
 _DISP_FIELD_CACHE: dict[tuple[str, float, str], Any] = {}
 _DISP_GRAD_CACHE: dict[tuple[str, float, str], Any] = {}
 _DISP_IMG_CACHE: dict[tuple[str, int, int], Any] = {}
@@ -392,26 +425,29 @@ _BSPLINE_PREFILTER_CACHE: dict[tuple[int, str, torch.dtype], torch.Tensor] = {}
 
 
 def _cache_disp_image_and_field(path: str, disp_img: Any, device: Any | None = None) -> None:
-    """Seed ``_DISP_IMG_CACHE`` and ``_DISP_FIELD_CACHE`` for a just-written 3D displacement
-    ``ANTsImage`` so immediate downstream ``jacobian_modulation`` / ``apply_transforms`` /
-    ``resample_series`` calls skip ``ants.image_read`` gzip decompression."""
+    """Seed ``_DISP_IMG_CACHE`` and (for standard-sized grids) ``_DISP_FIELD_CACHE`` for a
+    just-written 3D displacement ``ANTsImage`` so immediate downstream ``jacobian_modulation`` /
+    ``apply_transforms`` / ``resample_series`` calls skip ``ants.image_read`` gzip decompression."""
     if not isinstance(path, str) or len(getattr(disp_img, "shape", ())) != 3:
         return
     try:
         st = os.stat(path)
     except OSError:
         return
-    img_key = (path, st.st_mtime_ns, st.st_size)
-    if len(_DISP_IMG_CACHE) >= 4:
-        _DISP_IMG_CACHE.pop(next(iter(_DISP_IMG_CACHE)))
-    _DISP_IMG_CACHE[img_key] = disp_img
+    n_vox = int(np.prod(disp_img.shape[:3]))
+    if n_vox <= 67_108_864:
+        img_key = (path, st.st_mtime_ns, st.st_size)
+        if len(_DISP_IMG_CACHE) >= 4:
+            _DISP_IMG_CACHE.pop(next(iter(_DISP_IMG_CACHE)))
+        _DISP_IMG_CACHE[img_key] = disp_img
     if device is not None:
         dev = device if isinstance(device, torch.device) else torch.device(resolve_device(device, task="model"))
-        disp_key = (path, os.path.getmtime(path), str(dev))
-        field = ContinuousField(disp_img, device=dev, dtype=torch.float32)
-        if len(_DISP_FIELD_CACHE) >= 8:
-            _DISP_FIELD_CACHE.pop(next(iter(_DISP_FIELD_CACHE)))
-        _DISP_FIELD_CACHE[disp_key] = field
+        if str(dev) == "cpu" or n_vox <= _MAX_GPU_CACHE_VOXELS:
+            disp_key = (path, os.path.getmtime(path), str(dev))
+            field = ContinuousField(disp_img, device=dev, dtype=torch.float32)
+            if len(_DISP_FIELD_CACHE) >= 8:
+                _DISP_FIELD_CACHE.pop(next(iter(_DISP_FIELD_CACHE)))
+            _DISP_FIELD_CACHE[disp_key] = field
 
 
 def _bspline_prefilter_1d_matrix(
@@ -630,18 +666,26 @@ def _sample_field_itk(
     return out * mask + float(defaultvalue) * (1.0 - mask)
 
 
-def _reference_grid_points_lps(reference: Any, device: Any) -> torch.Tensor:
+def _reference_grid_points_lps(
+    reference: Any, device: Any, x_slice: tuple[int, int] | None = None
+) -> torch.Tensor:
     shape = tuple(int(s) for s in reference.shape[:3])
     spacing = torch.as_tensor(reference.spacing[:3], dtype=torch.float32, device=device)
     origin = torch.as_tensor(reference.origin[:3], dtype=torch.float32, device=device)
     direction = torch.as_tensor(np.asarray(reference.direction)[:3, :3], dtype=torch.float32, device=device)
     m_idx_to_phys = direction * spacing.unsqueeze(0)
-    gx = torch.arange(shape[0], dtype=torch.float32, device=device)
+    if x_slice is None:
+        gx = torch.arange(shape[0], dtype=torch.float32, device=device)
+    else:
+        gx = torch.arange(x_slice[0], x_slice[1], dtype=torch.float32, device=device)
     gy = torch.arange(shape[1], dtype=torch.float32, device=device)
     gz = torch.arange(shape[2], dtype=torch.float32, device=device)
     ii, jj, kk = torch.meshgrid(gx, gy, gz, indexing="ij")
     idx = torch.stack((ii.reshape(-1), jj.reshape(-1), kk.reshape(-1)), dim=-1)
-    return idx @ m_idx_to_phys.T + origin
+    del ii, jj, kk
+    out = idx @ m_idx_to_phys.T + origin
+    del idx
+    return out
 
 
 def _read_itk_affine(path_or_tx: Any, invert: bool = False) -> tuple[np.ndarray, np.ndarray]:
@@ -714,16 +758,22 @@ def _get_disp_and_grad_fields(path: str, device: Any) -> tuple[ContinuousField, 
             device=device,
             dtype=torch.float32,
         )
-        if len(_DISP_FIELD_CACHE) >= 8:
-            _DISP_FIELD_CACHE.pop(next(iter(_DISP_FIELD_CACHE)))
-        if len(_DISP_GRAD_CACHE) >= 8:
-            _DISP_GRAD_CACHE.pop(next(iter(_DISP_GRAD_CACHE)))
-        _DISP_FIELD_CACHE[key] = field
-        _DISP_GRAD_CACHE[key] = grad_field
+        if str(device) == "cpu" or int(np.prod(sp_shape)) <= _MAX_GPU_CACHE_VOXELS:
+            if len(_DISP_FIELD_CACHE) >= 8:
+                _DISP_FIELD_CACHE.pop(next(iter(_DISP_FIELD_CACHE)))
+            if len(_DISP_GRAD_CACHE) >= 8:
+                _DISP_GRAD_CACHE.pop(next(iter(_DISP_GRAD_CACHE)))
+            _DISP_FIELD_CACHE[key] = field
+            _DISP_GRAD_CACHE[key] = grad_field
     return field, grad_field
 
 
-def _map_points_to_moving_tensor(points_lps: torch.Tensor, chain: TransformChain, device: Any) -> torch.Tensor:
+def _map_points_to_moving_tensor(
+    points_lps: torch.Tensor,
+    chain: TransformChain,
+    device: Any,
+    local_disp_cache: dict[tuple[str, float, str], ContinuousField] | None = None,
+) -> torch.Tensor:
     import ants
 
     pts = points_lps.to(device=device, dtype=torch.float32)
@@ -743,14 +793,33 @@ def _map_points_to_moving_tensor(points_lps: torch.Tensor, chain: TransformChain
             mtime = os.path.getmtime(element.path) if os.path.exists(element.path) else 0.0
             disp_key = (element.path, mtime, str(device))
             field = _DISP_FIELD_CACHE.get(disp_key)
+            if field is None and local_disp_cache is not None:
+                field = local_disp_cache.get(disp_key)
             if field is None:
-                disp_img = ants.image_read(element.path)
+                disp_img = None
+                try:
+                    st = os.stat(element.path)
+                    disp_img = _DISP_IMG_CACHE.get((element.path, st.st_mtime_ns, st.st_size))
+                except OSError:
+                    pass
+                if disp_img is None:
+                    disp_img = ants.image_read(element.path)
+                n_vox = int(np.prod(disp_img.shape[:3]))
                 field = ContinuousField(disp_img, device=device, dtype=torch.float32)
-                if len(_DISP_FIELD_CACHE) >= 8:
-                    _DISP_FIELD_CACHE.pop(next(iter(_DISP_FIELD_CACHE)))
-                _DISP_FIELD_CACHE[disp_key] = field
+                del disp_img
+                if str(device) == "cpu" or n_vox <= _MAX_GPU_CACHE_VOXELS:
+                    if len(_DISP_FIELD_CACHE) >= 8:
+                        _DISP_FIELD_CACHE.pop(next(iter(_DISP_FIELD_CACHE)))
+                    _DISP_FIELD_CACHE[disp_key] = field
+                elif local_disp_cache is not None:
+                    local_disp_cache[disp_key] = field
             u = _sample_field_itk(field, pts, mode="bilinear")
-            pts = pts + u
+            del field
+            if pts is points_lps:
+                pts = pts + u
+            else:
+                pts = pts.add_(u)
+            del u
     return pts
 
 

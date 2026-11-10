@@ -239,6 +239,254 @@ class ANTsPseudoLNCC(torch.autograd.Function):
         return g_I, g_J, None, None
 
 
+def _slab_bounds(depth: int, n_chunks: int, radius: int) -> list[tuple[int, int, int, int, int, int]]:
+    """Partition ``[0, depth)`` into ``n_chunks`` core slabs ``[z0, z1)`` padded by a ``2 * radius``
+    halo ``[s0, s1)`` with local core slice ``[c0, c1)``."""
+    halo = 2 * radius
+    slabs: list[tuple[int, int, int, int, int, int]] = []
+    for idx in range(n_chunks):
+        z0 = (idx * depth) // n_chunks
+        z1 = ((idx + 1) * depth) // n_chunks
+        if z1 <= z0:
+            continue
+        s0 = max(0, z0 - halo)
+        s1 = min(depth, z1 + halo)
+        slabs.append((z0, z1, s0, s1, z0 - s0, z1 - s0))
+    return slabs
+
+
+def _lncc_chunked_no_grad(
+    I: torch.Tensor,
+    J: torch.Tensor,
+    mask: torch.Tensor | None,
+    window_size: int,
+    squared: bool,
+    floor_val: float,
+    n_chunks: int,
+    work_dtype: torch.dtype,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Memory-bounded no-grad evaluation of LNCC numerator and denominator across depth slabs."""
+    slabs = _slab_bounds(I.shape[2], n_chunks, window_size // 2)
+    total_num = torch.zeros((), device=I.device, dtype=work_dtype)
+    total_active = torch.zeros((), device=I.device, dtype=work_dtype) if mask is not None else None
+
+    for z0, z1, s0, s1, c0, c1 in slabs:
+        I_s = I[:, :, s0:s1].to(work_dtype)
+        J_s = J[:, :, s0:s1].to(work_dtype)
+        I_mean = _box_pool(I_s, window_size, count_include_pad=False)
+        J_mean = _box_pool(J_s, window_size, count_include_pad=False)
+        F_c = I_s - I_mean
+        M_c = J_s - J_mean
+        del I_s, J_s, I_mean, J_mean
+
+        I_var_c = torch.clamp(_box_pool(F_c * F_c, window_size, count_include_pad=False)[:, :, c0:c1], min=0.0)
+        J_var_c = torch.clamp(_box_pool(M_c * M_c, window_size, count_include_pad=False)[:, :, c0:c1], min=0.0)
+        IJ_cov_c = _box_pool(F_c * M_c, window_size, count_include_pad=False)[:, :, c0:c1]
+        del F_c, M_c
+
+        safe_I = torch.clamp(I_var_c, min=floor_val)
+        safe_J = torch.clamp(J_var_c, min=floor_val)
+        if squared:
+            cc_c = torch.clamp((IJ_cov_c**2) / (safe_I * safe_J + 1e-8), min=0.0, max=1.0)
+        else:
+            cc_c = torch.clamp(IJ_cov_c / (torch.sqrt(safe_I * safe_J) + 1e-6), min=-1.0, max=1.0)
+        del IJ_cov_c, safe_I, safe_J
+
+        if mask is not None:
+            m_c = (mask[:, :, z0:z1] if mask.shape[2] > 1 else mask).to(work_dtype)
+            active_c = ((I_var_c > floor_val) & (J_var_c > floor_val) & (m_c > 0.5)).to(work_dtype)
+            total_num = total_num - torch.sum(cc_c * active_c)
+            total_active = total_active + torch.sum(active_c)
+            del m_c, active_c
+        else:
+            total_num = total_num - torch.sum(cc_c)
+        del I_var_c, J_var_c, cc_c
+
+    if mask is not None:
+        total_den = total_active + 1e-8
+    else:
+        total_den = torch.tensor(float(I.numel()), device=I.device, dtype=work_dtype)
+    return total_num, total_den
+
+
+class _ChunkedLocalNCC(torch.autograd.Function):
+    """Exact slab-halo-chunked LNCC / CC^2 (autograd or ANTs pseudo-gradient) along spatial axis 0.
+
+    Each core slab ``[z0, z1)`` is evaluated with a ``2 * (window_size // 2)`` halo ``[s0, s1)``
+    so both nested ``box_mean_nd`` passes and their backward passes see exact interior window
+    counts at internal slab boundaries and exact border counts at ``0`` and ``D``.
+    """
+
+    @staticmethod
+    def forward(
+        ctx,
+        I: torch.Tensor,
+        J: torch.Tensor,
+        mask: torch.Tensor | None,
+        window_size: int,
+        squared: bool,
+        floor_val: float,
+        n_chunks: int,
+        use_pseudo: bool,
+    ) -> torch.Tensor:
+        needs_upcast = I.dtype in (torch.float16, torch.bfloat16)
+        work_dtype = torch.float32 if needs_upcast else I.dtype
+        dev_type = "cuda" if I.is_cuda else ("mps" if I.device.type == "mps" else "cpu")
+
+        if mask is not None and mask.dim() < I.dim():
+            mask = mask.expand_as(I[:, :1])
+
+        with torch.no_grad(), torch.amp.autocast(device_type=dev_type, enabled=False):
+            total_num, total_den = _lncc_chunked_no_grad(
+                I, J, mask, window_size, squared, floor_val, n_chunks, work_dtype
+            )
+            loss = total_num / total_den
+
+        if mask is not None:
+            ctx.save_for_backward(I, J, mask, total_den)
+            ctx.has_mask = True
+        else:
+            ctx.save_for_backward(I, J, total_den)
+            ctx.has_mask = False
+        ctx.window_size = window_size
+        ctx.squared = squared
+        ctx.floor_val = floor_val
+        ctx.n_chunks = n_chunks
+        ctx.use_pseudo = use_pseudo
+        ctx.work_dtype = work_dtype
+        ctx.orig_dtype = I.dtype
+        ctx.dev_type = dev_type
+        return loss if needs_upcast else loss.to(I.dtype)
+
+    @staticmethod
+    def backward(ctx, grad_output: torch.Tensor):
+        need_I = ctx.needs_input_grad[0]
+        need_J = ctx.needs_input_grad[1]
+        if not need_I and not need_J:
+            return None, None, None, None, None, None, None, None
+
+        if ctx.has_mask:
+            I, J, mask, total_den = ctx.saved_tensors
+        else:
+            I, J, total_den = ctx.saved_tensors
+            mask = None
+
+        work_dtype = ctx.work_dtype
+        window_size = ctx.window_size
+        squared = ctx.squared
+        floor_val = ctx.floor_val
+        slabs = _slab_bounds(I.shape[2], ctx.n_chunks, window_size // 2)
+
+        grad_I = torch.zeros(I.shape, device=I.device, dtype=work_dtype) if need_I else None
+        grad_J = torch.zeros(J.shape, device=J.device, dtype=work_dtype) if need_J else None
+
+        if ctx.use_pseudo:
+            with torch.no_grad(), torch.amp.autocast(device_type=ctx.dev_type, enabled=False):
+                for z0, z1, s0, s1, c0, c1 in slabs:
+                    I_s = I[:, :, s0:s1].to(work_dtype)
+                    J_s = J[:, :, s0:s1].to(work_dtype)
+                    I_mean = _box_pool(I_s, window_size, count_include_pad=False)
+                    J_mean = _box_pool(J_s, window_size, count_include_pad=False)
+                    F_full = I_s - I_mean
+                    M_full = J_s - J_mean
+                    del I_s, J_s, I_mean, J_mean
+
+                    I_var_c = torch.clamp(
+                        _box_pool(F_full * F_full, window_size, count_include_pad=False)[:, :, c0:c1], min=0.0
+                    )
+                    J_var_c = torch.clamp(
+                        _box_pool(M_full * M_full, window_size, count_include_pad=False)[:, :, c0:c1], min=0.0
+                    )
+                    IJ_cov_c = _box_pool(F_full * M_full, window_size, count_include_pad=False)[:, :, c0:c1]
+                    n_win_c = _window_counts(F_full, window_size)[:, :, c0:c1]
+                    F_c = F_full[:, :, c0:c1]
+                    M_c = M_full[:, :, c0:c1]
+                    del F_full, M_full
+
+                    safe_I = torch.clamp(I_var_c, min=floor_val)
+                    safe_J = torch.clamp(J_var_c, min=floor_val)
+                    if squared:
+                        sFF_sMM = safe_I * safe_J + 1e-8
+                        grad_factor = -2.0 * (1.0 / n_win_c) * (IJ_cov_c / sFF_sMM)
+                        gJ_c = grad_factor * (F_c - (IJ_cov_c / (safe_J + 1e-8)) * M_c)
+                        gI_c = grad_factor * (M_c - (IJ_cov_c / (safe_I + 1e-8)) * F_c)
+                    else:
+                        cc_c = torch.clamp(IJ_cov_c / (torch.sqrt(safe_I * safe_J) + 1e-6), min=-1.0, max=1.0)
+                        scale = -(1.0 / n_win_c) / (torch.sqrt(safe_I * safe_J) + 1e-6)
+                        gJ_c = scale * (F_c - cc_c * M_c)
+                        gI_c = scale * (M_c - cc_c * F_c)
+
+                    if mask is not None:
+                        m_c = (mask[:, :, z0:z1] if mask.shape[2] > 1 else mask).to(work_dtype)
+                        active_c = ((I_var_c > floor_val) & (J_var_c > floor_val) & (m_c > 0.5)).to(work_dtype)
+                        gI_c = gI_c * active_c
+                        gJ_c = gJ_c * active_c
+
+                    if grad_I is not None:
+                        grad_I[:, :, z0:z1].copy_(gI_c)
+                    if grad_J is not None:
+                        grad_J[:, :, z0:z1].copy_(gJ_c)
+
+            pseudo_den = total_den if mask is not None else (float(I.numel()) / float(I.shape[0]))
+            scale_out = grad_output.to(work_dtype) / pseudo_den
+        else:
+            with torch.enable_grad(), torch.amp.autocast(device_type=ctx.dev_type, enabled=False):
+                for z0, z1, s0, s1, c0, c1 in slabs:
+                    I_s = I[:, :, s0:s1].detach().to(work_dtype).requires_grad_(need_I)
+                    J_s = J[:, :, s0:s1].detach().to(work_dtype).requires_grad_(need_J)
+
+                    I_mean = box_mean_nd(I_s, window_size)
+                    J_mean = box_mean_nd(J_s, window_size)
+                    F_s = I_s - I_mean
+                    M_s = J_s - J_mean
+
+                    I_var_c = torch.clamp(box_mean_nd(F_s**2, window_size)[:, :, c0:c1], min=0.0)
+                    J_var_c = torch.clamp(box_mean_nd(M_s**2, window_size)[:, :, c0:c1], min=0.0)
+                    IJ_cov_c = box_mean_nd(F_s * M_s, window_size)[:, :, c0:c1]
+
+                    safe_I = torch.clamp(I_var_c, min=floor_val)
+                    safe_J = torch.clamp(J_var_c, min=floor_val)
+                    if squared:
+                        cc_c = torch.clamp((IJ_cov_c**2) / (safe_I * safe_J + 1e-8), min=0.0, max=1.0)
+                    else:
+                        cc_c = torch.clamp(IJ_cov_c / (torch.sqrt(safe_I * safe_J) + 1e-6), min=-1.0, max=1.0)
+
+                    if mask is not None:
+                        m_c = (mask[:, :, z0:z1] if mask.shape[2] > 1 else mask).detach().to(work_dtype)
+                        active_c = (
+                            (I_var_c.detach() > floor_val) & (J_var_c.detach() > floor_val) & (m_c > 0.5)
+                        ).to(work_dtype)
+                        slab_num = -torch.sum(cc_c * active_c)
+                    else:
+                        slab_num = -torch.sum(cc_c)
+
+                    if slab_num.requires_grad:
+                        req_inputs: list[torch.Tensor] = []
+                        if need_I:
+                            req_inputs.append(I_s)
+                        if need_J:
+                            req_inputs.append(J_s)
+                        grads = torch.autograd.grad(slab_num, req_inputs, allow_unused=True)
+                        g_idx = 0
+                        if need_I:
+                            if grads[g_idx] is not None:
+                                grad_I[:, :, s0:s1].add_(grads[g_idx])
+                            g_idx += 1
+                        if need_J:
+                            if grads[g_idx] is not None:
+                                grad_J[:, :, s0:s1].add_(grads[g_idx])
+
+                    del I_s, J_s, I_mean, J_mean, F_s, M_s, I_var_c, J_var_c, IJ_cov_c, safe_I, safe_J, cc_c, slab_num
+
+            scale_out = grad_output.to(work_dtype) / total_den
+
+        if grad_I is not None:
+            grad_I = (grad_I * scale_out).to(ctx.orig_dtype)
+        if grad_J is not None:
+            grad_J = (grad_J * scale_out).to(ctx.orig_dtype)
+        return grad_I, grad_J, None, None, None, None, None, None
+
+
 def local_ncc_loss_nd(
     I: torch.Tensor,
     J: torch.Tensor,
@@ -248,6 +496,7 @@ def local_ncc_loss_nd(
     squared: bool = False,
     var_floor: float = 1e-6,
     use_analytical_gradients: bool = False,
+    metric_chunks: int = 1,
 ) -> torch.Tensor:
     """
     Negative local normalised cross-correlation (LNCC) of 2-D or 3-D images I and J.
@@ -268,6 +517,10 @@ def local_ncc_loss_nd(
         Variance floor per GEMINI.md Rule 3.
     use_analytical_gradients : bool, default False
         Alias for ``use_ants_pseudo_gradient``.
+    metric_chunks : int, default 1
+        Number of slabs along spatial axis 0 (depth in 3-D, height in 2-D). ``> 1`` evaluates
+        each slab with an exact ``2 * (window_size // 2)`` halo, cutting transient LNCC
+        intermediate memory by ``~metric_chunks`` with identical forward and backward values.
 
     Returns
     -------
@@ -279,6 +532,8 @@ def local_ncc_loss_nd(
         raise ValueError(f"Only 2D and 3D images are supported, got {dim}D.")
     if window_size < 1 or window_size % 2 == 0:
         raise ValueError(f"local_ncc_loss_nd: window_size must be a positive odd integer, got {window_size}")
+    if int(metric_chunks) < 1:
+        raise ValueError(f"local_ncc_loss_nd: metric_chunks must be >= 1, got {metric_chunks}")
 
     use_pseudo = use_ants_pseudo_gradient or use_analytical_gradients
 
@@ -288,6 +543,22 @@ def local_ncc_loss_nd(
         window_size = min_spatial
         if window_size % 2 == 0:
             window_size = max(1, window_size - 1)
+
+    n_chunks = min(int(metric_chunks), I.shape[2])
+    if n_chunks > 1:
+        floor_c = 1e-6 if use_pseudo else max(float(var_floor), 1e-6)
+        if not torch.is_grad_enabled() or (not I.requires_grad and not J.requires_grad):
+            needs_upcast = I.dtype in (torch.float16, torch.bfloat16)
+            work_dtype = torch.float32 if needs_upcast else I.dtype
+            dev_type = "cuda" if I.is_cuda else ("mps" if I.device.type == "mps" else "cpu")
+            mask_exp = mask.expand_as(I[:, :1]) if (mask is not None and mask.dim() < I.dim()) else mask
+            with torch.no_grad(), torch.amp.autocast(device_type=dev_type, enabled=False):
+                total_num, total_den = _lncc_chunked_no_grad(
+                    I, J, mask_exp, window_size, squared, floor_c, n_chunks, work_dtype
+                )
+                loss = total_num / total_den
+            return loss if needs_upcast else loss.to(I.dtype)
+        return _ChunkedLocalNCC.apply(I, J, mask, window_size, squared, floor_c, n_chunks, use_pseudo)
 
     if use_pseudo and squared:
         return ANTsPseudoLNCC.apply(I, J, mask, window_size)
