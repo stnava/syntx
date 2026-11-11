@@ -2,11 +2,27 @@
 current phase: v6.34.2+ (microCT-scale SyN GPU memory housekeeping, slab-chunked LNCC `metric_chunks`, MPS 5-D reduction fix, and 256^3 GPU transform-cache cap: 18 um 241M/459M-voxel SyN fits in 23.26 GiB MPS peak; 36 um SyN drops from 19.53 GiB to 8.65 GiB; 36 um Anderson MPS crash resolved)
 next WP: per-run synthetic calibration of the clock thresholds (single-subject plan, Stage 1 step 3); fix the opt-in engine='projected' motion regression (xfail, bisected to 59513a9 and e066990)
 blockers: none
-active work: R30 (done)
+active work: R31 (done)
 device: Apple Silicon MPS / CPU (macOS arm64)
-last updated: 2026-11-10
+last updated: 2026-11-11
 
 ---
+
+## R31 (Fast 3-Subject Canonical Benchmark: `syntx` vs `ants.registration` Affine, 6 Regularizers & End-to-End; 2026-11-11)
+- **Motivation & Scope**: Added `benchmarks/fast_syn_ants_benchmark.py` (with `--smoke` gate and `tests/test_fast_syn_ants_benchmark.py`) to provide a standards-compliant 3-subject Mindboggle-101 benchmark (`pairs=[44, 77, 0]`: `44 = mbhard` `NKI-TRT-20-2 -> MMRR-21-2` RPI->LAI cross-site, `77 = OASIS-TRT-20-5 -> MMRR-21-8` PIR->LAI anisotropic cross-site, `0 = OASIS-TRT-20-17 -> OASIS-TRT-20-16` PIR intra-site) at canonical `reg_iterations = [100, 100, 20]`. All runs execute in isolated subprocesses (MPS Phase A before multi-core CPU Phase B), compose `[deformable, affine]` in a single interpolation pass, evaluate bidirectional NN Sørensen–Dice excluding background, grade QC exclusively via `antsxqc`, validate `syntx.provenance` manifests, and emit a self-contained light-theme `syntx.viz` HTML report (`docs/reports/fast_syn_ants_benchmark_2026-11-11.{html,md,json}`).
+- **Measured Cohort Results (`v6.34.2`, commit `9472fa80bd`, 24-core arm64 macOS MPS/CPU, `load_avg_1m: 1.11 -> 6.21`, single-pass `rep=0` across 42 runs)**:
+  - **Track 1 — Affine Registration**: Tight accuracy parity within `0.36 pp` across all four solvers: `ants_affine` **`0.3372 ± 0.0216`** (`3.19 s`), `syntx_affine_default` **`0.3348 ± 0.0267`** (`7.11 s`, `-0.24 pp`), `syntx_affine_fast` **`0.3339 ± 0.0118`** (`3.60 s`, `-0.33 pp`), and `ants_affine_fast` **`0.3336 ± 0.0220`** (`1.45 s`, `-0.36 pp`).
+  - **Track 2 — Deformable Regularizers on SHA-256-Locked Shared Affine (`[100, 100, 20]`)**: Every compressible `syntx.syn` regularizer beats matched C++ `ants.registration('SyNOnly', CC[r=2], (100, 100, 20))` (`3/3` pair wins each) with **`0.0000%` folding across all 24 runs**:
+    1. `syn_gaussian`: **`0.6204 ± 0.0230`** (**`+2.21 pp`** vs ANTs, `45.79 s`, **`2.55x` faster**, ICE p95 `0.0873 mm`)
+    2. `syn_sobolev` (canonical default): **`0.6201 ± 0.0195`** (**`+2.18 pp`** vs ANTs, `52.13 s`, **`2.23x` faster**, ICE p95 `0.0710 mm`)
+    3. `syn_hyperelastic` (`K=5.0`): **`0.6196 ± 0.0220`** (**`+2.13 pp`** vs ANTs, **`0.6197` #1 on `mbhard` Pair 44**, `55.96 s`, **`2.12x` faster**, ICE p95 `0.0992 mm`)
+    4. `syn_divcurl` (`β=4.0, γ=0.8`): **`0.6179 ± 0.0219`** (**`+1.96 pp`** vs ANTs, **`0.6177` #2 on `mbhard` Pair 44**, `60.18 s`, **`1.96x` faster**, ICE p95 `0.1043 mm`)
+    5. `syn_navier` (`ν=0.35`): **`0.6134 ± 0.0197`** (**`+1.51 pp`** vs ANTs, `51.95 s`, **`2.26x` faster**, ICE p95 `0.0979 mm`)
+    6. `ants_syn_matched` (`SyNOnly`): **`0.5983 ± 0.0160`** (`116.15 s`, `1.00x`, ICE p95 `0.0418 mm`)
+    7. `syn_solenoidal` (`div v = 0`): **`0.5843 ± 0.0160`** (`-1.40 pp` vs ANTs overall as expected for strictly volume-preserving inter-subject cortex, `1/3` wins — `0.5893` vs `0.5858` on `mbhard`, `63.81 s`, **`1.86x` faster**)
+    8. `ants_syn_quick` (`antsRegistrationSyNQuick[so]`, 32-bin MI, `[100x70x50x0]`): **`0.4798 ± 0.0160`** (`-11.85 pp`, `11.03 s`, `10.55x` faster)
+  - **Track 3 — End-to-End Pipeline (`initial_transform=None`, `[100, 100, 20]`)**: `syntx_e2e_syn` achieves **`0.6201 ± 0.0195`** (`0.6044` / `0.6140` / `0.6419`, bitwise matching two-stage `robust_affine` + `syn_sobolev`) vs `ants_e2e_syn` **`0.5982 ± 0.0166`** (`0.5849` / `0.5929` / `0.6168`) — **`+2.19 pp` mean Dice (`3/3` wins)** in **`58.56 s` vs `118.39 s`** (**`2.03x` faster**), `0.0000%` folding.
+- **Verification**: `python3 benchmarks/fast_syn_ants_benchmark.py --smoke` (`exit 0`, `0.46 min`), `pytest -q tests/test_fast_syn_ants_benchmark.py` (`2 passed`), `python3 -m antsxqc.lint src/syntx` (`0 finding(s)`). Repeated `rep=1` reproducibility reruns are opt-in (`--with-reproducibility`) and were skipped in this run per user instruction.
 
 ## R30 (MicroCT-Scale SyN GPU Memory Housekeeping, Slab-Chunked LNCC & MPS 5-D Reduction Fix; 2026-11-10)
 - **Motivation & Scope**: Audited `ANTsX/ANTsTorch#91` (*"GPU memory for SyN at microCT scale: 18 µm registration fits in 29 GiB (from >95 GiB)"*) against `syntx` without modifying `antstorch`. Uncovered both the shared tensor-lifetime issues and three `syntx`-specific bottlenecks (`SyNTo.__init__` full-res GPU placeholder fields, PyTorch 2.13 MPS 4-axis 5-D reduction corruption in `update_inverse_field_nd`, and unbounded global GPU displacement caches in `transforms.py`).
