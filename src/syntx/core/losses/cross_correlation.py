@@ -15,59 +15,201 @@ from torch import nn
 from ..smoothing import separable_1d_filter
 
 
+_WINDOW_COUNT_CACHE: dict[
+    tuple,
+    tuple[tuple[torch.Tensor, ...], tuple[torch.Tensor, ...], tuple[torch.Tensor, ...]],
+] = {}
+_FUSE_MAX_VOXELS = 16_777_216
+
+
+def _get_window_count_views(
+    spatial_shape: tuple[int, ...],
+    window_size: int,
+    device: torch.device,
+    dtype: torch.dtype,
+) -> tuple[tuple[torch.Tensor, ...], tuple[torch.Tensor, ...], tuple[torch.Tensor, ...]]:
+    """Return cached ``(inv_counts_1d, counts_1d, pad_ratios_1d)`` broadcast views."""
+    key = (tuple(int(s) for s in spatial_shape), int(window_size), str(device), dtype)
+    cached = _WINDOW_COUNT_CACHE.get(key)
+    if cached is not None:
+        return cached
+    if len(_WINDOW_COUNT_CACHE) >= 64:
+        _WINDOW_COUNT_CACHE.clear()
+
+    dim = len(spatial_shape)
+    pad = window_size // 2
+    k_f = float(window_size)
+    inv_views: list[torch.Tensor] = []
+    cnt_views: list[torch.Tensor] = []
+    ratio_views: list[torch.Tensor] = []
+    for d, n in enumerate(spatial_shape):
+        idx = torch.arange(n, device=device, dtype=dtype)
+        c_1d = torch.clamp(idx + pad, max=n - 1) - torch.clamp(idx - pad, min=0) + 1.0
+        v_shape = [1, 1] + [1] * dim
+        v_shape[d + 2] = n
+        cnt_views.append(c_1d.reshape(v_shape))
+        inv_views.append((1.0 / c_1d).reshape(v_shape))
+        ratio_views.append((k_f / c_1d).reshape(v_shape))
+
+    res = (tuple(inv_views), tuple(cnt_views), tuple(ratio_views))
+    _WINDOW_COUNT_CACHE[key] = res
+    return res
+
+
+def _scale_by_views_inplace(y: torch.Tensor, views: tuple[torch.Tensor, ...]) -> torch.Tensor:
+    for v in views:
+        y.mul_(v)
+    return y
+
+
+def _separable_avg_pool_nd(x: torch.Tensor, window_size: int, count_include_pad: bool) -> torch.Tensor:
+    """Exact separable 1-D ``avg_pool2d`` / ``avg_pool3d`` passes (`3 * k` or `2 * k` taps instead of `k^d`)."""
+    pad = window_size // 2
+    if x.dim() == 4:
+        y = F.avg_pool2d(
+            x, kernel_size=(window_size, 1), stride=1, padding=(pad, 0), count_include_pad=count_include_pad
+        )
+        return F.avg_pool2d(
+            y, kernel_size=(1, window_size), stride=1, padding=(0, pad), count_include_pad=count_include_pad
+        )
+    if x.dim() == 5:
+        y = F.avg_pool3d(
+            x, kernel_size=(window_size, 1, 1), stride=1, padding=(pad, 0, 0), count_include_pad=count_include_pad
+        )
+        y = F.avg_pool3d(
+            y, kernel_size=(1, window_size, 1), stride=1, padding=(0, pad, 0), count_include_pad=count_include_pad
+        )
+        return F.avg_pool3d(
+            y, kernel_size=(1, 1, window_size), stride=1, padding=(0, 0, pad), count_include_pad=count_include_pad
+        )
+    raise ValueError(f"Expected 4D or 5D tensor, got {x.dim()}D.")
+
+
 def _box_pool(x: torch.Tensor, window_size: int, count_include_pad: bool) -> torch.Tensor:
-    """Stride-1 ``avg_pool2d`` / ``avg_pool3d`` with zero padding ``window_size // 2``."""
-    pool_fn = F.avg_pool2d if x.dim() == 4 else F.avg_pool3d
-    return pool_fn(
-        x,
-        kernel_size=window_size,
-        stride=1,
-        padding=window_size // 2,
-        count_include_pad=count_include_pad,
-    )
+    """Stride-1 local box mean with zero padding ``window_size // 2`` (exact separable 1-D for odd windows)."""
+    if window_size % 2 == 0:
+        pool_fn = F.avg_pool2d if x.dim() == 4 else F.avg_pool3d
+        return pool_fn(
+            x,
+            kernel_size=window_size,
+            stride=1,
+            padding=window_size // 2,
+            count_include_pad=count_include_pad,
+        )
+    if window_size <= 1:
+        return x.clone()
+    return _separable_avg_pool_nd(x, window_size, count_include_pad=count_include_pad)
 
 
 class _DeterministicBoxMean(torch.autograd.Function):
-    """Local box mean (stride 1, zero padding, count_include_pad=False) whose backward is
-    run-to-run reproducible on GPU/MPS."""
+    """Exact separable local box mean (stride 1, zero padding, ``count_include_pad=False``)
+    with zero saved tensors and deterministic single-pass backward on CPU, CUDA, and MPS."""
 
     @staticmethod
     def forward(ctx, x: torch.Tensor, window_size: int) -> torch.Tensor:
-        y = _box_pool(x, window_size, count_include_pad=False)
         ctx.window_size = window_size
-        return y
+        return _box_pool(x, window_size, count_include_pad=False)
 
     @staticmethod
     def backward(ctx, g: torch.Tensor):
         k = ctx.window_size
-        ones = torch.ones((1, 1) + tuple(g.shape[2:]), dtype=g.dtype, device=g.device)
-        count = _box_pool(ones, k, count_include_pad=True)
-        return _box_pool(g / count, k, count_include_pad=True), None
+        if k <= 1:
+            return g.clone(), None
+        _, _, pad_ratios = _get_window_count_views(g.shape[2:], k, g.device, g.dtype)
+        scaled = _scale_by_views_inplace(g.clone(), pad_ratios)
+        return _separable_avg_pool_nd(scaled, k, count_include_pad=True), None
 
 
-# Devices on which box_mean_nd uses the deterministic backward (CPU pooling is already deterministic).
-DETERMINISTIC_POOL_DEVICES = ("mps", "cuda")
+# Devices on which box_mean_nd uses the deterministic backward (all devices use separable _DeterministicBoxMean).
+DETERMINISTIC_POOL_DEVICES = ("mps", "cuda", "cpu")
 
 
 def box_mean_nd(x: torch.Tensor, window_size: int) -> torch.Tensor:
     """Local box mean of ``x`` (B, C, *spatial), 2-D or 3-D: border mean is over in-image voxels only."""
-    if (
-        window_size % 2 == 1
-        and x.requires_grad
-        and torch.is_grad_enabled()
-        and x.device.type in DETERMINISTIC_POOL_DEVICES
-    ):
+    if window_size % 2 == 1 and x.requires_grad and torch.is_grad_enabled():
         return _DeterministicBoxMean.apply(x, window_size)
     return _box_pool(x, window_size, count_include_pad=False)
 
 
 def _window_counts(x: torch.Tensor, window_size: int) -> torch.Tensor:
-    """Number of in-image voxels of each box window (zero padding excluded), shape of ``x``."""
+    """Number of in-image voxels of each box window (zero padding excluded), shape ``(B, 1, *spatial)``."""
+    if window_size % 2 == 1:
+        _, cnt_views, _ = _get_window_count_views(x.shape[2:], window_size, x.device, x.dtype)
+        prod = cnt_views[0]
+        for cv in cnt_views[1:]:
+            prod = prod * cv
+        return prod.expand(x.shape[0], 1, *x.shape[2:]).clone()
     dim = x.dim() - 2
     pool = F.avg_pool2d if dim == 2 else F.avg_pool3d
     ones = torch.ones_like(x[:, :1])
     pad = window_size // 2
     return pool(ones, kernel_size=window_size, stride=1, padding=pad, count_include_pad=True) * (window_size**dim)
+
+
+def _centered_moments_nd(
+    I_w: torch.Tensor,
+    J_w: torch.Tensor,
+    window_size: int,
+    differentiable: bool,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Compute ``(F_c, M_c, I_var, J_var, IJ_cov)`` using fused ``[2C]`` + ``[3C]`` separable box means
+    below ``_FUSE_MAX_VOXELS``, falling back to per-channel passes on ultra-large unchunked volumes."""
+    pool = box_mean_nd if differentiable else (lambda t, k: _box_pool(t, k, count_include_pad=False))
+    c = I_w.shape[1]
+    if I_w.numel() <= _FUSE_MAX_VOXELS:
+        ij_mean = pool(torch.cat([I_w, J_w], dim=1), window_size)
+        I_mean = ij_mean[:, :c]
+        J_mean = ij_mean[:, c:]
+        F_c = I_w - I_mean
+        M_c = J_w - J_mean
+        del ij_mean, I_mean, J_mean
+        sec = pool(torch.cat([F_c.square(), M_c.square(), F_c * M_c], dim=1), window_size)
+        I_var = torch.clamp(sec[:, :c], min=0.0)
+        J_var = torch.clamp(sec[:, c : 2 * c], min=0.0)
+        IJ_cov = sec[:, 2 * c :]
+        return F_c, M_c, I_var, J_var, IJ_cov
+
+    I_mean = pool(I_w, window_size)
+    J_mean = pool(J_w, window_size)
+    F_c = I_w - I_mean
+    M_c = J_w - J_mean
+    del I_mean, J_mean
+    I_var = torch.clamp(pool(F_c.square(), window_size), min=0.0)
+    J_var = torch.clamp(pool(M_c.square(), window_size), min=0.0)
+    IJ_cov = pool(F_c * M_c, window_size)
+    return F_c, M_c, I_var, J_var, IJ_cov
+
+
+def _single_pass_5ch_moments_nd(
+    I_w: torch.Tensor,
+    J_w: torch.Tensor,
+    window_size: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Single-window ``E[X^2] - E[X]^2`` and ``E[XY] - E[X]E[Y]`` separable box moments
+    after translation-invariant global-mean centering, split as ``[2C] + [3C]`` below
+    ``_FUSE_MAX_VOXELS`` to halve peak concatenation traffic on unified-memory GPUs."""
+    spatial_dims = tuple(range(2, I_w.dim()))
+    I_0 = I_w - I_w.detach().mean(dim=spatial_dims, keepdim=True)
+    J_0 = J_w - J_w.detach().mean(dim=spatial_dims, keepdim=True)
+    c = I_w.shape[1]
+    if I_w.numel() <= _FUSE_MAX_VOXELS:
+        m1 = box_mean_nd(torch.cat([I_0, J_0], dim=1), window_size)
+        m_I = m1[:, :c]
+        m_J = m1[:, c:]
+        m2 = box_mean_nd(torch.cat([I_0.square(), J_0.square(), I_0 * J_0], dim=1), window_size)
+        m_II = m2[:, :c]
+        m_JJ = m2[:, c : 2 * c]
+        m_IJ = m2[:, 2 * c :]
+    else:
+        m_I = box_mean_nd(I_0, window_size)
+        m_J = box_mean_nd(J_0, window_size)
+        m_II = box_mean_nd(I_0.square(), window_size)
+        m_JJ = box_mean_nd(J_0.square(), window_size)
+        m_IJ = box_mean_nd(I_0 * J_0, window_size)
+    I_var = torch.clamp(m_II - m_I.square(), min=0.0)
+    J_var = torch.clamp(m_JJ - m_J.square(), min=0.0)
+    IJ_cov = m_IJ - m_I * m_J
+    return I_var, J_var, IJ_cov
 
 
 class AnalyticalLNCC(torch.autograd.Function):
@@ -76,7 +218,8 @@ class AnalyticalLNCC(torch.autograd.Function):
     @staticmethod
     def forward(ctx, I: torch.Tensor, J: torch.Tensor, mask: torch.Tensor | None, window_size: int):
         dim = I.dim() - 2
-        pad = window_size // 2
+        if dim not in (2, 3):
+            raise ValueError(f"Only 2D and 3D images are supported, got {dim}D.")
 
         # Safe execution across CPU and accelerators for Half precision
         needs_upcast = I.dtype in (torch.float16, torch.bfloat16)
@@ -85,25 +228,9 @@ class AnalyticalLNCC(torch.autograd.Function):
         J_w = J.to(work_dtype)
         mask_w = mask.to(work_dtype) if mask is not None else None
 
-        if dim == 2:
-            pool_fn = F.avg_pool2d
-        elif dim == 3:
-            pool_fn = F.avg_pool3d
-        else:
-            raise ValueError(f"Only 2D and 3D images are supported, got {dim}D.")
-
-        def box_filter(x):
-            return pool_fn(x, kernel_size=window_size, stride=1, padding=pad, count_include_pad=False)
-
-        I_mean = box_filter(I_w)
-        J_mean = box_filter(J_w)
-
-        F_centered = I_w - I_mean
-        M_centered = J_w - J_mean
-
-        I_var = torch.clamp(box_filter(F_centered**2), min=0.0)
-        J_var = torch.clamp(box_filter(M_centered**2), min=0.0)
-        IJ_cov = box_filter(F_centered * M_centered)
+        F_centered, M_centered, I_var, J_var, IJ_cov = _centered_moments_nd(
+            I_w, J_w, window_size, differentiable=False
+        )
 
         var_floor = 1e-6
         safe_I_var = torch.clamp(I_var, min=var_floor)
@@ -113,7 +240,8 @@ class AnalyticalLNCC(torch.autograd.Function):
         cc_raw = IJ_cov / denom
         cc = torch.clamp(cc_raw, min=-1.0, max=1.0)
 
-        ctx.save_for_backward(F_centered, M_centered, cc, safe_I_var, safe_J_var, _window_counts(I_w, window_size))
+        ctx.save_for_backward(F_centered, M_centered, cc, safe_I_var, safe_J_var)
+        ctx.window_size = window_size
         ctx.needs_upcast = needs_upcast
         ctx.orig_dtype = I.dtype
 
@@ -129,13 +257,16 @@ class AnalyticalLNCC(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, grad_output: torch.Tensor):
-        F_centered, M_centered, cc, safe_I_var, safe_J_var, n_window = ctx.saved_tensors
+        F_centered, M_centered, cc, safe_I_var, safe_J_var = ctx.saved_tensors
 
         work_dtype = F_centered.dtype
         grad_out_w = grad_output.to(work_dtype)
 
         inv_denom = 1.0 / (torch.sqrt(safe_I_var * safe_J_var) + 1e-6)
-        scale = -(1.0 / n_window) * inv_denom
+        inv_counts, _, _ = _get_window_count_views(
+            F_centered.shape[2:], ctx.window_size, F_centered.device, work_dtype
+        )
+        scale = _scale_by_views_inplace(-inv_denom, inv_counts)
 
         grad_J = scale * (F_centered - cc * M_centered)
         grad_I = scale * (M_centered - cc * F_centered)
@@ -160,7 +291,8 @@ class ANTsPseudoLNCC(torch.autograd.Function):
     @staticmethod
     def forward(ctx, I: torch.Tensor, J: torch.Tensor, mask: torch.Tensor | None, window_size: int):
         dim = I.dim() - 2
-        pad = window_size // 2
+        if dim not in (2, 3):
+            raise ValueError(f"Only 2D and 3D images are supported, got {dim}D.")
 
         needs_upcast = I.dtype in (torch.float16, torch.bfloat16)
         work_dtype = torch.float32 if needs_upcast else I.dtype
@@ -168,25 +300,9 @@ class ANTsPseudoLNCC(torch.autograd.Function):
         J_w = J.to(work_dtype)
         mask_w = mask.to(work_dtype) if mask is not None else None
 
-        if dim == 2:
-            pool_fn = F.avg_pool2d
-        elif dim == 3:
-            pool_fn = F.avg_pool3d
-        else:
-            raise ValueError(f"Only 2D and 3D images are supported, got {dim}D.")
-
-        def box_filter(x):
-            return pool_fn(x, kernel_size=window_size, stride=1, padding=pad, count_include_pad=False)
-
-        I_mean = box_filter(I_w)
-        J_mean = box_filter(J_w)
-
-        F_centered = I_w - I_mean
-        M_centered = J_w - J_mean
-
-        I_var = torch.clamp(box_filter(F_centered**2), min=0.0)
-        J_var = torch.clamp(box_filter(M_centered**2), min=0.0)
-        IJ_cov = box_filter(F_centered * M_centered)
+        F_centered, M_centered, I_var, J_var, IJ_cov = _centered_moments_nd(
+            I_w, J_w, window_size, differentiable=False
+        )
 
         var_floor = 1e-6
         safe_I_var = torch.clamp(I_var, min=var_floor)
@@ -195,7 +311,8 @@ class ANTsPseudoLNCC(torch.autograd.Function):
         cc2_raw = (IJ_cov**2) / (safe_I_var * safe_J_var + 1e-8)
         cc2 = torch.clamp(cc2_raw, min=0.0, max=1.0)
 
-        ctx.save_for_backward(F_centered, M_centered, IJ_cov, safe_I_var, safe_J_var, _window_counts(I_w, window_size))
+        ctx.save_for_backward(F_centered, M_centered, IJ_cov, safe_I_var, safe_J_var)
+        ctx.window_size = window_size
         ctx.needs_upcast = needs_upcast
         ctx.orig_dtype = I.dtype
 
@@ -211,7 +328,7 @@ class ANTsPseudoLNCC(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, grad_output: torch.Tensor):
-        F_centered, M_centered, IJ_cov, safe_I_var, safe_J_var, n_window = ctx.saved_tensors
+        F_centered, M_centered, IJ_cov, safe_I_var, safe_J_var = ctx.saved_tensors
 
         work_dtype = F_centered.dtype
         grad_out_w = grad_output.to(work_dtype)
@@ -221,7 +338,10 @@ class ANTsPseudoLNCC(torch.autograd.Function):
         s_MM = safe_J_var
         sFF_sMM = s_FF * s_MM + 1e-8
 
-        grad_factor = -2.0 * (1.0 / n_window) * (s_FM / sFF_sMM)
+        inv_counts, _, _ = _get_window_count_views(
+            F_centered.shape[2:], ctx.window_size, F_centered.device, work_dtype
+        )
+        grad_factor = _scale_by_views_inplace(-2.0 * (s_FM / sFF_sMM), inv_counts)
         grad_J = grad_factor * (F_centered - (s_FM / (s_MM + 1e-8)) * M_centered)
         grad_I = grad_factor * (M_centered - (s_FM / (s_FF + 1e-8)) * F_centered)
 
@@ -273,16 +393,14 @@ def _lncc_chunked_no_grad(
     for z0, z1, s0, s1, c0, c1 in slabs:
         I_s = I[:, :, s0:s1].to(work_dtype)
         J_s = J[:, :, s0:s1].to(work_dtype)
-        I_mean = _box_pool(I_s, window_size, count_include_pad=False)
-        J_mean = _box_pool(J_s, window_size, count_include_pad=False)
-        F_c = I_s - I_mean
-        M_c = J_s - J_mean
-        del I_s, J_s, I_mean, J_mean
-
-        I_var_c = torch.clamp(_box_pool(F_c * F_c, window_size, count_include_pad=False)[:, :, c0:c1], min=0.0)
-        J_var_c = torch.clamp(_box_pool(M_c * M_c, window_size, count_include_pad=False)[:, :, c0:c1], min=0.0)
-        IJ_cov_c = _box_pool(F_c * M_c, window_size, count_include_pad=False)[:, :, c0:c1]
-        del F_c, M_c
+        F_c, M_c, I_var_f, J_var_f, IJ_cov_f = _centered_moments_nd(
+            I_s, J_s, window_size, differentiable=False
+        )
+        del I_s, J_s, F_c, M_c
+        I_var_c = I_var_f[:, :, c0:c1]
+        J_var_c = J_var_f[:, :, c0:c1]
+        IJ_cov_c = IJ_cov_f[:, :, c0:c1]
+        del I_var_f, J_var_f, IJ_cov_f
 
         safe_I = torch.clamp(I_var_c, min=floor_val)
         safe_J = torch.clamp(J_var_c, min=floor_val)
@@ -385,19 +503,14 @@ class _ChunkedLocalNCC(torch.autograd.Function):
                 for z0, z1, s0, s1, c0, c1 in slabs:
                     I_s = I[:, :, s0:s1].to(work_dtype)
                     J_s = J[:, :, s0:s1].to(work_dtype)
-                    I_mean = _box_pool(I_s, window_size, count_include_pad=False)
-                    J_mean = _box_pool(J_s, window_size, count_include_pad=False)
-                    F_full = I_s - I_mean
-                    M_full = J_s - J_mean
-                    del I_s, J_s, I_mean, J_mean
-
-                    I_var_c = torch.clamp(
-                        _box_pool(F_full * F_full, window_size, count_include_pad=False)[:, :, c0:c1], min=0.0
+                    F_full, M_full, I_var_f, J_var_f, IJ_cov_f = _centered_moments_nd(
+                        I_s, J_s, window_size, differentiable=False
                     )
-                    J_var_c = torch.clamp(
-                        _box_pool(M_full * M_full, window_size, count_include_pad=False)[:, :, c0:c1], min=0.0
-                    )
-                    IJ_cov_c = _box_pool(F_full * M_full, window_size, count_include_pad=False)[:, :, c0:c1]
+                    del I_s, J_s
+                    I_var_c = I_var_f[:, :, c0:c1]
+                    J_var_c = J_var_f[:, :, c0:c1]
+                    IJ_cov_c = IJ_cov_f[:, :, c0:c1]
+                    del I_var_f, J_var_f, IJ_cov_f
                     n_win_c = _window_counts(F_full, window_size)[:, :, c0:c1]
                     F_c = F_full[:, :, c0:c1]
                     M_c = M_full[:, :, c0:c1]
@@ -435,14 +548,13 @@ class _ChunkedLocalNCC(torch.autograd.Function):
                     I_s = I[:, :, s0:s1].detach().to(work_dtype).requires_grad_(need_I)
                     J_s = J[:, :, s0:s1].detach().to(work_dtype).requires_grad_(need_J)
 
-                    I_mean = box_mean_nd(I_s, window_size)
-                    J_mean = box_mean_nd(J_s, window_size)
-                    F_s = I_s - I_mean
-                    M_s = J_s - J_mean
-
-                    I_var_c = torch.clamp(box_mean_nd(F_s**2, window_size)[:, :, c0:c1], min=0.0)
-                    J_var_c = torch.clamp(box_mean_nd(M_s**2, window_size)[:, :, c0:c1], min=0.0)
-                    IJ_cov_c = box_mean_nd(F_s * M_s, window_size)[:, :, c0:c1]
+                    F_s, M_s, I_var_f, J_var_f, IJ_cov_f = _centered_moments_nd(
+                        I_s, J_s, window_size, differentiable=True
+                    )
+                    I_var_c = I_var_f[:, :, c0:c1]
+                    J_var_c = J_var_f[:, :, c0:c1]
+                    IJ_cov_c = IJ_cov_f[:, :, c0:c1]
+                    del I_var_f, J_var_f, IJ_cov_f
 
                     safe_I = torch.clamp(I_var_c, min=floor_val)
                     safe_J = torch.clamp(J_var_c, min=floor_val)
@@ -476,7 +588,7 @@ class _ChunkedLocalNCC(torch.autograd.Function):
                             if grads[g_idx] is not None:
                                 grad_J[:, :, s0:s1].add_(grads[g_idx])
 
-                    del I_s, J_s, I_mean, J_mean, F_s, M_s, I_var_c, J_var_c, IJ_cov_c, safe_I, safe_J, cc_c, slab_num
+                    del I_s, J_s, F_s, M_s, I_var_c, J_var_c, IJ_cov_c, safe_I, safe_J, cc_c, slab_num
 
             scale_out = grad_output.to(work_dtype) / total_den
 
@@ -497,6 +609,7 @@ def local_ncc_loss_nd(
     var_floor: float = 1e-6,
     use_analytical_gradients: bool = False,
     metric_chunks: int = 1,
+    single_pass: bool = False,
 ) -> torch.Tensor:
     """
     Negative local normalised cross-correlation (LNCC) of 2-D or 3-D images I and J.
@@ -521,6 +634,10 @@ def local_ncc_loss_nd(
         Number of slabs along spatial axis 0 (depth in 3-D, height in 2-D). ``> 1`` evaluates
         each slab with an exact ``2 * (window_size // 2)`` halo, cutting transient LNCC
         intermediate memory by ``~metric_chunks`` with identical forward and backward values.
+    single_pass : bool, default False
+        When True (and ``not use_pseudo`` and ``metric_chunks == 1``), fuse all 5 moments
+        ``(I, J, I^2, J^2, I*J)`` into a single ``[B, 5*C, *spatial]`` separable pass
+        (ANTs single-window ``E[IJ] - E[I]E[J]`` formulation).
 
     Returns
     -------
@@ -573,15 +690,12 @@ def local_ncc_loss_nd(
         I_w = I.to(work_dtype)
         J_w = J.to(work_dtype)
 
-        def box_filter(x):
-            return box_mean_nd(x, window_size)
-
-        I_mean = box_filter(I_w)
-        J_mean = box_filter(J_w)
-
-        I_var = torch.clamp(box_filter((I_w - I_mean) ** 2), min=0.0)
-        J_var = torch.clamp(box_filter((J_w - J_mean) ** 2), min=0.0)
-        IJ_cov = box_filter((I_w - I_mean) * (J_w - J_mean))
+        if single_pass and I_w.numel() <= _FUSE_MAX_VOXELS:
+            I_var, J_var, IJ_cov = _single_pass_5ch_moments_nd(I_w, J_w, window_size)
+        else:
+            _, _, I_var, J_var, IJ_cov = _centered_moments_nd(
+                I_w, J_w, window_size, differentiable=True
+            )
 
         floor_val = max(float(var_floor), 1e-6)
         safe_I_var = torch.clamp(I_var, min=floor_val)

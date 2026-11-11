@@ -328,3 +328,270 @@ def test_anderson_baseline_numerical_parity():
         assert rel < 1e-5, f"rel_error={rel} exceeded 1e-5"
 
 
+def _build_high_strain_radial_diffeomorphism(
+    spatial,
+    spacing,
+    origin,
+    direction,
+    peak_strain: float = 5.0,
+    core_sigma_mm: float = 2.0,
+    support_radius_mm: float = 28.0,
+):
+    """Compactly supported radial diffeomorphism ``u(x) = x * A * s * (tanh(r/s)/r) * (1 - r/L)_+^2``
+    with ``sigma_max(grad u) > 2`` and strictly positive sub-cell multilinear Jacobian determinant."""
+    from syntx.spatial import get_physical_grid_torch, reverse_metadata
+
+    dim = len(spatial)
+    X_phys = get_physical_grid_torch(
+        spatial, spacing, origin, direction, device="cpu", dtype=torch.float32
+    )
+    sp_rev, or_rev, dir_rev = reverse_metadata(spacing, origin, direction)
+    center_idx = torch.tensor([(s - 1) / 2.0 for s in spatial], dtype=torch.float32)
+    center_phys = (
+        (center_idx * torch.tensor(sp_rev, dtype=torch.float32))
+        @ torch.tensor(dir_rev, dtype=torch.float32).T
+        + torch.tensor(or_rev, dtype=torch.float32)
+    )
+    rel = X_phys - center_phys.view(*([1] * (dim + 1)), dim)
+    r = torch.linalg.vector_norm(rel, dim=-1, keepdim=True)
+    taper = (1.0 - r / support_radius_mm).clamp(min=0.0) ** 2
+    ratio = torch.where(
+        r > 1e-4,
+        torch.tanh(r / core_sigma_mm) / r.clamp(min=1e-4),
+        torch.full_like(r, 1.0 / core_sigma_mm),
+    )
+    u = rel * (peak_strain * core_sigma_mm * ratio * taper)
+
+    right_mat = torch.from_numpy(
+        (np.diag(1.0 / np.asarray(sp_rev, dtype=np.float64)) @ np.linalg.inv(dir_rev)).astype(
+            np.float32
+        )
+    )
+    grad_axes = tuple(range(dim))
+    grad_u = torch.stack(torch.gradient(u[0], dim=grad_axes), dim=-1) @ right_mat
+    J = torch.eye(dim, dtype=torch.float32) + grad_u
+    det_J = torch.linalg.det(J)
+    sv_grad_u = torch.linalg.svdvals(grad_u)
+    return u, det_J, sv_grad_u
+
+
+def test_hybrid_lm_high_strain_3d_rpi_diffeomorphism_cpu():
+    """Verify safeguarded LM converges to <1e-3 mm on a 3D RPI diffeomorphism with
+    det(I + grad u) > 0.01 and sigma_max(grad u) > 2.0 where fixed-point & Anderson fail."""
+    spatial = (64, 64, 64)
+    spacing = (1.0, 1.0, 1.0)
+    origin = (-31.5, 31.5, -31.5)
+    # RPI orientation (diag(1, -1, 1)), matching Mindboggle Pair 44
+    direction = np.diag([1.0, -1.0, 1.0])
+
+    u, det_fwd, sv_grad = _build_high_strain_radial_diffeomorphism(
+        spatial, spacing, origin, direction, peak_strain=6.5, core_sigma_mm=2.0, support_radius_mm=29.5
+    )
+    assert det_fwd.min().item() > 0.01, f"Phantom folded: min det={det_fwd.min().item()}"
+    assert sv_grad[..., 0].max().item() > 2.0, f"Peak strain too small: {sv_grad[..., 0].max().item()}"
+
+    # Both ITK damped fixed-point and global-L2 Anderson diverge inside the high-strain core
+    v_fp = update_inverse_field_nd(
+        u, None, steps=25, method="fixed_point",
+        spacing=spacing, origin=origin, direction=direction,
+        max_error_threshold=1e-4, mean_error_threshold=1e-5,
+    )
+    ice_fp = calculate_inverse_identity_error(u, v_fp, spacing, origin, direction)
+    assert ice_fp["max_error"] > 1.0
+
+    v_aa = update_inverse_field_nd(
+        u, None, steps=25, method="anderson",
+        spacing=spacing, origin=origin, direction=direction,
+        max_error_threshold=1e-4, mean_error_threshold=1e-5,
+    )
+    ice_aa = calculate_inverse_identity_error(u, v_aa, spacing, origin, direction)
+    assert ice_aa["max_error"] > 1.0
+
+    # Cold-start safeguarded LM must converge cleanly below 1e-3 mm with det(I + grad v) > 0
+    stats = {}
+    v_lm = update_inverse_field_nd(
+        u, None, steps=30, method="hybrid_lm",
+        spacing=spacing, origin=origin, direction=direction,
+        max_error_threshold=5e-4, mean_error_threshold=1e-4,
+        stats=stats,
+    )
+    ice_lm = calculate_inverse_identity_error(u, v_lm, spacing, origin, direction)
+    assert ice_lm["max_error"] < 1e-3, f"LM max_error={ice_lm['max_error']} >= 1e-3 mm"
+    assert ice_lm["mean_error"] < 1e-4
+    assert stats["converged"] is True
+
+    from syntx.spatial import reverse_metadata
+    sp_rev, _, dir_rev = reverse_metadata(spacing, origin, direction)
+    rmat = torch.from_numpy((np.diag(1.0 / np.asarray(sp_rev)) @ np.linalg.inv(dir_rev)).astype(np.float32))
+    det_inv = torch.linalg.det(torch.eye(3) + torch.stack(torch.gradient(v_lm[0], dim=(0, 1, 2)), dim=-1) @ rmat)
+    # Isotropic core expansion (1 + 6.5)^3 = 421.9 => exact analytical inverse det = 1/421.9 = 0.00237 > 0
+    assert det_inv.min().item() > 1e-3, f"Inverse folded: min det_inv={det_inv.min().item()}"
+
+    # Warm-start from unconverged fixed-point must never worsen any interior voxel residual
+    v_warm = update_inverse_field_nd_hybrid_lm(
+        u, v_fp, steps=20,
+        max_error_threshold=5e-4, mean_error_threshold=1e-4,
+        spacing=spacing, origin=origin, direction=direction,
+    )
+    ice_warm = calculate_inverse_identity_error(u, v_warm, spacing, origin, direction)
+    assert (ice_warm["error_map"] <= ice_fp["error_map"] + 1e-6).all()
+    assert ice_warm["max_error"] < 1e-3
+
+
+def test_hybrid_lm_high_strain_2d_oblique_and_modes_cpu():
+    """Verify 2D oblique/anisotropic physical mode, normalized [-1, 1] mode, batch B=2,
+    channels-first layout, and JAX CPU backend parity on high-strain diffeomorphisms."""
+    theta = np.deg2rad(28.0)
+    # Reflection + rotation (det = -1) with anisotropic spacing
+    direction_2d = np.array(
+        [[np.cos(theta), -np.sin(theta)], [-np.sin(theta), -np.cos(theta)]],
+        dtype=np.float64,
+    )
+    spacing_2d = (0.8, 1.25)
+    origin_2d = (14.5, -21.0)
+    spatial_2d = (56, 52)
+
+    u1, det1, sv1 = _build_high_strain_radial_diffeomorphism(
+        spatial_2d, spacing_2d, origin_2d, direction_2d,
+        peak_strain=3.8, core_sigma_mm=2.2, support_radius_mm=18.5,
+    )
+    assert det1.min().item() > 0.01
+    assert sv1[..., 0].max().item() > 2.0
+
+    v1 = update_inverse_field_nd_hybrid_lm(
+        u1, None, steps=30, max_error_threshold=1e-3, mean_error_threshold=2e-4,
+        spacing=spacing_2d, origin=origin_2d, direction=direction_2d,
+    )
+    ice1 = calculate_inverse_identity_error(u1, v1, spacing_2d, origin_2d, direction_2d)
+    assert ice1["max_error"] < 1.5e-3
+
+    # Batch B=2 and channels-first parity
+    u2 = u1 * 0.5
+    v2 = update_inverse_field_nd_hybrid_lm(
+        u2, None, steps=30, max_error_threshold=1e-3, mean_error_threshold=2e-4,
+        spacing=spacing_2d, origin=origin_2d, direction=direction_2d,
+    )
+    vb = update_inverse_field_nd_hybrid_lm(
+        torch.cat([u1, u2], dim=0), None, steps=30,
+        max_error_threshold=1e-3, mean_error_threshold=2e-4,
+        spacing=spacing_2d, origin=origin_2d, direction=direction_2d,
+    )
+    assert torch.allclose(vb[0:1], v1, atol=1e-5)
+    assert torch.allclose(vb[1:2], v2, atol=1e-5)
+
+    u1_cf = torch.movedim(u1, -1, 1)
+    v1_cf = update_inverse_field_nd(
+        u1_cf, None, steps=30, method="hybrid_lm",
+        max_error_threshold=1e-3, mean_error_threshold=2e-4,
+        spacing=spacing_2d, origin=origin_2d, direction=direction_2d,
+    )
+    assert v1_cf.shape == u1_cf.shape
+    assert torch.allclose(torch.movedim(v1_cf, 1, -1), v1, atol=1e-5)
+
+    # Normalized [-1, 1] mode (spacing=None) + smoothing_sigma > 0 dense branch
+    import torch.nn.functional as F
+    grid_y, grid_x = torch.meshgrid(
+        torch.linspace(-1, 1, 45), torch.linspace(-1, 1, 45), indexing="ij"
+    )
+    identity_norm = torch.stack([grid_x, grid_y], dim=-1).unsqueeze(0)
+    r2 = grid_x ** 2 + grid_y ** 2
+    taper = (1.0 - r2 / 0.81).clamp(min=0.0) ** 3
+    factor = 2.6 * taper / (1.0 + r2 / 0.015)
+    u_norm = torch.stack([grid_x * factor, grid_y * factor], dim=-1).unsqueeze(0)
+    v_norm = update_inverse_field_nd(
+        u_norm, None, steps=30, method="hybrid_lm",
+        max_error_threshold=1e-3, mean_error_threshold=2e-4,
+    )
+    u_at_v = F.grid_sample(
+        torch.movedim(u_norm, -1, 1), identity_norm + v_norm,
+        mode="bilinear", padding_mode="border", align_corners=True,
+    ).movedim(1, -1)
+    err_vox = ((v_norm + u_at_v) * 22.0).norm(dim=-1)
+    assert float(err_vox[0, 1:-1, 1:-1].max().item()) < 1.5e-3
+
+    v1_smooth = update_inverse_field_nd_hybrid_lm(
+        u1, v1, steps=5, smoothing_sigma=0.35,
+        max_error_threshold=1e-3, mean_error_threshold=2e-4,
+        spacing=spacing_2d, origin=origin_2d, direction=direction_2d,
+    )
+    assert torch.isfinite(v1_smooth).all()
+
+    # JAX CPU backend parity on the 2D oblique/reflected high-strain diffeomorphism
+    import jax
+    import jax.numpy as jnp
+    from syntx.syn_jax import update_inverse_field_nd_jax
+
+    cpu_dev = jax.devices("cpu")[0]
+    with jax.default_device(cpu_dev):
+        u1_jax = jnp.asarray(u1.numpy())
+        v1_jax = update_inverse_field_nd_jax(
+            u1_jax, None, steps=30, method="hybrid_lm",
+            max_error_threshold=1e-3, mean_error_threshold=2e-4,
+            spacing=spacing_2d, origin=origin_2d, direction=direction_2d,
+        )
+    v1_jax_pt = torch.from_numpy(np.array(v1_jax, copy=True))
+    ice_jax = calculate_inverse_identity_error(u1, v1_jax_pt, spacing_2d, origin_2d, direction_2d)
+    assert ice_jax["max_error"] < 2e-3
+
+
+def test_synto_post_fit_safeguarded_lm_polish_cpu():
+    """Verify SyNTo.fit() on CPU with RPI orientation polishes both half-field and composed
+    inverses when midpoint_polish_tol/compose_polish_tol are enabled while keeping
+    liouville_determinant strictly positive."""
+    import ants
+    import syntx
+
+    yy, xx = np.meshgrid(np.linspace(-1, 1, 48), np.linspace(-1, 1, 48), indexing="ij")
+    fixed_np = np.exp(-((xx ** 2 + yy ** 2) / 0.18)).astype(np.float32)
+    moving_np = np.exp(-(((xx - 0.14 * np.exp(-4.0 * (xx ** 2 + yy ** 2))) ** 2 + (yy + 0.10) ** 2) / 0.14)).astype(np.float32)
+
+    direction = np.diag([1.0, -1.0])
+    fixed = ants.from_numpy(fixed_np, spacing=(1.0, 1.0), origin=(-24.0, 24.0), direction=direction)
+    moving = ants.from_numpy(moving_np, spacing=(1.0, 1.0), origin=(-24.0, 24.0), direction=direction)
+
+    res = syntx.syn(
+        fixed=fixed,
+        moving=moving,
+        initial_transform="identity",
+        backend="pytorch",
+        device="cpu",
+        levels=[2, 1],
+        reg_iterations=[15, 10],
+        midpoint_polish_tol=0.02,
+        compose_polish_tol=0.05,
+        seed=42,
+        verbose=False,
+    )
+    assert res["inverse_identity_errors"]["phi_1"]["max_error"] <= 0.06
+    jac_liouville = syntx.liouville_determinant(res, fixed=fixed)
+    assert float(jac_liouville.numpy().min()) > 0.0
+
+
+def test_hybrid_lm_mps_parity_3d_rpi():
+    """Verify safeguarded LM runs cleanly on Apple MPS and matches CPU on 3-D RPI high strain."""
+    if not (hasattr(torch.backends, "mps") and torch.backends.mps.is_available()):
+        return
+    spatial = (48, 48, 48)
+    spacing = (1.0, 1.0, 1.0)
+    origin = (-23.5, 23.5, -23.5)
+    direction = np.diag([1.0, -1.0, 1.0])
+    u_cpu, det_fwd, _ = _build_high_strain_radial_diffeomorphism(
+        spatial, spacing, origin, direction, peak_strain=5.0, core_sigma_mm=2.0, support_radius_mm=21.5
+    )
+    assert det_fwd.min().item() > 0.01
+
+    v_cpu = update_inverse_field_nd_hybrid_lm(
+        u_cpu, None, steps=25, max_error_threshold=1e-3, mean_error_threshold=2e-4,
+        spacing=spacing, origin=origin, direction=direction,
+    )
+    v_mps = update_inverse_field_nd_hybrid_lm(
+        u_cpu.to("mps"), None, steps=25, max_error_threshold=1e-3, mean_error_threshold=2e-4,
+        spacing=spacing, origin=origin, direction=direction,
+    ).cpu()
+    ice_mps = calculate_inverse_identity_error(u_cpu, v_mps, spacing, origin, direction)
+    assert ice_mps["max_error"] < 1.5e-3
+    assert torch.allclose(v_cpu, v_mps, atol=1e-4)
+
+
+
+

@@ -743,9 +743,132 @@ def _spatial_jacobian_nd_jax(field, physical_spacing=None):
 
 
 
+def _multilinear_val_and_jac_jax(u_grid, vox_coords, right_mat):
+    """Exact multilinear value and Jacobian of ``u_grid`` (*spatial, dim) at continuous voxel
+    coordinates ``vox_coords`` (..., dim), matching ``jax_grid_sample(..., padding_mode='border')``."""
+    dim = u_grid.shape[-1]
+    dtype = u_grid.dtype
+    orig_shape = vox_coords.shape[:-1]
+    pts = vox_coords.reshape(-1, dim)
+
+    if dim == 2:
+        H, W, _ = u_grid.shape
+        vy, vx = pts[:, 0], pts[:, 1]
+        in_y = ((vy >= 0.0) & (vy <= float(H - 1))).astype(dtype)
+        in_x = ((vx >= 0.0) & (vx <= float(W - 1))).astype(dtype)
+        vy_c = jnp.clip(vy, 0.0, float(max(H - 1, 0)))
+        vx_c = jnp.clip(vx, 0.0, float(max(W - 1, 0)))
+        iy0 = jnp.clip(jnp.floor(vy_c).astype(jnp.int32), 0, max(H - 2, 0))
+        ix0 = jnp.clip(jnp.floor(vx_c).astype(jnp.int32), 0, max(W - 2, 0))
+        iy1 = jnp.clip(iy0 + 1, 0, max(H - 1, 0))
+        ix1 = jnp.clip(ix0 + 1, 0, max(W - 1, 0))
+        ty = (vy_c - iy0.astype(dtype))[:, None]
+        tx = (vx_c - ix0.astype(dtype))[:, None]
+        omy, omx = 1.0 - ty, 1.0 - tx
+
+        flat = u_grid.reshape(-1, 2)
+        c00 = flat[iy0 * W + ix0]
+        c01 = flat[iy0 * W + ix1]
+        c10 = flat[iy1 * W + ix0]
+        c11 = flat[iy1 * W + ix1]
+        c0 = c00 * omx + c01 * tx
+        c1 = c10 * omx + c11 * tx
+        u_val = c0 * omy + c1 * ty
+
+        du_dvy = (c1 - c0) * in_y[:, None]
+        du_dvx = ((c01 - c00) * omy + (c11 - c10) * ty) * in_x[:, None]
+        grad_u = jnp.stack([du_dvy, du_dvx], axis=-1) @ right_mat
+        return u_val.reshape(*orig_shape, 2), grad_u.reshape(*orig_shape, 2, 2)
+
+    Z, Y, X, _ = u_grid.shape
+    vz, vy, vx = pts[:, 0], pts[:, 1], pts[:, 2]
+    in_z = ((vz >= 0.0) & (vz <= float(Z - 1))).astype(dtype)
+    in_y = ((vy >= 0.0) & (vy <= float(Y - 1))).astype(dtype)
+    in_x = ((vx >= 0.0) & (vx <= float(X - 1))).astype(dtype)
+    vz_c = jnp.clip(vz, 0.0, float(max(Z - 1, 0)))
+    vy_c = jnp.clip(vy, 0.0, float(max(Y - 1, 0)))
+    vx_c = jnp.clip(vx, 0.0, float(max(X - 1, 0)))
+    iz0 = jnp.clip(jnp.floor(vz_c).astype(jnp.int32), 0, max(Z - 2, 0))
+    iy0 = jnp.clip(jnp.floor(vy_c).astype(jnp.int32), 0, max(Y - 2, 0))
+    ix0 = jnp.clip(jnp.floor(vx_c).astype(jnp.int32), 0, max(X - 2, 0))
+    iz1 = jnp.clip(iz0 + 1, 0, max(Z - 1, 0))
+    iy1 = jnp.clip(iy0 + 1, 0, max(Y - 1, 0))
+    ix1 = jnp.clip(ix0 + 1, 0, max(X - 1, 0))
+    tz = (vz_c - iz0.astype(dtype))[:, None]
+    ty = (vy_c - iy0.astype(dtype))[:, None]
+    tx = (vx_c - ix0.astype(dtype))[:, None]
+    omz, omy, omx = 1.0 - tz, 1.0 - ty, 1.0 - tx
+
+    flat = u_grid.reshape(-1, 3)
+    sz, sy = Y * X, X
+    c000 = flat[iz0 * sz + iy0 * sy + ix0]
+    c001 = flat[iz0 * sz + iy0 * sy + ix1]
+    c010 = flat[iz0 * sz + iy1 * sy + ix0]
+    c011 = flat[iz0 * sz + iy1 * sy + ix1]
+    c100 = flat[iz1 * sz + iy0 * sy + ix0]
+    c101 = flat[iz1 * sz + iy0 * sy + ix1]
+    c110 = flat[iz1 * sz + iy1 * sy + ix0]
+    c111 = flat[iz1 * sz + iy1 * sy + ix1]
+    c00 = c000 * omx + c001 * tx
+    c01 = c010 * omx + c011 * tx
+    c10 = c100 * omx + c101 * tx
+    c11 = c110 * omx + c111 * tx
+    c0 = c00 * omy + c01 * ty
+    c1 = c10 * omy + c11 * ty
+    u_val = c0 * omz + c1 * tz
+
+    du_dvz = (c1 - c0) * in_z[:, None]
+    du_dvy = ((c01 - c00) * omz + (c11 - c10) * tz) * in_y[:, None]
+    du_dvx = (
+        ((c001 - c000) * omy + (c011 - c010) * ty) * omz
+        + ((c101 - c100) * omy + (c111 - c110) * ty) * tz
+    ) * in_x[:, None]
+    grad_u = jnp.stack([du_dvz, du_dvy, du_dvx], axis=-1) @ right_mat
+    return u_val.reshape(*orig_shape, 3), grad_u.reshape(*orig_shape, 3, 3)
+
+
+def _solve_spd_lm_jax(JTJ, rhs, lam):
+    """Closed-form Jacobi-equilibrated Cholesky solve of ``(JTJ + mu * I) dv = rhs`` for 2-D/3-D."""
+    dim = rhs.shape[-1]
+    diag = jnp.diagonal(JTJ, axis1=-2, axis2=-1)
+    diag_scale = jnp.maximum(jnp.max(diag, axis=-1), 1.0)
+    mu = jnp.maximum(lam * diag_scale, 1e-6)
+    s = jnp.sqrt(jnp.maximum(diag + mu[..., None], 1e-12))
+
+    if dim == 2:
+        s0, s1 = s[..., 0], s[..., 1]
+        h10 = JTJ[..., 1, 0] / (s1 * s0)
+        b0 = rhs[..., 0] / s0
+        b1 = rhs[..., 1] / s1
+        l11 = jnp.sqrt(jnp.maximum(1.0 - h10 * h10, 1e-7))
+        y0 = b0
+        y1 = (b1 - h10 * y0) / l11
+        z1 = y1 / l11
+        z0 = y0 - h10 * z1
+        return jnp.stack([z0 / s0, z1 / s1], axis=-1)
+
+    s0, s1, s2 = s[..., 0], s[..., 1], s[..., 2]
+    h10 = JTJ[..., 1, 0] / (s1 * s0)
+    h20 = JTJ[..., 2, 0] / (s2 * s0)
+    h21 = JTJ[..., 2, 1] / (s2 * s1)
+    b0 = rhs[..., 0] / s0
+    b1 = rhs[..., 1] / s1
+    b2 = rhs[..., 2] / s2
+    l11 = jnp.sqrt(jnp.maximum(1.0 - h10 * h10, 1e-7))
+    l21 = (h21 - h20 * h10) / l11
+    l22 = jnp.sqrt(jnp.maximum(1.0 - h20 * h20 - l21 * l21, 1e-7))
+    y0 = b0
+    y1 = (b1 - h10 * y0) / l11
+    y2 = (b2 - h20 * y0 - l21 * y1) / l22
+    z2 = y2 / l22
+    z1 = (y1 - l21 * z2) / l11
+    z0 = y0 - h10 * z1 - h20 * z2
+    return jnp.stack([z0 / s0, z1 / s1, z2 / s2], axis=-1)
+
+
 def update_inverse_field_jax_hybrid_lm(
-    W_disp, 
-    W_inv_disp, 
+    W_disp,
+    W_inv_disp,
     steps=30,
     relaxation=1.0,
     smoothing_sigma=0.0,
@@ -754,134 +877,169 @@ def update_inverse_field_jax_hybrid_lm(
     damping_factor=1.0,
     spacing=None,
     origin=None,
-    direction=None
+    direction=None,
+    stationary_boundary=True,
 ):
     """
-    Invert a displacement field with damped Newton (Levenberg-Marquardt-style) steps.
+    Invert a displacement field with safeguarded per-voxel Levenberg-Marquardt steps.
 
-    Each iteration computes the residual ``e = v + u(y + v)``, the Jacobian ``J = I + grad``
-    of ``u(y + v(y))`` with respect to y (central differences with ``jnp.roll``; the wrapped
-    differences only reach the outer rim, which the boundary mask zeroes),
-    and solves ``(J + lambda I) delta = -e`` per voxel, with
-    ``lambda = 10 * damping_factor * clip(0.2 - det J, 0, 1)``. The step is clipped like the
-    fixed-point solver, scaled by ``relaxation * epsilon`` (epsilon 0.75 on the first
-    iteration, then 0.5), optionally smoothed, and zeroed on the boundary. Iterations stop
-    (inside a ``fori_loop``) once max error <= ``max_error_threshold`` and mean error <=
-    ``mean_error_threshold`` (voxel units).
-
-    Parameters
-    ----------
-    W_disp : jnp.ndarray, shape (B, *spatial, dim)
-        Forward physical displacement, tensor (z, y, x) components.
-    W_inv_disp : jnp.ndarray or None
-        Initial guess; None uses ``-W_disp``.
-    steps : int, default 30
-    relaxation, damping_factor : float, default 1.0
-    smoothing_sigma : float, default 0.0
-        Gaussian sigma (voxels) applied to each iterate.
-    max_error_threshold, mean_error_threshold : float, default 0.1, 0.001
-    spacing, origin, direction : optional
-        ITK order. Given ``spacing``, missing origin / direction default to zero / identity.
-        Without ``spacing`` the call is delegated to the fixed point
-        (``update_inverse_field_nd_jax(method='fixed_point')``, same thresholds), as PyTorch.
-
-    Returns
-    -------
-    jnp.ndarray, same shape as ``W_disp``
+    Minimises ``0.5 * ||v(x) + u(x + v(x))||^2`` per voxel using the exact analytical
+    multilinear Jacobian ``J(y) = I + grad_y u(y)`` at ``y = x + v(x)`` (respecting full
+    ``spacing``, ``origin`` and ``direction`` cosines in physical mode, or normalised
+    ``[-1, 1]`` coordinates when ``spacing`` is omitted). Each step solves the SPD normal
+    equations ``(J^T J + mu I) dv = -J^T r``, clips ``||dv||`` to a trust-region radius, and
+    accepts ``v + dv`` per voxel strictly when ``||r(v + dv)|| < ||r(v)||`` while adapting the
+    damping parameter ``lambda``.
     """
     B = W_disp.shape[0]
     dim = W_disp.shape[-1]
-    spatial = W_disp.shape[1:-1]
-    
+    spatial = tuple(W_disp.shape[1:-1])
+    dtype = W_disp.dtype
+
     if spacing is not None and origin is None:
         origin = (0.0,) * dim
     if spacing is not None and direction is None:
         direction = np.eye(dim).flatten()
 
-    if W_inv_disp is None:
-        W_inv_disp = -W_disp
+    use_physical = (spacing is not None and origin is not None and direction is not None)
+    boundary_mask = get_boundary_mask_jax(spatial)
 
-    if spacing is not None and origin is not None and direction is not None:
-        spacing_rev = tuple(reversed(spacing))
-        origin_rev = tuple(reversed(origin))
-        dir_arr = np.asarray(direction)
+    if use_physical:
+        spacing_rev = tuple(float(s) for s in reversed(spacing))
+        origin_rev = tuple(float(o) for o in reversed(origin))
+        dir_arr = np.asarray(direction, dtype=np.float64)
         if dir_arr.ndim == 1:
             dir_arr = dir_arr.reshape(dim, dim)
-        direction_rev = tuple(tuple(float(x) for x in row) for row in dir_arr[::-1, ::-1])
-        
-        X_phys = _get_physical_grid_jax_yfirst(spatial, spacing_rev, origin_rev, direction_rev)
-        boundary_mask = get_boundary_mask_jax(spatial)
-        spacing_t = jnp.array(spacing_rev)
-        W_disp_cf = jnp.moveaxis(W_disp, -1, 1)
-        
-        def body_fn(i, val):
-            W_inv_disp_curr, max_err_prev, mean_err_prev = val
-            should_continue = jnp.logical_or(max_err_prev > max_error_threshold, mean_err_prev > mean_error_threshold)
-            
-            def do_iteration(_):
-                coords_phys = X_phys + W_inv_disp_curr
-                coords_norm = _physical_to_normalized_jax_yfirst(coords_phys, spatial, spacing_rev, origin_rev, direction_rev)
-                forward_at_inv = jnp.moveaxis(jax_grid_sample(W_disp_cf, coords_norm, padding_mode='border'), 1, -1)
-                error = W_inv_disp_curr + forward_at_inv
-                
-                scaled_norm = jnp.sqrt(jnp.sum((error / spacing_t)**2, axis=-1, keepdims=True))
-                max_err = jnp.max(scaled_norm)
-                mean_err = jnp.mean(scaled_norm)
-                
-                # Spatial gradients of forward displacement at shifted coordinates (B, *spatial, d, d)
-                grad_u = jnp.stack([
-                    (jnp.roll(forward_at_inv, -1, axis=s_idx+1) - jnp.roll(forward_at_inv, 1, axis=s_idx+1)) / (2.0 * spacing_t[s_idx])
-                    for s_idx in range(dim)
-                ], axis=-1)
-                
-                I_mat = jnp.eye(dim).reshape(*([1] * (dim + 1)), dim, dim)
-                J_mat = I_mat + grad_u
-                
-                if dim == 3:
-                    det_J = (
-                        J_mat[..., 0, 0] * (J_mat[..., 1, 1] * J_mat[..., 2, 2] - J_mat[..., 1, 2] * J_mat[..., 2, 1]) -
-                        J_mat[..., 0, 1] * (J_mat[..., 1, 0] * J_mat[..., 2, 2] - J_mat[..., 1, 2] * J_mat[..., 2, 0]) +
-                        J_mat[..., 0, 2] * (J_mat[..., 1, 0] * J_mat[..., 2, 1] - J_mat[..., 1, 1] * J_mat[..., 2, 0])
-                    )
-                else:
-                    det_J = J_mat[..., 0, 0] * J_mat[..., 1, 1] - J_mat[..., 0, 1] * J_mat[..., 1, 0]
-                
-                lambda_spatial = jnp.clip(0.2 - jnp.expand_dims(det_J, -1), 0.0, 1.0) * damping_factor * 10.0
-                M_lambda = J_mat + jnp.expand_dims(lambda_spatial, -1) * I_mat
-                
-                # per-voxel Cramer solve with a floored determinant (as PyTorch; a traced
-                # jnp.linalg.solve cannot raise, a singular system would give inf / NaN)
-                det_M = jnp.linalg.det(M_lambda)
-                safe_det = jnp.where(jnp.abs(det_M) < 1e-6, jnp.sign(det_M + 1e-6) * 1e-6, det_M)
-                b_vec = -error
-                cols = []
-                for c in range(dim):
-                    M_c = M_lambda.at[..., :, c].set(b_vec)
-                    cols.append(jnp.linalg.det(M_c) / safe_det)
-                delta_v = jnp.stack(cols, axis=-1)
-                
-                epsilon = jnp.where(i == 0, 0.75, 0.5)
-                clip_threshold = epsilon * max_err
-                clip_scale = jnp.where(scaled_norm > clip_threshold, clip_threshold / jnp.maximum(scaled_norm, 1e-10), 1.0)
-                update = delta_v * clip_scale
-                
-                W_inv_next = W_inv_disp_curr + update * relaxation * epsilon
-                if smoothing_sigma > 0.0:
-                    W_inv_next = separable_gaussian_filter_jax(W_inv_next, smoothing_sigma)
-                W_inv_next = W_inv_next * boundary_mask
-                return W_inv_next, max_err, mean_err
-            
-            return jax.lax.cond(should_continue, do_iteration, lambda _: (W_inv_disp_curr, max_err_prev, mean_err_prev), None)
-        
-        init_val = (W_inv_disp, jnp.float32(float('inf')), jnp.float32(float('inf')))
-        final_val = jax.lax.fori_loop(0, steps, body_fn, init_val)
-        return final_val[0]
+        direction_rev_np = dir_arr[::-1, ::-1].copy()
+        direction_rev = tuple(tuple(float(x) for x in row) for row in direction_rev_np)
+
+        X_base = _get_physical_grid_jax_yfirst(spatial, spacing_rev, origin_rev, direction_rev)
+        D_inv_np = np.linalg.inv(direction_rev_np)
+        sp_rev_np = np.asarray(spacing_rev, dtype=np.float64)
+        A_to_vox_np = D_inv_np.T / sp_rev_np[None, :]
+        b_to_vox_np = -np.asarray(origin_rev, dtype=np.float64) @ A_to_vox_np
+        right_mat_np = np.diag(1.0 / sp_rev_np) @ D_inv_np
+
+        A_to_vox = jnp.asarray(A_to_vox_np, dtype=dtype)
+        b_to_vox = jnp.asarray(b_to_vox_np, dtype=dtype)
+        right_mat = jnp.asarray(right_mat_np, dtype=dtype)
+        err_to_vox_scale = jnp.asarray(1.0 / sp_rev_np, dtype=dtype)
+        max_step_unit = float(min(spacing_rev)) * 2.0 * max(float(relaxation), 1e-3)
     else:
-        # no geometry: the plain fixed point with the same thresholds (as PyTorch)
-        return update_inverse_field_nd_jax(W_disp, W_inv_disp, steps=steps, relaxation=relaxation,
-                                           smoothing_sigma=smoothing_sigma, method='fixed_point',
-                                           max_error_threshold=max_error_threshold,
-                                           mean_error_threshold=mean_error_threshold)
+        grids = [jnp.linspace(-1.0, 1.0, size, dtype=dtype) for size in spatial]
+        meshgrid = jnp.meshgrid(*grids, indexing='ij')
+        X_base = jnp.stack(list(reversed(meshgrid)), axis=-1)[None, ...]
+
+        k_vec = np.asarray([max(s - 1, 1) / 2.0 for s in spatial], dtype=np.float64)
+        p_flip = np.eye(dim, dtype=np.float64)[::-1].copy()
+        A_to_vox_np = p_flip @ np.diag(k_vec)
+        b_to_vox_np = k_vec.copy()
+        right_mat_np = A_to_vox_np.T
+
+        A_to_vox = jnp.asarray(A_to_vox_np, dtype=dtype)
+        b_to_vox = jnp.asarray(b_to_vox_np, dtype=dtype)
+        right_mat = jnp.asarray(right_mat_np, dtype=dtype)
+        err_to_vox_scale = jnp.asarray(
+            [float(max(s - 1, 1) / 2.0) for s in reversed(spatial)], dtype=dtype
+        )
+        max_step_unit = (2.0 / float(max(max(spatial) - 1, 1))) * 2.0 * max(float(relaxation), 1e-3)
+
+    def _sample_val_and_jac_batch(v_field):
+        y_vox = jnp.matmul(X_base + v_field, A_to_vox) + b_to_vox
+        vals, jacs = [], []
+        for b_idx in range(B):
+            u_b, g_b = _multilinear_val_and_jac_jax(W_disp[b_idx], y_vox[b_idx], right_mat)
+            vals.append(u_b)
+            jacs.append(g_b)
+        return jnp.stack(vals, axis=0), jnp.stack(jacs, axis=0)
+
+    if W_inv_disp is None:
+        v_init = jnp.zeros_like(W_disp)
+        best_r_sq = jnp.sum((W_disp * err_to_vox_scale) ** 2, axis=-1, keepdims=True)
+        for alpha in (0.25, 0.5, 1.0):
+            v_cand = W_disp * (-alpha)
+            if stationary_boundary:
+                v_cand = v_cand * boundary_mask
+            u_cand, _ = _sample_val_and_jac_batch(v_cand)
+            r_cand_sq = jnp.sum(((v_cand + u_cand) * err_to_vox_scale) ** 2, axis=-1, keepdims=True)
+            better = r_cand_sq < best_r_sq
+            v_init = jnp.where(better, v_cand, v_init)
+            best_r_sq = jnp.where(better, r_cand_sq, best_r_sq)
+    else:
+        v_init = W_inv_disp * boundary_mask if stationary_boundary else W_inv_disp
+
+    if steps <= 0:
+        return v_init
+
+    domain_mask = boundary_mask[..., 0] if stationary_boundary else jnp.ones((1, *spatial), dtype=dtype)
+    n_domain = jnp.maximum(jnp.sum(domain_mask) * float(B), 1.0)
+    lam_init = jnp.full((B, *spatial), 1e-3 * max(float(damping_factor), 1e-6), dtype=dtype)
+    step_scale = float(relaxation) if float(relaxation) < 1.0 else 1.0
+    I_mat = jnp.eye(dim, dtype=dtype).reshape(*([1] * (dim + 1)), dim, dim)
+
+    def body_fn(i, val):
+        v_curr, lam_curr, max_err_prev, mean_err_prev = val
+        should_continue = jnp.logical_or(
+            max_err_prev > max_error_threshold, mean_err_prev > mean_error_threshold
+        )
+
+        def do_iteration(_):
+            u_val, grad_u = _sample_val_and_jac_batch(v_curr)
+            r = v_curr + u_val
+            r_vox_sq = jnp.sum((r * err_to_vox_scale) ** 2, axis=-1)
+            r_vox = jnp.sqrt(r_vox_sq) * domain_mask
+            max_err = jnp.max(r_vox)
+            mean_err = jnp.sum(r_vox) / n_domain
+
+            def do_step(_):
+                J = I_mat + grad_u
+                JT = jnp.swapaxes(J, -1, -2)
+                JTJ = jnp.matmul(JT, J)
+                rhs = -jnp.matmul(JT, r[..., None])[..., 0]
+                dv = _solve_spd_lm_jax(JTJ, rhs, lam_curr) * step_scale
+                dv_norm = jnp.linalg.norm(dv, axis=-1, keepdims=True)
+                dv = jnp.where(
+                    dv_norm > max_step_unit,
+                    dv * (max_step_unit / jnp.maximum(dv_norm, 1e-12)),
+                    dv,
+                )
+                v_trial = v_curr + dv
+                if stationary_boundary:
+                    v_trial = v_trial * boundary_mask
+                u_t, _ = _sample_val_and_jac_batch(v_trial)
+                r_t = v_trial + u_t
+                r_vox_sq_t = jnp.sum((r_t * err_to_vox_scale) ** 2, axis=-1)
+                imp = r_vox_sq_t < r_vox_sq
+                v_next = jnp.where(imp[..., None], v_trial, v_curr)
+                lam_next = jnp.where(
+                    imp,
+                    jnp.maximum(lam_curr * 0.25, 1e-6),
+                    jnp.minimum(lam_curr * 8.0, 1e8),
+                )
+                if smoothing_sigma > 0.0:
+                    v_next = separable_gaussian_filter_jax(v_next, smoothing_sigma)
+                if stationary_boundary:
+                    v_next = v_next * boundary_mask
+                return v_next, lam_next
+
+            v_out, lam_out = jax.lax.cond(
+                jnp.logical_or(max_err > max_error_threshold, mean_err > mean_error_threshold),
+                do_step,
+                lambda _: (v_curr, lam_curr),
+                None,
+            )
+            return v_out, lam_out, max_err, mean_err
+
+        return jax.lax.cond(
+            should_continue,
+            do_iteration,
+            lambda _: (v_curr, lam_curr, max_err_prev, mean_err_prev),
+            None,
+        )
+
+    init_val = (v_init, lam_init, jnp.float32(float('inf')), jnp.float32(float('inf')))
+    final_val = jax.lax.fori_loop(0, int(steps), body_fn, init_val)
+    return final_val[0]
 
 
 def integrate_time_varying_velocity_field_jax(

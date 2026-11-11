@@ -1596,7 +1596,25 @@ class SyNTo(nn.Module):
                     if verbose >= 2:
                         print(f"DEBUG PyTorch L{level_idx} E{epoch} max_norm_l: {float(max_norm_l)}, max_norm_r: {float(max_norm_r)}")
                     
-                    in_loop_inv_steps = self.in_loop_inv_steps if self.inverse_steps > 0 else 0
+                    if isinstance(self.in_loop_inv_steps, (list, tuple)):
+                        _lvl_inv_steps = int(self.in_loop_inv_steps[min(level_idx, len(self.in_loop_inv_steps) - 1)])
+                    else:
+                        _lvl_inv_steps = int(self.in_loop_inv_steps)
+                    in_loop_inv_steps = _lvl_inv_steps if self.inverse_steps > 0 else 0
+                    _raw_inv_every = kwargs.get('inv_refresh_every', 1)
+                    if isinstance(_raw_inv_every, (list, tuple)):
+                        curr_inv_every = max(1, int(_raw_inv_every[min(level_idx, len(_raw_inv_every) - 1)]))
+                    else:
+                        curr_inv_every = max(1, int(_raw_inv_every))
+                    cfl_proj_enabled = bool(kwargs.get('cfl_project_inverse', False))
+                    do_cfl_project = cfl_proj_enabled and ((epoch + 1) % self.projection_frequency == 0 or epoch == curr_syn_epochs - 1)
+                    do_legacy_project = bool(self.project_inverse) and ((epoch + 1) % self.projection_frequency == 0 or epoch == curr_syn_epochs - 1)
+                    need_inv_refresh = (
+                        do_cfl_project
+                        or smooth_deformed
+                        or ((epoch + 1) % curr_inv_every == 0)
+                        or (epoch == curr_syn_epochs - 1)
+                    )
                     if optimizer_type == 'cfl':
                         # ITK: scaledUpdate = (learningRate / maxNorm) * gradient
                         # gradient is in mm, maxNorm is in voxels, so result is in mm
@@ -1683,8 +1701,15 @@ class SyNTo(nn.Module):
                             warp_r2l.copy_(separable_gaussian_filter(warp_r2l, elastic_sig_val, kernel_type=kernel_type))
                             
                         # ITK-style diffeomorphic projection: compute inverse fields
-                        warp_l2r_inv, warp_r2l_inv = _inverse_pair(
-                            warp_l2r, warp_r2l, warp_l2r_inv, warp_r2l_inv, 'inv', X_phys_arg=X_phys, use_tol=True)
+                        if need_inv_refresh:
+                            warp_l2r_inv, warp_r2l_inv = _inverse_pair(
+                                warp_l2r, warp_r2l, warp_l2r_inv, warp_r2l_inv, 'inv', X_phys_arg=X_phys, use_tol=True)
+                        if do_cfl_project:
+                            proj_l, proj_r = _inverse_pair(
+                                warp_l2r_inv, warp_r2l_inv, warp_l2r, warp_r2l, 'proj', X_phys_arg=X_phys, use_tol=True)
+                            warp_l2r.copy_(proj_l)
+                            warp_r2l.copy_(proj_r)
+                            del proj_l, proj_r
                     
                     elif optimizer_type == 'rprop':
                         def rprop_update(grad, prev_grad, step):
@@ -1716,10 +1741,10 @@ class SyNTo(nn.Module):
                                 warp_r2l.copy_(separable_gaussian_filter(warp_r2l, elastic_sig_val, kernel_type=kernel_type))
                             
                         warp_l2r_inv, warp_r2l_inv = _inverse_pair(
-                            warp_l2r, warp_r2l, warp_l2r_inv, warp_r2l_inv, 'inv', use_tol=False)
-                        if self.project_inverse:
+                            warp_l2r, warp_r2l, warp_l2r_inv, warp_r2l_inv, 'inv', X_phys_arg=X_phys, use_tol=False)
+                        if do_legacy_project:
                             proj_l, proj_r = _inverse_pair(
-                                warp_l2r_inv, warp_r2l_inv, warp_l2r, warp_r2l, 'proj', use_tol=True)
+                                warp_l2r_inv, warp_r2l_inv, warp_l2r, warp_r2l, 'proj', X_phys_arg=X_phys, use_tol=True)
                             warp_l2r.copy_(proj_l)
                             warp_r2l.copy_(proj_r)
                             del proj_l, proj_r
@@ -1880,8 +1905,15 @@ class SyNTo(nn.Module):
                                 warp_l2r.copy_(separable_gaussian_filter(warp_l2r, elastic_sig_val))
                                 warp_r2l.copy_(separable_gaussian_filter(warp_r2l, elastic_sig_val))
                             
-                        warp_l2r_inv, warp_r2l_inv = _inverse_pair(
-                            warp_l2r, warp_r2l, warp_l2r_inv, warp_r2l_inv, 'inv', X_phys_arg=X_phys, use_tol=True)
+                        if need_inv_refresh:
+                            warp_l2r_inv, warp_r2l_inv = _inverse_pair(
+                                warp_l2r, warp_r2l, warp_l2r_inv, warp_r2l_inv, 'inv', X_phys_arg=X_phys, use_tol=True)
+                        if do_cfl_project:
+                            proj_l, proj_r = _inverse_pair(
+                                warp_l2r_inv, warp_r2l_inv, warp_l2r, warp_r2l, 'proj', X_phys_arg=X_phys, use_tol=True)
+                            warp_l2r.copy_(proj_l)
+                            warp_r2l.copy_(proj_r)
+                            del proj_l, proj_r
                         
                     elif optimizer_type == 'sgd':
                         update_l = -optimizer_lr * grad_l
@@ -1897,10 +1929,10 @@ class SyNTo(nn.Module):
                             warp_r2l.copy_(separable_gaussian_filter(warp_r2l, self.elastic_sigma))
                             
                         warp_l2r_inv, warp_r2l_inv = _inverse_pair(
-                            warp_l2r, warp_r2l, warp_l2r_inv, warp_r2l_inv, 'inv', use_tol=False)
-                        if self.project_inverse:
+                            warp_l2r, warp_r2l, warp_l2r_inv, warp_r2l_inv, 'inv', X_phys_arg=X_phys, use_tol=False)
+                        if do_legacy_project:
                             proj_l, proj_r = _inverse_pair(
-                                warp_l2r_inv, warp_r2l_inv, warp_l2r, warp_r2l, 'proj', use_tol=True)
+                                warp_l2r_inv, warp_r2l_inv, warp_l2r, warp_r2l, 'proj', X_phys_arg=X_phys, use_tol=True)
                             warp_l2r.copy_(proj_l)
                             warp_r2l.copy_(proj_r)
                             del proj_l, proj_r
@@ -1969,6 +2001,50 @@ class SyNTo(nn.Module):
                         warp_l2r_inv = best_warp_l2r_inv
                         warp_r2l_inv = best_warp_r2l_inv
 
+                _polish_steps = int(kwargs.get('polish_inv_steps', 0))
+                _raw_ie = kwargs.get('inv_refresh_every', 1)
+                _lvl_ie = int(_raw_ie[min(level_idx, len(_raw_ie) - 1)]) if isinstance(_raw_ie, (list, tuple)) else int(_raw_ie)
+                _raw_pproj = kwargs.get('polish_project_inverse', False)
+                _lvl_pproj = bool(_raw_pproj[min(level_idx, len(_raw_pproj) - 1)]) if isinstance(_raw_pproj, (list, tuple)) else bool(_raw_pproj)
+                if _polish_steps > 0 or _lvl_ie > 1 or _lvl_pproj:
+                    _p_steps = _polish_steps if _polish_steps > 0 else max(int(in_loop_inv_steps), 10)
+                    _raw_ptol = kwargs.get('polish_inv_tol', None)
+                    _p_tol = float(_raw_ptol) if _raw_ptol is not None else (
+                        min(float(self.inv_tolerance), 0.02 * min(curr_spacing_fixed))
+                        if (_polish_steps > 0 or _lvl_pproj) else float(self.inv_tolerance)
+                    )
+                    with torch.no_grad():
+                        _fwd_p = torch.cat([warp_l2r.detach(), warp_r2l.detach()])
+                        _init_p = torch.cat([warp_l2r_inv.detach(), warp_r2l_inv.detach()])
+                        _out_p = update_inverse_field_nd(
+                            _fwd_p, _init_p,
+                            steps=_p_steps, method=self.inverse_method,
+                            spacing=curr_spacing_fixed, origin=fixed_origin, direction=fixed_direction,
+                            X_phys=X_phys,
+                            max_error_threshold=_p_tol, mean_error_threshold=_p_tol * 0.01,
+                        )
+                        if _lvl_pproj:
+                            _proj_p = update_inverse_field_nd(
+                                _out_p, _fwd_p,
+                                steps=_p_steps, method=self.inverse_method,
+                                spacing=curr_spacing_fixed, origin=fixed_origin, direction=fixed_direction,
+                                X_phys=X_phys,
+                                max_error_threshold=_p_tol, mean_error_threshold=_p_tol * 0.01,
+                            )
+                            warp_l2r.data.copy_(_proj_p[0:1])
+                            warp_r2l.data.copy_(_proj_p[1:2])
+                            _out_p = update_inverse_field_nd(
+                                _proj_p, _out_p,
+                                steps=_p_steps, method=self.inverse_method,
+                                spacing=curr_spacing_fixed, origin=fixed_origin, direction=fixed_direction,
+                                X_phys=X_phys,
+                                max_error_threshold=_p_tol, mean_error_threshold=_p_tol * 0.01,
+                            )
+                            del _proj_p
+                        warp_l2r_inv = _out_p[0:1].clone()
+                        warp_r2l_inv = _out_p[1:2].clone()
+                        del _fwd_p, _init_p, _out_p
+
             warp_l2r.requires_grad_(False)
             warp_r2l.requires_grad_(False)
             del best_warp_l2r, best_warp_r2l, best_warp_l2r_inv, best_warp_r2l_inv
@@ -2022,16 +2098,51 @@ class SyNTo(nn.Module):
             w_r2l_inv = _upsample_or_take(warp_r2l_inv)
             del warp_l2r_inv, warp_r2l_inv
 
+            midpoint_polish_tol = kwargs.get('midpoint_polish_tol', None)
+            compose_polish_tol = kwargs.get('compose_polish_tol', None)
+            _default_lm_steps = int(self.inverse_steps) if self.inverse_steps is not None else 25
+            compose_polish_steps = int(kwargs.get('compose_polish_steps', max(_default_lm_steps, 25)))
+
+            X_phys = get_physical_grid_torch(
+                target_grid_shape, fixed_spacing, fixed_origin, fixed_direction, device=device, dtype=dtype
+            )
+
+            if midpoint_polish_tol is not None and float(midpoint_polish_tol) > 0.0:
+                if self.stationary_boundary:
+                    _zero_boundary_inplace(w_l2r)
+                    _zero_boundary_inplace(w_r2l)
+                _mp_tol = float(midpoint_polish_tol)
+                w_l2r_inv = update_inverse_field_nd_hybrid_lm(
+                    w_l2r,
+                    w_l2r_inv,
+                    steps=compose_polish_steps,
+                    max_error_threshold=_mp_tol,
+                    mean_error_threshold=_mp_tol * 0.5,
+                    spacing=fixed_spacing,
+                    origin=fixed_origin,
+                    direction=fixed_direction,
+                    X_phys=X_phys,
+                    stationary_boundary=self.stationary_boundary,
+                )
+                w_r2l_inv = update_inverse_field_nd_hybrid_lm(
+                    w_r2l,
+                    w_r2l_inv,
+                    steps=compose_polish_steps,
+                    max_error_threshold=_mp_tol,
+                    mean_error_threshold=_mp_tol * 0.5,
+                    spacing=fixed_spacing,
+                    origin=fixed_origin,
+                    direction=fixed_direction,
+                    X_phys=X_phys,
+                    stationary_boundary=self.stationary_boundary,
+                )
+
             # Preserve inverse of fixed-side half-warp for syntx.liouville_determinant;
             # offload midpoint fields to CPU above 256^3 voxels so they do not occupy GPU memory.
             mid_l2r_inv = w_l2r_inv.cpu() if offload_midpoints else w_l2r_inv.clone()
             self.midpoint_warp_l2r_inv = nn.Parameter(mid_l2r_inv, requires_grad=False)
             self.midpoint_warp_l2r_inv.is_physical = True
             del mid_l2r_inv
-
-            X_phys = get_physical_grid_torch(
-                target_grid_shape, fixed_spacing, fixed_origin, fixed_direction, device=device, dtype=dtype
-            )
 
             # Pre-compute normalization tensors for composition
             comp_spacing_rev, comp_origin_rev, comp_direction_rev = reverse_metadata(
@@ -2077,7 +2188,7 @@ class SyNTo(nn.Module):
             ).movedim(1, -1)
             del coords_norm_r
             phi_r2l_phys.add_(disp_l2r_sampled).sub_(X_phys)
-            del disp_l2r_sampled, X_phys
+            del disp_l2r_sampled
             algebraic_inv = phi_r2l_phys
             del phi_r2l_phys
 
@@ -2093,6 +2204,22 @@ class SyNTo(nn.Module):
             if self.stationary_boundary:
                 _zero_boundary_inplace(fwd_composed)
                 _zero_boundary_inplace(algebraic_inv)
+
+            if compose_polish_tol is not None and float(compose_polish_tol) > 0.0:
+                _cp_tol = float(compose_polish_tol)
+                algebraic_inv = update_inverse_field_nd_hybrid_lm(
+                    fwd_composed,
+                    algebraic_inv,
+                    steps=compose_polish_steps,
+                    max_error_threshold=_cp_tol,
+                    mean_error_threshold=min(_cp_tol * 0.5, 0.02),
+                    spacing=fixed_spacing,
+                    origin=fixed_origin,
+                    direction=fixed_direction,
+                    X_phys=X_phys,
+                    stationary_boundary=self.stationary_boundary,
+                )
+            del X_phys
 
             self.warp_l2r = nn.Parameter(fwd_composed)
             self.warp_l2r.is_physical = True
@@ -2378,9 +2505,14 @@ SYN_ADVANCED_OPTIONS = frozenset({
     'vgg_num_patches', 'vgg_patch_size', 'winsorize_quantiles',
     # SyNTo.fit()
     'amp', 'bootstrap_jitter_scale', 'bootstrap_mode', 'bootstrap_orig_weight',
-    'bootstrap_samples', 'elastic_mesh_size', 'elastic_sigma', 'elastic_spline_distance',
-    'fast_smooth', 'jacobian_epsilon', 'jacobian_penalty_weight', 'mesh_size', 'num_slices',
-    'optimizer_type', 'seed', 'spline_distance', 'verbose', 'convergence_slope',
+    'bootstrap_samples', 'cfl_project_inverse', 'compose_polish_steps', 'compose_polish_tol',
+    'elastic_mesh_size', 'elastic_sigma',
+    'elastic_spline_distance', 'fast_smooth', 'inv_refresh_every', 'jacobian_epsilon',
+    'jacobian_penalty_weight', 'lncc_single_pass', 'loss_sync_every', 'mesh_size',
+    'midpoint_polish_tol', 'num_slices',
+    'optimizer_type', 'polish_inv_steps', 'polish_inv_tol', 'polish_project_inverse',
+    'seed', 'single_pass',
+    'spline_distance', 'verbose', 'convergence_slope',
     # SyNTo._apply_bspline_operator()
     'enforce_stationary_boundary', 'spline_order',
     # Continuum mechanics regularizers

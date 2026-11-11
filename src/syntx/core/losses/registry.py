@@ -42,6 +42,7 @@ class SimilarityLossConfig:
     auto_mask: bool | None = None
     feature_layers: Sequence[int] | None = None
     metric_chunks: int = 1
+    single_pass: bool = False
 
 
 def parse_similarity_metric(
@@ -76,6 +77,7 @@ def parse_similarity_metric(
             "auto_mask": metric_spec.auto_mask,
             "feature_layers": metric_spec.feature_layers,
             "metric_chunks": metric_spec.metric_chunks,
+            "single_pass": metric_spec.single_pass,
         }
         for k, v in kwargs.items():
             if k in current_dict and v is not None:
@@ -117,6 +119,7 @@ def parse_similarity_metric(
     metric_chunks = int(kwargs.get("metric_chunks", 1) or 1)
     if metric_chunks < 1:
         raise ValueError(f"metric_chunks must be >= 1, got {metric_chunks}")
+    single_pass = bool(kwargs.get("single_pass", kwargs.get("lncc_single_pass", False)))
 
     canonical_metric = m_lower
 
@@ -196,6 +199,7 @@ def parse_similarity_metric(
         auto_mask=auto_mask,
         feature_layers=feature_layers,
         metric_chunks=metric_chunks,
+        single_pass=single_pass,
     )
 
 
@@ -275,6 +279,7 @@ class SimilarityLossWrapper(nn.Module):
                 squared=self.config.squared,
                 use_ants_pseudo_gradient=self.config.use_analytical_gradients,
                 metric_chunks=self.config.metric_chunks,
+                single_pass=self.config.single_pass,
             )
 
         elif m == "mattes_mi":
