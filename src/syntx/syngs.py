@@ -45,6 +45,8 @@ from .spatial import (
     disp_tensor_to_itk,
     disp_itk_to_tensor,
     get_physical_grid_torch,
+    get_physical_to_normalized_affine,
+    physical_to_normalized_fast,
     physical_to_normalized_torch_cached,
     grid_to_physical_affine,
     grid_to_physical_affine_torch,
@@ -387,7 +389,7 @@ class GeodesicShootingModel(nn.Module):
         v_cf = torch.fft.irfftn(v_fft, s=shape, dim=spatial_dims).to(dtype=dtype).contiguous()
         return torch.movedim(v_cf, 1, -1)
 
-    def shoot(self, v_init, target_shape, spacing_zyx, phys_grid, meta):
+    def shoot(self, v_init, target_shape, spacing_zyx, phys_grid, meta, _norm_cache=None):
         """
         Evolve initial momentum v_init forward along the geodesic trajectory.
         Integrates: d phi / dt = v(t, phi(t)).
@@ -407,39 +409,41 @@ class GeodesicShootingModel(nn.Module):
             v_up = v_init
             
         v0_smooth = self.apply_green_operator(v_up, target_shape, spacing_zyx)
-        shape_t, spacing_t, origin_t, direction_t = meta
-        disp = torch.zeros_like(phys_grid)
+        if self.n_steps <= 0:
+            return torch.zeros_like(phys_grid)
 
-        # Pre-compute affine mapping matrix and bias once, fusing torch.flip
-        scale_t = 2.0 / (spacing_t * (shape_t - 1.0))
-        M = direction_t * scale_t.unsqueeze(0)
-        b = - (origin_t @ M) - 1.0
-        M_norm = torch.flip(M, dims=[1])
-        b_norm = torch.flip(b, dims=[0])
-
-        # Pre-compute normalized identity grid once
-        u_id = (phys_grid.view(-1, self.dim) @ M_norm + b_norm).view(phys_grid.shape)
+        if _norm_cache is not None:
+            M_norm, b_norm, u_id = _norm_cache
+        else:
+            shape_t, spacing_t, origin_t, direction_t = meta
+            scale_t = 2.0 / (spacing_t * (shape_t - 1.0))
+            M = direction_t * scale_t.unsqueeze(0)
+            b = -(origin_t @ M) - 1.0
+            M_norm = torch.flip(M, dims=[1])
+            b_norm = torch.flip(b, dims=[0])
+            u_id = (phys_grid.view(-1, self.dim) @ M_norm + b_norm).view(phys_grid.shape)
 
         def _to_norm(disp_phys):
             return u_id + (disp_phys.view(-1, self.dim) @ M_norm).view(disp_phys.shape)
 
         if self.transport_mode == 'transport':
             # sample_field_cf(v0_cf, grid) = grid_sample_nd(v0_cf, grid).movedim(1,-1)
-            # v0_smooth is in last-channel format (B, *spatial, dim)
+            # v0_smooth is in last-channel format (B, *spatial, dim). At step 0, phi_0 == phys_grid
+            # so v0(phi_0) is identically v0_smooth without an identity grid_sample_nd pass.
             v0_cf = torch.movedim(v0_smooth, -1, 1)   # channel-first for repeated sampling
             sol = str(self.solver).lower()
             if sol in ('midpoint', 'rk2', 'heun'):
+                disp = torch.zeros_like(phys_grid)
                 for step in range(self.n_steps):
-                    phi_norm_1 = u_id if step == 0 else _to_norm(disp)
-                    k1 = sample_field_cf(v0_cf, phi_norm_1)
+                    k1 = v0_smooth if step == 0 else sample_field_cf(v0_cf, _to_norm(disp))
                     phi_norm_2 = _to_norm(disp + (0.5 * dt) * k1)
                     k2 = sample_field_cf(v0_cf, phi_norm_2)
                     disp = disp + dt * k2
                 return disp
             elif sol == 'rk4':
+                disp = torch.zeros_like(phys_grid)
                 for step in range(self.n_steps):
-                    phi_norm_1 = u_id if step == 0 else _to_norm(disp)
-                    k1 = sample_field_cf(v0_cf, phi_norm_1)
+                    k1 = v0_smooth if step == 0 else sample_field_cf(v0_cf, _to_norm(disp))
                     phi_norm_2 = _to_norm(disp + (0.5 * dt) * k1)
                     k2 = sample_field_cf(v0_cf, phi_norm_2)
                     phi_norm_3 = _to_norm(disp + (0.5 * dt) * k2)
@@ -449,16 +453,17 @@ class GeodesicShootingModel(nn.Module):
                     disp = disp + (dt / 6.0) * (k1 + 2.0 * k2 + 2.0 * k3 + k4)
                 return disp
             else:
-                for step in range(self.n_steps):
-                    phi_norm = u_id if step == 0 else _to_norm(disp)
+                disp = dt * v0_smooth
+                for _ in range(1, self.n_steps):
+                    phi_norm = _to_norm(disp)
                     v_sampled = sample_field_cf(v0_cf, phi_norm)
                     disp = disp + dt * v_sampled
                 return disp
 
+        disp = torch.zeros_like(phys_grid)
         v = v0_smooth
         for step in range(self.n_steps):
-            phi_norm = u_id if step == 0 else _to_norm(disp)
-            v_sampled = sample_field_cf(torch.movedim(v, -1, 1), phi_norm)
+            v_sampled = v if step == 0 else sample_field_cf(torch.movedim(v, -1, 1), _to_norm(disp))
             disp = disp + dt * v_sampled
 
             if step < self.n_steps - 1:
@@ -487,6 +492,65 @@ class GeodesicShootingModel(nn.Module):
             self._cached_loss_key = key
         return self._cached_loss_fn(I, J)
 
+    def _build_level_ctx(self, target_shape_f, target_shape_m, device, dtype):
+        """Build cached physical-to-normalized affine matrices and grids on CPU->device without MPS inv stalls."""
+        curr_spacing_f = level_spacing(self.spacing, self.image_shape, target_shape_f)
+        curr_spacing_m = level_spacing(self.moving_spacing, self.moving_shape, target_shape_m)
+        phys_grid_f = get_physical_grid_torch(
+            target_shape_f, curr_spacing_f, self.origin, self.direction,
+            device=device, dtype=dtype,
+        )
+        spacing_rev_f, origin_rev_f, direction_rev_f = reverse_metadata(
+            curr_spacing_f, self.origin, self.direction
+        )
+        spacing_rev_m, origin_rev_m, direction_rev_m = reverse_metadata(
+            curr_spacing_m, self.moving_origin, self.moving_direction
+        )
+
+        # Compute exact direction-aware normalization affines on CPU float64 (zero MPS linalg.inv syncs)
+        M_f_cpu, b_f_cpu = get_physical_to_normalized_affine(
+            torch.tensor(list(target_shape_f), dtype=torch.float64),
+            torch.tensor(spacing_rev_f, dtype=torch.float64),
+            torch.tensor(origin_rev_f, dtype=torch.float64),
+            torch.tensor(direction_rev_f, dtype=torch.float64),
+        )
+        M_m_cpu, b_m_cpu = get_physical_to_normalized_affine(
+            torch.tensor(list(target_shape_m), dtype=torch.float64),
+            torch.tensor(spacing_rev_m, dtype=torch.float64),
+            torch.tensor(origin_rev_m, dtype=torch.float64),
+            torch.tensor(direction_rev_m, dtype=torch.float64),
+        )
+        M_f_norm = M_f_cpu.to(device=device, dtype=dtype)
+        b_f_norm = b_f_cpu.to(device=device, dtype=dtype)
+        M_m_norm = M_m_cpu.to(device=device, dtype=dtype)
+        b_m_norm = b_m_cpu.to(device=device, dtype=dtype)
+        u_id_f = physical_to_normalized_fast(phys_grid_f, M_f_norm, b_f_norm)
+
+        shape_t_f = torch.tensor(list(target_shape_f), device=device, dtype=dtype)
+        spacing_t_f = torch.tensor(spacing_rev_f, device=device, dtype=dtype)
+        origin_t_f = torch.tensor(origin_rev_f, device=device, dtype=dtype)
+        direction_t_f = torch.tensor(direction_rev_f, device=device, dtype=dtype)
+        meta_f = (shape_t_f, spacing_t_f, origin_t_f, direction_t_f)
+
+        T_grid = self.affine.get_matrix()
+        M_phys_zyx, t_phys_zyx = grid_to_physical_affine_torch(
+            T_grid, target_shape_f, curr_spacing_f, self.origin, self.direction,
+            target_shape_m, curr_spacing_m, self.moving_origin, self.moving_direction,
+        )
+        return {
+            "phys_grid_f": phys_grid_f,
+            "spacing_rev_f": spacing_rev_f,
+            "spacing_t_f": spacing_t_f,
+            "meta_f": meta_f,
+            "norm_cache_f": (M_f_norm, b_f_norm, u_id_f),
+            "M_f_norm": M_f_norm,
+            "b_f_norm": b_f_norm,
+            "M_m_norm": M_m_norm,
+            "b_m_norm": b_m_norm,
+            "M_phys_zyx": M_phys_zyx,
+            "t_phys_zyx": t_phys_zyx,
+        }
+
     def forward(
         self,
         fixed_image,
@@ -494,6 +558,7 @@ class GeodesicShootingModel(nn.Module):
         lncc_window_size=5,
         similarity_metric=None,
         _prealigned_moving=None,
+        _level_ctx=None,
     ):
         """
         Loss of the current fields: shoot v0_fwd (moving -> fixed space) and v0_inv (fixed ->
@@ -507,61 +572,46 @@ class GeodesicShootingModel(nn.Module):
         target_shape_f = tuple(fixed_image.shape[2:])
         target_shape_m = tuple(moving_image.shape[2:])
 
-        curr_spacing_f = level_spacing(self.spacing, self.image_shape, target_shape_f)
-        curr_spacing_m = level_spacing(self.moving_spacing, self.moving_shape, target_shape_m)
-
-        phys_grid_f = get_physical_grid_torch(
-            target_shape_f, curr_spacing_f, self.origin, self.direction,
-            device=device, dtype=dtype
+        ctx = _level_ctx if _level_ctx is not None else self._build_level_ctx(
+            target_shape_f, target_shape_m, device, dtype
         )
-
-        spacing_rev_f, origin_rev_f, direction_rev_f = reverse_metadata(curr_spacing_f, self.origin, self.direction)
-
-        shape_t_f = torch.tensor(list(target_shape_f), device=device, dtype=dtype)
-        spacing_t_f = torch.tensor(spacing_rev_f, device=device, dtype=dtype)
-        origin_t_f = torch.tensor(origin_rev_f, device=device, dtype=dtype)
-        direction_t_f = torch.tensor(direction_rev_f, device=device, dtype=dtype)
-        meta_f = (shape_t_f, spacing_t_f, origin_t_f, direction_t_f)
-
-        spacing_rev_m, origin_rev_m, direction_rev_m = reverse_metadata(curr_spacing_m, self.moving_origin, self.moving_direction)
-        shape_t_m = torch.tensor(list(target_shape_m), device=device, dtype=dtype)
-        spacing_t_m = torch.tensor(spacing_rev_m, device=device, dtype=dtype)
-        origin_t_m = torch.tensor(origin_rev_m, device=device, dtype=dtype)
-        direction_t_m = torch.tensor(direction_rev_m, device=device, dtype=dtype)
-
-        T_grid = self.affine.get_matrix()
-        M_phys_zyx, t_phys_zyx = grid_to_physical_affine_torch(
-            T_grid, target_shape_f, curr_spacing_f, self.origin, self.direction,
-            target_shape_m, curr_spacing_m, self.moving_origin, self.moving_direction
-        )
+        phys_grid_f = ctx["phys_grid_f"]
+        spacing_rev_f = ctx["spacing_rev_f"]
+        spacing_t_f = ctx["spacing_t_f"]
+        meta_f = ctx["meta_f"]
+        norm_cache_f = ctx["norm_cache_f"]
+        M_f_norm = ctx["M_f_norm"]
+        b_f_norm = ctx["b_f_norm"]
+        M_m_norm = ctx["M_m_norm"]
+        b_m_norm = ctx["b_m_norm"]
+        M_phys_zyx = ctx["M_phys_zyx"]
+        t_phys_zyx = ctx["t_phys_zyx"]
 
         # 1. Forward shooting (+v0_fwd) -> warp moving to fixed space
-        disp_fwd = self.shoot(self.velocity_0_fwd, target_shape_f, spacing_rev_f, phys_grid_f, meta_f)
-        phi_moving = (phys_grid_f + disp_fwd) @ M_phys_zyx.t() + t_phys_zyx
-        phi_norm_fwd = physical_to_normalized_torch_cached(
-            phi_moving, shape_t_m, spacing_t_m, origin_t_m, direction_t_m
+        disp_fwd = self.shoot(
+            self.velocity_0_fwd, target_shape_f, spacing_rev_f, phys_grid_f, meta_f, _norm_cache=norm_cache_f
         )
+        phi_moving = (phys_grid_f + disp_fwd) @ M_phys_zyx.t() + t_phys_zyx
+        phi_norm_fwd = physical_to_normalized_fast(phi_moving, M_m_norm, b_m_norm)
         moving_warped = grid_sample_nd(moving_image, phi_norm_fwd, mode='bilinear', padding_mode='zeros')
-        
+
         # 2. Inverse shooting (+v0_inv)
         v0_inv_param = self.velocity_0_inv if (self.symmetric and self.velocity_0_inv is not None) else -self.velocity_0_fwd
-        disp_inv = self.shoot(v0_inv_param, target_shape_f, spacing_rev_f, phys_grid_f, meta_f)
+        disp_inv = self.shoot(
+            v0_inv_param, target_shape_f, spacing_rev_f, phys_grid_f, meta_f, _norm_cache=norm_cache_f
+        )
 
         # Prealigned moving on reference grid (reuse level-cached tensor when affine is frozen)
         if _prealigned_moving is not None:
             moving_aff = _prealigned_moving
         else:
             phi_m_aff = phys_grid_f @ M_phys_zyx.t() + t_phys_zyx
-            phi_m_aff_norm = physical_to_normalized_torch_cached(
-                phi_m_aff, shape_t_m, spacing_t_m, origin_t_m, direction_t_m
-            )
+            phi_m_aff_norm = physical_to_normalized_fast(phi_m_aff, M_m_norm, b_m_norm)
             moving_aff = grid_sample_nd(moving_image, phi_m_aff_norm, mode='bilinear', padding_mode='zeros')
 
         # Deformed fixed on reference grid
         phi_fixed = phys_grid_f + disp_inv
-        phi_norm_fixed = physical_to_normalized_torch_cached(
-            phi_fixed, shape_t_f, spacing_t_f, origin_t_f, direction_t_f
-        )
+        phi_norm_fixed = physical_to_normalized_fast(phi_fixed, M_f_norm, b_f_norm)
         fixed_warped = grid_sample_nd(fixed_image, phi_norm_fixed, mode='bilinear', padding_mode='zeros')
 
         metric_to_use = similarity_metric if similarity_metric is not None else self.similarity_metric
@@ -586,23 +636,23 @@ class GeodesicShootingModel(nn.Module):
 
             # Plus jitter
             phi_mov_p = (phys_grid_f + disp_fwd + jitter_phys) @ M_phys_zyx.t() + t_phys_zyx
-            norm_mov_p = physical_to_normalized_torch_cached(phi_mov_p, shape_t_m, spacing_t_m, origin_t_m, direction_t_m)
+            norm_mov_p = physical_to_normalized_fast(phi_mov_p, M_m_norm, b_m_norm)
             w_mov_p = grid_sample_nd(moving_image, norm_mov_p, mode='bilinear', padding_mode='zeros')
             loss_fwd_p = self._eval_similarity(fixed_image, w_mov_p, metric_to_use, lncc_window_size=lncc_window_size)
 
             phi_fix_p = phys_grid_f + disp_inv + jitter_phys
-            norm_fix_p = physical_to_normalized_torch_cached(phi_fix_p, shape_t_f, spacing_t_f, origin_t_f, direction_t_f)
+            norm_fix_p = physical_to_normalized_fast(phi_fix_p, M_f_norm, b_f_norm)
             w_fix_p = grid_sample_nd(fixed_image, norm_fix_p, mode='bilinear', padding_mode='zeros')
             loss_inv_p = self._eval_similarity(moving_aff, w_fix_p, metric_to_use, lncc_window_size=lncc_window_size)
 
             # Minus jitter
             phi_mov_m = (phys_grid_f + disp_fwd - jitter_phys) @ M_phys_zyx.t() + t_phys_zyx
-            norm_mov_m = physical_to_normalized_torch_cached(phi_mov_m, shape_t_m, spacing_t_m, origin_t_m, direction_t_m)
+            norm_mov_m = physical_to_normalized_fast(phi_mov_m, M_m_norm, b_m_norm)
             w_mov_m = grid_sample_nd(moving_image, norm_mov_m, mode='bilinear', padding_mode='zeros')
             loss_fwd_m = self._eval_similarity(fixed_image, w_mov_m, metric_to_use, lncc_window_size=lncc_window_size)
 
             phi_fix_m = phys_grid_f + disp_inv - jitter_phys
-            norm_fix_m = physical_to_normalized_torch_cached(phi_fix_m, shape_t_f, spacing_t_f, origin_t_f, direction_t_f)
+            norm_fix_m = physical_to_normalized_fast(phi_fix_m, M_f_norm, b_f_norm)
             w_fix_m = grid_sample_nd(fixed_image, norm_fix_m, mode='bilinear', padding_mode='zeros')
             loss_inv_m = self._eval_similarity(moving_aff, w_fix_m, metric_to_use, lncc_window_size=lncc_window_size)
 
@@ -616,14 +666,8 @@ class GeodesicShootingModel(nn.Module):
 
         # 3. Symmetric inverse identity consistency loss in reference fixed space
         if self.symmetric and self.inverse_identity_weight > 0:
-            phi_inv_pure = phys_grid_f + disp_inv
-            phi_inv_pure_norm = physical_to_normalized_torch_cached(
-                phi_inv_pure, shape_t_f, spacing_t_f, origin_t_f, direction_t_f
-            )
-            phi_fwd_pure = phys_grid_f + disp_fwd
-            phi_fwd_pure_norm = physical_to_normalized_torch_cached(
-                phi_fwd_pure, shape_t_f, spacing_t_f, origin_t_f, direction_t_f
-            )
+            phi_inv_pure_norm = physical_to_normalized_fast(phys_grid_f + disp_inv, M_f_norm, b_f_norm)
+            phi_fwd_pure_norm = physical_to_normalized_fast(phys_grid_f + disp_fwd, M_f_norm, b_f_norm)
             # compose_grids handles the movedim internally for any spatial dimensionality
             disp_fwd_at_inv = compose_grids(disp_fwd, phi_inv_pure_norm)
             disp_inv_at_fwd = compose_grids(disp_inv, phi_fwd_pure_norm)
@@ -631,7 +675,7 @@ class GeodesicShootingModel(nn.Module):
             comp_disp_2 = disp_fwd + disp_inv_at_fwd
             inv_id_loss = 0.5 * (torch.mean(comp_disp_1 ** 2) + torch.mean(comp_disp_2 ** 2))
         else:
-            inv_id_loss = torch.tensor(0.0, device=device, dtype=dtype)
+            inv_id_loss = torch.zeros((), device=device, dtype=dtype)
 
         return sim_loss + self.inverse_identity_weight * inv_id_loss
 
@@ -731,29 +775,15 @@ class GeodesicShootingModel(nn.Module):
             min_sp_f = max(min(float(x) for x in curr_spacing_f), 1e-4)
             spacing_rel_f = [float(x) / min_sp_f for x in curr_spacing_f]
 
-            # Precompute static affine-warped moving image once per pyramid level
+            # Precompute level coordinate context and static affine-warped moving image once per level
             with torch.no_grad():
                 curr_moving_shape = tuple(curr_moving.shape[2:])
-                curr_spacing_m = level_spacing(self.moving_spacing, self.moving_shape, curr_moving_shape)
-                phys_grid_lvl = get_physical_grid_torch(
-                    curr_vel_shape, curr_spacing_f, self.origin, self.direction,
-                    device=device, dtype=dtype,
+                level_ctx = self._build_level_ctx(curr_vel_shape, curr_moving_shape, device, dtype)
+                phi_m_aff_lvl = (
+                    level_ctx["phys_grid_f"] @ level_ctx["M_phys_zyx"].t() + level_ctx["t_phys_zyx"]
                 )
-                spacing_rev_m, origin_rev_m, direction_rev_m = reverse_metadata(
-                    curr_spacing_m, self.moving_origin, self.moving_direction
-                )
-                shape_t_m = torch.tensor(list(curr_moving_shape), device=device, dtype=dtype)
-                spacing_t_m = torch.tensor(spacing_rev_m, device=device, dtype=dtype)
-                origin_t_m = torch.tensor(origin_rev_m, device=device, dtype=dtype)
-                direction_t_m = torch.tensor(direction_rev_m, device=device, dtype=dtype)
-                T_grid_lvl = self.affine.get_matrix()
-                M_phys_zyx_lvl, t_phys_zyx_lvl = grid_to_physical_affine_torch(
-                    T_grid_lvl, curr_vel_shape, curr_spacing_f, self.origin, self.direction,
-                    curr_moving_shape, curr_spacing_m, self.moving_origin, self.moving_direction,
-                )
-                phi_m_aff_lvl = phys_grid_lvl @ M_phys_zyx_lvl.t() + t_phys_zyx_lvl
-                phi_m_aff_norm_lvl = physical_to_normalized_torch_cached(
-                    phi_m_aff_lvl, shape_t_m, spacing_t_m, origin_t_m, direction_t_m
+                phi_m_aff_norm_lvl = physical_to_normalized_fast(
+                    phi_m_aff_lvl, level_ctx["M_m_norm"], level_ctx["b_m_norm"]
                 )
                 curr_moving_aff = grid_sample_nd(
                     curr_moving, phi_m_aff_norm_lvl, mode='bilinear', padding_mode='zeros'
@@ -791,7 +821,7 @@ class GeodesicShootingModel(nn.Module):
                                  "'adamw', 'sgd' or 'lars'")
 
             lncc_ws = 2 * lncc_radius + 1
-            
+
             best_level_loss = float('inf')
             best_v0_fwd = None
             best_v0_inv = None
@@ -805,6 +835,7 @@ class GeodesicShootingModel(nn.Module):
                     lncc_window_size=lncc_ws,
                     similarity_metric=similarity_metric,
                     _prealigned_moving=curr_moving_aff,
+                    _level_ctx=level_ctx,
                 )
                 if total_loss < best_level_loss_t:
                     best_level_loss_t = total_loss.detach()
@@ -814,8 +845,13 @@ class GeodesicShootingModel(nn.Module):
 
                 total_loss.backward()
                 optimizer.step()
-                if (ep + 1) % 5 == 0 and stop.update(ep, float(total_loss.detach())):   # one device sync per 5 epochs
-                    break
+                if (ep + 1) % 5 == 0 or ep == epochs - 1:   # one device sync per 5 epochs + level end
+                    ep_loss = float(total_loss.detach().item())
+                    check_loss_collapse(
+                        ep_loss, float(best_level_loss_t.item()), f"syntx.syngs level {level}"
+                    )
+                    if stop.update(ep, ep_loss):
+                        break
             stop.end_level(ep + 1)
 
             best_level_loss = float(best_level_loss_t.item())
@@ -827,7 +863,9 @@ class GeodesicShootingModel(nn.Module):
                         lncc_window_size=lncc_ws,
                         similarity_metric=similarity_metric,
                         _prealigned_moving=curr_moving_aff,
+                        _level_ctx=level_ctx,
                     ).item())
+                check_loss_collapse(final_loss, best_level_loss, f"syntx.syngs level {level} final")
                 if final_loss < best_level_loss:
                     best_level_loss = final_loss
                 elif best_v0_fwd is not None:

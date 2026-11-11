@@ -60,3 +60,29 @@ def test_method_is_detected_and_validated(pair):
         syntx.liouville_determinant(r, fi, method="ants")
     s = syntx.determinant_summary(syntx.liouville_determinant(r, fi), fi)
     assert set(s) == {"min", "max", "mean", "std", "folding_pct"} and s["min"] > 0
+
+
+def test_step_log_det_explicit_3d_matches_linalg_det_and_mps_large_grid():
+    import torch
+    from syntx.liouville import step_log_det
+
+    torch.manual_seed(0)
+    grad_v = 0.25 * torch.randn(2, 8, 8, 8, 3, 3, dtype=torch.float32)
+    dt = 0.125
+    ld, neg = step_log_det(grad_v, dt)
+
+    ref_d = torch.linalg.det(torch.eye(3) + dt * grad_v)
+    ref_ld = torch.log(ref_d.abs().clamp(min=1e-30))
+    ref_neg = (ref_d <= 0).to(grad_v.dtype)
+    assert torch.allclose(ld, ref_ld, atol=1e-5, rtol=1e-5)
+    assert torch.equal(neg, ref_neg)
+
+    if torch.backends.mps.is_available():
+        # Full Mindboggle 3-D volume (12.58M 3x3 Jacobians) previously aborted MPS
+        # in torch.linalg.det with IOGPUDeviceShmem allocation failure.
+        g_mps = torch.zeros((1, 256, 256, 192, 3, 3), device="mps", dtype=torch.float32)
+        ld_mps, neg_mps = step_log_det(g_mps, 0.125)
+        torch.mps.synchronize()
+        assert float(ld_mps.abs().max().item()) < 1e-6
+        assert int(neg_mps.sum().item()) == 0
+

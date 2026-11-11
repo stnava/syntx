@@ -283,7 +283,7 @@ METHODS: Dict[str, MethodSpec] = {
             # flow_sigma is not searched: syngs accepts it only with regularizer='gaussian' (the
             # spectral regularisers searched here use alpha); fast_smooth does not exist.
             Param("optimizer_lr", lo=0.2, hi=3.0),
-            Param("n_steps", kind="int", values=(6, 12)),
+            Param("n_steps", kind="int", values=(6, 8, 10, 12)),
             Param("regularizer", kind="categorical", values=("sobolev", "dsti1", "solenoidal", "navier", "div_curl", "beltrami", "hyperelastic", "poroelastic")),
             Param("poisson_ratio", lo=0.10, hi=0.499, requires={"regularizer": ("navier", "stokes", "elastic")}),
             Param("beta", values=(1.0, 2.5, 5.0, 10.0, 20.0), requires={"regularizer": ("div_curl", "helmholtz")}),
@@ -318,8 +318,10 @@ METHODS: Dict[str, MethodSpec] = {
             Param("darcy_permeability", values=(0.05, 0.1, 0.2, 0.4), requires={"regularizer": ("poroelastic", "biot")}),
             Param("dilatation_weight", values=(0.1, 0.25, 0.5), requires={"regularizer": ("beltrami", "quasiconformal")}),
             Param("h3_envelope", kind="categorical", values=(True, False), requires={"regularizer": ("div_curl", "hyperelastic")}),
-            Param("n_time_steps", kind="int", values=(2, 5)),
-            Param("multipoint_loss", kind="list", values=([0.5], [0.0, 1.0])),
+            Param("n_time_steps", kind="int", values=(2, 3, 5)),
+            Param("multipoint_loss", kind="list", values=([0.5], [0.0, 1.0], [0.0, 0.5, 1.0])),
+            Param("cfl_momentum", values=(0.75, 0.85, 0.9, 0.95)),
+            Param("fast_smooth", kind="categorical", values=(False, True)),
             Param("constant_speed", kind="categorical", values=(True, False)),
             # the optimiser family is fixed at 'cfl' (per-voxel Adam normalisation roughens the
             # velocity); optimizer_lr / max_step_norm apply to the Adam family only

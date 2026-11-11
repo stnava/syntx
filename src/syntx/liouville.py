@@ -43,10 +43,15 @@ def velocity_gradient_at(sample: Callable[[torch.Tensor], torch.Tensor], points:
 
 
 def step_log_det(grad_v: torch.Tensor, dt: float):
-    """(log |det(I + dt grad v)|, 1 where det < 0 else 0) for one Euler step."""
-    dim = grad_v.shape[-1]
-    eye = torch.eye(dim, device=grad_v.device, dtype=grad_v.dtype)
-    d = torch.linalg.det(eye + dt * grad_v)
+    """(log |det(I + dt grad v)|, 1 where det < 0 else 0) for one Euler step.
+
+    Uses explicit 2-D / 3-D cofactor expansion via ``_det_identity_plus`` rather than
+    ``torch.linalg.det`` so large 3-D volumes on Apple MPS never trigger batched LU
+    ``IOGPUDeviceShmem`` exhaustion.
+    """
+    from .core.jacobian import _det_identity_plus
+
+    d = _det_identity_plus(dt * grad_v)
     return torch.log(d.abs().clamp(min=1e-30)), (d <= 0).to(grad_v.dtype)
 
 

@@ -280,10 +280,18 @@ class GPUComputationLost(RuntimeError):
 
 
 def check_loss_collapse(loss_val: float, best_level_loss: float, where: str) -> None:
-    """Raise ``GPUComputationLost`` when a similarity-based loss that was negative earlier in
-    the level becomes exactly 0.0 -- what discarded MPS command buffers produce (measured on
-    TVF level 1 of a 3-D Mindboggle pair while the GPU was recovering from a fault; the run
-    otherwise returned all-garbage fields). A real loss is never exactly 0 there."""
+    """Raise ``FloatingPointError`` on NaN / Inf loss (e.g. float16 AMP overflow) and
+    ``GPUComputationLost`` when a similarity-based loss that was negative earlier in the level
+    becomes exactly 0.0 -- what discarded MPS command buffers produce (measured on TVF level 1
+    of a 3-D Mindboggle pair while the GPU was recovering from a fault; the run otherwise
+    returned all-garbage fields). A real loss is never non-finite or exactly 0 there."""
+    import math
+
+    if not math.isfinite(loss_val):
+        raise FloatingPointError(
+            f"{where}: optimization produced non-finite loss ({loss_val}); refusing silent "
+            "fallback to zero/checkpointed velocity."
+        )
     if loss_val == 0.0 and best_level_loss < 0.0:
         raise GPUComputationLost(
             f"{where}: the loss collapsed to exactly 0 after reaching {best_level_loss:.6f}; the "

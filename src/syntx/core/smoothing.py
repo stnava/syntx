@@ -341,7 +341,7 @@ _SOBOLEV_ENERGY_CACHE = {}
 
 
 def _get_sobolev_energy_operator_cached(spatial_shape, alpha_val, s, spacing, device):
-    """Cached float32 Parseval operator L = (1 + alpha |k|^2)^s on the full ``fftn`` grid."""
+    """Cached float32 Parseval half-operator sqrt(L * w_rfft) / N on the ``rfftn`` grid, shape (*rfft_shape, 1)."""
     sp_tuple = tuple(float(x) for x in spacing) if spacing is not None else None
     cache_key = (tuple(spatial_shape), float(alpha_val), float(s), sp_tuple, str(device))
     if cache_key in _SOBOLEV_ENERGY_CACHE:
@@ -349,17 +349,28 @@ def _get_sobolev_energy_operator_cached(spatial_shape, alpha_val, s, spacing, de
 
     dim = len(spatial_shape)
     spacing_zyx = tuple(reversed(sp_tuple)) if sp_tuple is not None else (1.0,) * dim
-    k_axes = [
-        torch.fft.fftfreq(n, device=device) * (2.0 * math.pi) / max(float(sp), 1e-4)
-        for n, sp in zip(spatial_shape, spacing_zyx)
-    ]
+    k_axes = []
+    for d, (n_d, sp_d) in enumerate(zip(spatial_shape, spacing_zyx)):
+        scale = (2.0 * math.pi) / max(float(sp_d), 1e-4)
+        if d == dim - 1:
+            k_axes.append(torch.fft.rfftfreq(n_d, device=device) * scale)
+        else:
+            k_axes.append(torch.fft.fftfreq(n_d, device=device) * scale)
     k_sq = sum(k ** 2 for k in torch.meshgrid(*k_axes, indexing="ij"))
     L = ((1.0 + float(alpha_val) * k_sq) ** s).to(device=device, dtype=torch.float32)
 
+    n_last = int(spatial_shape[-1])
+    w = torch.full((n_last // 2 + 1,), 2.0, device=device, dtype=torch.float32)
+    w[0] = 1.0
+    if n_last % 2 == 0:
+        w[-1] = 1.0
+    n_vox = float(math.prod(spatial_shape))
+    L_sqrt = (torch.sqrt(L * w) / n_vox).unsqueeze(-1).contiguous()
+
     if len(_SOBOLEV_ENERGY_CACHE) > 32:
         _SOBOLEV_ENERGY_CACHE.clear()
-    _SOBOLEV_ENERGY_CACHE[cache_key] = L
-    return L
+    _SOBOLEV_ENERGY_CACHE[cache_key] = L_sqrt
+    return L_sqrt
 
 
 def sobolev_energy(v, alpha, spacing=None, s=2.0):
@@ -367,19 +378,25 @@ def sobolev_energy(v, alpha, spacing=None, s=2.0):
     L = (1 + alpha |k|^2)^s is the inverse of the periodic Sobolev kernel K applied by
     ``apply_sobolev_green_operator`` (same alpha, same k-grid; that function uses s = 2 and,
     without ``alpha``, alpha = fluid_sigma / 2). Summed over components, averaged over the N
-    voxels (Parseval); ``spacing`` in ANTs (x, y, z) order, None = unit spacing. Computed in
-    float32. Returns a (B,) tensor, differentiable. The LDDMM path energy is the time integral
-    of this quantity.
+    voxels (Parseval via real ``rfftn`` Hermitian symmetry); ``spacing`` in ANTs (x, y, z)
+    order, None = unit spacing. Computed in float32. Returns a (B,) tensor, differentiable.
+    The LDDMM path energy is the time integral of this quantity.
     """
     dim = v.ndim - 2
     spatial_shape = v.shape[1:-1]
-    L = _get_sobolev_energy_operator_cached(spatial_shape, alpha, s, spacing, v.device)
-    v_cf = torch.movedim(v, -1, 1).to(torch.float32)
-    vf = torch.fft.fftn(v_cf, dim=tuple(range(2, 2 + dim)))
-    n = float(math.prod(spatial_shape))
-    # Parseval: sum_x |v|^2 = sum_k |v_hat|^2 / N ; divide by N again for a per-voxel mean
-    e = (vf.real ** 2 + vf.imag ** 2) * L
-    return e.sum(dim=tuple(range(1, e.ndim))) / (n * n)
+    L_sqrt = _get_sobolev_energy_operator_cached(spatial_shape, alpha, s, spacing, v.device)
+    v_cf = torch.movedim(v, -1, 1).to(torch.float32).contiguous()
+    vf = torch.fft.rfftn(v_cf, dim=tuple(range(2, 2 + dim)))
+    w_flat = (torch.view_as_real(vf) * L_sqrt).square().flatten(1)
+    m = w_flat.shape[1]
+    if m > 8192:
+        blk = 4096
+        full = (m // blk) * blk
+        out = w_flat[:, :full].reshape(w_flat.shape[0], -1, blk).sum(-1).sum(-1)
+        if full < m:
+            out = out + w_flat[:, full:].sum(-1)
+        return out
+    return w_flat.sum(-1)
 
 
 def apply_sobolev_green_operator(m, fluid_sigma=3.0, alpha=None, spacing=None):
@@ -416,7 +433,7 @@ def apply_sobolev_green_operator(m, fluid_sigma=3.0, alpha=None, spacing=None):
     
     spatial_shape = m.shape[1:-1]
     spatial_dims = tuple(range(2, 2 + dim))
-    m_cf = torch.movedim(m, -1, 1).to(torch.float32)
+    m_cf = torch.movedim(m, -1, 1).to(torch.float32).contiguous()
     
     K_bc = _get_sobolev_filter_cached(spatial_shape, alpha_val, s, spacing, device, dtype)
     

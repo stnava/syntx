@@ -178,4 +178,73 @@ def test_tvf_and_syngs_reject_nan_inputs():
         syntx.syngs(fixed=fi_ok, moving=mi_bad, initial_transform=False, reg_iterations=[1], levels=[1], device="cpu")
 
 
+def test_sobolev_energy_rfft_parseval_parity():
+    """rfftn + two-stage block-reduced sobolev_energy must match float64 fftn Parseval reference."""
+    import math
+    from syntx.core.smoothing import sobolev_energy
+
+    def _ref_fftn(v, alpha, spacing):
+        dim = v.ndim - 2
+        sp = tuple(reversed(spacing))
+        vf = torch.fft.fftn(torch.movedim(v, -1, 1).to(torch.float64), dim=tuple(range(2, 2 + dim)))
+        ks = [
+            torch.fft.fftfreq(n, device=v.device, dtype=torch.float64) * 2.0 * math.pi / float(sd)
+            for n, sd in zip(v.shape[1:-1], sp)
+        ]
+        L = (1.0 + float(alpha) * sum(k ** 2 for k in torch.meshgrid(*ks, indexing="ij"))) ** 2.0
+        n_vox = float(math.prod(v.shape[1:-1]))
+        e = (vf.real.square() + vf.imag.square()) * L
+        return (e.sum(dim=tuple(range(1, e.ndim))) / (n_vox * n_vox)).to(torch.float32)
+
+    torch.manual_seed(11)
+    for shape, sp in [((17, 24), (1.2, 0.8)), ((19, 25, 32), (1.5, 1.0, 0.9)), ((20, 21, 23), (0.8, 1.1, 1.4))]:
+        v_fast = torch.randn(3, *shape, len(shape), requires_grad=True)
+        v_ref = v_fast.detach().clone().requires_grad_(True)
+        e_fast = sobolev_energy(v_fast, 1.7, spacing=sp)
+        e_ref = _ref_fftn(v_ref, 1.7, spacing=sp)
+        e_fast.sum().backward()
+        e_ref.sum().backward()
+        rel_val = float((e_fast.detach() - e_ref.detach()).abs().max() / e_ref.detach().abs().max())
+        rel_grad = float((v_fast.grad - v_ref.grad).abs().max() / v_ref.grad.abs().max())
+        assert rel_val < 1e-6, f"value mismatch on {shape}: {rel_val}"
+        assert rel_grad < 1e-6, f"grad mismatch on {shape}: {rel_grad}"
+
+
+def test_check_loss_collapse_rejects_nonfinite():
+    """check_loss_collapse must fail fast on NaN/Inf even on epoch 0 (best_level_loss == inf)."""
+    from syntx.core.utils import check_loss_collapse
+
+    for bad in (float("nan"), float("inf"), float("-inf")):
+        with pytest.raises(FloatingPointError, match="non-finite"):
+            check_loss_collapse(bad, float("inf"), "syntx.tvf level 4")
+
+
+def test_tvf_amp_stays_finite_and_deforms():
+    """syntx.tvf(..., amp=True) must not overflow spectral path energy to NaN or reset to identity."""
+    import ants
+    import syntx
+
+    dev = "mps" if torch.backends.mps.is_available() else "cpu"
+    zz, yy, xx = np.meshgrid(
+        np.linspace(-1, 1, 24), np.linspace(-1, 1, 24), np.linspace(-1, 1, 24), indexing="ij"
+    )
+    fi = ants.from_numpy(np.exp(-3.0 * ((xx - 0.10) ** 2 + yy ** 2 + zz ** 2)).astype(np.float32))
+    mi = ants.from_numpy(np.exp(-3.0 * ((xx + 0.10) ** 2 + yy ** 2 + zz ** 2)).astype(np.float32))
+
+    res = syntx.tvf(
+        fixed=fi,
+        moving=mi,
+        initial_transform=False,
+        reg_iterations=[4, 3],
+        levels=[2, 1],
+        amp=True,
+        device=dev,
+        verbose=False,
+    )
+    warp = ants.image_read(res["fwdtransforms"][0]).numpy()
+    assert np.all(np.isfinite(warp))
+    assert float(np.abs(warp).max()) > 1e-2, "AMP run silently collapsed to identity displacement"
+
+
+
 
