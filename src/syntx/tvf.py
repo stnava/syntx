@@ -55,7 +55,7 @@ from .core.smoothing import (
 )
 from .core.optimizers import LARS, RegAdam, SobolevAdam
 from .core.grid import compose_grids, sample_field_cf, resize_field
-from .core.utils import check_loss_collapse
+from .core.utils import check_loss_collapse, require_finite_images
 
 class TVFConjugateGradient(torch.optim.Optimizer):
     """
@@ -1694,30 +1694,26 @@ class TVFModel(nn.Module):
                             print(f"  Level {level} converged at epoch {epoch+1} (loss slope no longer below -{stop.slope_threshold:.2e} per epoch). Early stopping level.")
                         break
 
-                # Aggressive in-loop garbage collection (make less aggressive)
-                if epoch % 50 == 0 or epoch == epochs - 1:
-                    try:
-                        del sim_loss, total_loss, kinetic
-                    except NameError:
-                        pass
-
-                    gc.collect()
-                    if device.type == 'mps':
-                        torch.mps.empty_cache()
-
             if epochs > 0:
                 stop.end_level(epoch + 1)
-            # Evaluate final velocity after the last optimization step
+            # Evaluate final velocity after the last optimization step (including path energy
+            # so comparison against best_level_loss_t uses the identical total objective)
             if epochs > 0:
                 with torch.no_grad():
+                    final_kinetic = float(
+                        self._path_energy(
+                            energy_weight, temporal_weight, energy_alpha, vel_spacing, device, dtype
+                        ).item()
+                    )
                     if not getattr(self, 'use_analytical_gradients', False):
                         final_sim = float(self.forward(
                             curr_fixed, curr_moving,
                             multipoint_loss=multipoint_loss,
                             lncc_window_size=lncc_ws,
                         ).item())
-                        if final_sim < float(best_level_loss_t.item()):
-                            best_level_loss_t = torch.tensor(final_sim, device=device)
+                        final_total = final_sim + final_kinetic
+                        if final_total < float(best_level_loss_t.item()):
+                            best_level_loss_t = torch.tensor(final_total, device=device)
                         elif best_velocity is not None:
                             self.velocity.copy_(best_velocity)
                     else:
@@ -1737,8 +1733,9 @@ class TVFModel(nn.Module):
                         )
                         J_mid = grid_sample_nd(curr_moving, phi_moving_norm, mode='bilinear', padding_mode='zeros')
                         final_sim = float(self._eval_similarity(I_mid, J_mid, lncc_window_size=lncc_ws).item())
-                        if final_sim < float(best_level_loss_t.item()):
-                            best_level_loss_t = torch.tensor(final_sim, device=device)
+                        final_total = final_sim + final_kinetic
+                        if final_total < float(best_level_loss_t.item()):
+                            best_level_loss_t = torch.tensor(final_total, device=device)
                         elif best_velocity is not None:
                             self.velocity.copy_(best_velocity)
 
@@ -1834,6 +1831,9 @@ TVF_ADVANCED_OPTIONS = {
     'envelope_power': 'decay power for continuum envelope',
     'mask': 'anatomical tissue mask',
     'fixed_mask': 'fixed image anatomical mask',
+    # post-integration inverse field polish
+    'compose_polish_tol': 'safeguarded hybrid_lm max-error tolerance (vox) for exported inv_disp (default 0.30; <=0 disables)',
+    'compose_polish_steps': 'max hybrid_lm steps for exported inv_disp polish (default 25)',
 }
 
 
@@ -1990,6 +1990,7 @@ def tvf_registration(
     import ants
 
     t_start = _time.time()
+    require_finite_images(fixed=fixed, moving=moving)
     dim = fixed.dimension
     grid_shape = fixed.shape
     spacing = fixed.spacing
@@ -2104,7 +2105,11 @@ def tvf_registration(
     init_tx_list = []
     init_M_phys, init_t_phys = None, None
     from .syn import parse_ants_affine
-    if initial_transform is not None:
+    if initial_transform is False or (
+        isinstance(initial_transform, str) and initial_transform.lower() == "identity"
+    ):
+        init_tx_list = []  # explicit opt-out of initial alignment (matching syntx.syn / syngs)
+    elif initial_transform is not None:
         init_tx_list = initial_transform if isinstance(initial_transform, list) else [initial_transform]
         init_M_phys, init_t_phys = parse_ants_affine(init_tx_list, dim)
     else:
@@ -2123,6 +2128,8 @@ def tvf_registration(
 
     # everything TVFModel.fit reads, explicitly
     fit_kwargs = dict(advanced)
+    compose_polish_tol = fit_kwargs.pop('compose_polish_tol', 0.30)
+    compose_polish_steps = int(fit_kwargs.pop('compose_polish_steps', 25))
     inverse_identity_weight = float(fit_kwargs.pop('inverse_identity_weight', 0.05))
     model_kwargs = {k: fit_kwargs.pop(k) for k in ('solver', 'adjoint', 'integration_steps_per_interval',
                                                    'use_analytical_gradients') if k in fit_kwargs}
@@ -2149,7 +2156,7 @@ def tvf_registration(
             fixed, moving, winsorize_quantiles=winsor, backend='pytorch', device=device
         )
 
-        # --- Initialize model ---
+        # --- Initialize model (resize parameter on CPU before GPU upload when coarse pyramid starts smaller) ---
         model = TVFModel(
             dim=dim,
             image_shape=grid_shape_zyx,
@@ -2168,7 +2175,16 @@ def tvf_registration(
             adjoint=resolved_adjoint,
             integration_steps_per_interval=model_kwargs['integration_steps_per_interval'],
             use_analytical_gradients=model_kwargs.get('use_analytical_gradients', False),
-        ).to(device)
+        )
+        if sum(reg_iterations) > 0 and levels and levels[0] > 1:
+            from .pyramid import plan_levels
+            _max_vel_ds = int(fit_kwargs.get('max_velocity_downsample', 1))
+            _init_vel_shape = tuple(
+                plan_levels(grid_shape_zyx, spacing, [max(levels[0], _max_vel_ds)], 'deformable')[0].shape_zyx
+            )
+            if _init_vel_shape != tuple(grid_shape_zyx):
+                model._resize_velocity(_init_vel_shape, 'cpu', torch.float32)
+        model = model.to(device)
         model._foreground_mask_lncc = fg_mask
         model._gradient_checkpointing = grad_ckpt
         model.inverse_identity_weight = inverse_identity_weight
@@ -2206,10 +2222,41 @@ def tvf_registration(
         )
 
         with torch.no_grad():
-            fwd_disp = model.get_forward_warp(image_shape=grid_shape_zyx)
-            inv_disp = model.get_inverse_warp(image_shape=grid_shape_zyx)
-            fwd_np = fwd_disp.cpu().squeeze(0).numpy()
-            inv_np = inv_disp.cpu().squeeze(0).numpy()
+            fwd_disp_gpu = model.get_forward_warp(image_shape=grid_shape_zyx)
+            inv_disp_gpu = model.get_inverse_warp(image_shape=grid_shape_zyx)
+            from .core.inverse import (
+                calculate_inverse_identity_error,
+                update_inverse_field_nd_hybrid_lm,
+            )
+            if (
+                sum(reg_iterations) > 0
+                and compose_polish_tol is not None
+                and float(compose_polish_tol) > 0.0
+            ):
+                _cp_tol = float(compose_polish_tol)
+                inv_disp_gpu = update_inverse_field_nd_hybrid_lm(
+                    fwd_disp_gpu,
+                    inv_disp_gpu,
+                    steps=compose_polish_steps,
+                    max_error_threshold=_cp_tol,
+                    mean_error_threshold=min(_cp_tol * 0.5, 0.02),
+                    spacing=spacing,
+                    origin=origin,
+                    direction=direction,
+                    stationary_boundary=True,
+                )
+            inv_err_dict = calculate_inverse_identity_error(
+                fwd_disp_gpu,
+                inv_disp_gpu,
+                spacing=spacing,
+                origin=origin,
+                direction=direction,
+            )
+            fwd_disp = fwd_disp_gpu.cpu()
+            inv_disp = inv_disp_gpu.cpu()
+            del fwd_disp_gpu, inv_disp_gpu
+            fwd_np = fwd_disp.squeeze(0).numpy()
+            inv_np = inv_disp.squeeze(0).numpy()
 
 
         T_grid = model.affine.get_matrix().detach().cpu().numpy()
@@ -2222,7 +2269,8 @@ def tvf_registration(
         # what the JAX model implements; everything else would be silently dropped
         _jax_advanced = {'solver', 'integration_steps_per_interval', 'constant_speed',
                          'constant_speed_relaxation', 'mattes_bins', 'smooth_pyramid',
-                         'convergence_threshold', 'convergence_window', 'winsorize_quantiles'}
+                         'convergence_threshold', 'convergence_window', 'winsorize_quantiles',
+                         'compose_polish_tol', 'compose_polish_steps'}
         _unsupported = sorted(set(advanced) - _jax_advanced)
         if _unsupported:
             raise TypeError(f"syntx.tvf(backend='jax') does not support {_unsupported} "
@@ -2301,6 +2349,34 @@ def tvf_registration(
 
         fwd_disp = np.array(model.integrate(0.0, 1.0, image_shape=grid_shape_zyx))
         inv_disp = np.array(model.integrate(1.0, 0.0, image_shape=grid_shape_zyx))
+        with torch.no_grad():
+            from .core.inverse import (
+                calculate_inverse_identity_error,
+                update_inverse_field_nd_hybrid_lm,
+            )
+            fwd_t = torch.from_numpy(fwd_disp).float()
+            inv_t = torch.from_numpy(inv_disp).float()
+            if (
+                sum(reg_iterations) > 0
+                and compose_polish_tol is not None
+                and float(compose_polish_tol) > 0.0
+            ):
+                _cp_tol = float(compose_polish_tol)
+                inv_t = update_inverse_field_nd_hybrid_lm(
+                    fwd_t,
+                    inv_t,
+                    steps=compose_polish_steps,
+                    max_error_threshold=_cp_tol,
+                    mean_error_threshold=min(_cp_tol * 0.5, 0.02),
+                    spacing=spacing,
+                    origin=origin,
+                    direction=direction,
+                    stationary_boundary=True,
+                )
+                inv_disp = inv_t.numpy()
+            inv_err_dict = calculate_inverse_identity_error(
+                fwd_t, inv_t, spacing=spacing, origin=origin, direction=direction
+            )
         fwd_np = fwd_disp.squeeze(0)
         inv_np = inv_disp.squeeze(0)
 
@@ -2310,6 +2386,8 @@ def tvf_registration(
 
     else:
         raise ValueError(f"Unknown backend: {backend}")
+    from .transforms import _cache_disp_image_and_field, apply_transforms as _apply_transforms
+    _apply_dev = str(device) if backend.lower() == 'pytorch' else None
     fwd_img = disp_tensor_to_itk(fwd_disp, fixed)
     inv_img = disp_tensor_to_itk(inv_disp, fixed)
 
@@ -2317,6 +2395,8 @@ def tvf_registration(
     inv_file = tempfile.NamedTemporaryFile(suffix='_tvf_inv_Warp.nii.gz', delete=False).name
     ants.image_write(fwd_img, fwd_file)
     ants.image_write(inv_img, inv_file)
+    _cache_disp_image_and_field(fwd_file, fwd_img, _apply_dev)
+    _cache_disp_image_and_field(inv_file, inv_img, _apply_dev)
 
     # Export physical affine transform using standardized ITK layout
     M_phys, t_phys = grid_to_physical_affine(T_grid, fixed, moving)
@@ -2336,26 +2416,14 @@ def tvf_registration(
         whichtoinvert_inv = [True]
 
     # Generate warped output images (same as registration())
-    from .transforms import apply_transforms as _apply_transforms
     warpedmovout = _apply_transforms(fixed=fixed, moving=moving, transformlist=fwd_transforms)
     warpedfixout = _apply_transforms(fixed=moving, moving=fixed, transformlist=inv_transforms,
                                      whichtoinvert=whichtoinvert_inv)
 
     fit_time = _time.time() - t_start
 
-    # Clean up GPU memory
+    # Clean up GPU memory after all tensor work is complete (no post-cleanup GPU re-uploads)
     cleanup_gpu(device=device if 'device' in locals() else None, backend=backend)
-
-    from .syn import calculate_inverse_identity_error
-    
-
-    W_fwd_tensor = torch.from_numpy(fwd_np).to(device).float()
-    W_inv_tensor = torch.from_numpy(inv_np).to(device).float()
-    
-    inv_err_dict = calculate_inverse_identity_error(
-        W_fwd_tensor, W_inv_tensor, 
-        spacing=spacing, origin=origin, direction=direction
-    )
 
     ret_dict = {
         'convergence': model.stop.summary() if hasattr(model, 'stop') else None,

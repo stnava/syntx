@@ -53,7 +53,7 @@ from .spatial import (
     compute_grid_to_physical_reference_matrix,
 )
 from .pyramid import build_pyramid, level_spacing
-from .core.utils import check_loss_collapse
+from .core.utils import check_loss_collapse, require_finite_images
 
 
 # Default spectral (Sobolev) strength per dimension. 3-D: the benchmark configuration (3-D
@@ -216,6 +216,7 @@ class GeodesicShootingModel(nn.Module):
         self.affine = HierarchicalAffine(dim=dim, transform_type=transform_type)
         self._cached_loss_fn = None
         self._cached_loss_key = None
+        self._green_cache = {}
 
     def _resize_single_velocity(self, vel_param, new_shape, device=None, dtype=None):
         """Resize one velocity parameter to ``new_shape`` (trilinear; values are mm, unchanged)."""
@@ -331,24 +332,41 @@ class GeodesicShootingModel(nn.Module):
             )
             return reg_fn(m)
 
-        # Standard Sobolev with boundary cosine tapering
-        bmask = self._create_boundary_mask(shape, device, dtype, border_width=4)
+        # Standard Sobolev with boundary cosine tapering (cached per shape/spacing/alpha/device/dtype)
+        cache_dict = getattr(self, '_green_cache', None)
+        if cache_dict is None:
+            cache_dict = {}
+            self._green_cache = cache_dict
+        cache_key = (
+            tuple(int(s) for s in shape),
+            tuple(float(s) for s in spacing_zyx),
+            float(self.alpha),
+            str(device),
+            str(dtype),
+        )
+        cached = cache_dict.get(cache_key)
+        if cached is not None:
+            bmask, K_fourier = cached
+        else:
+            bmask = self._create_boundary_mask(shape, device, dtype, border_width=4)
+            k_axes = []
+            for d in range(dim):
+                n_d = shape[d]
+                sp_d = spacing_zyx[d]
+                if d == dim - 1:
+                    k_d = torch.fft.rfftfreq(n_d, d=sp_d, device=device) * (2.0 * math.pi)
+                else:
+                    k_d = torch.fft.fftfreq(n_d, d=sp_d, device=device) * (2.0 * math.pi)
+                k_axes.append(k_d)
+
+            k_mesh = torch.meshgrid(*k_axes, indexing='ij')
+            k_sq = sum(k_j ** 2 for k_j in k_mesh)
+            K_fourier = 1.0 / ((1.0 + self.alpha * k_sq) ** 2.0)
+            if len(cache_dict) > 32:
+                cache_dict.clear()
+            cache_dict[cache_key] = (bmask, K_fourier)
+
         m_tapered = m * bmask
-        
-        k_axes = []
-        for d in range(dim):
-            n_d = shape[d]
-            sp_d = spacing_zyx[d]
-            if d == dim - 1:
-                k_d = torch.fft.rfftfreq(n_d, d=sp_d, device=device) * (2.0 * math.pi)
-            else:
-                k_d = torch.fft.fftfreq(n_d, d=sp_d, device=device) * (2.0 * math.pi)
-            k_axes.append(k_d)
-            
-        k_mesh = torch.meshgrid(*k_axes, indexing='ij')
-        k_sq = sum(k_j ** 2 for k_j in k_mesh)
-        K_fourier = 1.0 / ((1.0 + self.alpha * k_sq) ** 2.0)
-        
         v_out = self._apply_sobolev_fft(m_tapered, K_fourier, shape, dtype)
         return v_out * bmask
 
@@ -453,19 +471,30 @@ class GeodesicShootingModel(nn.Module):
     def _eval_similarity(self, I, J, metric_name, lncc_window_size=5):
         """Similarity loss between ``I`` and ``J`` using canonical core losses; lower is better."""
         n_bins = getattr(self, 'mattes_bins', 32)
-        key = (str(metric_name).lower(), lncc_window_size, n_bins)
+        m_low = str(metric_name).lower()
+        key = (m_low, lncc_window_size, n_bins)
         if getattr(self, '_cached_loss_key', None) != key or getattr(self, '_cached_loss_fn', None) is None:
+            # SyNGS z-scores its optimization inputs, so fixed_range=None lets Mattes MI
+            # scale dynamically to sample bounds rather than clipping to [0, 1].
+            f_range = None if m_low in ('mattes', 'mattes_mi', 'mi') else (0.0, 1.0)
             self._cached_loss_fn = get_similarity_loss(
                 metric_name,
                 window_size=lncc_window_size,
                 mattes_bins=n_bins,
-                fixed_range=(0.0, 1.0),
+                fixed_range=f_range,
                 auto_mask=False,
             ).to(device=I.device)
             self._cached_loss_key = key
         return self._cached_loss_fn(I, J)
 
-    def forward(self, fixed_image, moving_image, lncc_window_size=5, similarity_metric=None):
+    def forward(
+        self,
+        fixed_image,
+        moving_image,
+        lncc_window_size=5,
+        similarity_metric=None,
+        _prealigned_moving=None,
+    ):
         """
         Loss of the current fields: shoot v0_fwd (moving -> fixed space) and v0_inv (fixed ->
         moving), compare each warped image with the other image (``similarity_metric``,
@@ -518,12 +547,15 @@ class GeodesicShootingModel(nn.Module):
         v0_inv_param = self.velocity_0_inv if (self.symmetric and self.velocity_0_inv is not None) else -self.velocity_0_fwd
         disp_inv = self.shoot(v0_inv_param, target_shape_f, spacing_rev_f, phys_grid_f, meta_f)
 
-        # Prealigned moving on reference grid
-        phi_m_aff = phys_grid_f @ M_phys_zyx.t() + t_phys_zyx
-        phi_m_aff_norm = physical_to_normalized_torch_cached(
-            phi_m_aff, shape_t_m, spacing_t_m, origin_t_m, direction_t_m
-        )
-        moving_aff = grid_sample_nd(moving_image, phi_m_aff_norm, mode='bilinear', padding_mode='zeros')
+        # Prealigned moving on reference grid (reuse level-cached tensor when affine is frozen)
+        if _prealigned_moving is not None:
+            moving_aff = _prealigned_moving
+        else:
+            phi_m_aff = phys_grid_f @ M_phys_zyx.t() + t_phys_zyx
+            phi_m_aff_norm = physical_to_normalized_torch_cached(
+                phi_m_aff, shape_t_m, spacing_t_m, origin_t_m, direction_t_m
+            )
+            moving_aff = grid_sample_nd(moving_image, phi_m_aff_norm, mode='bilinear', padding_mode='zeros')
 
         # Deformed fixed on reference grid
         phi_fixed = phys_grid_f + disp_inv
@@ -582,16 +614,22 @@ class GeodesicShootingModel(nn.Module):
 
         sim_loss = 0.5 * (loss_fwd + loss_inv)
 
-        # 3. Inverse identity consistency loss in reference fixed space
+        # 3. Symmetric inverse identity consistency loss in reference fixed space
         if self.symmetric and self.inverse_identity_weight > 0:
             phi_inv_pure = phys_grid_f + disp_inv
             phi_inv_pure_norm = physical_to_normalized_torch_cached(
                 phi_inv_pure, shape_t_f, spacing_t_f, origin_t_f, direction_t_f
             )
+            phi_fwd_pure = phys_grid_f + disp_fwd
+            phi_fwd_pure_norm = physical_to_normalized_torch_cached(
+                phi_fwd_pure, shape_t_f, spacing_t_f, origin_t_f, direction_t_f
+            )
             # compose_grids handles the movedim internally for any spatial dimensionality
             disp_fwd_at_inv = compose_grids(disp_fwd, phi_inv_pure_norm)
-            comp_disp = disp_inv + disp_fwd_at_inv
-            inv_id_loss = torch.mean(comp_disp ** 2)
+            disp_inv_at_fwd = compose_grids(disp_inv, phi_fwd_pure_norm)
+            comp_disp_1 = disp_inv + disp_fwd_at_inv
+            comp_disp_2 = disp_fwd + disp_inv_at_fwd
+            inv_id_loss = 0.5 * (torch.mean(comp_disp_1 ** 2) + torch.mean(comp_disp_2 ** 2))
         else:
             inv_id_loss = torch.tensor(0.0, device=device, dtype=dtype)
 
@@ -688,14 +726,46 @@ class GeodesicShootingModel(nn.Module):
             curr_moving = moving_pyr[idx].tensor
             curr_vel_shape = tuple(fixed_pyr[idx].shape)       # the velocity lives on the fixed level grid
             self._resize_velocity(curr_vel_shape, device, dtype)
-            
+
+            curr_spacing_f = level_spacing(self.spacing, self.image_shape, curr_vel_shape)
+            min_sp_f = max(min(float(x) for x in curr_spacing_f), 1e-4)
+            spacing_rel_f = [float(x) / min_sp_f for x in curr_spacing_f]
+
+            # Precompute static affine-warped moving image once per pyramid level
+            with torch.no_grad():
+                curr_moving_shape = tuple(curr_moving.shape[2:])
+                curr_spacing_m = level_spacing(self.moving_spacing, self.moving_shape, curr_moving_shape)
+                phys_grid_lvl = get_physical_grid_torch(
+                    curr_vel_shape, curr_spacing_f, self.origin, self.direction,
+                    device=device, dtype=dtype,
+                )
+                spacing_rev_m, origin_rev_m, direction_rev_m = reverse_metadata(
+                    curr_spacing_m, self.moving_origin, self.moving_direction
+                )
+                shape_t_m = torch.tensor(list(curr_moving_shape), device=device, dtype=dtype)
+                spacing_t_m = torch.tensor(spacing_rev_m, device=device, dtype=dtype)
+                origin_t_m = torch.tensor(origin_rev_m, device=device, dtype=dtype)
+                direction_t_m = torch.tensor(direction_rev_m, device=device, dtype=dtype)
+                T_grid_lvl = self.affine.get_matrix()
+                M_phys_zyx_lvl, t_phys_zyx_lvl = grid_to_physical_affine_torch(
+                    T_grid_lvl, curr_vel_shape, curr_spacing_f, self.origin, self.direction,
+                    curr_moving_shape, curr_spacing_m, self.moving_origin, self.moving_direction,
+                )
+                phi_m_aff_lvl = phys_grid_lvl @ M_phys_zyx_lvl.t() + t_phys_zyx_lvl
+                phi_m_aff_norm_lvl = physical_to_normalized_torch_cached(
+                    phi_m_aff_lvl, shape_t_m, spacing_t_m, origin_t_m, direction_t_m
+                )
+                curr_moving_aff = grid_sample_nd(
+                    curr_moving, phi_m_aff_norm_lvl, mode='bilinear', padding_mode='zeros'
+                )
+
             active_params = [self.velocity_0_fwd]
             if self.symmetric and self.velocity_0_inv is not None:
                 active_params.append(self.velocity_0_inv)
 
             level_lr = lr * math.sqrt(1.0 / level)
             max_step = float(kwargs.get('max_step_norm', cfl_step))
-            
+
             if opt_name in ('reg_adam', 'regadam', 'sobolev_adam', 'sobolevadam'):
                 optimizer = RegAdam(
                     active_params,
@@ -705,6 +775,7 @@ class GeodesicShootingModel(nn.Module):
                     dsti_alpha=self.alpha,
                     gaussian_sigma=self.fluid_sigma,
                     max_step_norm=max_step,
+                    spacing=spacing_rel_f,
                     **({"eps_rel": float(kwargs["adam_eps_rel"])} if kwargs.get("adam_eps_rel") is not None else {})
                 )
             elif opt_name == 'adam':
@@ -732,7 +803,8 @@ class GeodesicShootingModel(nn.Module):
                 total_loss = self.forward(
                     curr_fixed, curr_moving,
                     lncc_window_size=lncc_ws,
-                    similarity_metric=similarity_metric
+                    similarity_metric=similarity_metric,
+                    _prealigned_moving=curr_moving_aff,
                 )
                 if total_loss < best_level_loss_t:
                     best_level_loss_t = total_loss.detach()
@@ -753,7 +825,8 @@ class GeodesicShootingModel(nn.Module):
                     final_loss = float(self.forward(
                         curr_fixed, curr_moving,
                         lncc_window_size=lncc_ws,
-                        similarity_metric=similarity_metric
+                        similarity_metric=similarity_metric,
+                        _prealigned_moving=curr_moving_aff,
                     ).item())
                 if final_loss < best_level_loss:
                     best_level_loss = final_loss
@@ -919,11 +992,13 @@ def syngs_registration(
         ``'model'`` (the fitted ``GeodesicShootingModel``), ``'provenance'``.
     """
     t_start = _time.time()
+    require_finite_images(fixed=fixed, moving=moving)
     _allowed = {'regularizer', 'transport_mode', 'solver', 'symmetric', 'inverse_identity_weight',
                 'bootstrap_orig_weight', 'bootstrap_jitter_scale', 'spline_distance', 'mesh_size',
                 'device', 'winsorize_quantiles', 'adam_eps_rel', 'weight_decay', 'momentum',
                 'smoothing_sigmas', 'mattes_bins', 'similarity_metric', 'gaussian_sigma',
-                'fast_smooth', 'affine_iterations', 'aff_metric', 'aff_sampling', 'iterations'} | _REG_EXTRA_KEYS
+                'fast_smooth', 'affine_iterations', 'aff_metric', 'aff_sampling', 'iterations',
+                'compose_polish_tol', 'compose_polish_steps'} | _REG_EXTRA_KEYS
     if reg_iterations is None:
         reg_iterations = iterations
     if reg_iterations is None and 'iterations' in kwargs:
@@ -1049,6 +1124,9 @@ def syngs_registration(
 
     grid_shape_zyx = itk_shape_to_tensor_shape(grid_shape)
     moving_shape_zyx = itk_shape_to_tensor_shape(moving_shape)
+    compose_polish_tol = kwargs.pop('compose_polish_tol', 0.30)
+    compose_polish_steps = int(kwargs.pop('compose_polish_steps', 25))
+    coarse_vel_shape = tuple(max(2, s // levels[0]) for s in grid_shape_zyx) if levels else grid_shape_zyx
 
     if backend.lower() == 'pytorch':
         device_str = kwargs.pop('device', None)
@@ -1062,7 +1140,7 @@ def syngs_registration(
         model = GeodesicShootingModel(
             dim=dim,
             image_shape=grid_shape_zyx,
-            velocity_shape=grid_shape_zyx,
+            velocity_shape=coarse_vel_shape,
             n_steps=n_steps,
             spacing=spacing,
             origin=origin,
@@ -1131,28 +1209,50 @@ def syngs_registration(
         with torch.no_grad():
             fwd_disp = model.get_forward_warp(image_shape=grid_shape_zyx)
             inv_disp = model.get_inverse_warp(image_shape=grid_shape_zyx)
-            from .core.inverse import calculate_inverse_identity_error
-            try:
-                inv_err_calc = calculate_inverse_identity_error(
-                    fwd_disp, inv_disp, spacing=spacing, origin=origin, direction=direction
+            from .core.inverse import (
+                calculate_inverse_identity_error,
+                update_inverse_field_nd_hybrid_lm,
+            )
+            if (
+                sum(reg_iterations) > 0
+                and compose_polish_tol is not None
+                and float(compose_polish_tol) > 0.0
+            ):
+                _cp_tol = float(compose_polish_tol)
+                inv_disp = update_inverse_field_nd_hybrid_lm(
+                    fwd_disp,
+                    inv_disp,
+                    steps=compose_polish_steps,
+                    max_error_threshold=_cp_tol,
+                    mean_error_threshold=min(_cp_tol * 0.5, 0.02),
+                    spacing=spacing,
+                    origin=origin,
+                    direction=direction,
+                    stationary_boundary=True,
                 )
-                inv_err_dict = {
+            inv_err_calc = calculate_inverse_identity_error(
+                fwd_disp, inv_disp, spacing=spacing, origin=origin, direction=direction
+            )
+            inv_err_dict = {
+                'mean': float(inv_err_calc['mean_error']),
+                'max': float(inv_err_calc['max_error']),
+                'phi_1': {
                     'mean': float(inv_err_calc['mean_error']),
                     'max': float(inv_err_calc['max_error']),
-                    'phi_1': {
-                        'mean': float(inv_err_calc['mean_error']),
-                        'max': float(inv_err_calc['max_error']),
-                        # like registration(): lets benchmarks report interior / p95 statistics
-                        'max_error': float(inv_err_calc['max_error']),
-                        'mean_error': float(inv_err_calc['mean_error']),
-                        'error_map': inv_err_calc.get('error_map'),
-                    }
+                    # like registration(): lets benchmarks report interior / p95 statistics
+                    'max_error': float(inv_err_calc['max_error']),
+                    'mean_error': float(inv_err_calc['mean_error']),
+                    'error_map': inv_err_calc.get('error_map'),
                 }
-            except Exception:
-                inv_err_dict = {}
+            }
 
-            fwd_np = fwd_disp.cpu().squeeze(0).numpy()
-            inv_np = inv_disp.cpu().squeeze(0).numpy()
+            fwd_disp_cpu = fwd_disp.cpu()
+            inv_disp_cpu = inv_disp.cpu()
+            del fwd_disp, inv_disp
+            fwd_disp = fwd_disp_cpu
+            inv_disp = inv_disp_cpu
+            fwd_np = fwd_disp.squeeze(0).numpy()
+            inv_np = inv_disp.squeeze(0).numpy()
             v0_fwd_np = model.velocity_0_fwd.detach().cpu().squeeze(0).numpy()
             v0_inv_np = model.velocity_0_inv.detach().cpu().squeeze(0).numpy() if model.velocity_0_inv is not None else -v0_fwd_np
 
@@ -1238,6 +1338,45 @@ def syngs_registration(
 
         fwd_disp = np.array(model.get_forward_warp(image_shape=grid_shape_zyx))
         inv_disp = np.array(model.get_inverse_warp(image_shape=grid_shape_zyx))
+        with torch.no_grad():
+            from .core.inverse import (
+                calculate_inverse_identity_error,
+                update_inverse_field_nd_hybrid_lm,
+            )
+            fwd_t = torch.from_numpy(fwd_disp).float()
+            inv_t = torch.from_numpy(inv_disp).float()
+            if (
+                sum(reg_iterations) > 0
+                and compose_polish_tol is not None
+                and float(compose_polish_tol) > 0.0
+            ):
+                _cp_tol = float(compose_polish_tol)
+                inv_t = update_inverse_field_nd_hybrid_lm(
+                    fwd_t,
+                    inv_t,
+                    steps=compose_polish_steps,
+                    max_error_threshold=_cp_tol,
+                    mean_error_threshold=min(_cp_tol * 0.5, 0.02),
+                    spacing=spacing,
+                    origin=origin,
+                    direction=direction,
+                    stationary_boundary=True,
+                )
+                inv_disp = inv_t.numpy()
+            inv_err_calc = calculate_inverse_identity_error(
+                fwd_t, inv_t, spacing=spacing, origin=origin, direction=direction
+            )
+            inv_err_dict = {
+                'mean': float(inv_err_calc['mean_error']),
+                'max': float(inv_err_calc['max_error']),
+                'phi_1': {
+                    'mean': float(inv_err_calc['mean_error']),
+                    'max': float(inv_err_calc['max_error']),
+                    'max_error': float(inv_err_calc['max_error']),
+                    'mean_error': float(inv_err_calc['mean_error']),
+                    'error_map': inv_err_calc.get('error_map'),
+                }
+            }
         fwd_np = fwd_disp.squeeze(0)
         inv_np = inv_disp.squeeze(0)
         v0_fwd_np = np.array(model.velocity_0_fwd).squeeze(0)
@@ -1248,6 +1387,8 @@ def syngs_registration(
         raise ValueError(f"Unknown backend: {backend}")
 
     # Export displacement fields using standardized ITK components via syntx.spatial
+    from .transforms import _cache_disp_image_and_field, apply_transforms as _apply_transforms
+    _apply_dev = str(device_str) if backend.lower() == 'pytorch' else None
     fwd_img = disp_tensor_to_itk(fwd_disp, fixed)
     inv_img = disp_tensor_to_itk(inv_disp, fixed)
 
@@ -1255,6 +1396,8 @@ def syngs_registration(
     inv_file = tempfile.NamedTemporaryFile(suffix='_syngs_inv_Warp.nii.gz', delete=False).name
     ants.image_write(fwd_img, fwd_file)
     ants.image_write(inv_img, inv_file)
+    _cache_disp_image_and_field(fwd_file, fwd_img, _apply_dev)
+    _cache_disp_image_and_field(inv_file, inv_img, _apply_dev)
 
     # Export initial momentum vector fields (v_0 at t=0)
     v0_inv_disp = model.velocity_0_inv if (getattr(model, 'symmetric', False) and getattr(model, 'velocity_0_inv', None) is not None) else -model.velocity_0_fwd

@@ -31,16 +31,20 @@ DEFAULT_BENCHMARK_CONFIG: Dict[str, Any] = {
         "similarity_metric": "cc2",
         "reg_iterations": [100, 100, 20],
     },
-    # Canonical: docs/provenance/best_parameters.json "syntx.syn/canonical_2026_09_29"
-    # (automated tuning, pairs 77/44/0). Must equal syntx.syn()'s defaults -- enforced by
-    # tests/test_canonical_parameters.py. (grad_step 0.35 / fluid_sigma 2.5 /
-    # fast_smooth True were introduced without record in 9acc5fa, 2026-09-19.)
+    # Canonical: docs/provenance/best_parameters.json "syntx.syn/canonical_2026_11_11"
+    # (Option A: warm-started (1, 2, 4) inversion cadence + 30-step level polish + 0.30-vox
+    # post-composition Levenberg-Marquardt polish, pairs 77/44/0). Must equal syntx.syn()'s
+    # defaults -- enforced by tests/test_canonical_parameters.py.
     "syn_config": {
         "grad_step": 0.4,
         "fluid_sigma": 2.4,
         "elastic_sigma": 0.0,
         "lncc_radius": 2,
         "in_loop_inv_steps": 10,
+        "inv_refresh_every": [1, 2, 4],
+        "polish_inv_steps": 30,
+        "polish_inv_tol": 0.02,
+        "compose_polish_tol": 0.3,
         "syn_metric": "cc2",
         "syn_regularizer": "sobolev",
         "kernel_type": "sobolev",
@@ -290,6 +294,10 @@ _SYN_CONFIG_TO_SYN_KWARG = {
     "total_sigma": "total_sigma",
     "lncc_radius": "syn_sampling",
     "in_loop_inv_steps": "in_loop_inv_steps",
+    "inv_refresh_every": "inv_refresh_every",
+    "polish_inv_steps": "polish_inv_steps",
+    "polish_inv_tol": "polish_inv_tol",
+    "compose_polish_tol": "compose_polish_tol",
     "syn_metric": "syn_metric",
     "syn_regularizer": "regularizer",
     "kernel_type": "kernel_type",

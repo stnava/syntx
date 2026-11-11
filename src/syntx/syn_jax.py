@@ -2439,28 +2439,29 @@ def regularize_warp_fields_jax(
         warp_l2r = separable_gaussian_filter_jax(warp_l2r, elastic_sigma)
         warp_r2l = separable_gaussian_filter_jax(warp_r2l, elastic_sigma)
             
-    in_loop_inv_steps = min(6, inverse_steps) if inverse_steps > 0 else 0
-    # ITK-style diffeomorphic projection: compute inverse fields
-    warp_l2r_inv = update_inverse_field_nd_jax(
-        warp_l2r, warp_l2r_inv, steps=in_loop_inv_steps, method=inverse_method,
-        spacing=spacing, origin=origin, direction=direction
-    )
-    
-    warp_r2l_inv = update_inverse_field_nd_jax(
-        warp_r2l, warp_r2l_inv, steps=in_loop_inv_steps, method=inverse_method,
-        spacing=spacing, origin=origin, direction=direction
-    )
-    
-    # Apply double-inversion symmetric projection
-    if project_inverse:
-        warp_l2r = update_inverse_field_nd_jax(
-            warp_l2r_inv, warp_l2r, steps=in_loop_inv_steps, method=inverse_method,
+    in_loop_inv_steps = int(inverse_steps) if inverse_steps > 0 else 0
+    if in_loop_inv_steps > 0:
+        # ITK-style diffeomorphic projection: compute inverse fields
+        warp_l2r_inv = update_inverse_field_nd_jax(
+            warp_l2r, warp_l2r_inv, steps=in_loop_inv_steps, method=inverse_method,
             spacing=spacing, origin=origin, direction=direction
         )
-        warp_r2l = update_inverse_field_nd_jax(
-            warp_r2l_inv, warp_r2l, steps=in_loop_inv_steps, method=inverse_method,
+        
+        warp_r2l_inv = update_inverse_field_nd_jax(
+            warp_r2l, warp_r2l_inv, steps=in_loop_inv_steps, method=inverse_method,
             spacing=spacing, origin=origin, direction=direction
         )
+        
+        # Apply double-inversion symmetric projection
+        if project_inverse:
+            warp_l2r = update_inverse_field_nd_jax(
+                warp_l2r_inv, warp_l2r, steps=in_loop_inv_steps, method=inverse_method,
+                spacing=spacing, origin=origin, direction=direction
+            )
+            warp_r2l = update_inverse_field_nd_jax(
+                warp_r2l_inv, warp_r2l, steps=in_loop_inv_steps, method=inverse_method,
+                spacing=spacing, origin=origin, direction=direction
+            )
     
     return warp_l2r, warp_r2l, warp_l2r_inv, warp_r2l_inv
 def syn_update_step_jax(
@@ -4026,22 +4027,38 @@ class SyNJAX:
                             grad_r_in = grad_r_raw
                             sig_in = self.fluid_sigma
 
-                        in_loop_inv_steps = min(6, self.inverse_steps) if self.inverse_steps > 0 else 0
+                        _raw_in_loop = getattr(self, 'in_loop_inv_steps', 6)
+                        if isinstance(_raw_in_loop, (list, tuple)):
+                            _lvl_inv_steps = int(_raw_in_loop[min(level_idx, len(_raw_in_loop) - 1)])
+                        else:
+                            _lvl_inv_steps = int(_raw_in_loop)
+                        in_loop_inv_steps = min(_lvl_inv_steps, self.inverse_steps) if self.inverse_steps > 0 else 0
+                        _raw_inv_every = kwargs.get('inv_refresh_every', (1, 2, 4))
+                        if isinstance(_raw_inv_every, (list, tuple)):
+                            curr_inv_every = max(1, int(_raw_inv_every[min(level_idx, len(_raw_inv_every) - 1)]))
+                        else:
+                            curr_inv_every = max(1, int(_raw_inv_every))
+                        do_project = self.project_inverse and (epoch % self.projection_frequency == 0)
+                        need_inv_refresh = (
+                            do_project
+                            or (self.elastic_sigma > 0.0)
+                            or ((epoch + 1) % curr_inv_every == 0)
+                            or (epoch == curr_syn_epochs - 1)
+                        )
+                        eff_inv_steps = in_loop_inv_steps if need_inv_refresh else 0
                         if optimizer_type == 'cfl':
                             # level_cfl_voxels: set at level start, halved by a divergence retry
-                            do_project = self.project_inverse and (epoch % self.projection_frequency == 0)
                             warp_l2r, warp_r2l, warp_l2r_inv, warp_r2l_inv = syn_update_step_jax(
                                 warp_l2r, warp_r2l, warp_l2r_inv, warp_r2l_inv,
                                 grad_l_in, grad_r_in, X_phys, b_mask,
                                 fixed_shape_t, fixed_spacing_t, fixed_origin_t, fixed_direction_t,
                                 True, curr_spacing_fixed, fixed_origin, fixed_direction, sig_in, self.elastic_sigma, level_cfl_voxels,
-                                in_loop_inv_steps, self.inverse_method, do_project, self.antisymmetric,
+                                eff_inv_steps, self.inverse_method, do_project, self.antisymmetric,
                                 use_analytical_gradients=use_analytical_gradients
                             )
 
 
                         elif optimizer_type == 'sgd':
-                            do_project = self.project_inverse and (epoch % self.projection_frequency == 0)
                             warp_l2r, warp_r2l, v_l2r, v_r2l = sgd_update_step_jax(
                                 warp_l2r, warp_r2l, v_l2r, v_r2l,
                                 grad_l_raw, grad_r_raw, b_mask,
@@ -4050,11 +4067,10 @@ class SyNJAX:
                             warp_l2r, warp_r2l, warp_l2r_inv, warp_r2l_inv = regularize_warp_fields_jax(
                                 warp_l2r, warp_r2l, warp_l2r_inv, warp_r2l_inv,
                                 b_mask, curr_spacing_fixed, fixed_origin, fixed_direction, self.elastic_sigma,
-                                in_loop_inv_steps, self.inverse_method, do_project
+                                eff_inv_steps, self.inverse_method, do_project
                             )
                         elif optimizer_type == 'adam':
                             adam_t += 1
-                            do_project = self.project_inverse and (epoch % self.projection_frequency == 0)
                             warp_l2r, warp_r2l, m_l2r, m_r2l, v_l2r, v_r2l = adam_update_step_jax(
                                 warp_l2r, warp_r2l, m_l2r, m_r2l, v_l2r, v_r2l, float(adam_t),
                                 grad_l_raw, grad_r_raw, b_mask,
@@ -4063,10 +4079,9 @@ class SyNJAX:
                             warp_l2r, warp_r2l, warp_l2r_inv, warp_r2l_inv = regularize_warp_fields_jax(
                                 warp_l2r, warp_r2l, warp_l2r_inv, warp_r2l_inv,
                                 b_mask, curr_spacing_fixed, fixed_origin, fixed_direction, self.elastic_sigma,
-                                in_loop_inv_steps, self.inverse_method, do_project
+                                eff_inv_steps, self.inverse_method, do_project
                             )
                         elif optimizer_type == 'rprop':
-                            do_project = self.project_inverse and (epoch % self.projection_frequency == 0)
                             warp_l2r, warp_r2l, step_l2r, step_r2l, prev_grad_l2r, prev_grad_r2l = rprop_update_step_jax(
                                 warp_l2r, warp_r2l, step_l2r, step_r2l, prev_grad_l2r, prev_grad_r2l,
                                 grad_l_raw, grad_r_raw, b_mask,
@@ -4075,7 +4090,7 @@ class SyNJAX:
                             warp_l2r, warp_r2l, warp_l2r_inv, warp_r2l_inv = regularize_warp_fields_jax(
                                 warp_l2r, warp_r2l, warp_l2r_inv, warp_r2l_inv,
                                 b_mask, curr_spacing_fixed, fixed_origin, fixed_direction, self.elastic_sigma,
-                                in_loop_inv_steps, self.inverse_method, do_project
+                                eff_inv_steps, self.inverse_method, do_project
                             )
                         
                     self.syn_losses.append(loss_val_sum)
@@ -4110,6 +4125,47 @@ class SyNJAX:
                         warp_l2r_inv = jnp.copy(warp_l2r_inv_checkpoint)
                         warp_r2l_inv = jnp.copy(warp_r2l_inv_checkpoint)
                         continue
+                if curr_syn_epochs > 0 and self.inverse_steps > 0:
+                    _polish_steps = int(kwargs.get('polish_inv_steps', 30))
+                    _raw_ie = kwargs.get('inv_refresh_every', (1, 2, 4))
+                    _lvl_ie = int(_raw_ie[min(level_idx, len(_raw_ie) - 1)]) if isinstance(_raw_ie, (list, tuple)) else int(_raw_ie)
+                    _raw_pproj = kwargs.get('polish_project_inverse', False)
+                    _lvl_pproj = bool(_raw_pproj[min(level_idx, len(_raw_pproj) - 1)]) if isinstance(_raw_pproj, (list, tuple)) else bool(_raw_pproj)
+                    if _polish_steps > 0 or _lvl_ie > 1 or _lvl_pproj:
+                        _p_steps = _polish_steps if _polish_steps > 0 else max(int(getattr(self, 'in_loop_inv_steps', 10)), 10)
+                        _raw_ptol = kwargs.get('polish_inv_tol', 0.02)
+                        _p_tol = float(_raw_ptol) if _raw_ptol is not None else 0.1
+                        warp_l2r_inv = update_inverse_field_nd_jax(
+                            warp_l2r, warp_l2r_inv, steps=_p_steps, method=self.inverse_method,
+                            max_error_threshold=_p_tol, mean_error_threshold=_p_tol * 0.01,
+                            spacing=curr_spacing_fixed, origin=fixed_origin, direction=fixed_direction
+                        )
+                        warp_r2l_inv = update_inverse_field_nd_jax(
+                            warp_r2l, warp_r2l_inv, steps=_p_steps, method=self.inverse_method,
+                            max_error_threshold=_p_tol, mean_error_threshold=_p_tol * 0.01,
+                            spacing=curr_spacing_fixed, origin=fixed_origin, direction=fixed_direction
+                        )
+                        if _lvl_pproj:
+                            warp_l2r = update_inverse_field_nd_jax(
+                                warp_l2r_inv, warp_l2r, steps=_p_steps, method=self.inverse_method,
+                                max_error_threshold=_p_tol, mean_error_threshold=_p_tol * 0.01,
+                                spacing=curr_spacing_fixed, origin=fixed_origin, direction=fixed_direction
+                            )
+                            warp_r2l = update_inverse_field_nd_jax(
+                                warp_r2l_inv, warp_r2l, steps=_p_steps, method=self.inverse_method,
+                                max_error_threshold=_p_tol, mean_error_threshold=_p_tol * 0.01,
+                                spacing=curr_spacing_fixed, origin=fixed_origin, direction=fixed_direction
+                            )
+                            warp_l2r_inv = update_inverse_field_nd_jax(
+                                warp_l2r, warp_l2r_inv, steps=_p_steps, method=self.inverse_method,
+                                max_error_threshold=_p_tol, mean_error_threshold=_p_tol * 0.01,
+                                spacing=curr_spacing_fixed, origin=fixed_origin, direction=fixed_direction
+                            )
+                            warp_r2l_inv = update_inverse_field_nd_jax(
+                                warp_r2l, warp_r2l_inv, steps=_p_steps, method=self.inverse_method,
+                                max_error_threshold=_p_tol, mean_error_threshold=_p_tol * 0.01,
+                                spacing=curr_spacing_fixed, origin=fixed_origin, direction=fixed_direction
+                            )
                 break
 
             # Clear XLA cache between levels to prevent memory growth
@@ -4119,23 +4175,44 @@ class SyNJAX:
         w_r2l = upscale_field_jax(warp_r2l, self.grid_shape)
         
         # Recompute midpoint inverses at full resolution for accurate composition
-        w_l2r_inv_interp = upscale_field_jax(warp_l2r_inv, self.grid_shape)
-        w_r2l_inv_interp = upscale_field_jax(warp_r2l_inv, self.grid_shape)
-        midpoint_inv_steps = self.inverse_steps  # Warm-started from in-loop inverse; fewer steps needed
-        w_l2r_inv = update_inverse_field_nd_jax(
-            w_l2r, w_l2r_inv_interp, steps=midpoint_inv_steps, method=self.inverse_method,
-            spacing=fixed_spacing, origin=fixed_origin, direction=fixed_direction
-        )
-        w_r2l_inv = update_inverse_field_nd_jax(
-            w_r2l, w_r2l_inv_interp, steps=midpoint_inv_steps, method=self.inverse_method,
-            spacing=fixed_spacing, origin=fixed_origin, direction=fixed_direction
-        )
+        w_l2r_inv = upscale_field_jax(warp_l2r_inv, self.grid_shape)
+        w_r2l_inv = upscale_field_jax(warp_r2l_inv, self.grid_shape)
+        midpoint_polish_tol = kwargs.get('midpoint_polish_tol', None)
+        compose_polish_tol = kwargs.get('compose_polish_tol', 0.30)
+        _default_lm_steps = int(self.inverse_steps) if self.inverse_steps is not None else 25
+        compose_polish_steps = int(kwargs.get('compose_polish_steps', max(_default_lm_steps, 25)))
+        _run_deformable_polish = (self.inverse_steps > 0 and sum(epochs_per_level) > 0)
+        if _run_deformable_polish and midpoint_polish_tol is not None and float(midpoint_polish_tol) > 0.0:
+            _mp_tol = float(midpoint_polish_tol)
+            w_l2r_inv = update_inverse_field_jax_hybrid_lm(
+                w_l2r, w_l2r_inv, steps=compose_polish_steps,
+                max_error_threshold=_mp_tol, mean_error_threshold=_mp_tol * 0.5,
+                spacing=fixed_spacing, origin=fixed_origin, direction=fixed_direction,
+                stationary_boundary=getattr(self, 'stationary_boundary', True)
+            )
+            w_r2l_inv = update_inverse_field_jax_hybrid_lm(
+                w_r2l, w_r2l_inv, steps=compose_polish_steps,
+                max_error_threshold=_mp_tol, mean_error_threshold=_mp_tol * 0.5,
+                spacing=fixed_spacing, origin=fixed_origin, direction=fixed_direction,
+                stationary_boundary=getattr(self, 'stationary_boundary', True)
+            )
+        elif self.inverse_steps > 0:
+            midpoint_inv_steps = self.inverse_steps  # Warm-started from in-loop inverse
+            w_l2r_inv = update_inverse_field_nd_jax(
+                w_l2r, w_l2r_inv, steps=midpoint_inv_steps, method=self.inverse_method,
+                spacing=fixed_spacing, origin=fixed_origin, direction=fixed_direction
+            )
+            w_r2l_inv = update_inverse_field_nd_jax(
+                w_r2l, w_r2l_inv, steps=midpoint_inv_steps, method=self.inverse_method,
+                spacing=fixed_spacing, origin=fixed_origin, direction=fixed_direction
+            )
         
         # Preserve uncomposed half-warp fields for midpoint image export.
         # w_l2r maps midpoint→fixed, w_r2l maps midpoint→(affine)moving.
         # These are destroyed by the full composition below.
         self.midpoint_warp_l2r = PhysicalWarpArray(np.array(w_l2r), is_physical=True)
         self.midpoint_warp_r2l = PhysicalWarpArray(np.array(w_r2l), is_physical=True)
+        self.midpoint_warp_l2r_inv = PhysicalWarpArray(np.array(w_l2r_inv), is_physical=True)
         
         X_phys = get_physical_grid_jax(self.grid_shape, fixed_spacing, fixed_origin, fixed_direction)
         phi_l2r_phys = X_phys + w_l2r_inv
@@ -4143,14 +4220,28 @@ class SyNJAX:
         w_r2l_cf = jnp.moveaxis(w_r2l, -1, 1)
         disp_r2l_sampled = jnp.moveaxis(jax_grid_sample(w_r2l_cf, coords_norm, padding_mode='border'), 1, -1)
         full_l2r_phys = phi_l2r_phys + disp_r2l_sampled
-        self.warp_l2r = PhysicalWarpArray(np.array(full_l2r_phys - X_phys), is_physical=True)
+        fwd_composed_jax = full_l2r_phys - X_phys
         
         phi_r2l_phys = X_phys + w_r2l_inv
         coords_norm_r = physical_to_normalized_jax(phi_r2l_phys, self.grid_shape, fixed_spacing, fixed_origin, fixed_direction)
         w_l2r_cf = jnp.moveaxis(w_l2r, -1, 1)
         disp_l2r_sampled = jnp.moveaxis(jax_grid_sample(w_l2r_cf, coords_norm_r, padding_mode='border'), 1, -1)
         full_r2l_phys = phi_r2l_phys + disp_l2r_sampled
-        self.warp_r2l = PhysicalWarpArray(np.array(full_r2l_phys - X_phys), is_physical=True)
+        algebraic_inv_jax = full_r2l_phys - X_phys
+        if getattr(self, 'stationary_boundary', True):
+            b_mask_full = get_boundary_mask_jax(self.grid_shape)
+            fwd_composed_jax = fwd_composed_jax * b_mask_full
+            algebraic_inv_jax = algebraic_inv_jax * b_mask_full
+        if _run_deformable_polish and compose_polish_tol is not None and float(compose_polish_tol) > 0.0:
+            _cp_tol = float(compose_polish_tol)
+            algebraic_inv_jax = update_inverse_field_jax_hybrid_lm(
+                fwd_composed_jax, algebraic_inv_jax, steps=compose_polish_steps,
+                max_error_threshold=_cp_tol, mean_error_threshold=min(_cp_tol * 0.5, 0.02),
+                spacing=fixed_spacing, origin=fixed_origin, direction=fixed_direction,
+                stationary_boundary=getattr(self, 'stationary_boundary', True)
+            )
+        self.warp_l2r = PhysicalWarpArray(np.array(fwd_composed_jax), is_physical=True)
+        self.warp_r2l = PhysicalWarpArray(np.array(algebraic_inv_jax), is_physical=True)
         self.warp_l2r_inv = PhysicalWarpArray(np.array(self.warp_r2l), is_physical=True)
         self.warp_r2l_inv = PhysicalWarpArray(np.array(self.warp_l2r), is_physical=True)
         

@@ -1601,7 +1601,7 @@ class SyNTo(nn.Module):
                     else:
                         _lvl_inv_steps = int(self.in_loop_inv_steps)
                     in_loop_inv_steps = _lvl_inv_steps if self.inverse_steps > 0 else 0
-                    _raw_inv_every = kwargs.get('inv_refresh_every', 1)
+                    _raw_inv_every = kwargs.get('inv_refresh_every', (1, 2, 4))
                     if isinstance(_raw_inv_every, (list, tuple)):
                         curr_inv_every = max(1, int(_raw_inv_every[min(level_idx, len(_raw_inv_every) - 1)]))
                     else:
@@ -2001,14 +2001,14 @@ class SyNTo(nn.Module):
                         warp_l2r_inv = best_warp_l2r_inv
                         warp_r2l_inv = best_warp_r2l_inv
 
-                _polish_steps = int(kwargs.get('polish_inv_steps', 0))
-                _raw_ie = kwargs.get('inv_refresh_every', 1)
+                _polish_steps = int(kwargs.get('polish_inv_steps', 30))
+                _raw_ie = kwargs.get('inv_refresh_every', (1, 2, 4))
                 _lvl_ie = int(_raw_ie[min(level_idx, len(_raw_ie) - 1)]) if isinstance(_raw_ie, (list, tuple)) else int(_raw_ie)
                 _raw_pproj = kwargs.get('polish_project_inverse', False)
                 _lvl_pproj = bool(_raw_pproj[min(level_idx, len(_raw_pproj) - 1)]) if isinstance(_raw_pproj, (list, tuple)) else bool(_raw_pproj)
-                if _polish_steps > 0 or _lvl_ie > 1 or _lvl_pproj:
+                if self.inverse_steps > 0 and (_polish_steps > 0 or _lvl_ie > 1 or _lvl_pproj):
                     _p_steps = _polish_steps if _polish_steps > 0 else max(int(in_loop_inv_steps), 10)
-                    _raw_ptol = kwargs.get('polish_inv_tol', None)
+                    _raw_ptol = kwargs.get('polish_inv_tol', 0.02)
                     _p_tol = float(_raw_ptol) if _raw_ptol is not None else (
                         min(float(self.inv_tolerance), 0.02 * min(curr_spacing_fixed))
                         if (_polish_steps > 0 or _lvl_pproj) else float(self.inv_tolerance)
@@ -2099,15 +2099,16 @@ class SyNTo(nn.Module):
             del warp_l2r_inv, warp_r2l_inv
 
             midpoint_polish_tol = kwargs.get('midpoint_polish_tol', None)
-            compose_polish_tol = kwargs.get('compose_polish_tol', None)
+            compose_polish_tol = kwargs.get('compose_polish_tol', 0.30)
             _default_lm_steps = int(self.inverse_steps) if self.inverse_steps is not None else 25
             compose_polish_steps = int(kwargs.get('compose_polish_steps', max(_default_lm_steps, 25)))
+            _run_deformable_polish = (self.inverse_steps > 0 and sum(epochs_per_level) > 0)
 
             X_phys = get_physical_grid_torch(
                 target_grid_shape, fixed_spacing, fixed_origin, fixed_direction, device=device, dtype=dtype
             )
 
-            if midpoint_polish_tol is not None and float(midpoint_polish_tol) > 0.0:
+            if _run_deformable_polish and midpoint_polish_tol is not None and float(midpoint_polish_tol) > 0.0:
                 if self.stationary_boundary:
                     _zero_boundary_inplace(w_l2r)
                     _zero_boundary_inplace(w_r2l)
@@ -2205,7 +2206,11 @@ class SyNTo(nn.Module):
                 _zero_boundary_inplace(fwd_composed)
                 _zero_boundary_inplace(algebraic_inv)
 
-            if compose_polish_tol is not None and float(compose_polish_tol) > 0.0:
+            if (
+                _run_deformable_polish
+                and compose_polish_tol is not None
+                and float(compose_polish_tol) > 0.0
+            ):
                 _cp_tol = float(compose_polish_tol)
                 algebraic_inv = update_inverse_field_nd_hybrid_lm(
                     fwd_composed,
@@ -2558,6 +2563,10 @@ def registration(
     inverse_method='anderson',
     inverse_steps=30,
     in_loop_inv_steps=10,
+    inv_refresh_every=(1, 2, 4),
+    polish_inv_steps=30,
+    polish_inv_tol=0.02,
+    compose_polish_tol=0.30,
     inv_tolerance=None,
     fast_smooth=None,
     antisymmetric=True,
@@ -2581,11 +2590,12 @@ def registration(
     side each carry half the deformation -- and composed at the end, so forward and inverse
     are equally accurate. Each iteration takes a step along the smoothed similarity gradient
     (``grad_step`` voxels at most, with ``optimizer='cfl'``) and composes it into the half
-    fields; the inverse of each half is refreshed every iteration. The initial affine comes
-    from ``syntx.robust_affine`` unless ``initial_transform`` is given. Defaults
-    (grad_step / flow_sigma / sobolev_alpha / in_loop_inv_steps) are the canonical
-    benchmark parameters, tuned on Mindboggle pairs 77 / 44 / 0
-    (docs/provenance/best_parameters.json, "syntx.syn/canonical_2026_09_29").
+    fields; each half inverse is warm-started on ``inv_refresh_every`` cadence, polished at
+    level transitions (``polish_inv_steps``, ``polish_inv_tol``), and refined after composition
+    with safeguarded multilinear Levenberg-Marquardt (``compose_polish_tol``). The initial
+    affine comes from ``syntx.robust_affine`` unless ``initial_transform`` is given. Defaults
+    are the canonical benchmark parameters on Mindboggle pairs 77 / 44 / 0
+    (docs/provenance/best_parameters.json, "syntx.syn/canonical_2026_11_11").
 
     Images
     ------
@@ -2680,8 +2690,18 @@ def registration(
         Solver for the inverse of each half field.
     inverse_steps : int, default 30
         Iterations of the final inverse solve.
-    in_loop_inv_steps : int, default 10
-        Iterations refreshing each half inverse after every update.
+    in_loop_inv_steps : int or sequence of int, default 10
+        Iterations refreshing each half inverse when an in-loop refresh runs.
+    inv_refresh_every : int or sequence of int, default (1, 2, 4)
+        Per-level iteration cadence for refreshing warm-started half-field inverses inside
+        the pyramid loop (always refreshed on the final epoch of each level).
+    polish_inv_steps : int, default 30
+        End-of-level half-field inverse polish iterations (0 disables).
+    polish_inv_tol : float or None, default 0.02
+        End-of-level half-field inverse max-error tolerance in voxels.
+    compose_polish_tol : float or None, default 0.30
+        Post-composition active-set Levenberg-Marquardt max-error tolerance in voxels on the
+        composed full-resolution inverse warp (0 or None disables).
     inv_tolerance : float or None
         Inverse-solver tolerance (mm). None: 0.1 x the smallest spacing.
     project_inverse : bool, default True
@@ -3154,8 +3174,12 @@ def registration(
         'grad_step', 'regularizer', 'sobolev_alpha', 'fast_smooth', 'verbose', 'optimizer',
         'optimizer_type', 'optimizer_lr', 'interpolator', 'initial_transform', 'fixed_spacing',
         'fixed_origin', 'fixed_direction', 'moving_spacing', 'moving_origin', 'moving_direction',
-        'smoothing_sigmas'
+        'smoothing_sigmas', 'inv_refresh_every', 'polish_inv_steps', 'polish_inv_tol',
+        'compose_polish_tol'
     )}
+    _eff_compose_polish_tol = (
+        0.0 if (midpoint_only and kwargs.get('outprefix', None) is None) else compose_polish_tol
+    )
     if backend == 'pytorch':
         initial_grid_tensor = torch.tensor(initial_grid, dtype=torch.float32, device=device) if initial_grid is not None else None
         model.fit(
@@ -3190,6 +3214,10 @@ def registration(
             init_M_phys=init_M_phys,
             init_t_phys=init_t_phys,
             interpolator=interpolator,
+            inv_refresh_every=inv_refresh_every,
+            polish_inv_steps=polish_inv_steps,
+            polish_inv_tol=polish_inv_tol,
+            compose_polish_tol=_eff_compose_polish_tol,
             seed=seed,
             **fit_kwargs
         )
@@ -3232,6 +3260,10 @@ def registration(
             init_M_phys=init_M_phys.cpu().numpy() if init_M_phys is not None else None,
             init_t_phys=init_t_phys.cpu().numpy() if init_t_phys is not None else None,
             interpolator=interpolator,
+            inv_refresh_every=inv_refresh_every,
+            polish_inv_steps=polish_inv_steps,
+            polish_inv_tol=polish_inv_tol,
+            compose_polish_tol=_eff_compose_polish_tol,
             **fit_kwargs
         )
     

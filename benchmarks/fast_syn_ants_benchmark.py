@@ -132,6 +132,8 @@ ARM_LABELS: Dict[str, str] = {
     "syn_bspline": "syntx.syn (bspline)",
     "syn_beltrami": "syntx.syn (beltrami)",
     "syn_poroelastic": "syntx.syn (poroelastic)",
+    "syngs_best": "syntx.syngs (sobolev α=0.70, reg_adam, LM polish)",
+    "tvf_best": "syntx.tvf (sobolev α=2.0, cfl, scheduled multipoint, LM polish)",
     "syntx_e2e_syn": "syntx.syn ('SyN' end-to-end: robust_affine + sobolev)",
     "ants_e2e_syn": "ants.registration ('SyN' end-to-end: Affine + SyN)",
 }
@@ -488,6 +490,50 @@ def _execute_single_registration(
                 verbose=False,
             )
             return res, "cpu/itk"
+        if arm == "syngs_best":
+            res = syntx.syngs(
+                fixed=fi,
+                moving=mi,
+                initial_transform=shared_affine_path,
+                backend="pytorch",
+                device=device,
+                regularizer="sobolev",
+                alpha=0.70,
+                optimizer="reg_adam",
+                optimizer_lr=1.15,
+                max_step_norm=0.30,
+                n_steps=8,
+                bootstrap_mode="none",
+                compose_polish_tol=0.30,
+                reg_iterations=reg_iters_list,
+                seed=pairs_seed,
+                verbose=False,
+            )
+            return res, device
+        if arm == "tvf_best":
+            mp_sched = [[0.5]] * max(0, len(reg_iters_list) - 1) + [[0.0, 0.5, 1.0]]
+            res = syntx.tvf(
+                fixed=fi,
+                moving=mi,
+                initial_transform=shared_affine_path,
+                backend="pytorch",
+                device=device,
+                regularizer="sobolev",
+                alpha=2.0,
+                optimizer="cfl",
+                grad_step=1.0,
+                cfl_momentum=0.9,
+                energy_weight=1e-3,
+                n_time_steps=3,
+                multipoint_loss=(0.0, 0.5, 1.0),
+                multipoint_schedule=mp_sched,
+                amp=(str(device) in ("mps", "cuda")),
+                compose_polish_tol=0.30,
+                reg_iterations=reg_iters_list,
+                affine_seed=pairs_seed,
+                verbose=False,
+            )
+            return res, device
         if arm.startswith("syn_"):
             reg_key = arm[len("syn_") :]
             if reg_key == "divcurl":
@@ -1852,6 +1898,11 @@ def build_parser() -> argparse.ArgumentParser:
         help="Opt-in: run repeated rep=1 fresh-process & same-process reproducibility checks (off by default).",
     )
     p.add_argument(
+        "--include-syngs-tvf",
+        action="store_true",
+        help="Opt-in: include syntx.syngs and syntx.tvf deformable arms alongside syntx.syn regularizers.",
+    )
+    p.add_argument(
         "--smoke",
         action="store_true",
         help=(
@@ -1953,6 +2004,8 @@ def main(argv: Optional[Sequence[str]] = None) -> Dict[str, Any]:
         script_path = os.path.abspath(__file__)
 
         syn_arms = [f"syn_{ ('divcurl' if r == 'div_curl' else r) }" for r in args.regularizers]
+        if args.include_syngs_tvf:
+            syn_arms.extend(["syngs_best", "tvf_best"])
 
         def _common_flags(pair_i: int, persist: bool = False, regional: bool = False) -> List[str]:
             fl = [

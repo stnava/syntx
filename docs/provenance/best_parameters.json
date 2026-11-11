@@ -778,6 +778,95 @@
                     }
                 }
             }
+        },
+        "canonical_2026_11_11": {
+            "selection": "adopted as syntx.syn default by the user (2026-11-11, Option A 'Best Overall Balance' from results/pilot_lncc_inv_2026-11-11/full): separable 1-D LNCC + warm-started inv_refresh_every=(1, 2, 4) + 30-step level polish (tol 0.02 vox) + safeguarded post-composition multilinear Levenberg-Marquardt polish (compose_polish_tol=0.30 vox). Regularizer-agnostic across all 6 regularizers, 40.4 s mean MPS runtime (vs 52.1 s R31 Sobolev baseline and 116.2 s matched ANTs C++), 0.6197 mean bidirectional cortical Dice (+2.14 pp vs ANTs), 0 Liouville folds across all 3 pairs, and phi_1 ICE interior max <= 0.30 mm (max <= 0.80 mm vs 4.92 mm unpolished).",
+            "pairs": [
+                77,
+                44,
+                0
+            ],
+            "parameters": {
+                "grad_step": 0.4,
+                "flow_sigma": 2.4,
+                "total_sigma": 0.0,
+                "fast_smooth": false,
+                "in_loop_inv_steps": 10,
+                "inv_refresh_every": [
+                    1,
+                    2,
+                    4
+                ],
+                "polish_inv_steps": 30,
+                "polish_inv_tol": 0.02,
+                "compose_polish_tol": 0.3,
+                "optimizer": "cfl",
+                "regularizer": "sobolev",
+                "sobolev_alpha": 2.25,
+                "reg_iterations": [
+                    100,
+                    100,
+                    20
+                ]
+            },
+            "mean_dice": 0.6196918556896804,
+            "mean_runtime_s": 40.3511660898636,
+            "per_pair": {
+                "77": {
+                    "dice_sym": 0.6136570703304314,
+                    "dice_fixed": 0.6102474770474514,
+                    "dice_moving": 0.6170666636134112,
+                    "folding_pct": 0.0,
+                    "jac_min": 0.01651647686958313,
+                    "jac_max": 43.28228759765625,
+                    "fd_folding_pct": 8.652742097234324e-05,
+                    "fd_jac_min": -0.06839323043823242,
+                    "inv_mean_mm": 0.011404549703001976,
+                    "inv_p95_mm": 0.06994663178920746,
+                    "inv_max_mm": 0.36708754301071167,
+                    "inv_interior_max_mm": 0.2992965281009674,
+                    "time_s": 39.88991945749149
+                },
+                "44": {
+                    "dice_sym": 0.6038953195840824,
+                    "dice_fixed": 0.6037651462833842,
+                    "dice_moving": 0.6040254928847807,
+                    "folding_pct": 0.0,
+                    "jac_min": 0.01585511490702629,
+                    "jac_max": 56.67206954956055,
+                    "fd_folding_pct": 0.0,
+                    "fd_jac_min": 0.011388259008526802,
+                    "inv_mean_mm": 0.009571938775479794,
+                    "inv_p95_mm": 0.0632946714758873,
+                    "inv_max_mm": 0.6472089290618896,
+                    "inv_interior_max_mm": 0.29822108149528503,
+                    "time_s": 43.581674416549504
+                },
+                "0": {
+                    "dice_sym": 0.6415231771545273,
+                    "dice_fixed": 0.6409489699014739,
+                    "dice_moving": 0.6420973844075808,
+                    "folding_pct": 0.0,
+                    "jac_min": 0.03885117173194885,
+                    "jac_max": 36.65430450439453,
+                    "fd_folding_pct": 0.0,
+                    "fd_jac_min": 0.011290987953543663,
+                    "inv_mean_mm": 0.010599789209663868,
+                    "inv_p95_mm": 0.066864974796772,
+                    "inv_max_mm": 0.7984910607337952,
+                    "inv_interior_max_mm": 0.2993777096271515,
+                    "time_s": 37.58150425041094
+                }
+            },
+            "previous_canonical_record": "syntx.syn/canonical_2026_09_29",
+            "ablation_dir": "results/pilot_lncc_inv_2026-11-11/full",
+            "provenance": {
+                "schema_version": 1,
+                "n_runs": 3,
+                "commit": "365e90a",
+                "syntx_version": "6.35.0",
+                "hardware": "Apple Silicon GPU (MPS)"
+            }
         }
     },
     "syntx.robust_affine": {

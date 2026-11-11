@@ -337,6 +337,31 @@ def _get_sobolev_filter_cached(spatial_shape, alpha_val, s, spacing, device, dty
     return K_fourier
 
 
+_SOBOLEV_ENERGY_CACHE = {}
+
+
+def _get_sobolev_energy_operator_cached(spatial_shape, alpha_val, s, spacing, device):
+    """Cached float32 Parseval operator L = (1 + alpha |k|^2)^s on the full ``fftn`` grid."""
+    sp_tuple = tuple(float(x) for x in spacing) if spacing is not None else None
+    cache_key = (tuple(spatial_shape), float(alpha_val), float(s), sp_tuple, str(device))
+    if cache_key in _SOBOLEV_ENERGY_CACHE:
+        return _SOBOLEV_ENERGY_CACHE[cache_key]
+
+    dim = len(spatial_shape)
+    spacing_zyx = tuple(reversed(sp_tuple)) if sp_tuple is not None else (1.0,) * dim
+    k_axes = [
+        torch.fft.fftfreq(n, device=device) * (2.0 * math.pi) / max(float(sp), 1e-4)
+        for n, sp in zip(spatial_shape, spacing_zyx)
+    ]
+    k_sq = sum(k ** 2 for k in torch.meshgrid(*k_axes, indexing="ij"))
+    L = ((1.0 + float(alpha_val) * k_sq) ** s).to(device=device, dtype=torch.float32)
+
+    if len(_SOBOLEV_ENERGY_CACHE) > 32:
+        _SOBOLEV_ENERGY_CACHE.clear()
+    _SOBOLEV_ENERGY_CACHE[cache_key] = L
+    return L
+
+
 def sobolev_energy(v, alpha, spacing=None, s=2.0):
     """Per-field V-norm energy <v, L v> / N of velocity fields ``v`` (B, *spatial, dim), where
     L = (1 + alpha |k|^2)^s is the inverse of the periodic Sobolev kernel K applied by
@@ -348,11 +373,7 @@ def sobolev_energy(v, alpha, spacing=None, s=2.0):
     """
     dim = v.ndim - 2
     spatial_shape = v.shape[1:-1]
-    spacing_zyx = tuple(reversed(spacing)) if spacing is not None else (1.0,) * dim
-    k_axes = [torch.fft.fftfreq(n, device=v.device) * (2.0 * math.pi) / max(float(sp), 1e-4)
-              for n, sp in zip(spatial_shape, spacing_zyx)]
-    k_sq = sum(k ** 2 for k in torch.meshgrid(*k_axes, indexing="ij"))
-    L = (1.0 + float(alpha) * k_sq) ** s
+    L = _get_sobolev_energy_operator_cached(spatial_shape, alpha, s, spacing, v.device)
     v_cf = torch.movedim(v, -1, 1).to(torch.float32)
     vf = torch.fft.fftn(v_cf, dim=tuple(range(2, 2 + dim)))
     n = float(math.prod(spatial_shape))

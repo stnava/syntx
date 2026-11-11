@@ -109,3 +109,73 @@ def test_problem_3_velocity_cfl_clamping():
     assert max_vel <= 0.5, f"Expected velocity magnitude to be clamped within CFL bound <= 0.5 mm, got max_vel={max_vel}"
 
 
+def test_tvf_initial_transform_false_and_compose_polish():
+    """initial_transform=False must opt out of alignment cleanly (no bool TypeError) and polish inv_disp."""
+    import ants
+    import syntx
+
+    rng = np.random.default_rng(17)
+    yy, xx = np.meshgrid(np.linspace(-1, 1, 32), np.linspace(-1, 1, 32), indexing="ij")
+    fi_np = np.exp(-3.0 * ((xx - 0.08) ** 2 + yy ** 2)).astype(np.float32) + 0.01 * rng.standard_normal((32, 32)).astype(np.float32)
+    mi_np = np.exp(-3.0 * ((xx + 0.08) ** 2 + yy ** 2)).astype(np.float32) + 0.01 * rng.standard_normal((32, 32)).astype(np.float32)
+    fi = ants.from_numpy(np.clip(fi_np, 0.0, 1.0), origin=(0.0, 0.0), spacing=(1.5, 1.5))
+    mi = ants.from_numpy(np.clip(mi_np, 0.0, 1.0), origin=(0.0, 0.0), spacing=(1.5, 1.5))
+
+    res = syntx.tvf(
+        fixed=fi,
+        moving=mi,
+        initial_transform=False,
+        reg_iterations=[6, 4],
+        levels=[2, 1],
+        compose_polish_tol=0.25,
+        device="cpu",
+        verbose=False,
+    )
+    assert len(res["fwdtransforms"]) == 2
+    ice = res["inverse_identity_errors"]["phi_1"]
+    assert float(ice["max_error"]) <= 0.40
+
+
+def test_syngs_mattes_zscore_and_compose_polish():
+    """SyNGS must handle syn_metric='mattes' on z-scored inputs and polish exported inv_disp."""
+    import ants
+    import syntx
+
+    yy, xx = np.meshgrid(np.linspace(-1, 1, 32), np.linspace(-1, 1, 32), indexing="ij")
+    fi = ants.from_numpy(np.exp(-3.0 * ((xx - 0.06) ** 2 + yy ** 2)).astype(np.float32), origin=(0.0, 0.0), spacing=(1.2, 1.5))
+    mi = ants.from_numpy(np.exp(-3.0 * ((xx + 0.06) ** 2 + yy ** 2)).astype(np.float32), origin=(0.0, 0.0), spacing=(1.2, 1.5))
+
+    res = syntx.syngs(
+        fixed=fi,
+        moving=mi,
+        initial_transform=False,
+        syn_metric="mattes",
+        reg_iterations=[4, 3],
+        levels=[2, 1],
+        compose_polish_tol=0.25,
+        device="cpu",
+        verbose=False,
+    )
+    ice = res["inverse_identity_errors"]["phi_1"]
+    assert np.isfinite(float(ice["max_error"]))
+    assert float(ice["max_error"]) <= 0.40
+
+
+def test_tvf_and_syngs_reject_nan_inputs():
+    """Both tvf and syngs must reject non-finite input images at entry."""
+    import ants
+    import syntx
+
+    arr_ok = np.ones((16, 16), dtype=np.float32)
+    arr_bad = arr_ok.copy()
+    arr_bad[4, 4] = np.nan
+    fi_ok = ants.from_numpy(arr_ok)
+    mi_bad = ants.from_numpy(arr_bad)
+
+    with pytest.raises(ValueError, match="finite|NaN|non-finite"):
+        syntx.tvf(fixed=fi_ok, moving=mi_bad, initial_transform=False, reg_iterations=[1], levels=[1], device="cpu")
+    with pytest.raises(ValueError, match="finite|NaN|non-finite"):
+        syntx.syngs(fixed=fi_ok, moving=mi_bad, initial_transform=False, reg_iterations=[1], levels=[1], device="cpu")
+
+
+
