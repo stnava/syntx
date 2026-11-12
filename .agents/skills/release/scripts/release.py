@@ -43,10 +43,10 @@ def main():
     new_version = increment_version(old_version)
     print(f"Bumping version from {old_version} to {new_version}")
 
-    # Update pyproject.toml
+    # Update pyproject.toml (anchor to start of line so [tool.ruff] target-version is untouched)
     update_file(
         "pyproject.toml",
-        r'(version\s*=\s*)"[^"]+"',
+        r'(?m)^(version\s*=\s*)"[^"]+"',
         rf'\g<1>"{new_version}"'
     )
 

@@ -57,7 +57,7 @@ addopts = ""
 
 [tool.ruff]
 line-length = 120
-target-version = "6.35.1"
+target-version = "py310"
 
 [tool.ruff.lint]
 select = ["E", "F", "W", "B", "I"]
