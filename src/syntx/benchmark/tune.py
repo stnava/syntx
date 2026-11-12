@@ -278,19 +278,19 @@ METHODS: Dict[str, MethodSpec] = {
                     # the effective 3-D default (SYNGS_DEFAULT_ALPHA[3]): benchmarks are 3-D
                     "alpha": lambda: __import__("importlib").import_module("syntx.syngs").default_alpha(3)}),
         space=[
-            Param("max_step_norm", lo=0.05, hi=0.6),
-            Param("alpha", lo=0.05, hi=3.0, requires={"regularizer": ("sobolev", "dsti", "dsti1", "solenoidal", "navier", "div_curl", "beltrami", "hyperelastic", "poroelastic")}),
+            Param("max_step_norm", lo=0.05, hi=1.2),
+            Param("alpha", lo=0.02, hi=3.0, requires={"regularizer": ("sobolev", "dsti", "dsti1", "solenoidal", "navier", "div_curl", "beltrami", "hyperelastic", "poroelastic")}),
             # flow_sigma is not searched: syngs accepts it only with regularizer='gaussian' (the
             # spectral regularisers searched here use alpha); fast_smooth does not exist.
-            Param("optimizer_lr", lo=0.2, hi=3.0),
+            Param("optimizer_lr", lo=0.2, hi=3.5),
             Param("n_steps", kind="int", values=(6, 8, 10, 12)),
-            Param("regularizer", kind="categorical", values=("sobolev", "dsti1", "solenoidal", "navier", "div_curl", "beltrami", "hyperelastic", "poroelastic")),
+            Param("regularizer", kind="categorical", values=("sobolev", "dsti1", "solenoidal", "navier", "div_curl", "beltrami", "hyperelastic")),
             Param("poisson_ratio", lo=0.10, hi=0.499, requires={"regularizer": ("navier", "stokes", "elastic")}),
             Param("beta", values=(1.0, 2.5, 5.0, 10.0, 20.0), requires={"regularizer": ("div_curl", "helmholtz")}),
             Param("gamma", values=(0.5, 1.0, 2.0), requires={"regularizer": ("div_curl", "helmholtz")}),
             Param("bulk_modulus", values=(2.0, 5.0, 10.0, 20.0, 50.0), requires={"regularizer": ("hyperelastic", "simo_pister")}),
-            Param("darcy_permeability", values=(0.05, 0.1, 0.2, 0.4), requires={"regularizer": ("poroelastic", "biot")}),
             Param("dilatation_weight", values=(0.1, 0.25, 0.5), requires={"regularizer": ("beltrami", "quasiconformal")}),
+            Param("s", kind="categorical", values=(1.0, 2.0), requires={"regularizer": ("navier", "stokes", "elastic", "beltrami", "hyperelastic")}),
             Param("h3_envelope", kind="categorical", values=(True, False), requires={"regularizer": ("div_curl", "hyperelastic")}),
             Param("bootstrap_mode", kind="categorical", values=("antithetic", "none")),
         ],
@@ -339,20 +339,19 @@ METHODS: Dict[str, MethodSpec] = {
             hidden={"regularizer": "sobolev", "fast_smooth": False,
                     "reg_iterations": [100, 100, 20]}),
         space=[
-            Param("grad_step", lo=0.05, hi=0.75),
-            Param("flow_sigma", lo=1.0, hi=8.0),
+            Param("grad_step", lo=0.05, hi=1.25),
+            Param("flow_sigma", lo=1.0, hi=8.0, requires={"regularizer": ("gaussian",)}),
             Param("sobolev_alpha", lo=0.5, hi=4.0,
-                  requires={"regularizer": ("sobolev", "dsti", "dsti1", "solenoidal", "navier", "div_curl", "beltrami", "hyperelastic", "poroelastic")}),
-            Param("regularizer", kind="categorical", values=("sobolev", "dsti1", "gaussian", "solenoidal", "navier", "div_curl", "beltrami", "hyperelastic", "poroelastic")),
+                  requires={"regularizer": ("sobolev", "dsti", "dsti1", "solenoidal", "navier", "div_curl", "beltrami", "hyperelastic")}),
+            Param("regularizer", kind="categorical", values=("sobolev", "dsti1", "gaussian", "solenoidal", "navier", "div_curl", "beltrami", "hyperelastic")),
             Param("poisson_ratio", lo=0.10, hi=0.499, requires={"regularizer": ("navier", "stokes", "elastic")}),
             Param("beta", values=(1.0, 2.5, 5.0, 10.0, 20.0), requires={"regularizer": ("div_curl", "helmholtz")}),
             Param("gamma", values=(0.5, 1.0, 2.0), requires={"regularizer": ("div_curl", "helmholtz")}),
             Param("bulk_modulus", values=(2.0, 5.0, 10.0, 20.0, 50.0), requires={"regularizer": ("hyperelastic", "simo_pister")}),
-            Param("darcy_permeability", values=(0.05, 0.1, 0.2, 0.4), requires={"regularizer": ("poroelastic", "biot")}),
             Param("dilatation_weight", values=(0.1, 0.25, 0.5), requires={"regularizer": ("beltrami", "quasiconformal")}),
             Param("h3_envelope", kind="categorical", values=(True, False), requires={"regularizer": ("div_curl", "hyperelastic")}),
-            Param("s", kind="categorical", values=(1.0, 2.0), requires={"regularizer": ("navier", "stokes", "elastic", "beltrami", "hyperelastic", "poroelastic")}),
-            Param("fast_smooth", kind="categorical", values=(False, True)),
+            Param("s", kind="categorical", values=(1.0, 2.0), requires={"regularizer": ("navier", "stokes", "elastic", "beltrami", "hyperelastic")}),
+            Param("fast_smooth", kind="categorical", values=(False, True), requires={"regularizer": ("gaussian",)}),
             Param("optimizer", kind="categorical", values=("cfl", "reg_adam")),
         ],
     ),
@@ -1432,17 +1431,21 @@ class Tuner:
 
         gainers = [r for r in ranked if not r["feasible"] and r["gain"] > best_gain + self.margin
                    and delta(r)][: self.top_k]
-        clean = sorted((r for r in ranked if topology_clean(r) and delta(r)),
-                       key=lambda r: r["gain"], reverse=True)[: self.top_k]
+        gainer_keys = {_key(r["overrides"]) for r in gainers}
+        clean = sorted((r for r in ranked if topology_clean(r) and delta(r)
+                        and _key(r["overrides"]) not in gainer_keys),
+                       key=lambda r: r["gain"], reverse=True)[: max(self.top_k * 3, 9)]
         out = []
         for g in gainers:
             for cl in clean:
                 dg, dc = delta(g), delta(cl)
-                if set(dg) & set(dc):
+                if any(dg[k] != dc[k] for k in set(dg) & set(dc)):
                     continue
                 ov = dict(best)
                 ov.update(dg)
                 ov.update(dc)
+                if ov == g["overrides"] or ov == cl["overrides"]:
+                    continue
                 full = self._full(ov)
                 if not all(q.active(full) or q.name not in ov for q in self.space):
                     continue

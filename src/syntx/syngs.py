@@ -325,6 +325,17 @@ class GeodesicShootingModel(nn.Module):
         if self.regularizer in _SYNGS_CONTINUUM_REGS:
             from .core.regularizers import get_regularizer
             spacing_itk = tuple(reversed(spacing_zyx))
+            bmask_cache = getattr(self, '_continuum_bmask_cache', None)
+            if bmask_cache is None:
+                bmask_cache = {}
+                self._continuum_bmask_cache = bmask_cache
+            bkey = (tuple(int(s) for s in shape), str(device), str(dtype))
+            bmask = bmask_cache.get(bkey)
+            if bmask is None:
+                bmask = self._create_boundary_mask(shape, device, dtype, border_width=4)
+                if len(bmask_cache) > 32:
+                    bmask_cache.clear()
+                bmask_cache[bkey] = bmask
             reg_fn = get_regularizer(
                 self.regularizer,
                 alpha=self.alpha,
@@ -332,7 +343,7 @@ class GeodesicShootingModel(nn.Module):
                 spacing=spacing_itk,
                 **getattr(self, 'extra_reg_kwargs', {}),
             )
-            return reg_fn(m)
+            return reg_fn(m * bmask) * bmask
 
         # Standard Sobolev with boundary cosine tapering (cached per shape/spacing/alpha/device/dtype)
         cache_dict = getattr(self, '_green_cache', None)
@@ -797,10 +808,26 @@ class GeodesicShootingModel(nn.Module):
             max_step = float(kwargs.get('max_step_norm', cfl_step))
 
             if opt_name in ('reg_adam', 'regadam', 'sobolev_adam', 'sobolevadam'):
+                cont_reg_fn = None
+                if self.regularizer in _SYNGS_CONTINUUM_REGS:
+                    from .core.regularizers import get_regularizer
+                    _lvl_shape = tuple(int(s) for s in self.velocity_0_fwd.shape[1:-1])
+                    _bmask_lvl = self._create_boundary_mask(
+                        _lvl_shape, self.velocity_0_fwd.device, self.velocity_0_fwd.dtype, border_width=4
+                    )
+                    _raw_cont_fn = get_regularizer(
+                        self.regularizer,
+                        alpha=self.alpha,
+                        fluid_sigma=self.fluid_sigma or 3.0,
+                        spacing=spacing_rel_f,
+                        **getattr(self, 'extra_reg_kwargs', {}),
+                    )
+                    cont_reg_fn = lambda d, _fn=_raw_cont_fn, _bm=_bmask_lvl: _fn(d * _bm) * _bm
                 optimizer = RegAdam(
                     active_params,
                     lr=level_lr,
                     regularizer=self.regularizer,
+                    regularizer_fn=cont_reg_fn,
                     sobolev_alpha=self.alpha,
                     dsti_alpha=self.alpha,
                     gaussian_sigma=self.fluid_sigma,
