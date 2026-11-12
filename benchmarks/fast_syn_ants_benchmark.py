@@ -132,8 +132,8 @@ ARM_LABELS: Dict[str, str] = {
     "syn_bspline": "syntx.syn (bspline)",
     "syn_beltrami": "syntx.syn (beltrami)",
     "syn_poroelastic": "syntx.syn (poroelastic)",
-    "syngs_best": "syntx.syngs (sobolev α=0.70, reg_adam, LM polish)",
-    "tvf_best": "syntx.tvf (sobolev α=2.0, cfl, scheduled multipoint, LM polish)",
+    "syngs_best": "syntx.syngs (sobolev α=0.448 — canonical)",
+    "tvf_best": "syntx.tvf (beltrami α=2.5 — canonical)",
     "syntx_e2e_syn": "syntx.syn ('SyN' end-to-end: robust_affine + sobolev)",
     "ants_e2e_syn": "ants.registration ('SyN' end-to-end: Affine + SyN)",
 }
@@ -497,13 +497,6 @@ def _execute_single_registration(
                 initial_transform=shared_affine_path,
                 backend="pytorch",
                 device=device,
-                regularizer="sobolev",
-                alpha=0.70,
-                optimizer="reg_adam",
-                optimizer_lr=1.15,
-                max_step_norm=0.30,
-                n_steps=8,
-                bootstrap_mode="none",
                 compose_polish_tol=0.30,
                 reg_iterations=reg_iters_list,
                 seed=pairs_seed,
@@ -511,23 +504,12 @@ def _execute_single_registration(
             )
             return res, device
         if arm == "tvf_best":
-            mp_sched = [[0.5]] * max(0, len(reg_iters_list) - 1) + [[0.0, 0.5, 1.0]]
             res = syntx.tvf(
                 fixed=fi,
                 moving=mi,
                 initial_transform=shared_affine_path,
                 backend="pytorch",
                 device=device,
-                regularizer="sobolev",
-                alpha=2.0,
-                optimizer="cfl",
-                grad_step=1.0,
-                cfl_momentum=0.9,
-                energy_weight=1e-3,
-                n_time_steps=3,
-                multipoint_loss=(0.0, 0.5, 1.0),
-                multipoint_schedule=mp_sched,
-                amp=(str(device) in ("mps", "cuda")),
                 compose_polish_tol=0.30,
                 reg_iterations=reg_iters_list,
                 affine_seed=pairs_seed,

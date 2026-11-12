@@ -61,7 +61,7 @@ from .core.utils import check_loss_collapse, require_finite_images
 # Default spectral (Sobolev) strength per dimension. 3-D: the benchmark configuration (3-D
 # sweep 2026-09-19); 2-D: the calibrated legacy value. Shared by syngs_registration(), the model
 # and integrate_momentum() so a saved momentum field reconstructs exactly.
-SYNGS_DEFAULT_ALPHA = {2: 0.060, 3: 0.675}
+SYNGS_DEFAULT_ALPHA = {2: 0.060, 3: 0.448}
 
 _SYNGS_CONTINUUM_REGS = frozenset({
     'solenoidal', 'leray', 'incompressible', 'solenoidal_sobolev',
@@ -935,14 +935,14 @@ def syngs_registration(
     grad_step=0.25,
     flow_sigma=None,
     alpha=None,
-    max_step_norm=0.3,
+    max_step_norm=0.6,
     n_steps=8,
     verbose=False,
     backend='pytorch',
     levels=None,
     optimizer='reg_adam',
-    optimizer_lr=1.0,
-    bootstrap_mode='antithetic',
+    optimizer_lr=2.246094,
+    bootstrap_mode='none',
     seed=42,
     convergence_slope=DEFAULT_SLOPE_THRESHOLD,
     **kwargs
@@ -958,9 +958,9 @@ def syngs_registration(
     The deformation is the flow of a smoothed initial velocity field v0 (stationary in the
     default 'transport' mode: ``n_steps`` Euler steps of exp(v0)); a second field gives the
     inverse. See the module docstring. The initial affine comes from ``syntx.robust_affine``
-    unless ``initial_transform`` is given. 3-D defaults (``max_step_norm`` 0.3, ``alpha``
-    0.675) were tuned on Mindboggle pairs 77 / 44 / 0
-    (docs/provenance/tuning/syngs_2026-09-30.md).
+    unless ``initial_transform`` is given. 3-D defaults (``alpha`` 0.448, ``max_step_norm``
+    0.6, ``optimizer_lr`` 2.246094, ``bootstrap_mode`` 'none') were tuned on Mindboggle
+    pairs 77 / 44 / 0 (docs/provenance/tuning/syngs_2026-11-11.md).
 
     Parameters
     ----------
@@ -984,7 +984,7 @@ def syngs_registration(
         [4, 2, 1] (3-D) / [8, 4, 2, 1] (2-D).
     alpha : float or None, default None
         Spectral strength (larger = smoother; 0 = no smoothing). None:
-        ``SYNGS_DEFAULT_ALPHA[dim]`` (3-D 0.675, 2-D 0.06). Spectral regularisers only
+        ``SYNGS_DEFAULT_ALPHA[dim]`` (3-D 0.448, 2-D 0.06). Spectral regularisers only
         (raises with 'gaussian' / 'bspline'); no aliases: ``sobolev_alpha`` / ``dsti_alpha`` raise TypeError.
         ``integrate_momentum`` uses the same default.
     flow_sigma : float or None, default None
@@ -995,14 +995,14 @@ def syngs_registration(
     optimizer : str, default 'reg_adam'
         'reg_adam' (Adam with the regulariser applied to each step), 'adam', 'adamw', 'sgd';
         other values use LARS.
-    optimizer_lr : float or None, default 1.0
+    optimizer_lr : float or None, default 2.246094
         Learning rate (None: 0.6).
-    max_step_norm : float or None, default 0.3
+    max_step_norm : float or None, default 0.6
         Largest per-iteration update (voxels). None: ``grad_step``.
     grad_step : float, default 0.25
         Used only as ``max_step_norm`` when that is None.
-    bootstrap_mode : {'antithetic', 'none'}, default 'antithetic'
-        Also evaluate the loss on a randomly jittered grid and its mirror image.
+    bootstrap_mode : {'antithetic', 'none'}, default 'none'
+        Also evaluate the loss on a randomly jittered grid and its mirror image when 'antithetic'.
     seed : int, default 42
     backend : {'pytorch', 'jax'}, default 'pytorch'
     verbose : bool, default False

@@ -69,32 +69,36 @@ DEFAULT_BENCHMARK_CONFIG: Dict[str, Any] = {
         "syn_formulation": "eulerian",
         "reg_iterations": [100, 100, 20],
     },
-    # Must equal syntx.tvf()'s defaults (tests/test_tvf_interface.py).
+    # Canonical: docs/provenance/best_parameters.json "syntx.tvf/canonical_2026_11_12"
+    # (docs/provenance/tuning/tvf_2026-11-11.md). Must equal syntx.tvf()'s defaults
+    # (tests/test_tvf_interface.py & tests/test_canonical_parameters.py).
     "tvf_config": {
-        "regularizer": "sobolev",
-        "alpha": 2.0,             # provisional (2-D study 2026-09-30); 3-D to be tuned
+        "regularizer": "beltrami",
+        "alpha": 2.5,
         "optimizer": "cfl",
-        "grad_step": 1.0,
+        "grad_step": 1.25,
         "cfl_momentum": 0.9,
-        "energy_weight": 0.001,
+        "energy_weight": 0.0008,
         "n_time_steps": 3,
-        "multipoint_loss": [0.0, 0.5, 1.0],
+        "multipoint_loss": [0.0, 1.0],
         "fast_smooth": False,
         "syn_metric": "cc2",
         "syn_sampling": 2,
         "reg_iterations": [100, 100, 20],
     },
-    # Must equal syntx.syngs()'s defaults (tests/test_canonical_parameters.py).
+    # Canonical: docs/provenance/best_parameters.json "syntx.syngs/canonical_2026_11_12"
+    # (docs/provenance/tuning/syngs_2026-11-11.md). Must equal syntx.syngs()'s defaults
+    # (tests/test_canonical_parameters.py).
     "syngs_config": {
         "grad_step": 0.25,
-        "alpha": 0.675,          # tuned 2026-09-30 (docs/provenance/tuning/syngs_2026-09-30.md)
+        "alpha": 0.448,
         "regularizer": "sobolev",
         "optimizer": "reg_adam",
-        "optimizer_lr": 1.0,
-        "max_step_norm": 0.3,    # tuned 2026-09-30: +0.0159 mean Dice, 0 % folding on 77/44/0
+        "optimizer_lr": 2.246094,
+        "max_step_norm": 0.6,
         "syn_metric": "cc2",
         "n_steps": 8,
-        "bootstrap_mode": "antithetic",
+        "bootstrap_mode": "none",
         "reg_iterations": [100, 100, 20],
     },
     # Must equal syntx.greedy()'s defaults (tests/test_canonical_parameters.py).

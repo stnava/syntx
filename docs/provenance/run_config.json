@@ -41,14 +41,14 @@
         "reg_iterations": [100, 100, 20]
     },
     "tvf_config": {
-        "regularizer": "sobolev",
-        "alpha": 2.0,
+        "regularizer": "beltrami",
+        "alpha": 2.5,
         "optimizer": "cfl",
-        "grad_step": 1.0,
+        "grad_step": 1.25,
         "cfl_momentum": 0.9,
-        "energy_weight": 0.001,
+        "energy_weight": 0.0008,
         "n_time_steps": 3,
-        "multipoint_loss": [0.0, 0.5, 1.0],
+        "multipoint_loss": [0.0, 1.0],
         "fast_smooth": false,
         "syn_metric": "cc2",
         "syn_sampling": 2,
@@ -56,13 +56,14 @@
     },
     "syngs_config": {
         "grad_step": 0.25,
-        "alpha": 0.675,
+        "alpha": 0.448,
         "regularizer": "sobolev",
         "optimizer": "reg_adam",
-        "optimizer_lr": 1.0,
-        "max_step_norm": 0.3,
+        "optimizer_lr": 2.246094,
+        "max_step_norm": 0.6,
         "syn_metric": "cc2",
         "n_steps": 8,
+        "bootstrap_mode": "none",
         "reg_iterations": [100, 100, 20]
     },
     "greedy_config": {

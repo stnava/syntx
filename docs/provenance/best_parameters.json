@@ -1091,6 +1091,264 @@
                 "min_det_j": 0.0412,
                 "runtime_seconds": 133.3
             }
+        },
+        "canonical_2026_11_12": {
+            "selection": "codified tuning winner (syntx.benchmark.codify)",
+            "pairs": [
+                77,
+                44,
+                0
+            ],
+            "parameters": {
+                "regularizer": "beltrami",
+                "n_time_steps": 3,
+                "multipoint_loss": [
+                    0.0,
+                    1.0
+                ],
+                "cfl_max": 0.0,
+                "syn_sampling": 2,
+                "reg_iterations": [
+                    100,
+                    100,
+                    20
+                ],
+                "optimizer": "cfl",
+                "grad_step": 1.25,
+                "cfl_momentum": 0.9,
+                "energy_weight": 0.0008,
+                "total_alpha": 0.0,
+                "constant_speed": true,
+                "alpha": 2.5
+            },
+            "previous_defaults": {
+                "regularizer": "sobolev",
+                "n_time_steps": 3,
+                "multipoint_loss": [
+                    0.0,
+                    0.5,
+                    1.0
+                ],
+                "cfl_max": 0.0,
+                "syn_sampling": 2,
+                "reg_iterations": [
+                    100,
+                    100,
+                    20
+                ],
+                "optimizer": "cfl",
+                "grad_step": 1.0,
+                "cfl_momentum": 0.9,
+                "energy_weight": 0.001,
+                "total_alpha": 0.0,
+                "constant_speed": true,
+                "alpha": 2.0
+            },
+            "mean_dice_gain_vs_previous_defaults": 0.026847676906387268,
+            "per_pair": {
+                "77": {
+                    "dice_sym": 0.6162873065638066,
+                    "dice_fixed": 0.6122352660422313,
+                    "dice_moving": 0.6203393470853819,
+                    "folding_pct": 0.0,
+                    "jac_min": 0.009445290081202984,
+                    "jac_max": 45.124542236328125,
+                    "inv_mean_mm": 0.000949238776229322,
+                    "inv_p95_mm": 0.0035952888429164886,
+                    "inv_max_mm": 2.4556429386138916,
+                    "inv_interior_mean_mm": 0.0009774027857929468,
+                    "inv_interior_max_mm": 0.5041577219963074,
+                    "time_s": 168.67758905887604,
+                    "fd_folding_pct": 0.14640439628520477,
+                    "fd_jac_min": -11.31541633605957
+                },
+                "44": {
+                    "dice_sym": 0.6293695773953494,
+                    "dice_fixed": 0.632831878523562,
+                    "dice_moving": 0.6259072762671366,
+                    "folding_pct": 0.0,
+                    "jac_min": 0.026606189087033272,
+                    "jac_max": 35.195701599121094,
+                    "inv_mean_mm": 0.0008347721304744482,
+                    "inv_p95_mm": 0.003191189607605338,
+                    "inv_max_mm": 2.013775110244751,
+                    "inv_interior_mean_mm": 0.0011763372458517551,
+                    "inv_interior_max_mm": 0.9717273116111755,
+                    "time_s": 207.6642965078354,
+                    "fd_folding_pct": 0.1930817755389699,
+                    "fd_jac_min": -32.926239013671875
+                },
+                "0": {
+                    "dice_sym": 0.6580690821681422,
+                    "dice_fixed": 0.6612327694993411,
+                    "dice_moving": 0.6549053948369433,
+                    "folding_pct": 0.0,
+                    "jac_min": 0.028453346341848373,
+                    "jac_max": 23.16744041442871,
+                    "inv_mean_mm": 0.0008949965122155845,
+                    "inv_p95_mm": 0.0035518743097782135,
+                    "inv_max_mm": 2.448594808578491,
+                    "inv_interior_mean_mm": 0.0009644246893003583,
+                    "inv_interior_max_mm": 0.41380923986434937,
+                    "time_s": 157.75700783729553,
+                    "fd_folding_pct": 0.14801372490903703,
+                    "fd_jac_min": -11.348470687866211
+                }
+            },
+            "baseline_per_pair": {
+                "77": {
+                    "dice_sym": 0.5839717656086125,
+                    "dice_fixed": 0.5807444592146246,
+                    "dice_moving": 0.5871990720026004,
+                    "folding_pct": 0.0,
+                    "jac_min": 0.01878569833934307,
+                    "jac_max": 52.988338470458984,
+                    "inv_mean_mm": 0.0007953865570016205,
+                    "inv_p95_mm": 0.002988220890983939,
+                    "inv_max_mm": 2.596144914627075,
+                    "inv_interior_mean_mm": 0.0010144306579604745,
+                    "inv_interior_max_mm": 0.7216782569885254,
+                    "time_s": 240.61594474315643,
+                    "fd_folding_pct": 0.20498346028348116,
+                    "fd_jac_min": -21.257232666015625
+                },
+                "44": {
+                    "dice_sym": 0.5998777943038716,
+                    "dice_fixed": 0.6034917561133111,
+                    "dice_moving": 0.596263832494432,
+                    "folding_pct": 0.0,
+                    "jac_min": 0.026566077023744583,
+                    "jac_max": 38.665897369384766,
+                    "inv_mean_mm": 0.0006616660393774509,
+                    "inv_p95_mm": 0.002291965065523982,
+                    "inv_max_mm": 2.5193560123443604,
+                    "inv_interior_mean_mm": 0.0012772491900250316,
+                    "inv_interior_max_mm": 1.4177170991897583,
+                    "time_s": 285.8384062051773,
+                    "fd_folding_pct": 0.27118330753055897,
+                    "fd_jac_min": -10.416572570800781
+                },
+                "0": {
+                    "dice_sym": 0.6393333754956523,
+                    "dice_fixed": 0.6403924389967887,
+                    "dice_moving": 0.6382743119945159,
+                    "folding_pct": 0.0,
+                    "jac_min": 0.03731658309698105,
+                    "jac_max": 30.536142349243164,
+                    "inv_mean_mm": 0.0006920589949004352,
+                    "inv_p95_mm": 0.0027417349629104137,
+                    "inv_max_mm": 2.6129496097564697,
+                    "inv_interior_mean_mm": 0.0010729733621701598,
+                    "inv_interior_max_mm": 0.992555558681488,
+                    "time_s": 230.43601083755493,
+                    "fd_folding_pct": 0.17383430099881989,
+                    "fd_jac_min": -11.097411155700684
+                }
+            },
+            "criteria": {
+                "folding_abs": 0.0005,
+                "folding_rel": 1.0,
+                "inv_interior_abs": 1.0,
+                "inv_interior_rel": 1.1,
+                "positive_jac_if_baseline": true,
+                "inverse_cap_only_if_baseline_fold_free": true,
+                "max_pair_drop": 0.001,
+                "jac_min_rel": null,
+                "min_gain": 0.0005,
+                "noise_k": 3.0
+            },
+            "margin": 0.0005,
+            "provenance": {
+                "schema_version": 1,
+                "n_runs": 3,
+                "commit": "0fe451a2e10080b51db58daf480dfbe94ff0f5f7",
+                "commits": [
+                    "0fe451a2e10080b51db58daf480dfbe94ff0f5f7"
+                ],
+                "registration_code": null,
+                "describe": "v6.35.0-1-g0fe451a",
+                "dirty": false,
+                "diff_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+                "syntx_version": "6.35.0",
+                "script_sha256": [
+                    "64c19955bb2c592082fcc7a64ac1344684d62032cacfb95d134f240935af49ea"
+                ],
+                "hosts": [
+                    "barncreek.radio.virginia.edu"
+                ],
+                "packages": {
+                    "torch": "2.13.0",
+                    "antspyx": "0.6.4",
+                    "numpy": "2.3.5",
+                    "scipy": "1.18.1",
+                    "jax": "0.10.2",
+                    "antstorch": "0.2.0"
+                },
+                "parameters": {
+                    "function": "syntx.tvf",
+                    "explicit": {
+                        "backend": "pytorch",
+                        "device": "mps",
+                        "verbose": false,
+                        "grad_step": 1.25,
+                        "multipoint_loss": [
+                            0.0,
+                            1.0
+                        ],
+                        "regularizer": "beltrami",
+                        "energy_weight": 0.0008,
+                        "alpha": 2.5
+                    },
+                    "fit_kwargs": {
+                        "levels": [
+                            4,
+                            2,
+                            1
+                        ],
+                        "epochs_per_level": [
+                            100,
+                            100,
+                            20
+                        ],
+                        "similarity_metric": "cc2",
+                        "lr": 1.0,
+                        "energy_weight": 0.0008,
+                        "temporal_weight": 0.0,
+                        "verbose": false,
+                        "lncc_radius": 2,
+                        "regularizer": "beltrami",
+                        "alpha": 2.5,
+                        "total_alpha": 0.0,
+                        "optimizer_type": "cfl",
+                        "cfl_momentum": 0.9,
+                        "max_step_norm": null,
+                        "multipoint_loss": [
+                            0.0,
+                            1.0
+                        ],
+                        "fast_smooth": false,
+                        "cfl_max": 0.0,
+                        "smooth_pyramid": true,
+                        "cfl_step": 1.25
+                    },
+                    "model_attributes": {
+                        "training": true,
+                        "dim": 3,
+                        "n_time_steps": 3,
+                        "antisymmetric": false,
+                        "use_analytical_gradients": false,
+                        "cfl_max": 0.0,
+                        "adjoint": false,
+                        "solver": "euler",
+                        "fluid_sigma": 0.0,
+                        "elastic_sigma": 0.0,
+                        "integration_steps_per_interval": 1,
+                        "similarity_metric": "cc2",
+                        "mattes_bins": 32,
+                        "inverse_identity_weight": 0.05
+                    }
+                }
+            }
         }
     },
     "syntx.syngs": {
@@ -1811,6 +2069,236 @@
                         "similarity_metric": "cc2",
                         "mattes_bins": 32,
                         "bootstrap_mode": "antithetic",
+                        "bootstrap_orig_weight": 0.5,
+                        "bootstrap_jitter_scale": 0.25,
+                        "regularizer": "sobolev",
+                        "spline_distance": null,
+                        "mesh_size": null,
+                        "transport_mode": "transport"
+                    }
+                }
+            }
+        },
+        "canonical_2026_11_12": {
+            "selection": "codified tuning winner (syntx.benchmark.codify)",
+            "pairs": [
+                77,
+                44,
+                0
+            ],
+            "parameters": {
+                "alpha": 0.448,
+                "max_step_norm": 0.6,
+                "optimizer": "reg_adam",
+                "optimizer_lr": 2.246094,
+                "n_steps": 8,
+                "bootstrap_mode": "none",
+                "regularizer": "sobolev",
+                "reg_iterations": [
+                    100,
+                    100,
+                    20
+                ]
+            },
+            "previous_defaults": {
+                "alpha": 0.675,
+                "max_step_norm": 0.3,
+                "optimizer": "reg_adam",
+                "optimizer_lr": 1.0,
+                "n_steps": 8,
+                "bootstrap_mode": "antithetic",
+                "regularizer": "sobolev",
+                "reg_iterations": [
+                    100,
+                    100,
+                    20
+                ]
+            },
+            "mean_dice_gain_vs_previous_defaults": 0.02220302589692998,
+            "per_pair": {
+                "77": {
+                    "dice_sym": 0.5998332636868784,
+                    "dice_fixed": 0.597308707031716,
+                    "dice_moving": 0.6023578203420408,
+                    "folding_pct": 0.0,
+                    "jac_min": 0.03623312711715698,
+                    "jac_max": 31.010162353515625,
+                    "inv_mean_mm": 0.005243371240794659,
+                    "inv_p95_mm": 0.01389710046350956,
+                    "inv_max_mm": 1.2839637994766235,
+                    "inv_interior_mean_mm": 0.0009461392764933407,
+                    "inv_interior_max_mm": 0.3771348297595978,
+                    "time_s": 42.77552807331085,
+                    "fd_folding_pct": 0.048887992849373924,
+                    "fd_jac_min": -6.265789031982422
+                },
+                "44": {
+                    "dice_sym": 0.6095642884052039,
+                    "dice_fixed": 0.610051273842198,
+                    "dice_moving": 0.6090773029682097,
+                    "folding_pct": 0.0,
+                    "jac_min": 0.03009742498397827,
+                    "jac_max": 44.81751251220703,
+                    "inv_mean_mm": 0.005373042076826096,
+                    "inv_p95_mm": 0.013176469132304192,
+                    "inv_max_mm": 1.4809330701828003,
+                    "inv_interior_mean_mm": 0.0010220144176855683,
+                    "inv_interior_max_mm": 0.7355769276618958,
+                    "time_s": 50.90186405181885,
+                    "fd_folding_pct": 0.062573653441782,
+                    "fd_jac_min": -7.69032621383667
+                },
+                "0": {
+                    "dice_sym": 0.6452675648276528,
+                    "dice_fixed": 0.6482820756072387,
+                    "dice_moving": 0.6422530540480669,
+                    "folding_pct": 0.0,
+                    "jac_min": 0.042319633066654205,
+                    "jac_max": 28.75999641418457,
+                    "inv_mean_mm": 0.005314658395946026,
+                    "inv_p95_mm": 0.014210095629096031,
+                    "inv_max_mm": 1.4269012212753296,
+                    "inv_interior_mean_mm": 0.0009672861779108644,
+                    "inv_interior_max_mm": 0.5258677005767822,
+                    "time_s": 42.4196857213974,
+                    "fd_folding_pct": 0.045458760721448714,
+                    "fd_jac_min": -7.120903968811035
+                }
+            },
+            "baseline_per_pair": {
+                "77": {
+                    "dice_sym": 0.5814912744457048,
+                    "dice_fixed": 0.5792029030526415,
+                    "dice_moving": 0.5837796458387682,
+                    "folding_pct": 0.0,
+                    "jac_min": 0.06361936777830124,
+                    "jac_max": 14.653210639953613,
+                    "inv_mean_mm": 0.001493551186285913,
+                    "inv_p95_mm": 0.0067423307336866856,
+                    "inv_max_mm": 0.6444454789161682,
+                    "inv_interior_mean_mm": 0.0007120045484043658,
+                    "inv_interior_max_mm": 0.015990400686860085,
+                    "time_s": 60.86403691768646,
+                    "fd_folding_pct": 0.0,
+                    "fd_jac_min": 0.06555569916963577
+                },
+                "44": {
+                    "dice_sym": 0.5864775763339877,
+                    "dice_fixed": 0.5865526682801372,
+                    "dice_moving": 0.5864024843878382,
+                    "folding_pct": 0.0,
+                    "jac_min": 0.07742711156606674,
+                    "jac_max": 18.401227951049805,
+                    "inv_mean_mm": 0.001222739345394075,
+                    "inv_p95_mm": 0.006203335244208574,
+                    "inv_max_mm": 0.26717135310173035,
+                    "inv_interior_mean_mm": 0.0006908307550475001,
+                    "inv_interior_max_mm": 0.01599077321588993,
+                    "time_s": 71.62525498867035,
+                    "fd_folding_pct": 0.0,
+                    "fd_jac_min": 0.07845199853181839
+                },
+                "0": {
+                    "dice_sym": 0.6200871884492527,
+                    "dice_fixed": 0.6208529382318984,
+                    "dice_moving": 0.6193214386666069,
+                    "folding_pct": 0.0,
+                    "jac_min": 0.07955256849527359,
+                    "jac_max": 13.930679321289062,
+                    "inv_mean_mm": 0.0015143107157200575,
+                    "inv_p95_mm": 0.0070536392740905285,
+                    "inv_max_mm": 0.542212724685669,
+                    "inv_interior_mean_mm": 0.0007278473349288106,
+                    "inv_interior_max_mm": 0.015987331047654152,
+                    "time_s": 59.94133472442627,
+                    "fd_folding_pct": 0.0,
+                    "fd_jac_min": 0.057907938957214355
+                }
+            },
+            "criteria": {
+                "folding_abs": 0.0005,
+                "folding_rel": 1.0,
+                "inv_interior_abs": 1.0,
+                "inv_interior_rel": 1.1,
+                "positive_jac_if_baseline": true,
+                "inverse_cap_only_if_baseline_fold_free": true,
+                "max_pair_drop": 0.001,
+                "jac_min_rel": null,
+                "min_gain": 0.0005,
+                "noise_k": 3.0
+            },
+            "margin": 0.0005,
+            "provenance": {
+                "schema_version": 1,
+                "n_runs": 3,
+                "commit": "0fe451a2e10080b51db58daf480dfbe94ff0f5f7",
+                "commits": [
+                    "0fe451a2e10080b51db58daf480dfbe94ff0f5f7"
+                ],
+                "registration_code": null,
+                "describe": "v6.35.0-1-g0fe451a",
+                "dirty": false,
+                "diff_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+                "syntx_version": "6.35.0",
+                "script_sha256": [
+                    "64c19955bb2c592082fcc7a64ac1344684d62032cacfb95d134f240935af49ea"
+                ],
+                "hosts": [
+                    "barncreek.radio.virginia.edu"
+                ],
+                "packages": {
+                    "torch": "2.13.0",
+                    "antspyx": "0.6.4",
+                    "numpy": "2.3.5",
+                    "scipy": "1.18.1",
+                    "jax": "0.10.2",
+                    "antstorch": "0.2.0"
+                },
+                "parameters": {
+                    "function": "syntx.syngs",
+                    "explicit": {
+                        "backend": "pytorch",
+                        "device": "mps",
+                        "verbose": false,
+                        "bootstrap_mode": "none",
+                        "alpha": 0.448,
+                        "max_step_norm": 0.6,
+                        "optimizer_lr": 2.246094
+                    },
+                    "fit_kwargs": {
+                        "levels": [
+                            4,
+                            2,
+                            1
+                        ],
+                        "epochs_per_level": [
+                            60,
+                            40,
+                            20
+                        ],
+                        "similarity_metric": "cc2",
+                        "lr": 2.246094,
+                        "max_step_norm": 0.6,
+                        "verbose": false,
+                        "lncc_radius": 2,
+                        "optimizer_type": "reg_adam",
+                        "cfl_step": 0.25,
+                        "seed": 42,
+                        "convergence_slope": 1e-06
+                    },
+                    "model_attributes": {
+                        "training": true,
+                        "dim": 3,
+                        "seed": 42,
+                        "n_steps": 8,
+                        "symmetric": true,
+                        "inverse_identity_weight": 0.5,
+                        "fluid_sigma": null,
+                        "solver": "euler",
+                        "alpha": 0.448,
+                        "similarity_metric": "cc2",
+                        "mattes_bins": 32,
+                        "bootstrap_mode": "none",
                         "bootstrap_orig_weight": 0.5,
                         "bootstrap_jitter_scale": 0.25,
                         "regularizer": "sobolev",

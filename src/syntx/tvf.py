@@ -1780,6 +1780,24 @@ class TVFModel(nn.Module):
                                 sl_last[d + 1] = -1
                                 vel_tapered[tuple(sl_last)] = 0.0
                             vel_smoothed = self._apply_sobolev_green_operator(vel_tapered, fluid_sigma=1.0, alpha=total_alpha, spacing=vel_spacing)
+                        elif regularizer_mode in _TVF_CONTINUUM:
+                            from .core.regularizers import get_regularizer
+                            vel_tapered = vel_batch.clone()
+                            for d in range(self.dim):
+                                sl_first = [slice(None)] * (self.dim + 2)
+                                sl_first[d + 1] = 0
+                                vel_tapered[tuple(sl_first)] = 0.0
+                                sl_last = [slice(None)] * (self.dim + 2)
+                                sl_last[d + 1] = -1
+                                vel_tapered[tuple(sl_last)] = 0.0
+                            reg_total_fn = get_regularizer(
+                                regularizer_mode,
+                                alpha=total_alpha,
+                                spacing=vel_spacing,
+                                fluid_sigma=elastic_sigma_val or 3.0,
+                                **{k: kwargs[k] for k in _TVF_EXTRA_REG_KEYS if k in kwargs},
+                            )
+                            vel_smoothed = reg_total_fn(vel_tapered)
                         elif regularizer_mode in ['bspline', 'bsplinesyn']:
                             from .core.smoothing import smooth_displacement_field_bspline
                             vel_smoothed = smooth_displacement_field_bspline(
@@ -1918,11 +1936,13 @@ class TVFModel(nn.Module):
         Returns displacement field integrating from t=1 to t=0 in physical space.
         """
         return self.integrate(1.0, 0.0, image_shape=image_shape)
-# Default spectral strength alpha (mm^2, physical units at every pyramid level) per dimension.
-# 2-D study 2026-09-30 (3 pairs, grad_step 1.0, energy 1e-3): mean Dice 0.749 vs SyN 0.741,
-# Liouville determinant > 0 (min 0.023), interior inverse error 3.3-4.5 mm vs SyN 3.6-4.7 mm;
-# alpha 4 / 8 trade Dice for smoothness (0.741 / 0.726). 3-D to be set by the TVF tune.
-TVF_DEFAULT_ALPHA = {2: 2.0, 3: 2.0}
+# Default spectral strength alpha (mm^2) and CFL step parameters.
+# 3-D canonical defaults tuned on Mindboggle pairs 77 / 44 / 0 (2026-11-11,
+# docs/provenance/tuning/tvf_2026-11-11.md): regularizer='beltrami', alpha=2.5,
+# grad_step=1.25, energy_weight=0.0008, multipoint_loss=(0.0, 1.0) (+0.0268 mean Dice,
+# 0.6346 mean bidirectional cortical Dice, 0 % Liouville folding).
+TVF_DEFAULT_ALPHA = {2: 2.0, 3: 2.5}
+TVF_DEFAULT_CFL = {"grad_step": 1.25, "cfl_momentum": 0.9}
 
 _TVF_SPECTRAL = ('sobolev', 'dsti', 'dsti1') + _TVF_CONTINUUM
 _TVF_SIGMA = ('gaussian', 'bspline')
@@ -2003,8 +2023,8 @@ def tvf_registration(
     iterations=None,
     levels=None,
     n_time_steps=3,
-    multipoint_loss=(0.0, 0.5, 1.0),
-    regularizer='sobolev',
+    multipoint_loss=(0.0, 1.0),
+    regularizer='beltrami',
     alpha=None,
     total_alpha=None,
     flow_sigma=None,
@@ -2015,7 +2035,7 @@ def tvf_registration(
     grad_step=None,
     cfl_momentum=None,
     cfl_max=0.0,
-    energy_weight=1e-3,
+    energy_weight=0.0008,
     temporal_weight=0.0,
     fast_smooth=None,
     solver='euler',
@@ -2062,12 +2082,14 @@ def tvf_registration(
         Times at which the similarity is evaluated (0 = fixed side, 1 = moving side,
         0.5 = geodesic midpoint). Including both 0 and 1 is the symmetric formulation and
         also adds a forward/inverse consistency penalty (weight 0.05; see TVFModel.forward).
-        Default (0.0, 0.5, 1.0).
+        Default (0.0, 1.0).
 
     Regularisation -- one strength parameter per regulariser
     ---------------------------------------------------------
-    regularizer : {'sobolev', 'dsti', 'dsti1', 'gaussian', 'bspline'}
-        Default 'sobolev'.
+    regularizer : str
+        Spectral / continuum ('beltrami', 'sobolev', 'dsti', 'dsti1', 'poroelastic',
+        'div_curl', 'hyperelastic', 'navier', 'solenoidal') or spatial ('gaussian', 'bspline').
+        Default 'beltrami'.
     alpha : float
         Spectral regularisers only: strength (mm^2, physical units at every pyramid level) of
         the fluid smoothing applied to every update (0 = off). Default ``TVF_DEFAULT_ALPHA[dim]``.
@@ -2095,7 +2117,7 @@ def tvf_registration(
     max_step_norm : float
         'reg_adam' only: largest per-iteration update (voxels). Default 0.5.
     grad_step : float
-        'cfl' only: CFL step (voxels). Default 1.0.
+        'cfl' only: CFL step (voxels). Default 1.25 (``TVF_DEFAULT_CFL['grad_step']``).
     cfl_momentum : float
         'cfl' only: direction momentum in [0, 1). Default 0.9.
     cfl_max : float
@@ -2103,7 +2125,7 @@ def tvf_registration(
     energy_weight : float
         Weight of the path energy mean_t <v_t, L v_t> (L = inverse of the regulariser's kernel,
         same alpha): the LDDMM geodesic energy -- symmetric in time, it makes short, smooth
-        paths preferable among those reaching the same map. Default 1e-3 (provisional, 2-D);
+        paths preferable among those reaching the same map. Default 0.0008;
         0 = off. With the default constant_speed the keyframe speeds are equalised in the
         same V-norm (geodesics have constant speed).
     temporal_weight : float
@@ -2208,8 +2230,8 @@ def tvf_registration(
         for name, val in (('optimizer_lr', optimizer_lr), ('max_step_norm', max_step_norm)):
             if val is not None:
                 raise ValueError(f"{name} is not used by optimizer='cfl' (it uses grad_step / cfl_momentum)")
-        grad_step = 1.0 if grad_step is None else float(grad_step)
-        cfl_momentum = 0.9 if cfl_momentum is None else float(cfl_momentum)
+        grad_step = float(TVF_DEFAULT_CFL['grad_step']) if grad_step is None else float(grad_step)
+        cfl_momentum = float(TVF_DEFAULT_CFL['cfl_momentum']) if cfl_momentum is None else float(cfl_momentum)
         optimizer_lr = 1.0
     else:
         for name, val in (('grad_step', grad_step), ('cfl_momentum', cfl_momentum)):

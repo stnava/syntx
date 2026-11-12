@@ -12,7 +12,8 @@ import os
 import pytest
 
 import syntx
-from syntx.tvf import TVF_ADVANCED_OPTIONS, TVF_DEFAULT_ALPHA, tvf_registration
+from syntx.tvf import TVF_ADVANCED_OPTIONS, TVF_DEFAULT_ALPHA, TVF_DEFAULT_CFL, tvf_registration
+
 
 ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 
@@ -22,8 +23,8 @@ def _effective_defaults(dim=3):
     d = {k: p.default for k, p in sig.parameters.items() if p.default is not inspect.Parameter.empty}
     d["alpha"] = TVF_DEFAULT_ALPHA[dim] if d["alpha"] is None else d["alpha"]
     if d["optimizer"] == "cfl":            # optimiser-family parameters resolve per family
-        d["grad_step"] = 1.0 if d["grad_step"] is None else d["grad_step"]
-        d["cfl_momentum"] = 0.9 if d["cfl_momentum"] is None else d["cfl_momentum"]
+        d["grad_step"] = TVF_DEFAULT_CFL["grad_step"] if d["grad_step"] is None else d["grad_step"]
+        d["cfl_momentum"] = TVF_DEFAULT_CFL["cfl_momentum"] if d["cfl_momentum"] is None else d["cfl_momentum"]
         del d["optimizer_lr"], d["max_step_norm"]
     else:
         d["optimizer_lr"] = 1.2 if d["optimizer_lr"] is None else d["optimizer_lr"]
