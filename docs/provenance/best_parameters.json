@@ -2308,6 +2308,238 @@
                     }
                 }
             }
+        },
+        "tuned_syngs_2026_11_12": {
+            "pairs": [
+                77,
+                44,
+                0
+            ],
+            "mean_dice_gain_vs_defaults": 0.01230893929029179,
+            "parameters": {
+                "alpha": 0.27,
+                "max_step_norm": 0.825,
+                "optimizer": "reg_adam",
+                "optimizer_lr": 2.246094,
+                "n_steps": 8,
+                "bootstrap_mode": "none",
+                "regularizer": "beltrami",
+                "reg_iterations": [
+                    100,
+                    100,
+                    20
+                ],
+                "dilatation_weight": 0.075
+            },
+            "defaults": {
+                "alpha": 0.448,
+                "max_step_norm": 0.6,
+                "optimizer": "reg_adam",
+                "optimizer_lr": 2.246094,
+                "n_steps": 8,
+                "bootstrap_mode": "none",
+                "regularizer": "sobolev",
+                "reg_iterations": [
+                    100,
+                    100,
+                    20
+                ]
+            },
+            "per_pair": {
+                "77": {
+                    "dice_sym": 0.616544654908698,
+                    "dice_fixed": 0.6162180090512703,
+                    "dice_moving": 0.6168713007661257,
+                    "folding_pct": 0.0,
+                    "jac_min": 0.009870355948805809,
+                    "jac_max": 71.98228454589844,
+                    "inv_mean_mm": 0.003739822655916214,
+                    "inv_p95_mm": 0.014428514055907726,
+                    "inv_max_mm": 2.351331949234009,
+                    "inv_interior_mean_mm": 0.0009477948187850416,
+                    "inv_interior_max_mm": 0.6660937070846558,
+                    "time_s": 44.45193672180176,
+                    "fd_folding_pct": 0.20584873449320454,
+                    "fd_jac_min": -12.656272888183594
+                },
+                "44": {
+                    "dice_sym": 0.6192072039311352,
+                    "dice_fixed": 0.6225153334154219,
+                    "dice_moving": 0.6158990744468485,
+                    "folding_pct": 0.0,
+                    "jac_min": 0.010018298402428627,
+                    "jac_max": 55.25401306152344,
+                    "inv_mean_mm": 0.005194052588194609,
+                    "inv_p95_mm": 0.01463172398507595,
+                    "inv_max_mm": 1.5645214319229126,
+                    "inv_interior_mean_mm": 0.0010221200063824654,
+                    "inv_interior_max_mm": 0.782192587852478,
+                    "time_s": 51.77333855628967,
+                    "fd_folding_pct": 0.2905931557178178,
+                    "fd_jac_min": -15.206747055053711
+                },
+                "0": {
+                    "dice_sym": 0.6558400759507773,
+                    "dice_fixed": 0.6592900475285575,
+                    "dice_moving": 0.6523901043729972,
+                    "folding_pct": 0.0,
+                    "jac_min": 0.019954893738031387,
+                    "jac_max": 67.4256362915039,
+                    "inv_mean_mm": 0.003357155714184046,
+                    "inv_p95_mm": 0.014305434189736843,
+                    "inv_max_mm": 2.4908342361450195,
+                    "inv_interior_mean_mm": 0.0009709279984235764,
+                    "inv_interior_max_mm": 0.6251713633537292,
+                    "time_s": 43.925161361694336,
+                    "fd_folding_pct": 0.2205659070204692,
+                    "fd_jac_min": -13.870771408081055
+                }
+            },
+            "baseline_per_pair": {
+                "77": {
+                    "dice_sym": 0.5998332636868784,
+                    "dice_fixed": 0.597308707031716,
+                    "dice_moving": 0.6023578203420408,
+                    "folding_pct": 0.0,
+                    "jac_min": 0.03623312711715698,
+                    "jac_max": 31.010162353515625,
+                    "inv_mean_mm": 0.005243371240794659,
+                    "inv_p95_mm": 0.01389710046350956,
+                    "inv_max_mm": 1.2839637994766235,
+                    "inv_interior_mean_mm": 0.0009461392764933407,
+                    "inv_interior_max_mm": 0.3771348297595978,
+                    "time_s": 43.450616002082825,
+                    "fd_folding_pct": 0.048887992849373924,
+                    "fd_jac_min": -6.265789031982422
+                },
+                "44": {
+                    "dice_sym": 0.6095642884052039,
+                    "dice_fixed": 0.610051273842198,
+                    "dice_moving": 0.6090773029682097,
+                    "folding_pct": 0.0,
+                    "jac_min": 0.03009742498397827,
+                    "jac_max": 44.81751251220703,
+                    "inv_mean_mm": 0.005373042076826096,
+                    "inv_p95_mm": 0.013176469132304192,
+                    "inv_max_mm": 1.4809330701828003,
+                    "inv_interior_mean_mm": 0.0010220144176855683,
+                    "inv_interior_max_mm": 0.7355769276618958,
+                    "time_s": 51.41396152973175,
+                    "fd_folding_pct": 0.062573653441782,
+                    "fd_jac_min": -7.69032621383667
+                },
+                "0": {
+                    "dice_sym": 0.6452675648276528,
+                    "dice_fixed": 0.6482820756072387,
+                    "dice_moving": 0.6422530540480669,
+                    "folding_pct": 0.0,
+                    "jac_min": 0.042319633066654205,
+                    "jac_max": 28.75999641418457,
+                    "inv_mean_mm": 0.005314658395946026,
+                    "inv_p95_mm": 0.014210095629096031,
+                    "inv_max_mm": 1.4269012212753296,
+                    "inv_interior_mean_mm": 0.0009672861779108644,
+                    "inv_interior_max_mm": 0.5258677005767822,
+                    "time_s": 43.57618725299835,
+                    "fd_folding_pct": 0.045458760721448714,
+                    "fd_jac_min": -7.120903968811035
+                }
+            },
+            "criteria": {
+                "folding_abs": 0.0005,
+                "folding_rel": 1.0,
+                "inv_interior_abs": 1.0,
+                "inv_interior_rel": 1.1,
+                "positive_jac_if_baseline": true,
+                "inverse_cap_only_if_baseline_fold_free": true,
+                "max_pair_drop": 0.001,
+                "jac_min_rel": null,
+                "min_gain": 0.0005,
+                "noise_k": 3.0
+            },
+            "noise": 0.0,
+            "margin": 0.0005,
+            "tuning_report": "results/tune_syngs_beltrami_20261112/report.md",
+            "provenance": {
+                "schema_version": 1,
+                "n_runs": 3,
+                "commit": "c3a0b3cc2b0622377fc540be3d3dd7daf836571c",
+                "commits": [
+                    "c3a0b3cc2b0622377fc540be3d3dd7daf836571c"
+                ],
+                "registration_code": null,
+                "describe": "v6.35.2-1-gc3a0b3c",
+                "dirty": false,
+                "diff_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+                "syntx_version": "6.35.2",
+                "script_sha256": [
+                    "daba50023c965183e2eb1ef0495f4496c443df7e07ef44e1a30f314ab27d9382"
+                ],
+                "hosts": [
+                    "barncreek.radio.virginia.edu"
+                ],
+                "packages": {
+                    "torch": "2.13.0",
+                    "antspyx": "0.6.4",
+                    "numpy": "2.3.5",
+                    "scipy": "1.18.1",
+                    "jax": "0.10.2",
+                    "antstorch": "0.2.0"
+                },
+                "parameters": {
+                    "function": "syntx.syngs",
+                    "explicit": {
+                        "backend": "pytorch",
+                        "device": "mps",
+                        "verbose": false,
+                        "regularizer": "beltrami",
+                        "alpha": 0.27,
+                        "dilatation_weight": 0.075,
+                        "max_step_norm": 0.825
+                    },
+                    "fit_kwargs": {
+                        "levels": [
+                            4,
+                            2,
+                            1
+                        ],
+                        "epochs_per_level": [
+                            60,
+                            40,
+                            20
+                        ],
+                        "similarity_metric": "cc2",
+                        "lr": 2.246094,
+                        "max_step_norm": 0.825,
+                        "verbose": false,
+                        "lncc_radius": 2,
+                        "optimizer_type": "reg_adam",
+                        "cfl_step": 0.25,
+                        "seed": 42,
+                        "convergence_slope": 1e-06
+                    },
+                    "model_attributes": {
+                        "training": true,
+                        "dim": 3,
+                        "seed": 42,
+                        "n_steps": 8,
+                        "symmetric": true,
+                        "inverse_identity_weight": 0.5,
+                        "fluid_sigma": null,
+                        "solver": "euler",
+                        "alpha": 0.27,
+                        "similarity_metric": "cc2",
+                        "mattes_bins": 32,
+                        "bootstrap_mode": "none",
+                        "bootstrap_orig_weight": 0.5,
+                        "bootstrap_jitter_scale": 0.25,
+                        "regularizer": "beltrami",
+                        "spline_distance": null,
+                        "mesh_size": null,
+                        "transport_mode": "transport"
+                    }
+                }
+            }
         }
     },
     "affine_pt2": {

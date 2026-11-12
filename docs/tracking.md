@@ -1,12 +1,22 @@
 # Tracking Summary
-current phase: v6.35.1 (MPS engine acceleration, stability fixes, and 2-rep confirmed Mindboggle 3-D canonical promotions for `syntx.syngs` and `syntx.tvf`; `fast_syn_ants_benchmark` Track 1–3 complete with `--include-syngs-tvf`)
-next WP: per-run synthetic calibration of the slice-set clock thresholds; fix opt-in `engine='projected'` motion regression
+current phase: v6.35.3 (continuum regularizer support in `syntx.syngs`, 2-rep confirmed 3-D Beltrami presets for `syntx.syn` and `syntx.syngs`, and live pair-by-pair 90-subject Mindboggle cohort benchmark harness)
+next WP: complete 90-pair Mindboggle random-order evaluation (`task-2695`); per-run synthetic calibration of slice-set clock thresholds; fix opt-in `engine='projected'` motion regression
 blockers: none
-active work: none (v6.35.1 released)
+active work: 90-pair random-order Mindboggle-101 benchmark (`tvf`, `syngs`, `syn`, `ants.registration`) streaming live to `docs/reports/mindboggle_90pair_benchmark_2026-11-12.html`
 device: Apple Silicon MPS / CPU (macOS arm64)
 last updated: 2026-11-12
 
 ---
+
+## R34 (`syntx.syngs` Continuum Regularizers, 2-Rep Confirmed 3-D Beltrami Presets & Live 90-Pair Cohort Benchmark Harness; v6.35.3, 2026-11-12)
+- **`syntx.syngs` Continuum Regularizer Integration (`src/syntx/syngs.py`, `src/syntx/benchmark/tune.py`)**:
+  - Wired continuum mechanics and quasiconformal regularizers (`beltrami`, `hyperelastic`, `div_curl`, `navier`, `solenoidal`, `poroelastic`) into `GeodesicShootingModel.apply_green_operator` and `RegAdam` with cached 4-voxel cosine boundary tapering (`reg_fn(m * bmask) * bmask`) and relative voxel aspect-ratio frequency normalization (`spacing_rel = spacing / min(spacing)`), leaving canonical `regularizer='sobolev'` bitwise unchanged.
+- **2-Rep Confirmed Mindboggle `(77, 44, 0)` 3-D Beltrami Autotuning (`src/syntx/benchmark/config.py`, `docs/provenance/{best_parameters,run_config}.json`, `docs/provenance/tuning/{syn_beltrami,syngs_beltrami}_2026-11-12.md`)**:
+  - **`syntx.syngs` + `beltrami` (`syngs_beltrami_config`, `syntx.syngs/tuned_syngs_2026_11_12`, `~130` isolated MPS evals)**: `regularizer='beltrami'`, `alpha=0.27`, `dilatation_weight=0.075`, `max_step_norm=0.825`, `optimizer='reg_adam'`, `optimizer_lr=2.246094`, `n_steps=8`, `bootstrap_mode='none'`. Lifts 3-pair mean bidirectional cortical Dice from **`0.6182` (`sobolev`) to `0.6305` (`+1.23 pp`)** (`77: 0.6165`, `44: 0.6192`, `0: 0.6558`), strictly beating canonical `syngs sobolev` on all 3 pairs as well as `syn sobolev` (`0.6261`) and `syn beltrami` (`0.6283`), with **`0.0000%` Liouville folding** (`jac_min = +0.0099`), `ICE_int_max <= 0.78 mm`, and **`0.00000` 2-rep spread** (`~46.5 s/pair`).
+  - **`syntx.syn` + `beltrami` (`syn_beltrami_config`, `162` isolated MPS evals, `52` configs)**: `regularizer='beltrami'`, `grad_step=0.6`, `dilatation_weight=0.1`, `sobolev_alpha=2.25`, `s=2.0`. Achieves **`0.6283`** 3-pair mean bidirectional cortical Dice (`+0.21 pp` vs canonical `syn sobolev` `0.6261`; **`0.6207` vs `0.6137` = `+0.70 pp` on `mbhard` Pair 44**, `0.6489` on Pair 0, `0.6151` on Pair 77) with **`0.0000%` Liouville folding** (`jac_min = +0.0104`), `ICE_int_max = 0.30 mm`, and **`0.000000` 2-rep spread**.
+- **Live Pair-by-Pair 90-Subject Mindboggle Benchmark Harness (`benchmarks/fast_syn_ants_benchmark.py`, `tests/test_fast_syn_ants_benchmark.py`)**:
+  - Added `--all-pairs`, `--shuffle-pairs` (persisted in `pair_order.json`), `--pair-by-pair` (isolated MPS subprocesses followed by multi-core CPU ANTs subprocesses per pair, zero contention), `--best-models-only`, `--include-syngs-beltrami`, atomic `.tmp -> os.replace` HTML/MD/JSON streaming updates, intra-cohort vs. inter-site subgroup stratification, paired two-sided Wilcoxon signed-rank $p$-values, disk-cached `syntx.viz` 4-panel QC figures, cohort per-pair Dice box/strip distribution plot, and ephemeral `/tmp` warp cleanup.
+- **Verification**: `python3 -m antsxqc.lint src/syntx` (`0 finding(s)`), `python3 benchmarks/fast_syn_ants_benchmark.py --smoke` (`exit 0`), `pytest -q tests/test_fast_syn_ants_benchmark.py tests/test_implementation_standards.py tests/test_canonical_parameters.py -k "not slow"` (`28 passed`).
 
 ## R33 (MPS Engine Acceleration & Canonical 3-D Autotuning for `syntx.syngs` & `syntx.tvf`; v6.35.1, 2026-11-12)
 - **MPS Engine Stability & Performance Fixes (`src/syntx/liouville.py`, `src/syntx/core/smoothing.py`, `src/syntx/core/utils.py`, `src/syntx/syngs.py`, `src/syntx/tvf.py`, `tests/test_liouville.py`, `tests/test_tvf_bugs.py`)**:

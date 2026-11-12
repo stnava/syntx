@@ -147,3 +147,93 @@ def test_fast_syn_ants_benchmark_cli_smoke_flag(tmp_path: Path):
     assert Path(res["md_path"]).exists()
     assert Path(res["json_path"]).exists()
     assert len(res["summary"]["figures"]) >= 4
+
+
+def test_pair_by_pair_shuffle_best_models_mode(tmp_path: Path):
+    mod = _load_benchmark_module()
+    data_dir, pairs_csv = _make_synthetic_mindboggle_fixture(tmp_path)
+    # Add a second intra-site pair so both intra and inter subgroups are exercised
+    subj3 = data_dir / "OASIS-TRT-20_volumes" / "OASIS-TRT-20-3"
+    subj3.mkdir(parents=True, exist_ok=True)
+    src2 = data_dir / "OASIS-TRT-20_volumes" / "OASIS-TRT-20-2"
+    for fn in ("t1weighted_brain.nii.gz", "labels.DKT31.manual.nii.gz"):
+        (subj3 / fn).write_bytes((src2 / fn).read_bytes())
+    pairs_csv.write_text(
+        "type,cohort1,subject1,cohort2,subject2\n"
+        "inter,OASIS-TRT-20,OASIS-TRT-20-1,OASIS-TRT-20,OASIS-TRT-20-2\n"
+        "intra,OASIS-TRT-20,OASIS-TRT-20-1,OASIS-TRT-20,OASIS-TRT-20-3\n",
+        encoding="utf-8",
+    )
+
+    out_dir = tmp_path / "pbp_results"
+    report_stem = tmp_path / "pbp_reports" / "cohort_bench"
+    res = mod.main(
+        [
+            "--all-pairs",
+            "--shuffle-pairs",
+            "--pair-by-pair",
+            "--best-models-only",
+            "--include-syngs-tvf",
+            "--include-syngs-beltrami",
+            "--regularizers",
+            "beltrami",
+            "sobolev",
+            "--reg-iterations",
+            "2",
+            "1",
+            "--seed",
+            "20261112",
+            "--pairs-csv",
+            str(pairs_csv),
+            "--data-dir",
+            str(data_dir),
+            "--no-n4",
+            "--device",
+            "cpu",
+            "--ants-aff-iterations",
+            "3",
+            "2",
+            "--syntx-aff-iterations",
+            "3",
+            "2",
+            "--out-dir",
+            str(out_dir),
+            "--report-stem",
+            str(report_stem),
+        ]
+    )
+
+    assert (out_dir / "pair_order.json").exists()
+    p_order = json.loads((out_dir / "pair_order.json").read_text(encoding="utf-8"))
+    assert p_order["seed"] == 20261112
+    assert sorted(p_order["shuffled_pairs"]) == [0, 1]
+
+    summary = res["summary"]
+    assert summary["in_progress"] is False
+    assert summary["completed_pairs"] == 2
+    assert summary["total_pairs"] == 2
+    assert len(summary["track1_affine_summary"]) == 2
+    assert len(summary["track2_deformable_summary"]) == 6
+    assert summary["track3_e2e_summary"] == []
+
+    arms_def = {r["arm"] for r in summary["track2_deformable_summary"]}
+    assert arms_def == {
+        "syn_beltrami",
+        "syn_sobolev",
+        "syngs_beltrami",
+        "syngs_best",
+        "tvf_best",
+        "ants_syn_matched",
+    }
+    for r in summary["track2_deformable_summary"]:
+        assert r["n_intra"] == 1
+        assert r["n_inter"] == 1
+
+    figs = summary["figures"]
+    for req_fig in ("pareto", "distribution", "4panel_tvf", "4panel_syngs_beltrami", "4panel_syn_beltrami"):
+        assert req_fig in figs
+        assert Path(figs[req_fig]).exists()
+
+    html_txt = Path(res["html_path"]).read_text(encoding="utf-8")
+    assert "Intra-Cohort vs. Cross-Cohort" in html_txt
+    assert "syngs_beltrami" in html_txt
