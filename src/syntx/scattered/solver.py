@@ -246,6 +246,9 @@ class ScatteredRegistrationConfig:
     initial_landmarks: Optional[Tuple[Union[torch.Tensor, np.ndarray], Union[torch.Tensor, np.ndarray]]] = None
     distance_transform_tau: Optional[float] = None
     distance_transform_weight: float = 1.0
+    digital_diffeomorphism: bool = True
+    digital_diffeomorphism_floor: float = 0.05
+    digital_diffeomorphism_steps: int = 25
     verbose: bool = False
     device: Optional[Union[str, torch.device]] = None
     dtype: torch.dtype = torch.float32
@@ -1718,6 +1721,61 @@ class SyNScattered(nn.Module):
             err_cand = _inverse_consistency_error(u_fwd, u_inv_cand, seed=42)['max_error']
             if err_cand <= err_base:
                 u_inv = u_inv_cand
+
+        if self.config.digital_diffeomorphism:
+            from syntx.core.digital_diffeomorphism import (
+                enforce_digital_diffeomorphism_nd,
+                pullback_digital_diffeomorphism_to_halves,
+            )
+            u_fwd_pre = u_fwd.clone()
+            # Measure current interior chord discrepancy (in voxels) so non-stationary affine
+            # boundary shear on [-1, 1]^d does not falsely trigger paired-mode clamping while
+            # any genuine Jacobian fold (det < jac_floor) is strictly unfolded!
+            vox_sc = torch.tensor(
+                [float(max(s - 1, 1) / 2.0) for s in reversed(self.spatial_shape)],
+                device=device,
+                dtype=dtype,
+            )
+            bmask_sc = get_boundary_mask(self.spatial_shape, device, dtype)[..., 0] > 0.5
+            yf_sc = full_identity + u_fwd
+            xi_sc = full_identity + u_inv
+            iny_sc = ((yf_sc >= -1.0) & (yf_sc <= 1.0)).all(dim=-1) & bmask_sc
+            inx_sc = ((xi_sc >= -1.0) & (xi_sc <= 1.0)).all(dim=-1) & bmask_sc
+            r_fi_sc = (u_fwd + compose_grids(u_inv, yf_sc)) * vox_sc
+            r_if_sc = (u_inv + compose_grids(u_fwd, xi_sc)) * vox_sc
+            n_fi_sc = torch.linalg.vector_norm(r_fi_sc, dim=-1) * iny_sc.to(dtype)
+            n_if_sc = torch.linalg.vector_norm(r_if_sc, dim=-1) * inx_sc.to(dtype)
+            dd_ice_tol = max(0.25, float(torch.maximum(n_fi_sc, n_if_sc).amax().item()) + 1e-3)
+            u_fwd, u_inv = enforce_digital_diffeomorphism_nd(
+                u_fwd,
+                u_inv,
+                spacing=None,
+                ice_tol=dd_ice_tol,
+                jac_floor=float(self.config.digital_diffeomorphism_floor),
+                steps=int(self.config.digital_diffeomorphism_steps),
+                stationary_boundary=False,
+            )
+            delta_dd = u_fwd - u_fwd_pre
+            if float(delta_dd.abs().amax().item()) > 0.0:
+                w_l2r_new, w_r2l_new, w_l2r_inv_new, w_r2l_inv_new = (
+                    pullback_digital_diffeomorphism_to_halves(
+                        delta_dd,
+                        self.warp_l2r,
+                        self.warp_r2l,
+                        self.warp_l2r_inv,
+                        self.warp_r2l_inv,
+                        spacing=None,
+                        jac_floor=float(self.config.digital_diffeomorphism_floor),
+                        stationary_boundary=False,
+                    )
+                )
+                self.warp_l2r.copy_(w_l2r_new)
+                self.warp_r2l.copy_(w_r2l_new)
+                self.warp_l2r_inv.copy_(w_l2r_inv_new)
+                if w_r2l_inv_new is not None:
+                    self.warp_r2l_inv.copy_(w_r2l_inv_new)
+                phi_l_full = full_identity + self.warp_l2r
+                phi_r_full = full_identity + self.warp_r2l
 
         self.disp_fwd.copy_(u_fwd)
         self.disp_inv.copy_(u_inv)

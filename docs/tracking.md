@@ -1,12 +1,25 @@
 # Tracking Summary
-current phase: v6.35.4 (idempotent inverse-field solvers across PyTorch and JAX, Option A diffeomorphic constraint projection `cfl_project_tol=1.0` voxel max error + physical Jacobian fold guard, and `syn_beltrami_proj` + 2-mm FD Jacobian benchmark tracking)
-next WP: complete Mindboggle evaluation across `syn_beltrami` and `syn_beltrami_proj`; per-run synthetic calibration of slice-set clock thresholds; fix opt-in `engine='projected'` motion regression
+current phase: v6.36.0 (default-on sparse O(|active|) digital diffeomorphism finish polish across `syn`, `tvf`, `syngs`, `greedy`, and `syn_scattered` with opt-out `digital_diffeomorphism=False`, plus 2-rep confirmed `syn_beltrami` / `syn_beltrami_proj` presets)
+next WP: complete 90-pair Mindboggle population benchmark (`results/mindboggle_90pair_v6_36_0_2026-11-12`); per-run synthetic calibration of slice-set clock thresholds; fix opt-in `engine='projected'` motion regression
 blockers: none
-active work: post-release `mbhard` (Mindboggle Pair 44) evaluation of `syntx.syn` (`beltrami` vs `beltrami_proj` Option A)
+active work: resuming 90-pair Mindboggle benchmark (`40/90` cached -> `90/90`) with default `digital_diffeomorphism=True`
 device: Apple Silicon MPS / CPU (macOS arm64)
-last updated: 2026-11-12
+last updated: 2026-11-13
 
 ---
+
+## R36 (Default-On Sparse Digital Diffeomorphism Finish Polish Across All Solvers & Tuned Beltrami Presets; v6.36.0, 2026-11-13)
+- **Model-Agnostic Digital Diffeomorphism Module (`src/syntx/core/digital_diffeomorphism.py`, `src/syntx/{__init__,syn,syn_jax,tvf,syngs,greedy}.py`, `src/syntx/scattered/solver.py`, `tests/test_digital_diffeomorphism.py`)**:
+  - Added `enforce_digital_diffeomorphism_nd`, `enforce_digital_diffeomorphism_jax`, `pullback_digital_diffeomorphism_to_halves`, and smooth-$L_\infty$ `digital_diffeomorphism_loss` / `digital_diffeomorphism_penalty` respecting full ITK physical `spacing`, `origin`, and `direction` cosines (as well as normalized `[-1, 1]` coordinates for `syn_scattered`) in both symmetric paired mode (`W_inv` provided) and unidirectional mode (`W_inv=None`, e.g. `greedy(..., return_inverse=False)`).
+  - **Pure $O(|\text{active}|)$ Sparse Stencil & 2-Pass Border Refresh**: Replaced full-volume/bounding-box finite differences and 5-D `grid_sample` inside the projection loop with exact sparse 6-neighbor central-difference index tables (`_build_sparse_fd_stencil`, `_eval_sparse_fd_det`), lightweight 1-pass initial scan (`_physical_fd_det_only`), differentiable sparse multilinear corner gathers (`_gather_multilinear_sparse`), sparse Levenberg–Marquardt subset refinement (`_pointwise_lm_refine_subset`), and a 2-pass border-shell refresh for deep cortical creases. Strictly idempotent (`0` steps, bitwise identical output) when interior voxels already satisfy `det >= jac_floor` (`0.05`) and chord `ICE <= ice_tol`, and preserves exterior voxels bitwise.
+  - **Default-On End-of-Registration Polish (Opt-Out `digital_diffeomorphism=False`)**: Enabled once at the end of deformable registration (`digital_diffeomorphism=True` default across `syntx.syn` PyTorch/JAX, `syntx.tvf`, `syntx.syngs`, `syntx.greedy`, and `ScatteredRegistrationConfig`; opt-out via `digital_diffeomorphism=False`), propagating endpoint corrections back onto `SyN` midpoint half-warps so `syntx.liouville_determinant` remains consistent with exported `.nii.gz` warps.
+- **Measured Mindboggle Pair 77 (`OASIS-TRT-20-5 -> MMRR-21-8`, PIR->LAI) Beltrami Evidence (Isolated MPS, `[100, 100, 20]`)**:
+  - **`syntx.syn` (`beltrami`)**: `Dice = 0.6193` (vs `0.6195` base, `Δ = -0.01 pp`), **2-mm FD folding `0.00061% -> 0.00000%` (`min|J| = -0.79 -> +0.0035`)**, Liouville folding `0.00000%` (`min|J| = +0.0362`), reverse `Max ICE = 3.58 mm -> 0.91 mm` (`61.8 s`).
+  - **`syntx.tvf` (`beltrami`)**: `Dice = 0.6163` (vs `0.6163` base, `Δ = 0.00 pp`), **2-mm FD `min|J| = -11.32 -> -0.17` (`98.5%` fold-depth elimination)**, Liouville folding `0.00000%`, `Max ICE (Fwd / Rev) = 2.46 / 5.45 mm -> 1.12 / 1.17 mm`.
+  - **`syntx.syngs` (`beltrami`)**: `Dice = 0.6021` (vs `0.6021` base, `Δ = 0.00 pp`), **2-mm FD `min|J| = -8.05 -> -0.15` (`98.1%` fold-depth elimination)**, Liouville folding `0.00000%`, `Max ICE (Fwd / Rev) = 1.72 / 3.13 mm -> 1.17 / 1.07 mm`.
+- **2-Rep Confirmed `syn_beltrami` (`grad_step=0.7`) & `syn_beltrami_proj` + Matched-ANTs Preset (`src/syntx/benchmark/config.py`, `benchmarks/{autotune_syn_beltrami_suite,fast_syn_ants_benchmark}.py`, `docs/provenance/{best_parameters,run_config}.json`, `docs/provenance/tuning/syn_beltrami_proj_2026-11-12.md`)**:
+  - Promoted `syn_beltrami` (`grad_step=0.7`, 3-pair mean Dice `0.6295`), `syn_beltrami_proj` (`cfl_project_inverse=True, projection_frequency=1, cfl_project_tol=1.0`), and `syn_matched` (ITK-matched Gaussian SyN reference), plus skipped candidate-buffer allocation on `steps_taken == 0` in `update_inverse_field_nd_anderson` (`src/syntx/core/inverse.py`).
+- **Verification**: `python3 -m antsxqc.lint src/syntx` (`0 finding(s)`), full fast `pytest tests/ -q` suite (`2,516 passed, 398 skipped, 0 failed`), and `python3 benchmarks/fast_syn_ants_benchmark.py --smoke` (`exit 0`).
 
 ## R35 (Idempotent Inverse Solvers & Option A Diffeomorphic Constraint Projection; v6.35.4, 2026-11-12)
 - **Root-Cause Defect & Idempotent Inverse-Solver Fix (`src/syntx/core/inverse.py`, `src/syntx/syn_jax.py`, `tests/test_core_inverse.py`, `tests/test_syn_microct_memory.py`)**:

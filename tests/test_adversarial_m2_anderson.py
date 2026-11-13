@@ -144,7 +144,6 @@ def _baseline_anderson(
         g_k, max_err, mean_err, err_k = itk_fixed_point_step(v_k, iteration)
 
         if max_err <= max_error_threshold and mean_err <= mean_error_threshold:
-            v_k = g_k
             break
 
         r_k = (g_k - v_k).reshape(-1)

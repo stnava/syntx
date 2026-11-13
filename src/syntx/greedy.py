@@ -27,6 +27,7 @@ import torch.nn.functional as F
 import ants
 
 from .spatial import (
+    disp_itk_to_tensor,
     disp_tensor_to_itk,
     itk_shape_to_tensor_shape,
     export_ants_affine_transform,
@@ -226,8 +227,14 @@ class GreedyRegistrationModel(nn.Module):
         device: Optional[torch.device] = None,
         extra_reg_kwargs: Optional[Dict[str, Any]] = None,
         convergence_slope: Optional[float] = DEFAULT_SLOPE_THRESHOLD,
+        digital_diffeomorphism: bool = True,
+        digital_diffeomorphism_floor: float = 0.05,
+        digital_diffeomorphism_steps: int = 25,
     ):
         super().__init__()
+        self.digital_diffeomorphism = bool(digital_diffeomorphism)
+        self.digital_diffeomorphism_floor = float(digital_diffeomorphism_floor)
+        self.digital_diffeomorphism_steps = int(digital_diffeomorphism_steps)
         self.stop = LossSlopeStop(slope_threshold=convergence_slope)   # the shared deformable stopping rule (core.convergence)
         self.convergence = []
         self.dim = dim
@@ -745,6 +752,9 @@ def greedy_registration(
     )
     num_bins = cfg.num_bins
     sampling_percentage = cfg.sampling_percentage
+    digital_diffeomorphism = bool(kwargs.pop('digital_diffeomorphism', True))
+    digital_diffeomorphism_floor = float(kwargs.pop('digital_diffeomorphism_floor', 0.05))
+    digital_diffeomorphism_steps = int(kwargs.pop('digital_diffeomorphism_steps', 25))
     if kwargs:
         raise TypeError(f"syntx.greedy() got unexpected keyword(s) {sorted(kwargs)}")
 
@@ -772,6 +782,9 @@ def greedy_registration(
         restrict_transformation=restrict_transformation,
         device=torch_device,
         convergence_slope=convergence_slope,
+        digital_diffeomorphism=digital_diffeomorphism,
+        digital_diffeomorphism_floor=digital_diffeomorphism_floor,
+        digital_diffeomorphism_steps=digital_diffeomorphism_steps,
     )
 
     t0_opt = time.time()
@@ -801,6 +814,92 @@ def greedy_registration(
     disp_img = _convert_composed_grid_to_ants_displacement(
         full_id_grid + warp, fixed, P_F, P_F, restrict_transformation=restrict_transformation
     )
+
+    # Optional physical inverse and/or digital_diffeomorphism projection
+    inv_disp_img = None
+    t1_inv = 0.0
+    if return_inverse:
+        t0_inv = time.time()
+        if verbose:
+            print("[greedy] Computing physical inverse displacement field with Anderson acceleration...")
+        if digital_diffeomorphism and sum(reg_iterations) > 0:
+            from .core.digital_diffeomorphism import enforce_digital_diffeomorphism_nd
+            disp_t = disp_itk_to_tensor(disp_img, device=torch_device).float()
+            inv_steps = max(anderson_steps, 15)
+            inv_disp_t = update_inverse_field_nd_anderson(
+                W_disp=disp_t,
+                W_inv_disp=None,
+                steps=inv_steps,
+                m=anderson_m,
+                spacing=fixed.spacing,
+                origin=fixed.origin,
+                direction=fixed.direction,
+            )
+            disp_t, inv_disp_t = enforce_digital_diffeomorphism_nd(
+                disp_t,
+                inv_disp_t,
+                spacing=fixed.spacing,
+                origin=fixed.origin,
+                direction=fixed.direction,
+                ice_tol=0.30,
+                jac_floor=digital_diffeomorphism_floor,
+                steps=digital_diffeomorphism_steps,
+                stationary_boundary=(padding_mode == 'border'),
+            )
+            disp_img = disp_tensor_to_itk(disp_t, fixed)
+            inv_disp_img = disp_tensor_to_itk(inv_disp_t, fixed)
+            if restrict_transformation is not None:
+                disp_arr = disp_img.numpy()
+                inv_arr = inv_disp_img.numpy()
+                for i, w in enumerate(restrict_transformation):
+                    if w == 0.0:
+                        disp_arr[..., i] = 0.0
+                        inv_arr[..., i] = 0.0
+                disp_img = ants.from_numpy(
+                    disp_arr, origin=fixed.origin, spacing=fixed.spacing,
+                    direction=fixed.direction, has_components=True,
+                )
+                inv_disp_img = ants.from_numpy(
+                    inv_arr, origin=fixed.origin, spacing=fixed.spacing,
+                    direction=fixed.direction, has_components=True,
+                )
+        else:
+            disp_t = disp_itk_to_tensor(disp_img, device=torch_device).float()
+            inv_steps = max(anderson_steps, 15)
+            inv_disp_t = update_inverse_field_nd_anderson(
+                W_disp=disp_t,
+                W_inv_disp=None,
+                steps=inv_steps,
+                m=anderson_m,
+                spacing=fixed.spacing,
+                origin=fixed.origin,
+                direction=fixed.direction,
+            )
+            inv_disp_img = disp_tensor_to_itk(inv_disp_t, fixed)
+        t1_inv = time.time() - t0_inv
+    elif digital_diffeomorphism and sum(reg_iterations) > 0:
+        from .core.digital_diffeomorphism import enforce_digital_diffeomorphism_nd
+        disp_t = disp_itk_to_tensor(disp_img, device=torch_device).float()
+        disp_t = enforce_digital_diffeomorphism_nd(
+            disp_t,
+            None,
+            spacing=fixed.spacing,
+            origin=fixed.origin,
+            direction=fixed.direction,
+            jac_floor=digital_diffeomorphism_floor,
+            steps=digital_diffeomorphism_steps,
+            stationary_boundary=(padding_mode == 'border'),
+        )
+        disp_img = disp_tensor_to_itk(disp_t, fixed)
+        if restrict_transformation is not None:
+            disp_arr = disp_img.numpy()
+            for i, w in enumerate(restrict_transformation):
+                if w == 0.0:
+                    disp_arr[..., i] = 0.0
+            disp_img = ants.from_numpy(
+                disp_arr, origin=fixed.origin, spacing=fixed.spacing,
+                direction=fixed.direction, has_components=True,
+            )
 
     # Affine transform handling
     affine_file = None
@@ -842,35 +941,11 @@ def greedy_registration(
         interpolator=interpolator
     )
 
-    # 9. Optional Physical Inverse Transform Export via Anderson Acceleration
+    # 9. Optional Physical Inverse Transform Export
     inv_transforms = []
     whichtoinvert_inv = []
     warpedfixout = None
-    t1_inv = 0.0
-    if return_inverse:
-        t0_inv = time.time()
-        if verbose:
-            print("[greedy] Computing physical inverse displacement field with Anderson acceleration...")
-        disp_t = torch.from_numpy(disp_img.numpy().T).float().unsqueeze(0).to(torch_device)
-        inv_steps = max(anderson_steps, 15)
-        inv_disp_t = update_inverse_field_nd_anderson(
-            W_disp=disp_t,
-            W_inv_disp=None,
-            steps=inv_steps,
-            m=anderson_m,
-            spacing=fixed.spacing,
-            origin=fixed.origin,
-            direction=fixed.direction,
-        )
-        inv_np = inv_disp_t.squeeze(0).cpu().numpy().T
-        inv_disp_img = ants.from_numpy(
-            inv_np.astype(np.float32),
-            origin=fixed.origin,
-            spacing=fixed.spacing,
-            direction=fixed.direction,
-            has_components=True
-        )
-
+    if return_inverse and inv_disp_img is not None:
         if outprefix is not None:
             inv_file = f"{outprefix}1InverseWarp.nii.gz"
         else:
@@ -896,7 +971,6 @@ def greedy_registration(
             whichtoinvert=whichtoinvert_inv,
             interpolator=interpolator
         )
-        t1_inv = time.time() - t0_inv
 
     total_runtime = time.time() - t0_total
 
@@ -916,6 +990,7 @@ def greedy_registration(
         'anderson_steps': anderson_steps if (anderson or return_inverse) else 0,
         'anderson_freq': anderson_freq if anderson else 'none',
         'return_inverse': return_inverse,
+        'digital_diffeomorphism': digital_diffeomorphism,
         'runtime_total_sec': round(total_runtime, 2),
         'runtime_affine_sec': round(t1_aff, 2),
         'runtime_deformable_sec': round(t1_opt, 2),

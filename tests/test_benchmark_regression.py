@@ -133,20 +133,23 @@ class TestBenchmarkConfigInvariants:
             assert m_cfg["reg_iterations"] == expected_iters, f"{m} iterations {m_cfg['reg_iterations']} != {expected_iters}"
 
     def test_tvf_peak_parameters(self):
-        """The TVF benchmark block is syntx.tvf's defaults (sobolev + cfl + path energy)."""
+        """The TVF benchmark block is syntx.tvf's defaults (beltrami + cfl + path energy, tuned 2026-11-12)."""
         tvf_cfg = get_model_config("tvf")
-        assert tvf_cfg["regularizer"] == "sobolev"
+        assert tvf_cfg["regularizer"] == "beltrami"
+        assert tvf_cfg["alpha"] == 2.5
+        assert tvf_cfg["grad_step"] == 1.25
+        assert tvf_cfg["energy_weight"] == 0.0008
         assert tvf_cfg["optimizer"] == "cfl"
         assert tvf_cfg["syn_metric"] == "cc2"
         assert "flow_sigma" not in tvf_cfg and "total_sigma" not in tvf_cfg   # not spectral parameters
 
     def test_syngs_peak_parameters(self):
-        """SyNGS canonical: alpha 0.675, max_step_norm 0.3, Sobolev (tuned 2026-09-30, 0 % folding)."""
+        """SyNGS canonical: alpha 0.448, max_step_norm 0.6, Sobolev (tuned 2026-11-12, 0 % folding)."""
         syngs_cfg = get_model_config("syngs")
-        assert syngs_cfg["alpha"] == 0.675
-        assert syngs_cfg["max_step_norm"] == 0.3
+        assert syngs_cfg["alpha"] == 0.448
+        assert syngs_cfg["max_step_norm"] == 0.6
         assert syngs_cfg["regularizer"] == "sobolev"
-        assert syngs_cfg["optimizer_lr"] == 1.0
+        assert syngs_cfg["optimizer_lr"] == 2.246094
         assert syngs_cfg["syn_metric"] == "cc2"
 
     def test_syn_peak_parameters(self):

@@ -4313,6 +4313,48 @@ class SyNJAX:
                 spacing=fixed_spacing, origin=fixed_origin, direction=fixed_direction,
                 stationary_boundary=getattr(self, 'stationary_boundary', True)
             )
+        if bool(kwargs.get('digital_diffeomorphism', True)) and _run_deformable_polish:
+            from .core.digital_diffeomorphism import (
+                enforce_digital_diffeomorphism_jax,
+                pullback_digital_diffeomorphism_to_halves,
+            )
+            _dd_floor = float(kwargs.get('digital_diffeomorphism_floor', 0.05))
+            _dd_steps = int(kwargs.get('digital_diffeomorphism_steps', compose_polish_steps))
+            _dd_ice_tol = (
+                float(compose_polish_tol)
+                if compose_polish_tol is not None and float(compose_polish_tol) > 0.0
+                else 0.30
+            )
+            _stat_b = getattr(self, 'stationary_boundary', True)
+            _fwd_pre_dd = fwd_composed_jax
+            fwd_composed_jax, algebraic_inv_jax = enforce_digital_diffeomorphism_jax(
+                fwd_composed_jax,
+                algebraic_inv_jax,
+                spacing=fixed_spacing,
+                origin=fixed_origin,
+                direction=fixed_direction,
+                ice_tol=_dd_ice_tol,
+                jac_floor=_dd_floor,
+                steps=_dd_steps,
+                stationary_boundary=_stat_b,
+            )
+            _delta_np = np.asarray(fwd_composed_jax) - np.asarray(_fwd_pre_dd)
+            if float(np.max(np.abs(_delta_np))) > 0.0:
+                _w_l2r_t, _w_r2l_t, _w_l2r_inv_t, _ = pullback_digital_diffeomorphism_to_halves(
+                    torch.from_numpy(_delta_np.copy()),
+                    torch.from_numpy(np.asarray(w_l2r).copy()),
+                    torch.from_numpy(np.asarray(w_r2l).copy()),
+                    torch.from_numpy(np.asarray(w_l2r_inv).copy()),
+                    torch.from_numpy(np.asarray(w_r2l_inv).copy()),
+                    spacing=fixed_spacing,
+                    origin=fixed_origin,
+                    direction=fixed_direction,
+                    jac_floor=_dd_floor,
+                    stationary_boundary=_stat_b,
+                )
+                self.midpoint_warp_l2r = PhysicalWarpArray(_w_l2r_t.numpy(), is_physical=True)
+                self.midpoint_warp_r2l = PhysicalWarpArray(_w_r2l_t.numpy(), is_physical=True)
+                self.midpoint_warp_l2r_inv = PhysicalWarpArray(_w_l2r_inv_t.numpy(), is_physical=True)
         self.warp_l2r = PhysicalWarpArray(np.array(fwd_composed_jax), is_physical=True)
         self.warp_r2l = PhysicalWarpArray(np.array(algebraic_inv_jax), is_physical=True)
         self.warp_l2r_inv = PhysicalWarpArray(np.array(self.warp_r2l), is_physical=True)

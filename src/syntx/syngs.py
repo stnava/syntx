@@ -393,9 +393,10 @@ class GeodesicShootingModel(nn.Module):
         """Applies frequency-domain Fourier Sobolev Green filter using dimension-agnostic movedim."""
         dim = len(shape)
         spatial_dims = tuple(range(2, 2 + dim))
-        m_cf = torch.movedim(m_tapered, -1, 1).to(torch.float32).contiguous()
+        fft_dtype = torch.float64 if dtype == torch.float64 else torch.float32
+        m_cf = torch.movedim(m_tapered, -1, 1).to(fft_dtype).contiguous()
         m_fft = torch.fft.rfftn(m_cf, dim=spatial_dims)
-        K_bc = K_fourier.unsqueeze(0).unsqueeze(0).to(torch.float32)
+        K_bc = K_fourier.unsqueeze(0).unsqueeze(0).to(fft_dtype)
         v_fft = m_fft * K_bc
         v_cf = torch.fft.irfftn(v_fft, s=shape, dim=spatial_dims).to(dtype=dtype).contiguous()
         return torch.movedim(v_cf, 1, -1)
@@ -1063,7 +1064,9 @@ def syngs_registration(
                 'device', 'winsorize_quantiles', 'adam_eps_rel', 'weight_decay', 'momentum',
                 'smoothing_sigmas', 'mattes_bins', 'similarity_metric', 'gaussian_sigma',
                 'fast_smooth', 'affine_iterations', 'aff_metric', 'aff_sampling', 'iterations',
-                'compose_polish_tol', 'compose_polish_steps'} | _REG_EXTRA_KEYS
+                'compose_polish_tol', 'compose_polish_steps',
+                'digital_diffeomorphism', 'digital_diffeomorphism_floor',
+                'digital_diffeomorphism_steps'} | _REG_EXTRA_KEYS
     if reg_iterations is None:
         reg_iterations = iterations
     if reg_iterations is None and 'iterations' in kwargs:
@@ -1191,6 +1194,9 @@ def syngs_registration(
     moving_shape_zyx = itk_shape_to_tensor_shape(moving_shape)
     compose_polish_tol = kwargs.pop('compose_polish_tol', 0.30)
     compose_polish_steps = int(kwargs.pop('compose_polish_steps', 25))
+    _dd_on = bool(kwargs.pop('digital_diffeomorphism', True))
+    _dd_floor = float(kwargs.pop('digital_diffeomorphism_floor', 0.05))
+    _dd_steps = int(kwargs.pop('digital_diffeomorphism_steps', compose_polish_steps))
     coarse_vel_shape = tuple(max(2, s // levels[0]) for s in grid_shape_zyx) if levels else grid_shape_zyx
 
     if backend.lower() == 'pytorch':
@@ -1293,6 +1299,24 @@ def syngs_registration(
                     spacing=spacing,
                     origin=origin,
                     direction=direction,
+                    stationary_boundary=True,
+                )
+            if _dd_on and sum(reg_iterations) > 0:
+                from .core.digital_diffeomorphism import enforce_digital_diffeomorphism_nd
+                _dd_ice_tol = (
+                    float(compose_polish_tol)
+                    if compose_polish_tol is not None and float(compose_polish_tol) > 0.0
+                    else 0.30
+                )
+                fwd_disp, inv_disp = enforce_digital_diffeomorphism_nd(
+                    fwd_disp,
+                    inv_disp,
+                    spacing=spacing,
+                    origin=origin,
+                    direction=direction,
+                    ice_tol=_dd_ice_tol,
+                    jac_floor=_dd_floor,
+                    steps=_dd_steps,
                     stationary_boundary=True,
                 )
             inv_err_calc = calculate_inverse_identity_error(
@@ -1427,6 +1451,26 @@ def syngs_registration(
                     direction=direction,
                     stationary_boundary=True,
                 )
+                inv_disp = inv_t.numpy()
+            if _dd_on and sum(reg_iterations) > 0:
+                from .core.digital_diffeomorphism import enforce_digital_diffeomorphism_nd
+                _dd_ice_tol = (
+                    float(compose_polish_tol)
+                    if compose_polish_tol is not None and float(compose_polish_tol) > 0.0
+                    else 0.30
+                )
+                fwd_t, inv_t = enforce_digital_diffeomorphism_nd(
+                    fwd_t,
+                    inv_t,
+                    spacing=spacing,
+                    origin=origin,
+                    direction=direction,
+                    ice_tol=_dd_ice_tol,
+                    jac_floor=_dd_floor,
+                    steps=_dd_steps,
+                    stationary_boundary=True,
+                )
+                fwd_disp = fwd_t.numpy()
                 inv_disp = inv_t.numpy()
             inv_err_calc = calculate_inverse_identity_error(
                 fwd_t, inv_t, spacing=spacing, origin=origin, direction=direction

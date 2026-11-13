@@ -106,6 +106,7 @@ AFFINE_ARMS_CPU: Tuple[str, ...] = ("ants_affine", "ants_affine_fast")
 DEFORMABLE_SYN_CONFIG_KEY: Dict[str, Optional[str]] = {
     "sobolev": None,  # canonical syntx.syn() defaults
     "gaussian": "gaussian",
+    "matched": "syn_matched",
     "hyperelastic": "syn_hyperelastic",
     "div_curl": "syn_divcurl",
     "navier": "syn_navier",
@@ -113,7 +114,7 @@ DEFORMABLE_SYN_CONFIG_KEY: Dict[str, Optional[str]] = {
     "dsti1": None,
     "bspline": None,
     "beltrami": "syn_beltrami",
-    "beltrami_proj": "syn_beltrami",
+    "beltrami_proj": "syn_beltrami_proj",
     "poroelastic": None,
 }
 
@@ -126,14 +127,15 @@ ARM_LABELS: Dict[str, str] = {
     "ants_syn_quick": "ants.registration ('antsRegistrationSyNQuick[so]')",
     "syn_sobolev": "syntx.syn (sobolev — canonical)",
     "syn_gaussian": "syntx.syn (gaussian)",
+    "syn_matched": "syntx.syn (matched to ANTs: gaussian σ²=3.6, step=0.30, project_inverse freq=1)",
     "syn_hyperelastic": "syntx.syn (hyperelastic, K=5.0)",
     "syn_divcurl": "syntx.syn (div_curl, β=4.0, γ=0.8)",
     "syn_navier": "syntx.syn (navier, ν=0.35)",
     "syn_solenoidal": "syntx.syn (solenoidal, div v = 0)",
     "syn_dsti1": "syntx.syn (dsti1)",
     "syn_bspline": "syntx.syn (bspline)",
-    "syn_beltrami": "syntx.syn (beltrami — tuned grad_step=0.6, dil=0.1)",
-    "syn_beltrami_proj": "syntx.syn (beltrami + cfl_project_inverse=True)",
+    "syn_beltrami": "syntx.syn (beltrami — tuned grad_step=0.7, dil=0.1)",
+    "syn_beltrami_proj": "syntx.syn (beltrami + Option A cfl_project_inverse=True, grad_step=0.6)",
     "syn_poroelastic": "syntx.syn (poroelastic)",
     "syngs_best": "syntx.syngs (sobolev α=0.448 — canonical)",
     "syngs_beltrami": "syntx.syngs (beltrami α=0.27, dil=0.075, step=0.825 — tuned)",
@@ -1125,6 +1127,7 @@ def _render_report_figures(
 
     panel_targets = (
         ("ants_syn_matched", "4panel_ants"),
+        ("syn_matched", "4panel_syn_matched"),
         ("tvf_best", "4panel_tvf"),
         ("syngs_beltrami", "4panel_syngs_beltrami"),
         ("syn_beltrami", "4panel_syn_beltrami"),
@@ -1288,11 +1291,13 @@ def _render_report_figures(
                 "syn_beltrami_proj": "syn (beltrami+proj)",
                 "syn_sobolev": "syn (sobolev)",
                 "syn_gaussian": "syn (gaussian)",
+                "syn_matched": "syn (matched)",
                 "syn_hyperelastic": "syn (hyperelastic)",
             }
             short = short_map.get(arm_k, arm_k.replace("syn_", ""))
             offsets = {
                 "syn_gaussian": (-58, -14),
+                "syn_matched": (10, -14),
                 "syn_sobolev": (-58, -4),
                 "syn_beltrami": (10, 6),
                 "syn_beltrami_proj": (10, -14),
@@ -1371,6 +1376,7 @@ def _render_report_figures(
             "syn_beltrami_proj": "syntx.syn (beltrami + proj)",
             "syn_sobolev": "syntx.syn (sobolev)",
             "syn_gaussian": "syntx.syn (gaussian)",
+            "syn_matched": "syntx.syn (matched to ANTs)",
             "syn_hyperelastic": "syntx.syn (hyperelastic)",
             "ants_syn_matched": "ants.registration (SyNOnly)",
             "ants_syn_quick": "ants.registration (SyNQuick)",
@@ -2121,6 +2127,10 @@ def _write_reports(
             f"{viz_tag} Standard 4-Panel QC — syntx.syn Continuum Hyperelastic ([100, 100, 20], Shared Affine).",
         ),
         (
+            "4panel_syn_matched",
+            f"{viz_tag} Standard 4-Panel QC — syntx.syn Matched to ANTs (gaussian σ²=3.6, step=0.30, project_inverse freq=1, Shared Affine).",
+        ),
+        (
             "4panel_ants",
             f"{viz_tag} Standard 4-Panel QC — ANTs C++ SyNOnly ([100, 100, 20], Shared Affine).",
         ),
@@ -2790,16 +2800,19 @@ def main(argv: Optional[Sequence[str]] = None) -> Dict[str, Any]:
                     + ([("e2e", "ants_e2e_syn")] if run_e2e else [])
                 )
                 for p_pre in pairs:
-                    ants_sentinel = runs_dir / f"deformable_pair{p_pre:03d}_ants_syn_matched_rep0.json"
-                    if not ants_sentinel.exists():
-                        continue
+                    all_ok = True
                     for trk_pre, arm_pre in active_pair_specs:
                         cand_p = runs_dir / f"{trk_pre}_pair{p_pre:03d}_{arm_pre}_rep0.json"
                         if cand_p.exists():
                             c_rec = json.loads(cand_p.read_text())
                             if c_rec.get("status") == "SUCCESS":
                                 records_map[(trk_pre, int(p_pre), arm_pre, 0)] = c_rec
-                    preloaded_completed_pairs.add(int(p_pre))
+                            else:
+                                all_ok = False
+                        else:
+                            all_ok = False
+                    if all_ok:
+                        preloaded_completed_pairs.add(int(p_pre))
                 if records_map:
                     all_records[:] = list(records_map.values())
 

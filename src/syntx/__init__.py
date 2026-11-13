@@ -67,6 +67,11 @@ from .core import (
     compute_log_jacobian_penalty,
     compute_hyperelastic_volumetric_penalty,
     compute_deviatoric_strain_penalty,
+    digital_diffeomorphism_loss,
+    digital_diffeomorphism_penalty,
+    enforce_digital_diffeomorphism_jax,
+    enforce_digital_diffeomorphism_nd,
+    pullback_digital_diffeomorphism_to_halves,
 )
 from .syn_jax import SyNTo as SyNToJax
 from .transform import SyNToTransform
@@ -361,7 +366,7 @@ from .liouville import liouville_determinant, determinant_summary
 syngs = syngs_registration
 affine_benchmark = evaluate_affine_benchmark
 
-__version__ = "6.35.4"
+__version__ = "6.36.0"
 
 
 
@@ -606,6 +611,11 @@ __all__ = [
     "compute_log_jacobian_penalty",
     "compute_hyperelastic_volumetric_penalty",
     "compute_deviatoric_strain_penalty",
+    "digital_diffeomorphism_loss",
+    "digital_diffeomorphism_penalty",
+    "enforce_digital_diffeomorphism_jax",
+    "enforce_digital_diffeomorphism_nd",
+    "pullback_digital_diffeomorphism_to_halves",
     "joint_label_fusion",
     "frames",
     "VECTOR_FRAME",

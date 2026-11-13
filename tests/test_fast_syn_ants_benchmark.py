@@ -247,3 +247,41 @@ def test_pair_by_pair_shuffle_best_models_mode(tmp_path: Path):
     html_txt = Path(res["html_path"]).read_text(encoding="utf-8")
     assert "Intra-Cohort vs. Cross-Cohort" in html_txt
     assert "syngs_beltrami" in html_txt
+
+
+def test_beltrami_and_beltrami_proj_config_separation():
+    from syntx.benchmark.config import get_model_config, syn_config_to_syn_kwargs
+
+    mod = _load_benchmark_module()
+    assert mod.DEFORMABLE_SYN_CONFIG_KEY["beltrami"] == "syn_beltrami"
+    assert mod.DEFORMABLE_SYN_CONFIG_KEY["beltrami_proj"] == "syn_beltrami_proj"
+    assert mod.DEFORMABLE_SYN_CONFIG_KEY["matched"] == "syn_matched"
+
+    kw_belt = syn_config_to_syn_kwargs(get_model_config("syn_beltrami"))
+    assert kw_belt["regularizer"] == "beltrami"
+    assert kw_belt["grad_step"] == 0.7
+    assert kw_belt["dilatation_weight"] == 0.1
+    assert kw_belt["sobolev_alpha"] == 2.25
+    assert kw_belt.get("cfl_project_inverse", False) is False
+
+    kw_proj = syn_config_to_syn_kwargs(get_model_config("syn_beltrami_proj"))
+    assert kw_proj["regularizer"] == "beltrami"
+    assert kw_proj["grad_step"] == 0.6
+    assert kw_proj["dilatation_weight"] == 0.1
+    assert kw_proj["sobolev_alpha"] == 2.25
+    assert kw_proj["cfl_project_inverse"] is True
+    assert kw_proj["projection_frequency"] == 1
+    assert kw_proj["cfl_project_tol"] == 1.0
+    assert kw_proj["cfl_project_jac_floor"] == 0.0
+
+    kw_matched = syn_config_to_syn_kwargs(get_model_config("syn_matched"))
+    assert kw_matched["regularizer"] == "gaussian"
+    assert kw_matched["grad_step"] == 0.30
+    assert kw_matched["flow_sigma"] == 3.6
+    assert kw_matched["cfl_project_inverse"] is True
+    assert kw_matched["projection_frequency"] == 1
+    assert kw_matched["cfl_project_tol"] == 0.20
+    assert kw_matched["cfl_project_jac_floor"] == 0.0
+    assert kw_matched["inv_refresh_every"] == [1, 1, 1]
+    assert kw_matched["lncc_single_pass"] is True
+

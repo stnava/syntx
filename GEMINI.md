@@ -57,6 +57,11 @@ experiment before changing either.
   physical origin/spacing/direction explicitly, never assume normalised grids align. [§6]
 * **Determinism.** Seed everything; make sample sets explicit and fixed; use deterministic accumulations
   (see §4 below). Same device, same inputs → bitwise identical parameters is the standard, and it is tested. [§16]
+* **In-loop inverse projection cadence (`projection_frequency=1`).** Whenever in-loop inverse projection is
+  enabled (`project_inverse=True` or `cfl_project_inverse=True`), keep `projection_frequency=1` (every
+  iteration, matching ITK/ANTs `SyNImageRegistrationMethod`). Never subsample projection across epochs
+  (`projection_frequency > 1`) in presets, autotuning search spaces, or benchmarks; control step magnitude
+  and projection tightness via `grad_step` and `cfl_project_tol` instead.
 * **Landmark role in multi-start pools.** Feature landmarks (e.g. SIFT3D + RANSAC) provide coarse initial
   basins for hard pairs, but cortical self-similarity can cause spurious inlier counts that deceive RANSAC.
   Never unconditionally force landmark transforms to displace intensity-based multi-start candidates;

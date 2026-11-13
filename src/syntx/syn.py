@@ -1413,6 +1413,109 @@ class SyNTo(nn.Module):
                             scale_norm = float(torch.mean((fixed_shape_t - 1.0) * fixed_spacing_t / 2.0).item())
                             loss = loss + (jac_penalty_w / (scale_norm + 1e-6)) * (l_jac_l + l_jac_r)
 
+                        dd_loss_w = float(kwargs.get('digital_diffeomorphism_loss_weight', getattr(self, 'digital_diffeomorphism_loss_weight', 0.0)))
+                        if dd_loss_w > 0.0:
+                            from .core.digital_diffeomorphism import digital_diffeomorphism_loss
+                            dd_floor_loop = float(kwargs.get('digital_diffeomorphism_floor', 0.05))
+                            dd_beta_loop = kwargs.get('digital_diffeomorphism_beta', 25.0)
+                            # Compute in float32 outside half-precision autocast so central-difference
+                            # cofactor determinants and logmeanexp never underflow/overflow.
+                            # Evaluate both half-warps AND the composed secant map Phi_12 = phi_2 o phi_1^-1
+                            # (using detached w_l2r_inv + differentiable warp_l2r + sample(warp_r2l) so
+                            # gradients flow into both half-warps when discrete composition creases form
+                            # even if each individual half-warp has det >= jac_floor!).
+                            with torch.amp.autocast(device_type=dev_type, enabled=False):
+                                wl_f32 = warp_l2r.float()
+                                wr_f32 = warp_r2l.float()
+                                l_dd_l = digital_diffeomorphism_loss(
+                                    wl_f32,
+                                    spacing=curr_spacing_fixed,
+                                    origin=fixed_origin,
+                                    direction=fixed_direction,
+                                    jac_floor=dd_floor_loop,
+                                    linf_beta=dd_beta_loop,
+                                    stationary_boundary=self.stationary_boundary,
+                                    is_physical=True,
+                                )
+                                l_dd_r = digital_diffeomorphism_loss(
+                                    wr_f32,
+                                    spacing=curr_spacing_fixed,
+                                    origin=fixed_origin,
+                                    direction=fixed_direction,
+                                    jac_floor=dd_floor_loop,
+                                    linf_beta=dd_beta_loop,
+                                    stationary_boundary=self.stationary_boundary,
+                                    is_physical=True,
+                                )
+                                l_dd_tot = l_dd_l + l_dd_r
+                                if self.inverse_steps > 0:
+                                    wli_det = warp_l2r_inv.detach().float()
+                                    wri_det = warp_r2l_inv.detach().float()
+                                    phi_l_dd = X_phys.float() + wli_det
+                                    cn_l_dd = physical_to_normalized_torch_cached(
+                                        phi_l_dd,
+                                        fixed_shape_t.float(),
+                                        fixed_spacing_t.float(),
+                                        fixed_origin_t.float(),
+                                        fixed_direction_t.float(),
+                                    )
+                                    # Differentiable inverse step surrogate: dw_l2r_inv ~ -w_l2r(x + w_l2r_inv) - w_l2r_inv
+                                    wl_at_m = F.grid_sample(
+                                        torch.movedim(wl_f32, -1, 1),
+                                        cn_l_dd,
+                                        padding_mode='border',
+                                        align_corners=True,
+                                    ).movedim(1, -1)
+                                    wr_at_m = F.grid_sample(
+                                        torch.movedim(wr_f32, -1, 1),
+                                        cn_l_dd,
+                                        padding_mode='border',
+                                        align_corners=True,
+                                    ).movedim(1, -1)
+                                    wli_diff = wli_det - (wl_at_m - wl_at_m.detach())
+                                    fwd_comp_dd = (wli_diff + wr_at_m) * b_mask.float()
+
+                                    phi_r_dd = X_phys.float() + wri_det
+                                    cn_r_dd = physical_to_normalized_torch_cached(
+                                        phi_r_dd,
+                                        fixed_shape_t.float(),
+                                        fixed_spacing_t.float(),
+                                        fixed_origin_t.float(),
+                                        fixed_direction_t.float(),
+                                    )
+                                    wr_at_mr = F.grid_sample(
+                                        torch.movedim(wr_f32, -1, 1),
+                                        cn_r_dd,
+                                        padding_mode='border',
+                                        align_corners=True,
+                                    ).movedim(1, -1)
+                                    wl_at_mr = F.grid_sample(
+                                        torch.movedim(wl_f32, -1, 1),
+                                        cn_r_dd,
+                                        padding_mode='border',
+                                        align_corners=True,
+                                    ).movedim(1, -1)
+                                    wri_diff = wri_det - (wr_at_mr - wr_at_mr.detach())
+                                    inv_comp_dd = (wri_diff + wl_at_mr) * b_mask.float()
+
+                                    l_dd_comp = digital_diffeomorphism_loss(
+                                        fwd_comp_dd,
+                                        inv_comp_dd,
+                                        spacing=curr_spacing_fixed,
+                                        origin=fixed_origin,
+                                        direction=fixed_direction,
+                                        X_phys=X_phys.float(),
+                                        jac_floor=dd_floor_loop,
+                                        ice_tol=float(kwargs.get('compose_polish_tol', 0.30) or 0.30),
+                                        ice_weight=0.25,
+                                        linf_beta=dd_beta_loop,
+                                        stationary_boundary=self.stationary_boundary,
+                                        is_physical=True,
+                                    )
+                                    l_dd_tot = l_dd_tot + l_dd_comp
+                            scale_norm_dd = float(torch.mean((fixed_shape_t - 1.0) * fixed_spacing_t / 2.0).item())
+                            loss = loss + (dd_loss_w / (scale_norm_dd + 1e-6)) * l_dd_tot
+
                         boot_m = kwargs.get('bootstrap_mode', getattr(self, 'bootstrap_mode', None))
                         if boot_m in ['jitter', 'antithetic', 'strided']:
                             orig_w = float(kwargs.get('bootstrap_orig_weight', getattr(self, 'bootstrap_orig_weight', 0.50)))
@@ -2170,6 +2273,9 @@ class SyNTo(nn.Module):
             _default_lm_steps = int(self.inverse_steps) if self.inverse_steps is not None else 25
             compose_polish_steps = int(kwargs.get('compose_polish_steps', max(_default_lm_steps, 25)))
             _run_deformable_polish = (self.inverse_steps > 0 and sum(epochs_per_level) > 0)
+            _dd_on = bool(kwargs.get('digital_diffeomorphism', True))
+            _dd_floor = float(kwargs.get('digital_diffeomorphism_floor', 0.05))
+            _dd_steps = int(kwargs.get('digital_diffeomorphism_steps', compose_polish_steps))
 
             X_phys = get_physical_grid_torch(
                 target_grid_shape, fixed_spacing, fixed_origin, fixed_direction, device=device, dtype=dtype
@@ -2205,92 +2311,212 @@ class SyNTo(nn.Module):
                     stationary_boundary=self.stationary_boundary,
                 )
 
-            # Preserve inverse of fixed-side half-warp for syntx.liouville_determinant;
-            # offload midpoint fields to CPU above 256^3 voxels so they do not occupy GPU memory.
-            mid_l2r_inv = w_l2r_inv.cpu() if offload_midpoints else w_l2r_inv.clone()
-            self.midpoint_warp_l2r_inv = nn.Parameter(mid_l2r_inv, requires_grad=False)
-            self.midpoint_warp_l2r_inv.is_physical = True
-            del mid_l2r_inv
+            if not _dd_on:
+                # Preserve inverse of fixed-side half-warp for syntx.liouville_determinant;
+                # offload midpoint fields to CPU above 256^3 voxels so they do not occupy GPU memory.
+                mid_l2r_inv = w_l2r_inv.cpu() if offload_midpoints else w_l2r_inv.clone()
+                self.midpoint_warp_l2r_inv = nn.Parameter(mid_l2r_inv, requires_grad=False)
+                self.midpoint_warp_l2r_inv.is_physical = True
+                del mid_l2r_inv
 
-            # Pre-compute normalization tensors for composition
-            comp_spacing_rev, comp_origin_rev, comp_direction_rev = reverse_metadata(
-                fixed_spacing, fixed_origin, fixed_direction
-            )
-            comp_shape_t = torch.tensor(list(target_grid_shape), device=device, dtype=dtype)
-            comp_spacing_t = torch.tensor(comp_spacing_rev, device=device, dtype=dtype)
-            comp_origin_t = torch.tensor(comp_origin_rev, device=device, dtype=dtype)
-            comp_direction_t = torch.tensor(comp_direction_rev, device=device, dtype=dtype)
-
-            # Compose forward F -> M (phi_2 o phi_1^-1) in physical space
-            phi_l2r_phys = X_phys + w_l2r_inv
-            del w_l2r_inv
-            coords_norm = physical_to_normalized_torch_cached(
-                phi_l2r_phys, comp_shape_t, comp_spacing_t, comp_origin_t, comp_direction_t
-            )
-            disp_r2l_sampled = F.grid_sample(
-                torch.movedim(w_r2l, -1, 1), coords_norm, padding_mode='border', align_corners=True
-            ).movedim(1, -1)
-            del coords_norm
-            phi_l2r_phys.add_(disp_r2l_sampled).sub_(X_phys)
-            del disp_r2l_sampled
-            fwd_composed = phi_l2r_phys
-            del phi_l2r_phys
-
-            # w_r2l is no longer needed for composition; preserve as midpoint_warp_r2l and free
-            if self.stationary_boundary:
-                _zero_boundary_inplace(w_r2l)
-            mid_r2l = w_r2l.cpu() if offload_midpoints else w_r2l
-            del w_r2l
-            self.midpoint_warp_r2l = nn.Parameter(mid_r2l, requires_grad=False)
-            self.midpoint_warp_r2l.is_physical = True
-            del mid_r2l
-
-            # Compose inverse M -> F (phi_1 o phi_2^-1) once in physical space
-            phi_r2l_phys = X_phys + w_r2l_inv
-            del w_r2l_inv
-            coords_norm_r = physical_to_normalized_torch_cached(
-                phi_r2l_phys, comp_shape_t, comp_spacing_t, comp_origin_t, comp_direction_t
-            )
-            disp_l2r_sampled = F.grid_sample(
-                torch.movedim(w_l2r, -1, 1), coords_norm_r, padding_mode='border', align_corners=True
-            ).movedim(1, -1)
-            del coords_norm_r
-            phi_r2l_phys.add_(disp_l2r_sampled).sub_(X_phys)
-            del disp_l2r_sampled
-            algebraic_inv = phi_r2l_phys
-            del phi_r2l_phys
-
-            # w_l2r is no longer needed for composition; preserve as midpoint_warp_l2r and free
-            if self.stationary_boundary:
-                _zero_boundary_inplace(w_l2r)
-            mid_l2r = w_l2r.cpu() if offload_midpoints else w_l2r
-            del w_l2r
-            self.midpoint_warp_l2r = nn.Parameter(mid_l2r, requires_grad=False)
-            self.midpoint_warp_l2r.is_physical = True
-            del mid_l2r
-
-            if self.stationary_boundary:
-                _zero_boundary_inplace(fwd_composed)
-                _zero_boundary_inplace(algebraic_inv)
-
-            if (
-                _run_deformable_polish
-                and compose_polish_tol is not None
-                and float(compose_polish_tol) > 0.0
-            ):
-                _cp_tol = float(compose_polish_tol)
-                algebraic_inv = update_inverse_field_nd_hybrid_lm(
-                    fwd_composed,
-                    algebraic_inv,
-                    steps=compose_polish_steps,
-                    max_error_threshold=_cp_tol,
-                    mean_error_threshold=min(_cp_tol * 0.5, 0.02),
-                    spacing=fixed_spacing,
-                    origin=fixed_origin,
-                    direction=fixed_direction,
-                    X_phys=X_phys,
-                    stationary_boundary=self.stationary_boundary,
+                # Pre-compute normalization tensors for composition
+                comp_spacing_rev, comp_origin_rev, comp_direction_rev = reverse_metadata(
+                    fixed_spacing, fixed_origin, fixed_direction
                 )
+                comp_shape_t = torch.tensor(list(target_grid_shape), device=device, dtype=dtype)
+                comp_spacing_t = torch.tensor(comp_spacing_rev, device=device, dtype=dtype)
+                comp_origin_t = torch.tensor(comp_origin_rev, device=device, dtype=dtype)
+                comp_direction_t = torch.tensor(comp_direction_rev, device=device, dtype=dtype)
+
+                # Compose forward F -> M (phi_2 o phi_1^-1) in physical space
+                phi_l2r_phys = X_phys + w_l2r_inv
+                del w_l2r_inv
+                coords_norm = physical_to_normalized_torch_cached(
+                    phi_l2r_phys, comp_shape_t, comp_spacing_t, comp_origin_t, comp_direction_t
+                )
+                disp_r2l_sampled = F.grid_sample(
+                    torch.movedim(w_r2l, -1, 1), coords_norm, padding_mode='border', align_corners=True
+                ).movedim(1, -1)
+                del coords_norm
+                phi_l2r_phys.add_(disp_r2l_sampled).sub_(X_phys)
+                del disp_r2l_sampled
+                fwd_composed = phi_l2r_phys
+                del phi_l2r_phys
+
+                # w_r2l is no longer needed for composition; preserve as midpoint_warp_r2l and free
+                if self.stationary_boundary:
+                    _zero_boundary_inplace(w_r2l)
+                mid_r2l = w_r2l.cpu() if offload_midpoints else w_r2l
+                del w_r2l
+                self.midpoint_warp_r2l = nn.Parameter(mid_r2l, requires_grad=False)
+                self.midpoint_warp_r2l.is_physical = True
+                del mid_r2l
+
+                # Compose inverse M -> F (phi_1 o phi_2^-1) once in physical space
+                phi_r2l_phys = X_phys + w_r2l_inv
+                del w_r2l_inv
+                coords_norm_r = physical_to_normalized_torch_cached(
+                    phi_r2l_phys, comp_shape_t, comp_spacing_t, comp_origin_t, comp_direction_t
+                )
+                disp_l2r_sampled = F.grid_sample(
+                    torch.movedim(w_l2r, -1, 1), coords_norm_r, padding_mode='border', align_corners=True
+                ).movedim(1, -1)
+                del coords_norm_r
+                phi_r2l_phys.add_(disp_l2r_sampled).sub_(X_phys)
+                del disp_l2r_sampled
+                algebraic_inv = phi_r2l_phys
+                del phi_r2l_phys
+
+                # w_l2r is no longer needed for composition; preserve as midpoint_warp_l2r and free
+                if self.stationary_boundary:
+                    _zero_boundary_inplace(w_l2r)
+                mid_l2r = w_l2r.cpu() if offload_midpoints else w_l2r
+                del w_l2r
+                self.midpoint_warp_l2r = nn.Parameter(mid_l2r, requires_grad=False)
+                self.midpoint_warp_l2r.is_physical = True
+                del mid_l2r
+
+                if self.stationary_boundary:
+                    _zero_boundary_inplace(fwd_composed)
+                    _zero_boundary_inplace(algebraic_inv)
+
+                if (
+                    _run_deformable_polish
+                    and compose_polish_tol is not None
+                    and float(compose_polish_tol) > 0.0
+                ):
+                    _cp_tol = float(compose_polish_tol)
+                    algebraic_inv = update_inverse_field_nd_hybrid_lm(
+                        fwd_composed,
+                        algebraic_inv,
+                        steps=compose_polish_steps,
+                        max_error_threshold=_cp_tol,
+                        mean_error_threshold=min(_cp_tol * 0.5, 0.02),
+                        spacing=fixed_spacing,
+                        origin=fixed_origin,
+                        direction=fixed_direction,
+                        X_phys=X_phys,
+                        stationary_boundary=self.stationary_boundary,
+                    )
+            else:
+                from .core.digital_diffeomorphism import (
+                    enforce_digital_diffeomorphism_nd,
+                    pullback_digital_diffeomorphism_to_halves,
+                )
+                if self.stationary_boundary:
+                    _zero_boundary_inplace(w_l2r)
+                    _zero_boundary_inplace(w_r2l)
+                    _zero_boundary_inplace(w_l2r_inv)
+                    _zero_boundary_inplace(w_r2l_inv)
+
+                comp_spacing_rev, comp_origin_rev, comp_direction_rev = reverse_metadata(
+                    fixed_spacing, fixed_origin, fixed_direction
+                )
+                comp_shape_t = torch.tensor(list(target_grid_shape), device=device, dtype=dtype)
+                comp_spacing_t = torch.tensor(comp_spacing_rev, device=device, dtype=dtype)
+                comp_origin_t = torch.tensor(comp_origin_rev, device=device, dtype=dtype)
+                comp_direction_t = torch.tensor(comp_direction_rev, device=device, dtype=dtype)
+
+                phi_l2r_phys = X_phys + w_l2r_inv
+                coords_norm = physical_to_normalized_torch_cached(
+                    phi_l2r_phys, comp_shape_t, comp_spacing_t, comp_origin_t, comp_direction_t
+                )
+                disp_r2l_sampled = F.grid_sample(
+                    torch.movedim(w_r2l, -1, 1), coords_norm, padding_mode='border', align_corners=True
+                ).movedim(1, -1)
+                del coords_norm
+                fwd_composed = phi_l2r_phys + disp_r2l_sampled - X_phys
+                del phi_l2r_phys, disp_r2l_sampled
+
+                phi_r2l_phys = X_phys + w_r2l_inv
+                coords_norm_r = physical_to_normalized_torch_cached(
+                    phi_r2l_phys, comp_shape_t, comp_spacing_t, comp_origin_t, comp_direction_t
+                )
+                disp_l2r_sampled = F.grid_sample(
+                    torch.movedim(w_l2r, -1, 1), coords_norm_r, padding_mode='border', align_corners=True
+                ).movedim(1, -1)
+                del coords_norm_r
+                algebraic_inv = phi_r2l_phys + disp_l2r_sampled - X_phys
+                del phi_r2l_phys, disp_l2r_sampled
+
+                if self.stationary_boundary:
+                    _zero_boundary_inplace(fwd_composed)
+                    _zero_boundary_inplace(algebraic_inv)
+
+                if (
+                    _run_deformable_polish
+                    and compose_polish_tol is not None
+                    and float(compose_polish_tol) > 0.0
+                ):
+                    _cp_tol = float(compose_polish_tol)
+                    algebraic_inv = update_inverse_field_nd_hybrid_lm(
+                        fwd_composed,
+                        algebraic_inv,
+                        steps=compose_polish_steps,
+                        max_error_threshold=_cp_tol,
+                        mean_error_threshold=min(_cp_tol * 0.5, 0.02),
+                        spacing=fixed_spacing,
+                        origin=fixed_origin,
+                        direction=fixed_direction,
+                        X_phys=X_phys,
+                        stationary_boundary=self.stationary_boundary,
+                    )
+
+                if _run_deformable_polish:
+                    _dd_ice_tol = (
+                        float(compose_polish_tol)
+                        if compose_polish_tol is not None and float(compose_polish_tol) > 0.0
+                        else 0.30
+                    )
+                    _fwd_pre_dd = fwd_composed.clone()
+                    fwd_composed, algebraic_inv = enforce_digital_diffeomorphism_nd(
+                        fwd_composed,
+                        algebraic_inv,
+                        spacing=fixed_spacing,
+                        origin=fixed_origin,
+                        direction=fixed_direction,
+                        X_phys=X_phys,
+                        ice_tol=_dd_ice_tol,
+                        jac_floor=_dd_floor,
+                        steps=_dd_steps,
+                        stationary_boundary=self.stationary_boundary,
+                    )
+                    _delta_dd = fwd_composed - _fwd_pre_dd
+                    del _fwd_pre_dd
+                    w_l2r, w_r2l, w_l2r_inv, w_r2l_inv = pullback_digital_diffeomorphism_to_halves(
+                        _delta_dd,
+                        w_l2r,
+                        w_r2l,
+                        w_l2r_inv,
+                        w_r2l_inv,
+                        spacing=fixed_spacing,
+                        origin=fixed_origin,
+                        direction=fixed_direction,
+                        X_phys=X_phys,
+                        jac_floor=_dd_floor,
+                        stationary_boundary=self.stationary_boundary,
+                    )
+                    del _delta_dd
+
+                del w_r2l_inv
+                mid_l2r_inv = w_l2r_inv.cpu() if offload_midpoints else w_l2r_inv
+                del w_l2r_inv
+                self.midpoint_warp_l2r_inv = nn.Parameter(mid_l2r_inv, requires_grad=False)
+                self.midpoint_warp_l2r_inv.is_physical = True
+                del mid_l2r_inv
+
+                mid_r2l = w_r2l.cpu() if offload_midpoints else w_r2l
+                del w_r2l
+                self.midpoint_warp_r2l = nn.Parameter(mid_r2l, requires_grad=False)
+                self.midpoint_warp_r2l.is_physical = True
+                del mid_r2l
+
+                mid_l2r = w_l2r.cpu() if offload_midpoints else w_l2r
+                del w_l2r
+                self.midpoint_warp_l2r = nn.Parameter(mid_l2r, requires_grad=False)
+                self.midpoint_warp_l2r.is_physical = True
+                del mid_l2r
+
             del X_phys
 
             self.warp_l2r = nn.Parameter(fwd_composed)
@@ -2579,6 +2805,8 @@ SYN_ADVANCED_OPTIONS = frozenset({
     'amp', 'bootstrap_jitter_scale', 'bootstrap_mode', 'bootstrap_orig_weight',
     'bootstrap_samples', 'cfl_project_inverse', 'cfl_project_jac_floor', 'cfl_project_tol',
     'compose_polish_steps', 'compose_polish_tol',
+    'digital_diffeomorphism', 'digital_diffeomorphism_beta', 'digital_diffeomorphism_floor',
+    'digital_diffeomorphism_loss_weight', 'digital_diffeomorphism_steps',
     'elastic_mesh_size', 'elastic_sigma',
     'elastic_spline_distance', 'fast_smooth', 'inv_refresh_every', 'jacobian_epsilon',
     'jacobian_penalty_weight', 'lncc_single_pass', 'loss_sync_every', 'mesh_size',

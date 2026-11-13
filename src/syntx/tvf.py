@@ -2001,6 +2001,9 @@ TVF_ADVANCED_OPTIONS = {
     # post-integration inverse field polish
     'compose_polish_tol': 'safeguarded hybrid_lm max-error tolerance (vox) for exported inv_disp (default 0.30; <=0 disables)',
     'compose_polish_steps': 'max hybrid_lm steps for exported inv_disp polish (default 25)',
+    'digital_diffeomorphism': 'end-of-registration sparse L_inf digital diffeomorphism projection on exported warps (default True; pass False to opt out)',
+    'digital_diffeomorphism_floor': 'discrete central-difference Jacobian determinant floor for digital_diffeomorphism (default 0.05)',
+    'digital_diffeomorphism_steps': 'max active-set iterations for digital_diffeomorphism (default compose_polish_steps)',
 }
 
 
@@ -2299,6 +2302,9 @@ def tvf_registration(
     fit_kwargs = dict(advanced)
     compose_polish_tol = fit_kwargs.pop('compose_polish_tol', 0.30)
     compose_polish_steps = int(fit_kwargs.pop('compose_polish_steps', 25))
+    _dd_on = bool(fit_kwargs.pop('digital_diffeomorphism', True))
+    _dd_floor = float(fit_kwargs.pop('digital_diffeomorphism_floor', 0.05))
+    _dd_steps = int(fit_kwargs.pop('digital_diffeomorphism_steps', compose_polish_steps))
     inverse_identity_weight = float(fit_kwargs.pop('inverse_identity_weight', 0.05))
     model_kwargs = {k: fit_kwargs.pop(k) for k in ('solver', 'adjoint', 'integration_steps_per_interval',
                                                    'use_analytical_gradients') if k in fit_kwargs}
@@ -2414,6 +2420,24 @@ def tvf_registration(
                     direction=direction,
                     stationary_boundary=True,
                 )
+            if _dd_on and sum(reg_iterations) > 0:
+                from .core.digital_diffeomorphism import enforce_digital_diffeomorphism_nd
+                _dd_ice_tol = (
+                    float(compose_polish_tol)
+                    if compose_polish_tol is not None and float(compose_polish_tol) > 0.0
+                    else 0.30
+                )
+                fwd_disp_gpu, inv_disp_gpu = enforce_digital_diffeomorphism_nd(
+                    fwd_disp_gpu,
+                    inv_disp_gpu,
+                    spacing=spacing,
+                    origin=origin,
+                    direction=direction,
+                    ice_tol=_dd_ice_tol,
+                    jac_floor=_dd_floor,
+                    steps=_dd_steps,
+                    stationary_boundary=True,
+                )
             inv_err_dict = calculate_inverse_identity_error(
                 fwd_disp_gpu,
                 inv_disp_gpu,
@@ -2439,16 +2463,18 @@ def tvf_registration(
         _jax_advanced = {'solver', 'integration_steps_per_interval', 'constant_speed',
                          'constant_speed_relaxation', 'mattes_bins', 'smooth_pyramid',
                          'convergence_threshold', 'convergence_window', 'winsorize_quantiles',
-                         'compose_polish_tol', 'compose_polish_steps'}
+                         'compose_polish_tol', 'compose_polish_steps',
+                         'digital_diffeomorphism', 'digital_diffeomorphism_floor',
+                         'digital_diffeomorphism_steps'}
         _unsupported = sorted(set(advanced) - _jax_advanced)
         if _unsupported:
             raise TypeError(f"syntx.tvf(backend='jax') does not support {_unsupported} "
                             "(PyTorch-backend options)")
         if resolved_adjoint or str(resolved_solver).lower().startswith('adjoint'):
             raise NotImplementedError("backend='jax' does not support adjoint solvers; use backend='pytorch'")
-        if max_step_norm is not None or temporal_weight != 0.0 or energy_weight != 1e-3:
+        if max_step_norm is not None or temporal_weight != 0.0 or energy_weight != 0.0008:
             raise ValueError("backend='jax' has no path-energy / step-norm options: leave "
-                             "energy_weight (1e-3), temporal_weight (0) and max_step_norm (None) at "
+                             "energy_weight (0.0008), temporal_weight (0) and max_step_norm (None) at "
                              "their defaults (the JAX model uses a plain mean(v^2) penalty instead)")
         if device not in (None, 'cpu'):
             raise ValueError("backend='jax' runs on the JAX default device; device is not used")
@@ -2542,6 +2568,26 @@ def tvf_registration(
                     direction=direction,
                     stationary_boundary=True,
                 )
+                inv_disp = inv_t.numpy()
+            if _dd_on and sum(reg_iterations) > 0:
+                from .core.digital_diffeomorphism import enforce_digital_diffeomorphism_nd
+                _dd_ice_tol = (
+                    float(compose_polish_tol)
+                    if compose_polish_tol is not None and float(compose_polish_tol) > 0.0
+                    else 0.30
+                )
+                fwd_t, inv_t = enforce_digital_diffeomorphism_nd(
+                    fwd_t,
+                    inv_t,
+                    spacing=spacing,
+                    origin=origin,
+                    direction=direction,
+                    ice_tol=_dd_ice_tol,
+                    jac_floor=_dd_floor,
+                    steps=_dd_steps,
+                    stationary_boundary=True,
+                )
+                fwd_disp = fwd_t.numpy()
                 inv_disp = inv_t.numpy()
             inv_err_dict = calculate_inverse_identity_error(
                 fwd_t, inv_t, spacing=spacing, origin=origin, direction=direction

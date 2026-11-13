@@ -247,14 +247,15 @@ def test_swin_unetr_extractor_interpolation():
 def test_swin_unetr_weights_download_and_key_cleaning():
     monai = pytest.importorskip("monai")
     import unittest.mock as mock
-    
-    with mock.patch("os.path.exists", side_effect=[False, True]), \
-         mock.patch("os.makedirs") as mock_makedirs, \
-         mock.patch("urllib.request.urlretrieve") as mock_urlretrieve, \
-         mock.patch("os.rename") as mock_rename, \
+
+    mock_antsxdata = mock.MagicMock()
+    mock_antsxdata.fetch.return_value = "/tmp/mock_model_swinvit.pt"
+
+    with mock.patch("syntx.features._import_antsxdata", return_value=mock_antsxdata), \
+         mock.patch("os.path.exists", return_value=True), \
          mock.patch("torch.load") as mock_torch_load, \
          mock.patch("monai.networks.nets.SwinUNETR") as mock_swin_unetr:
-             
+
         class _Leaf(torch.nn.Module):
             def __init__(self, n):
                 super().__init__()
@@ -271,20 +272,18 @@ def test_swin_unetr_weights_download_and_key_cleaning():
         mock_instance = mock.MagicMock()
         mock_instance.swinViT = _ViT()
         mock_swin_unetr.return_value = mock_instance
-        
+
         mock_state_dict = {
             'module.swinViT.patch_embed.proj.weight': torch.ones(1),
             'swinViT.layer1.weight': torch.zeros(1),
             'layer2.weight': torch.ones(2)
         }
         mock_torch_load.return_value = {'state_dict': mock_state_dict}
-        
+
         extractor = SwinUNETRExtractor(feature_layers=[4])
-        
-        mock_makedirs.assert_called_once()
-        mock_urlretrieve.assert_called_once()
-        mock_rename.assert_called_once()
-        
+
+        mock_antsxdata.fetch.assert_called_once_with("syntx_features/model_swinvit")
+
         # 'module.' / 'swinViT.' prefixes stripped, every tensor loaded by name
         vit = mock_instance.swinViT
         assert torch.equal(vit.patch_embed.proj.weight.data, torch.ones(1))

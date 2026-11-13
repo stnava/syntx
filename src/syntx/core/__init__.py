@@ -72,6 +72,13 @@ from .losses import (
     soft_dice_loss_nd,
 )
 from .convergence import DEFAULT_SLOPE_THRESHOLD, DEFAULT_WINDOW, LossSlopeStop, loss_slope
+from .digital_diffeomorphism import (
+    digital_diffeomorphism_loss,
+    digital_diffeomorphism_penalty,
+    enforce_digital_diffeomorphism_jax,
+    enforce_digital_diffeomorphism_nd,
+    pullback_digital_diffeomorphism_to_halves,
+)
 from .optimizers import (
     LARS,
     GaussianAdam,
@@ -177,7 +184,11 @@ __all__ = [
     'compute_log_jacobian_penalty',
     'compute_physical_jacobian_determinant',
     'compute_soft_distance_transform',
+    'digital_diffeomorphism_loss',
+    'digital_diffeomorphism_penalty',
     'distance_transform_loss',
+    'enforce_digital_diffeomorphism_jax',
+    'enforce_digital_diffeomorphism_nd',
     'get_boundary_mask',
     'get_cached_gaussian_kernel_1d',
     'get_cfl_max_norm',
@@ -212,6 +223,7 @@ __all__ = [
     'physical_to_normalized_torch_cached',
     'prepare_mid_images_and_gradients_torch',
     'project_solenoidal',
+    'pullback_digital_diffeomorphism_to_halves',
     'register_regularizer',
     'resize_field',
     'sample_field_cf',

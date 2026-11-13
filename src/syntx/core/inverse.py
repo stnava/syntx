@@ -18,6 +18,7 @@ Inverse error: ``calculate_inverse_identity_error`` (summary dict; exported as
 (error map).
 """
 
+import math
 import numpy as np
 import torch
 import torch.nn.functional as F
@@ -810,7 +811,9 @@ def update_inverse_field_nd_anderson(
     bshape = (B,) + (1,) * (W_disp.dim() - 1)
     ones_b = torch.ones(bshape, device=device, dtype=dtype)
 
-    def itk_fixed_point_step(v_curr, iteration, compute_mean: bool = True):
+    need_mean = math.isfinite(float(mean_error_threshold))
+
+    def _eval_fp_residual(v_curr, compute_mean: bool = True):
         if use_physical:
             coords_phys = X_phys + v_curr
             coords_norm = physical_to_normalized_fast(coords_phys, M_norm, b_norm)
@@ -833,8 +836,10 @@ def update_inverse_field_nd_anderson(
 
         # Per-element reductions (B,): each field in the batch is independent.
         max_err = _batch_reduce_amax(scaled_norm)
-        mean_err = _batch_reduce_mean(scaled_norm) if compute_mean else None
+        mean_err = _batch_reduce_mean(scaled_norm) if (compute_mean and need_mean) else None
+        return error, scaled_norm, max_err, mean_err, residual_fp
 
+    def _finish_fp_step(v_curr, error, scaled_norm, max_err, iteration):
         epsilon = 0.75 if iteration == 0 else 0.5
         clip_threshold = (epsilon * max_err).reshape(bshape)
         clip_scale = torch.where(
@@ -854,7 +859,7 @@ def update_inverse_field_nd_anderson(
             v_new = separable_gaussian_filter(v_new, smoothing_sigma)     # sigma in voxels
 
         v_new.mul_(boundary_mask)
-        return v_new, max_err, mean_err, residual_fp
+        return v_new
 
     v_k = W_inv_disp.clone()
     R_history: list[torch.Tensor] = []
@@ -876,22 +881,27 @@ def update_inverse_field_nd_anderson(
                             or (checks_on and iteration + 1 > first_check
                                 and (iteration + 1 - first_check) % check_interval == 0)
                             or iteration == steps - 1)
-        g_k, max_err, mean_err, residual_fp = itk_fixed_point_step(v_k, iteration, compute_mean=True)
-        conv_now = (max_err <= max_error_threshold) & (mean_err <= mean_error_threshold)   # (B,)
+        err_buf, s_norm_buf, max_err, mean_err, residual_fp = _eval_fp_residual(v_k, compute_mean=True)
+        conv_now = (max_err <= max_error_threshold) if mean_err is None else (
+            (max_err <= max_error_threshold) & (mean_err <= mean_error_threshold)
+        )
         conv_step = torch.where(conv_now & ~done, torch.full_like(conv_step, iteration), conv_step)
         done_next = done | conv_now
 
-        # Check convergence before allocating history/Anderson buffers: when every element in
-        # the batch has already met the thresholds at ``v_k`` (idempotent on feasible fields:
-        # ``steps_taken == 0`` when the initial guess already satisfies the thresholds), leave
-        # ``v_k`` untouched rather than applying an extra unverified fixed-point resample.
+        # Check convergence before building the fixed-point candidate or Anderson history:
+        # when every element in the batch has already met the thresholds at ``v_k`` (idempotent
+        # on feasible fields: ``steps_taken == 0`` when the initial guess already satisfies the
+        # thresholds), leave ``v_k`` untouched and skip candidate tensor construction.
         if should_check:
             flag = torch.stack([done_next.all().to(torch.int64), conv_step.max()]).tolist()   # one sync
             if flag[0]:
-                del g_k
+                del err_buf, s_norm_buf
                 converged = True
                 steps_taken = int(flag[1])
                 break
+
+        g_k = _finish_fp_step(v_k, err_buf, s_norm_buf, max_err, iteration)
+        del err_buf, s_norm_buf
 
         g_k_flat = g_k.reshape(B, -1)
         if len(R_history) == m + 1:

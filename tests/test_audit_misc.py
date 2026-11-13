@@ -283,8 +283,15 @@ def test_temp_seed_restores_accelerator_rng(monkeypatch):
 # ---------------------------------------------------------------------------------------
 
 def test_diagnose_records_why_tier2_did_not_run(monkeypatch):
+    import syntx.diagnose as dg
     from syntx.diagnose import diagnose_image
     import ants
+    orig_exists = dg.os.path.exists
+    monkeypatch.setattr(
+        dg.os.path,
+        "exists",
+        lambda p: False if str(p).endswith("diagnostic_resnet10_3d.pth") else orig_exists(p),
+    )
     vol = ants.from_numpy(np.random.default_rng(0).random((48, 48, 48)).astype(np.float32) * 100,
                           spacing=(2.0, 2.0, 2.0))                 # 96 mm: classifier-eligible
     d = diagnose_image(vol, fast=False)
