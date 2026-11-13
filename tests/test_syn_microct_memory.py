@@ -174,7 +174,7 @@ def test_inverse_field_batch_independence_and_warmstart_stats(method: str) -> No
     assert torch.allclose(inv_pair[0:1], inv_0, atol=2e-3)
     assert torch.allclose(inv_pair[1:2], inv_1, atol=2e-3)
 
-    # Warm-started with converged inverse -> exits on step 1 without allocating history
+    # Warm-started with converged inverse -> exits with 0 steps (idempotent) without allocating history
     warm_stats: dict = {}
     inv_warm = update_inverse_field_nd(
         fwd_pair,
@@ -188,9 +188,9 @@ def test_inverse_field_batch_independence_and_warmstart_stats(method: str) -> No
         mean_error_threshold=1e-3,
         stats=warm_stats,
     )
-    assert warm_stats["steps"] == 1
+    assert warm_stats["steps"] == 0
     assert warm_stats["converged"] is True
-    assert torch.allclose(inv_warm, inv_pair, atol=1e-3)
+    assert torch.equal(inv_warm, inv_pair)
 
 
 @pytest.mark.skipif(

@@ -977,6 +977,23 @@ def update_inverse_field_jax_hybrid_lm(
     step_scale = float(relaxation) if float(relaxation) < 1.0 else 1.0
     I_mat = jnp.eye(dim, dtype=dtype).reshape(*([1] * (dim + 1)), dim, dim)
 
+    u_init_val, _ = _sample_val_and_jac_batch(v_init)
+    r_init_vox_sq = jnp.sum(((v_init + u_init_val) * err_to_vox_scale) ** 2, axis=-1)
+    r_init_vox = jnp.sqrt(r_init_vox_sq) * domain_mask
+    max_err_init = jnp.max(r_init_vox)
+    mean_err_init = jnp.sum(r_init_vox) / n_domain
+    active_tol_vox = jnp.where(
+        mean_err_init <= mean_error_threshold,
+        jnp.asarray(max_error_threshold, dtype=dtype),
+        jnp.asarray(min(float(max_error_threshold), max(float(mean_error_threshold) * 0.8, 1e-6)), dtype=dtype),
+    )
+    target_vox_sq = jnp.maximum((0.25 * active_tol_vox) ** 2, 1e-12)
+    init_active = (
+        (r_init_vox_sq > (active_tol_vox ** 2)) & (domain_mask > 0.5)
+        if smoothing_sigma <= 0.0
+        else (domain_mask > 0.5)
+    )
+
     def body_fn(i, val):
         v_curr, lam_curr, max_err_prev, mean_err_prev = val
         should_continue = jnp.logical_or(
@@ -992,6 +1009,11 @@ def update_inverse_field_jax_hybrid_lm(
             mean_err = jnp.sum(r_vox) / n_domain
 
             def do_step(_):
+                alive_mask = (
+                    init_active & (r_vox_sq > target_vox_sq) & (lam_curr < 1e7)
+                    if smoothing_sigma <= 0.0
+                    else init_active
+                )
                 J = I_mat + grad_u
                 JT = jnp.swapaxes(J, -1, -2)
                 JTJ = jnp.matmul(JT, J)
@@ -1009,12 +1031,16 @@ def update_inverse_field_jax_hybrid_lm(
                 u_t, _ = _sample_val_and_jac_batch(v_trial)
                 r_t = v_trial + u_t
                 r_vox_sq_t = jnp.sum((r_t * err_to_vox_scale) ** 2, axis=-1)
-                imp = r_vox_sq_t < r_vox_sq
+                imp = (r_vox_sq_t < r_vox_sq) & alive_mask
                 v_next = jnp.where(imp[..., None], v_trial, v_curr)
                 lam_next = jnp.where(
-                    imp,
-                    jnp.maximum(lam_curr * 0.25, 1e-6),
-                    jnp.minimum(lam_curr * 8.0, 1e8),
+                    alive_mask,
+                    jnp.where(
+                        imp,
+                        jnp.maximum(lam_curr * 0.25, 1e-6),
+                        jnp.minimum(lam_curr * 8.0, 1e8),
+                    ),
+                    lam_curr,
                 )
                 if smoothing_sigma > 0.0:
                     v_next = separable_gaussian_filter_jax(v_next, smoothing_sigma)
@@ -1022,13 +1048,25 @@ def update_inverse_field_jax_hybrid_lm(
                     v_next = v_next * boundary_mask
                 return v_next, lam_next
 
+            need_step = (
+                jnp.any(init_active & (r_vox_sq > target_vox_sq) & (lam_curr < 1e7))
+                if smoothing_sigma <= 0.0
+                else jnp.logical_or(max_err > max_error_threshold, mean_err > mean_error_threshold)
+            )
             v_out, lam_out = jax.lax.cond(
-                jnp.logical_or(max_err > max_error_threshold, mean_err > mean_error_threshold),
+                jnp.logical_and(
+                    jnp.logical_or(max_err_init > max_error_threshold, mean_err_init > mean_error_threshold)
+                    if smoothing_sigma <= 0.0
+                    else True,
+                    need_step,
+                ),
                 do_step,
                 lambda _: (v_curr, lam_curr),
                 None,
             )
-            return v_out, lam_out, max_err, mean_err
+            eff_max = max_err if smoothing_sigma > 0.0 else jnp.where(need_step, jnp.float32(float('inf')), jnp.float32(0.0))
+            eff_mean = mean_err if smoothing_sigma > 0.0 else jnp.where(need_step, jnp.float32(float('inf')), jnp.float32(0.0))
+            return v_out, lam_out, eff_max, eff_mean
 
         return jax.lax.cond(
             should_continue,
@@ -1266,9 +1304,8 @@ def update_inverse_field_nd_jax_anderson(
     for iteration in range(steps):
         g_k, max_err, mean_err, err_k = itk_fixed_point_step(v_k, iteration)
 
-        # Convergence check (ITK parity: logical_or)
+        # Convergence check (idempotent on already-converged fields: preserve v_k)
         if max_err <= max_error_threshold and mean_err <= mean_error_threshold:
-            v_k = g_k
             break
 
         # Residual: r_k = g(v_k) - v_k
@@ -1485,8 +1522,13 @@ def update_inverse_field_nd_jax(
                 
                 # Enforce boundary condition
                 W_inv_disp_new = W_inv_disp_new * boundary_mask
+                already_conv = jnp.logical_and(
+                    max_error_norm <= max_error_threshold,
+                    mean_error_norm <= mean_error_threshold,
+                )
+                W_inv_disp_out = jnp.where(already_conv, W_inv_disp_curr, W_inv_disp_new)
                 
-                return W_inv_disp_new, max_error_norm, mean_error_norm
+                return W_inv_disp_out, max_error_norm, mean_error_norm
             
             return jax.lax.cond(
                 should_continue,
@@ -1551,8 +1593,13 @@ def update_inverse_field_nd_jax(
                     W_inv_disp_new = separable_gaussian_filter_jax(W_inv_disp_new, smoothing_sigma)
                 
                 W_inv_disp_new = W_inv_disp_new * boundary_mask
+                already_conv = jnp.logical_and(
+                    max_error_norm <= max_error_threshold,
+                    mean_error_norm <= mean_error_threshold,
+                )
+                W_inv_disp_out = jnp.where(already_conv, W_inv_disp_curr, W_inv_disp_new)
                 
-                return W_inv_disp_new, max_error_norm, mean_error_norm
+                return W_inv_disp_out, max_error_norm, mean_error_norm
             
             return jax.lax.cond(
                 should_continue,
@@ -2421,16 +2468,18 @@ def rprop_update_step_jax(
 def regularize_warp_fields_jax(
     warp_l2r, warp_r2l, warp_l2r_inv, warp_r2l_inv,
     b_mask, spacing, origin, direction, elastic_sigma,
-    inverse_steps, inverse_method, project_inverse
+    inverse_steps, inverse_method, project_inverse,
+    project_max_tol=0.1, project_mean_tol=0.001,
 ):
     """
     Regularise the two half fields after an update and refresh their inverses.
 
     Zeroes the boundary (``b_mask``), smooths by ``elastic_sigma`` (voxels) if > 0, updates
-    each inverse with ``min(6, inverse_steps)`` iterations of ``update_inverse_field_nd_jax``
+    each inverse with ``inverse_steps`` iterations of ``update_inverse_field_nd_jax``
     (warm-started from the previous inverse; ``spacing`` / ``origin`` / ``direction`` ITK
-    order), and, if ``project_inverse``, replaces each forward field by the inverse of its
-    new inverse. Returns ``(warp_l2r, warp_r2l, warp_l2r_inv, warp_r2l_inv)``.
+    order), and, if ``project_inverse``, idempotently projects any half field exceeding
+    ``(project_max_tol, project_mean_tol)`` onto the inverse of its new inverse and refreshes
+    the inverse when modified. Returns ``(warp_l2r, warp_r2l, warp_l2r_inv, warp_r2l_inv)``.
     """
     warp_l2r = warp_l2r * b_mask
     warp_r2l = warp_r2l * b_mask
@@ -2452,16 +2501,30 @@ def regularize_warp_fields_jax(
             spacing=spacing, origin=origin, direction=direction
         )
         
-        # Apply double-inversion symmetric projection
+        # Apply idempotent diffeomorphic constraint projection
         if project_inverse:
-            warp_l2r = update_inverse_field_nd_jax(
+            proj_l2r = update_inverse_field_nd_jax(
                 warp_l2r_inv, warp_l2r, steps=in_loop_inv_steps, method=inverse_method,
+                max_error_threshold=project_max_tol, mean_error_threshold=project_mean_tol,
                 spacing=spacing, origin=origin, direction=direction
             )
-            warp_r2l = update_inverse_field_nd_jax(
+            proj_r2l = update_inverse_field_nd_jax(
                 warp_r2l_inv, warp_r2l, steps=in_loop_inv_steps, method=inverse_method,
+                max_error_threshold=project_max_tol, mean_error_threshold=project_mean_tol,
                 spacing=spacing, origin=origin, direction=direction
             )
+            if not jnp.array_equal(proj_l2r, warp_l2r):
+                warp_l2r = proj_l2r
+                warp_l2r_inv = update_inverse_field_nd_jax(
+                    warp_l2r, warp_l2r_inv, steps=in_loop_inv_steps, method=inverse_method,
+                    spacing=spacing, origin=origin, direction=direction
+                )
+            if not jnp.array_equal(proj_r2l, warp_r2l):
+                warp_r2l = proj_r2l
+                warp_r2l_inv = update_inverse_field_nd_jax(
+                    warp_r2l, warp_r2l_inv, steps=in_loop_inv_steps, method=inverse_method,
+                    spacing=spacing, origin=origin, direction=direction
+                )
     
     return warp_l2r, warp_r2l, warp_l2r_inv, warp_r2l_inv
 def syn_update_step_jax(
@@ -2470,7 +2533,7 @@ def syn_update_step_jax(
     fixed_shape_t, fixed_spacing_t, fixed_origin_t, fixed_direction_t,
     has_spacing, spacing, origin, direction, fluid_sigma, elastic_sigma, cfl_voxels,
     inverse_steps, inverse_method, project_inverse=False, antisymmetric=False,
-    use_analytical_gradients=False
+    use_analytical_gradients=False, project_max_tol=0.1, project_mean_tol=0.001,
 ):
     """
     One CFL-normalised greedy SyN update of both half fields (the default 'cfl' optimiser).
@@ -2590,7 +2653,8 @@ def syn_update_step_jax(
     warp_l2r, warp_r2l, warp_l2r_inv, warp_r2l_inv = regularize_warp_fields_jax(
         warp_l2r, warp_r2l, warp_l2r_inv, warp_r2l_inv,
         b_mask, curr_spacing_fixed, origin, direction, elastic_sigma,
-        inverse_steps, inverse_method, project_inverse
+        inverse_steps, inverse_method, project_inverse,
+        project_max_tol=project_max_tol, project_mean_tol=project_mean_tol,
     )
     
     return warp_l2r, warp_r2l, warp_l2r_inv, warp_r2l_inv
@@ -4038,7 +4102,13 @@ class SyNJAX:
                             curr_inv_every = max(1, int(_raw_inv_every[min(level_idx, len(_raw_inv_every) - 1)]))
                         else:
                             curr_inv_every = max(1, int(_raw_inv_every))
-                        do_project = self.project_inverse and (epoch % self.projection_frequency == 0)
+                        cfl_proj_enabled = bool(kwargs.get('cfl_project_inverse', False))
+                        cfl_proj_tol = float(kwargs.get('cfl_project_tol', 1.0))
+                        do_cfl_project = cfl_proj_enabled and ((epoch + 1) % self.projection_frequency == 0 or epoch == curr_syn_epochs - 1)
+                        do_legacy_project = bool(self.project_inverse) and ((epoch + 1) % self.projection_frequency == 0 or epoch == curr_syn_epochs - 1)
+                        do_project = do_cfl_project or do_legacy_project
+                        proj_max_tol = cfl_proj_tol if do_cfl_project else float(getattr(self, 'inv_tolerance', 0.1))
+                        proj_mean_tol = float('inf') if do_cfl_project else proj_max_tol * 0.01
                         need_inv_refresh = (
                             do_project
                             or (self.elastic_sigma > 0.0)
@@ -4054,7 +4124,8 @@ class SyNJAX:
                                 fixed_shape_t, fixed_spacing_t, fixed_origin_t, fixed_direction_t,
                                 True, curr_spacing_fixed, fixed_origin, fixed_direction, sig_in, self.elastic_sigma, level_cfl_voxels,
                                 eff_inv_steps, self.inverse_method, do_project, self.antisymmetric,
-                                use_analytical_gradients=use_analytical_gradients
+                                use_analytical_gradients=use_analytical_gradients,
+                                project_max_tol=proj_max_tol, project_mean_tol=proj_mean_tol,
                             )
 
 
@@ -4067,7 +4138,8 @@ class SyNJAX:
                             warp_l2r, warp_r2l, warp_l2r_inv, warp_r2l_inv = regularize_warp_fields_jax(
                                 warp_l2r, warp_r2l, warp_l2r_inv, warp_r2l_inv,
                                 b_mask, curr_spacing_fixed, fixed_origin, fixed_direction, self.elastic_sigma,
-                                eff_inv_steps, self.inverse_method, do_project
+                                eff_inv_steps, self.inverse_method, do_project,
+                                project_max_tol=proj_max_tol, project_mean_tol=proj_mean_tol,
                             )
                         elif optimizer_type == 'adam':
                             adam_t += 1
@@ -4079,7 +4151,8 @@ class SyNJAX:
                             warp_l2r, warp_r2l, warp_l2r_inv, warp_r2l_inv = regularize_warp_fields_jax(
                                 warp_l2r, warp_r2l, warp_l2r_inv, warp_r2l_inv,
                                 b_mask, curr_spacing_fixed, fixed_origin, fixed_direction, self.elastic_sigma,
-                                eff_inv_steps, self.inverse_method, do_project
+                                eff_inv_steps, self.inverse_method, do_project,
+                                project_max_tol=proj_max_tol, project_mean_tol=proj_mean_tol,
                             )
                         elif optimizer_type == 'rprop':
                             warp_l2r, warp_r2l, step_l2r, step_r2l, prev_grad_l2r, prev_grad_r2l = rprop_update_step_jax(

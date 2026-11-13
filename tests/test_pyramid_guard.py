@@ -40,7 +40,7 @@ PATTERNS = {
 
 ALLOW = {
     # ---- avg_pool: box windows / SSIM / MS-SSIM, none builds a registration pyramid level
-    ("core/losses/cross_correlation.py", "avg_pool"): (8, "stride-1 box windows of the LNCC / NCC losses (not a downsample)"),
+    ("core/losses/cross_correlation.py", "avg_pool"): (9, "stride-1 separable 1-D and n-D box windows of the LNCC / NCC losses (not a downsample)"),
     ("landmarks/mind.py", "avg_pool"): (3, "stride-1 box means of the MIND descriptor"),
     ("joint_label_fusion.py", "avg_pool"): (2, "stride-1 box sum (patch similarity)"),
     ("image_compare.py", "avg_pool"): (6, "SSIM windows and the factor-2 downsample of ms_ssim (a metric's own scale space, not a registration level)"),
@@ -53,7 +53,7 @@ ALLOW = {
     ("generators.py", "interpolate"): (2, "synthetic low-resolution displacement / bias field upsampling"),
     ("tvf.py", "interpolate"): (3, "velocity-field resize between levels (field, not image) and the fast-smooth gradient down/up-sample"),
     ("tvf_adj.py", "interpolate"): (1, "velocity-field resize between levels (field, not image)"),
-    ("syn.py", "interpolate"): (23, "warp-field resizes between levels, 2.5-D deep-feature slices, and the CoM-init low-resolution grid (corner-aligned, spacing from level_spacing)"),
+    ("syn.py", "interpolate"): (20, "warp-field resizes between levels, 2.5-D deep-feature slices, and the CoM-init low-resolution grid (corner-aligned, spacing from level_spacing)"),
     ("tvf_jax.py", "jax_resize"): (2, "fast-smooth gradient down/up-sample inside the update (a gradient field, not an image level)"),
     # ---- ANTs resampling
     ("dewarp.py", "ants_resample_image"): (1, "isotropic motion reference for the dewarp (a registration target, not a pyramid level)"),

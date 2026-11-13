@@ -177,6 +177,7 @@ def test_pair_by_pair_shuffle_best_models_mode(tmp_path: Path):
             "--include-syngs-beltrami",
             "--regularizers",
             "beltrami",
+            "beltrami_proj",
             "sobolev",
             "--reg-iterations",
             "2",
@@ -213,12 +214,13 @@ def test_pair_by_pair_shuffle_best_models_mode(tmp_path: Path):
     assert summary["completed_pairs"] == 2
     assert summary["total_pairs"] == 2
     assert len(summary["track1_affine_summary"]) == 2
-    assert len(summary["track2_deformable_summary"]) == 6
+    assert len(summary["track2_deformable_summary"]) == 7
     assert summary["track3_e2e_summary"] == []
 
     arms_def = {r["arm"] for r in summary["track2_deformable_summary"]}
     assert arms_def == {
         "syn_beltrami",
+        "syn_beltrami_proj",
         "syn_sobolev",
         "syngs_beltrami",
         "syngs_best",
@@ -228,9 +230,17 @@ def test_pair_by_pair_shuffle_best_models_mode(tmp_path: Path):
     for r in summary["track2_deformable_summary"]:
         assert r["n_intra"] == 1
         assert r["n_inter"] == 1
+        assert "mean_fd_folding_pct" in r
 
     figs = summary["figures"]
-    for req_fig in ("pareto", "distribution", "4panel_tvf", "4panel_syngs_beltrami", "4panel_syn_beltrami"):
+    for req_fig in (
+        "pareto",
+        "distribution",
+        "4panel_tvf",
+        "4panel_syngs_beltrami",
+        "4panel_syn_beltrami",
+        "4panel_syn_beltrami_proj",
+    ):
         assert req_fig in figs
         assert Path(figs[req_fig]).exists()
 

@@ -882,14 +882,15 @@ def update_inverse_field_nd_anderson(
         done_next = done | conv_now
 
         # Check convergence before allocating history/Anderson buffers: when every element in
-        # the batch is either already frozen or converging now, v_next is unused.
+        # the batch has already met the thresholds at ``v_k`` (idempotent on feasible fields:
+        # ``steps_taken == 0`` when the initial guess already satisfies the thresholds), leave
+        # ``v_k`` untouched rather than applying an extra unverified fixed-point resample.
         if should_check:
             flag = torch.stack([done_next.all().to(torch.int64), conv_step.max()]).tolist()   # one sync
             if flag[0]:
-                v_k = torch.where(done.reshape(bshape), v_k, g_k)
                 del g_k
                 converged = True
-                steps_taken = int(flag[1]) + 1
+                steps_taken = int(flag[1])
                 break
 
         g_k_flat = g_k.reshape(B, -1)
@@ -968,10 +969,9 @@ def update_inverse_field_nd_anderson(
             v_next = torch.where(accept, v_candidate, g_k)
             del v_candidate
 
-        # Freeze: an element already converged keeps its value; one converging now takes the
-        # plain step g_k (as the unbatched early exit did); the rest take v_next.
-        v_k = torch.where(done.reshape(bshape), v_k,
-                          torch.where(conv_now.reshape(bshape), g_k, v_next))
+        # Freeze: any element that has already met the thresholds at ``v_k`` (``done_next``)
+        # keeps ``v_k`` intact (idempotent); only unconverged elements advance to ``v_next``.
+        v_k = torch.where(done_next.reshape(bshape), v_k, v_next)
         del v_next, g_k
         done = done_next
 
@@ -1172,6 +1172,14 @@ def update_inverse_field_nd(
         conv_step = torch.where(conv_now & ~done, torch.full_like(conv_step, iteration), conv_step)
         done_next = done | conv_now
 
+        if should_check:
+            flag = torch.stack([done_next.all().to(torch.int64), conv_step.max()]).tolist()
+            if flag[0]:
+                del scaled_norm, error
+                converged = True
+                steps_taken = int(flag[1])
+                break
+
         epsilon = 0.75 if iteration == 0 else 0.5
         clip_threshold = (epsilon * max_err).reshape(bshape)
         clip_scale = torch.where(
@@ -1191,17 +1199,11 @@ def update_inverse_field_nd(
             g_k = separable_gaussian_filter(g_k, smoothing_sigma)
         g_k.mul_(boundary_mask)
 
-        v_k = torch.where(done.reshape(bshape), v_k, g_k)
+        v_k = torch.where(done_next.reshape(bshape), v_k, g_k)
         del g_k
         done = done_next
 
-        if should_check:
-            flag = torch.stack([done.all().to(torch.int64), conv_step.max()]).tolist()
-            if flag[0]:
-                converged = True
-                steps_taken = int(flag[1]) + 1
-                break
-        elif mps_large_field and (iteration + 1) % 4 == 0:
+        if not should_check and mps_large_field and (iteration + 1) % 4 == 0:
             torch.mps.synchronize()
 
     if stats is not None:

@@ -114,7 +114,7 @@ def test_anderson_check_interval_behavior():
     update_inverse_field_nd_anderson(
         disp, None, steps=10, m=3, max_error_threshold=100.0, mean_error_threshold=100.0,
         check_interval=3, stats=st)
-    assert st == {'steps': 1, 'converged': True}
+    assert st == {'steps': 0, 'converged': True}
     # check_after defers the first test; the field is unchanged by the deferral.
     st2 = {}
     inv_after = update_inverse_field_nd_anderson(disp, None, steps=10, m=3, check_after=4, stats=st2)
@@ -254,7 +254,6 @@ def test_anderson_baseline_numerical_parity():
             g_k, max_err, mean_err, err_k = itk_fixed_point_step(v_k, iteration)
 
             if max_err <= max_error_threshold and mean_err <= mean_error_threshold:
-                v_k = g_k
                 break
 
             r_k = (g_k - v_k).reshape(-1)
@@ -591,6 +590,120 @@ def test_hybrid_lm_mps_parity_3d_rpi():
     ice_mps = calculate_inverse_identity_error(u_cpu, v_mps, spacing, origin, direction)
     assert ice_mps["max_error"] < 1.5e-3
     assert torch.allclose(v_cpu, v_mps, atol=1e-4)
+
+
+def test_inverse_solvers_idempotent_when_already_converged():
+    """When an initial inverse field already satisfies (max_error_threshold, mean_error_threshold),
+    every solver in PyTorch and JAX must return it bitwise untouched with steps == 0, and batched
+    calls must preserve feasible elements while projecting only violating elements."""
+    import jax
+    import jax.numpy as jnp
+    from syntx.core.inverse import update_inverse_field_nd
+    from syntx.syn_jax import update_inverse_field_nd_jax
+
+    spatial = (24, 24)
+    spacing = (1.0, 1.2)
+    origin = (-12.0, 14.0)
+    direction = np.diag([1.0, -1.0])
+    u1, det1, _ = _build_high_strain_radial_diffeomorphism(
+        spatial, spacing, origin, direction, peak_strain=1.2, core_sigma_mm=2.5, support_radius_mm=9.5
+    )
+    assert det1.min().item() > 0.05
+
+    v1_exact = update_inverse_field_nd_hybrid_lm(
+        u1, None, steps=25, max_error_threshold=1e-3, mean_error_threshold=2e-4,
+        spacing=spacing, origin=origin, direction=direction,
+    )
+
+    for method in ("anderson", "fixed_point", "hybrid_lm"):
+        st = {}
+        out = update_inverse_field_nd(
+            u1, v1_exact, steps=10, method=method,
+            spacing=spacing, origin=origin, direction=direction,
+            max_error_threshold=1.0, mean_error_threshold=float("inf"),
+            check_after=1, stats=st,
+        )
+        assert st == {"steps": 0, "converged": True}, f"{method} took non-zero steps: {st}"
+        assert torch.equal(out, v1_exact), f"{method} mutated already-converged field"
+
+    # Mixed batch: element 0 already within 1.0 voxel, element 1 starts at zeros (> 1.0 voxel)
+    u2, _, _ = _build_high_strain_radial_diffeomorphism(
+        spatial, spacing, origin, direction, peak_strain=3.5, core_sigma_mm=2.2, support_radius_mm=9.5
+    )
+    v2_bad = torch.zeros_like(u2)
+    st_mix = {}
+    out_mix = update_inverse_field_nd(
+        torch.cat([u1, u2], dim=0),
+        torch.cat([v1_exact, v2_bad], dim=0),
+        steps=12,
+        method="anderson",
+        spacing=spacing,
+        origin=origin,
+        direction=direction,
+        max_error_threshold=1.0,
+        mean_error_threshold=float("inf"),
+        check_after=1,
+        stats=st_mix,
+    )
+    assert st_mix["steps"] >= 1
+    assert torch.equal(out_mix[0:1], v1_exact), "Feasible batch item 0 must remain bitwise untouched"
+    ice2 = calculate_inverse_identity_error(u2, out_mix[1:2], spacing, origin, direction)
+    assert ice2["max_error"] <= 1.25
+
+    cpu_dev = jax.devices("cpu")[0]
+    with jax.default_device(cpu_dev):
+        u1_j = jnp.asarray(u1.numpy())
+        v1_j = jnp.asarray(v1_exact.numpy())
+        for method in ("anderson", "fixed_point", "hybrid_lm"):
+            out_j = update_inverse_field_nd_jax(
+                u1_j, v1_j, steps=10, method=method,
+                max_error_threshold=1.0, mean_error_threshold=float("inf"),
+                spacing=spacing, origin=origin, direction=direction,
+            )
+            assert np.array_equal(np.asarray(out_j), np.asarray(v1_j)), f"JAX {method} mutated converged field"
+
+
+def test_syn_cfl_project_inverse_option_a_idempotent():
+    """Verify Option A (cfl_project_inverse=True, cfl_project_tol=1.0) is bitwise idempotent
+    on feasible trajectories and activates cleanly when a tighter tolerance is violated."""
+    import ants
+    import syntx
+    from syntx.spatial import disp_itk_to_tensor
+
+    yy, xx = np.meshgrid(np.linspace(-1, 1, 40), np.linspace(-1, 1, 40), indexing="ij")
+    fixed_np = np.exp(-((xx ** 2 + yy ** 2) / 0.20)).astype(np.float32)
+    moving_np = np.exp(-(((xx - 0.08 * np.exp(-3.0 * (xx ** 2 + yy ** 2))) ** 2 + (yy + 0.06) ** 2) / 0.18)).astype(np.float32)
+
+    direction = np.diag([1.0, -1.0])
+    fixed = ants.from_numpy(fixed_np, spacing=(1.0, 1.0), origin=(-20.0, 20.0), direction=direction)
+    moving = ants.from_numpy(moving_np, spacing=(1.0, 1.0), origin=(-20.0, 20.0), direction=direction)
+
+    common_kw = dict(
+        fixed=fixed,
+        moving=moving,
+        initial_transform="identity",
+        regularizer="beltrami",
+        grad_step=0.4,
+        dilatation_weight=0.1,
+        inv_refresh_every=1,
+        backend="pytorch",
+        device="cpu",
+        levels=[2, 1],
+        reg_iterations=[8, 6],
+        seed=42,
+        verbose=False,
+    )
+    res_unproj = syntx.syn(cfl_project_inverse=False, **common_kw)
+    res_proj = syntx.syn(cfl_project_inverse=True, cfl_project_tol=1.0, **common_kw)
+
+    w_unproj = disp_itk_to_tensor(res_unproj["fwdtransforms"][0], device="cpu")
+    w_proj = disp_itk_to_tensor(res_proj["fwdtransforms"][0], device="cpu")
+    assert torch.equal(w_unproj, w_proj), "Option A must be bitwise identical when max_err <= 1.0 vox and det > 0"
+
+    res_tight = syntx.syn(cfl_project_inverse=True, cfl_project_tol=1e-4, **common_kw)
+    jac_tight = syntx.liouville_determinant(res_tight, fixed=fixed)
+    assert float(jac_tight.numpy().min()) > 0.0
+
 
 
 

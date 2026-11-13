@@ -1,12 +1,23 @@
 # Tracking Summary
-current phase: v6.35.3 (continuum regularizer support in `syntx.syngs`, 2-rep confirmed 3-D Beltrami presets for `syntx.syn` and `syntx.syngs`, and live pair-by-pair 90-subject Mindboggle cohort benchmark harness)
-next WP: complete 90-pair Mindboggle random-order evaluation (`task-2695`); per-run synthetic calibration of slice-set clock thresholds; fix opt-in `engine='projected'` motion regression
+current phase: v6.35.4 (idempotent inverse-field solvers across PyTorch and JAX, Option A diffeomorphic constraint projection `cfl_project_tol=1.0` voxel max error + physical Jacobian fold guard, and `syn_beltrami_proj` + 2-mm FD Jacobian benchmark tracking)
+next WP: complete Mindboggle evaluation across `syn_beltrami` and `syn_beltrami_proj`; per-run synthetic calibration of slice-set clock thresholds; fix opt-in `engine='projected'` motion regression
 blockers: none
-active work: 90-pair random-order Mindboggle-101 benchmark (`tvf`, `syngs`, `syn`, `ants.registration`) streaming live to `docs/reports/mindboggle_90pair_benchmark_2026-11-12.html`
+active work: post-release `mbhard` (Mindboggle Pair 44) evaluation of `syntx.syn` (`beltrami` vs `beltrami_proj` Option A)
 device: Apple Silicon MPS / CPU (macOS arm64)
 last updated: 2026-11-12
 
 ---
+
+## R35 (Idempotent Inverse Solvers & Option A Diffeomorphic Constraint Projection; v6.35.4, 2026-11-12)
+- **Root-Cause Defect & Idempotent Inverse-Solver Fix (`src/syntx/core/inverse.py`, `src/syntx/syn_jax.py`, `tests/test_core_inverse.py`, `tests/test_syn_microct_memory.py`)**:
+  - **Verified Bug**: In `update_inverse_field_nd_anderson`, `update_inverse_field_nd` (`method='fixed_point'`), `update_inverse_field_nd_jax_anderson`, and `update_inverse_field_nd_jax` (`method='fixed_point'`), convergence (`max_err <= max_error_threshold` and `mean_err <= mean_error_threshold`) is evaluated on `v_k` *prior* to computing the damped fixed-point resample `g_k`, yet all four routines overwrote `v_k = g_k` (`0.75`-damped trilinear resample + boundary mask) before breaking or freezing (`steps_taken = 1` instead of `0`). Combined with `mean_error_threshold = 0.001` voxels firing on smooth trilinear chord error ($O(h^2 \Delta\phi)$), `cfl_project_inverse=True` at `projection_frequency=1` injected 220 rounds of artificial interpolation viscosity (`0.5598` on `mbhard` Pair 44 vs `0.6161`–`0.6207` unprojected).
+  - **Fix**: Preserved `v_k` bitwise untouched (`steps_taken = 0`, matching `update_inverse_field_nd_hybrid_lm`) whenever `v_k` already satisfies the convergence thresholds, and froze converged batch elements in place (`torch.where(done_next.reshape(bshape), v_k, v_next)` / `jnp.where(already_conv, W_inv_disp_curr, W_inv_disp_new)`) across both PyTorch and JAX backends.
+- **Option A Diffeomorphic Constraint Projection (`src/syntx/syn.py`, `src/syntx/syn_jax.py`, `src/syntx/benchmark/config.py`)**:
+  - Replaced unconditional half-field double-inversion in `SyNTo.fit()` (`cfl_project_inverse=True`) with an idempotent constraint projection operator $\mathcal{P}_{\mathcal{D}}(\phi_b)$ (`_project_diffeo_pair`) parameterized by `cfl_project_tol=1.0` voxel max error (`mean_error_threshold=float('inf')`) and `cfl_project_jac_floor=0.0` (`compute_physical_jacobian_determinant` with `.is_physical = True` and 2-D `direction`).
+  - Whenever a half-field $\phi_b \in \{\phi_1, \phi_2\}$ satisfies $\max_x \|(\phi_b(x) + \phi_b^{-1}(x + \phi_b(x))) \oslash h_\ell\|_2 \le 1.0\text{ vox}$ and $\min_x \det(I + \nabla \phi_b(x)) > 0.0$, $\mathcal{P}_{\mathcal{D}}(\phi_b) = \phi_b$ (`0` steps, zero interpolation diffusion at `projection_frequency=1`). Only violating or sub-voxel-folded half-fields are projected onto $(\phi_b^{-1})^{-1}$ and have their inverses refreshed.
+- **Benchmark Harness (`benchmarks/fast_syn_ants_benchmark.py`, `tests/test_fast_syn_ants_benchmark.py`)**:
+  - Added `beltrami_proj` (`syn_beltrami_proj`: `syntx.syn` Beltrami with `cfl_project_inverse=True`) and explicit 2-mm finite-difference Jacobian summary fields (`mean_fd_folding_pct`, `worst_fd_min_jac`) alongside intrinsic Liouville Jacobian metrics.
+- **Verification**: `python3 -m antsxqc.lint src/syntx` (`0 finding(s)`), `python3 benchmarks/fast_syn_ants_benchmark.py --smoke --regularizers beltrami beltrami_proj` (`exit 0`), and `200+ passed` across `test_core_inverse`, `test_syn_microct_memory`, `test_syn`, `test_tvf_and_hybrid_inversion`, `test_separable_lncc_and_projection`, `test_implementation_standards`, `test_canonical_parameters`, `test_fast_syn_ants_benchmark`, and JAX parity suites.
 
 ## R34 (`syntx.syngs` Continuum Regularizers, 2-Rep Confirmed 3-D Beltrami Presets & Live 90-Pair Cohort Benchmark Harness; v6.35.3, 2026-11-12)
 - **`syntx.syngs` Continuum Regularizer Integration (`src/syntx/syngs.py`, `src/syntx/benchmark/tune.py`)**:

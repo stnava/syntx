@@ -1153,6 +1153,79 @@ class SyNTo(nn.Module):
                 if 'steps' in stats:
                     self._inv_step_hint[key] = stats['steps']
                 return out[0:1], out[1:2]
+
+            cfl_proj_tol = float(kwargs.get('cfl_project_tol', 1.0))
+            cfl_proj_jac_floor = float(kwargs.get('cfl_project_jac_floor', 0.0))
+            _dir_2d = np.asarray(fixed_direction, dtype=float).reshape(dim, dim)
+            if level_idx == 0:
+                self._cfl_proj_triggered_epochs = 0
+
+            def _project_diffeo_pair(w_l, w_r, w_l_inv, w_r_inv, X_phys_arg=None):
+                """Idempotent diffeomorphic constraint projection (Option A):
+                when each half-field satisfies ``max_err <= cfl_project_tol`` (default 1.0 voxel)
+                and ``min det(I + D phi_b) > cfl_project_jac_floor`` (default 0.0), leaves the
+                half-fields bitwise untouched (``P_D(phi_b) = phi_b``). Projects only half-fields
+                that violate either constraint and refreshes their inverses when modified."""
+                if in_loop_inv_steps <= 0:
+                    return w_l_inv, w_r_inv
+                with torch.no_grad():
+                    fwd_pair = torch.cat([w_l.detach(), w_r.detach()])
+                    fwd_pair.is_physical = True
+                    det_pair = compute_physical_jacobian_determinant(
+                        fwd_pair, direction=_dir_2d, spacing=curr_spacing_fixed
+                    )
+                    min_jac_pair = det_pair.reshape(2, -1).amin(dim=1)
+                    del det_pair
+                    if bool((min_jac_pair > cfl_proj_jac_floor).all()):
+                        inv_pair = torch.cat([w_l_inv.detach(), w_r_inv.detach()])
+                        proj_stats = {}
+                        proj_pair = update_inverse_field_nd(
+                            inv_pair, fwd_pair,
+                            steps=in_loop_inv_steps, method=self.inverse_method,
+                            spacing=curr_spacing_fixed, origin=fixed_origin, direction=fixed_direction,
+                            X_phys=X_phys_arg,
+                            max_error_threshold=cfl_proj_tol, mean_error_threshold=float('inf'),
+                            check_after=1, stats=proj_stats,
+                        )
+                        del fwd_pair, inv_pair
+                        if proj_stats.get('converged', False) and proj_stats.get('steps', 1) == 0:
+                            del proj_pair
+                            return w_l_inv, w_r_inv
+                        w_l.copy_(proj_pair[0:1])
+                        w_r.copy_(proj_pair[1:2])
+                        del proj_pair
+                        self._cfl_proj_triggered_epochs += 1
+                        return _inverse_pair(
+                            w_l, w_r, w_l_inv, w_r_inv, 'inv', X_phys_arg=X_phys_arg, use_tol=True
+                        )
+
+                    del fwd_pair
+                    fold_flags = (min_jac_pair <= cfl_proj_jac_floor).tolist()
+                    modified = False
+                    for w_b, w_b_inv, is_folded in (
+                        (w_l, w_l_inv, fold_flags[0]),
+                        (w_r, w_r_inv, fold_flags[1]),
+                    ):
+                        b_stats = {}
+                        proj_b = update_inverse_field_nd(
+                            w_b_inv.detach(), w_b.detach(),
+                            steps=in_loop_inv_steps, method=self.inverse_method,
+                            spacing=curr_spacing_fixed, origin=fixed_origin, direction=fixed_direction,
+                            X_phys=X_phys_arg,
+                            max_error_threshold=0.0 if is_folded else cfl_proj_tol,
+                            mean_error_threshold=0.0 if is_folded else float('inf'),
+                            check_after=1, stats=b_stats,
+                        )
+                        if is_folded or not (b_stats.get('converged', False) and b_stats.get('steps', 1) == 0):
+                            w_b.copy_(proj_b)
+                            modified = True
+                        del proj_b
+                    if modified:
+                        self._cfl_proj_triggered_epochs += 1
+                        return _inverse_pair(
+                            w_l, w_r, w_l_inv, w_r_inv, 'inv', X_phys_arg=X_phys_arg, use_tol=True
+                        )
+                    return w_l_inv, w_r_inv
             
             stop.start_level(level_idx, curr_syn_epochs)
             for epoch in range(curr_syn_epochs):
@@ -1705,11 +1778,8 @@ class SyNTo(nn.Module):
                             warp_l2r_inv, warp_r2l_inv = _inverse_pair(
                                 warp_l2r, warp_r2l, warp_l2r_inv, warp_r2l_inv, 'inv', X_phys_arg=X_phys, use_tol=True)
                         if do_cfl_project:
-                            proj_l, proj_r = _inverse_pair(
-                                warp_l2r_inv, warp_r2l_inv, warp_l2r, warp_r2l, 'proj', X_phys_arg=X_phys, use_tol=True)
-                            warp_l2r.copy_(proj_l)
-                            warp_r2l.copy_(proj_r)
-                            del proj_l, proj_r
+                            warp_l2r_inv, warp_r2l_inv = _project_diffeo_pair(
+                                warp_l2r, warp_r2l, warp_l2r_inv, warp_r2l_inv, X_phys_arg=X_phys)
                     
                     elif optimizer_type == 'rprop':
                         def rprop_update(grad, prev_grad, step):
@@ -1909,11 +1979,8 @@ class SyNTo(nn.Module):
                             warp_l2r_inv, warp_r2l_inv = _inverse_pair(
                                 warp_l2r, warp_r2l, warp_l2r_inv, warp_r2l_inv, 'inv', X_phys_arg=X_phys, use_tol=True)
                         if do_cfl_project:
-                            proj_l, proj_r = _inverse_pair(
-                                warp_l2r_inv, warp_r2l_inv, warp_l2r, warp_r2l, 'proj', X_phys_arg=X_phys, use_tol=True)
-                            warp_l2r.copy_(proj_l)
-                            warp_r2l.copy_(proj_r)
-                            del proj_l, proj_r
+                            warp_l2r_inv, warp_r2l_inv = _project_diffeo_pair(
+                                warp_l2r, warp_r2l, warp_l2r_inv, warp_r2l_inv, X_phys_arg=X_phys)
                         
                     elif optimizer_type == 'sgd':
                         update_l = -optimizer_lr * grad_l
@@ -2510,7 +2577,8 @@ SYN_ADVANCED_OPTIONS = frozenset({
     'vgg_num_patches', 'vgg_patch_size', 'winsorize_quantiles',
     # SyNTo.fit()
     'amp', 'bootstrap_jitter_scale', 'bootstrap_mode', 'bootstrap_orig_weight',
-    'bootstrap_samples', 'cfl_project_inverse', 'compose_polish_steps', 'compose_polish_tol',
+    'bootstrap_samples', 'cfl_project_inverse', 'cfl_project_jac_floor', 'cfl_project_tol',
+    'compose_polish_steps', 'compose_polish_tol',
     'elastic_mesh_size', 'elastic_sigma',
     'elastic_spline_distance', 'fast_smooth', 'inv_refresh_every', 'jacobian_epsilon',
     'jacobian_penalty_weight', 'lncc_single_pass', 'loss_sync_every', 'mesh_size',

@@ -113,6 +113,7 @@ DEFORMABLE_SYN_CONFIG_KEY: Dict[str, Optional[str]] = {
     "dsti1": None,
     "bspline": None,
     "beltrami": "syn_beltrami",
+    "beltrami_proj": "syn_beltrami",
     "poroelastic": None,
 }
 
@@ -132,6 +133,7 @@ ARM_LABELS: Dict[str, str] = {
     "syn_dsti1": "syntx.syn (dsti1)",
     "syn_bspline": "syntx.syn (bspline)",
     "syn_beltrami": "syntx.syn (beltrami — tuned grad_step=0.6, dil=0.1)",
+    "syn_beltrami_proj": "syntx.syn (beltrami + cfl_project_inverse=True)",
     "syn_poroelastic": "syntx.syn (poroelastic)",
     "syngs_best": "syntx.syngs (sobolev α=0.448 — canonical)",
     "syngs_beltrami": "syntx.syngs (beltrami α=0.27, dil=0.075, step=0.825 — tuned)",
@@ -554,6 +556,8 @@ def _execute_single_registration(
             elif cfg_block is not None:
                 syn_kw = syn_config_to_syn_kwargs(get_model_config(cfg_block))
                 syn_kw["reg_iterations"] = reg_iters_list
+                if reg_key == "beltrami_proj":
+                    syn_kw["cfl_project_inverse"] = True
             else:
                 syn_kw = {"regularizer": reg_key, "reg_iterations": reg_iters_list}
                 if reg_key == "poroelastic":
@@ -1124,6 +1128,7 @@ def _render_report_figures(
         ("tvf_best", "4panel_tvf"),
         ("syngs_beltrami", "4panel_syngs_beltrami"),
         ("syn_beltrami", "4panel_syn_beltrami"),
+        ("syn_beltrami_proj", "4panel_syn_beltrami_proj"),
         ("syn_sobolev", "4panel_sobolev"),
         ("syn_hyperelastic", "4panel_hyperelastic"),
     )
@@ -1255,7 +1260,7 @@ def _render_report_figures(
             if track_k == "e2e":
                 color = "#d97706" if is_ants else "#059669"
                 marker = "D"
-            elif arm_k in ("tvf_best", "syngs_beltrami", "syn_beltrami"):
+            elif arm_k in ("tvf_best", "syngs_beltrami", "syn_beltrami", "syn_beltrami_proj"):
                 color = "#059669"
                 marker = "^"
             else:
@@ -1280,6 +1285,7 @@ def _render_report_figures(
                 "syngs_beltrami": "syngs (beltrami)",
                 "syngs_best": "syngs (sobolev)",
                 "syn_beltrami": "syn (beltrami)",
+                "syn_beltrami_proj": "syn (beltrami+proj)",
                 "syn_sobolev": "syn (sobolev)",
                 "syn_gaussian": "syn (gaussian)",
                 "syn_hyperelastic": "syn (hyperelastic)",
@@ -1289,8 +1295,9 @@ def _render_report_figures(
                 "syn_gaussian": (-58, -14),
                 "syn_sobolev": (-58, -4),
                 "syn_beltrami": (10, 6),
+                "syn_beltrami_proj": (10, -14),
                 "syngs_beltrami": (-68, 12),
-                "syngs_best": (10, -14),
+                "syngs_best": (-62, -14),
                 "tvf_best": (-62, 10),
                 "syn_navier": (-45, -18),
                 "syn_hyperelastic": (10, -4),
@@ -1361,6 +1368,7 @@ def _render_report_figures(
             "syngs_beltrami": "syntx.syngs (beltrami)",
             "syngs_best": "syntx.syngs (sobolev)",
             "syn_beltrami": "syntx.syn (beltrami)",
+            "syn_beltrami_proj": "syntx.syn (beltrami + proj)",
             "syn_sobolev": "syntx.syn (sobolev)",
             "syn_gaussian": "syntx.syn (gaussian)",
             "syn_hyperelastic": "syntx.syn (hyperelastic)",
@@ -1566,6 +1574,8 @@ def _aggregate_arm_rows(
         folds = [r["folding_pct"] for r in recs]
         min_j = [r["min_jacobian"] for r in recs]
         max_j = [r["max_jacobian"] for r in recs if math.isfinite(r["max_jacobian"])]
+        fd_folds = [float(r.get("fd_folding_pct", r["folding_pct"])) for r in recs]
+        fd_min_j = [float(r.get("fd_min_jacobian", r["min_jacobian"])) for r in recs]
         harm = [r["harmonic_energy"] for r in recs]
         bend = [r["bending_energy"] for r in recs]
         ice_m = [r["inv_mean_mm"] for r in recs]
@@ -1636,6 +1646,9 @@ def _aggregate_arm_rows(
                 "mean_folding_pct": float(statistics.mean(folds)),
                 "worst_min_jac": float(min(min_j)),
                 "mean_max_jac": float(statistics.mean(max_j)) if max_j else float("nan"),
+                "mean_fd_folding_pct": float(statistics.mean(fd_folds)),
+                "max_fd_folding_pct": float(max(fd_folds)),
+                "worst_fd_min_jac": float(min(fd_min_j)),
                 "jac_measure": recs[0]["jacobian_measure"],
                 "mean_harmonic_energy": float(statistics.mean(harm)),
                 "mean_bending_energy": float(statistics.mean(bend)),
@@ -1830,6 +1843,8 @@ def _write_reports(
                         "wilcoxon_p",
                         "mean_folding_pct",
                         "worst_min_jac",
+                        "mean_fd_folding_pct",
+                        "worst_fd_min_jac",
                         "mean_inv_mm",
                         "mean_inv_p95_mm",
                         "mean_time_s",
@@ -1932,7 +1947,7 @@ def _write_reports(
             hdr += "<th>Wilcoxon <em>p</em></th>"
         if include_deform:
             hdr += (
-                "<th>Fold %</th><th>Min |J|</th><th>Max |J|</th>"
+                "<th>Fold %</th><th>Min |J|</th><th>FD Fold % (Min |J|)</th><th>Max |J|</th>"
                 "<th>Harm / Bend Energy</th><th>ICE Mean / P95 (mm)</th>"
             )
         hdr += "<th>Mean Time (s)</th><th>Speedup</th><th>antsxqc</th></tr>"
@@ -1946,7 +1961,7 @@ def _write_reports(
             row_html = (
                 f"<tr>"
                 f"<td><strong>{_html.escape(r['arm'])}</strong>"
-                f"<div class='sub'>{_html.escape(r['arm_label'])}</div></td>"
+                f"<div class='sub'>{_html.escape(r['arm_label'])} (n={r['n_pairs']})</div></td>"
                 f"<td><code>{_html.escape(str(r['device']))}</code></td>"
                 f"<td{d_style}>{r['mean_dice_sym']:.4f} ± {r['std_dice_sym']:.4f}</td>"
                 f"<td>{r['median_dice_sym']:.4f} ({r['iqr_dice_sym']:.4f})</td>"
@@ -1963,6 +1978,7 @@ def _write_reports(
                 row_html += (
                     f"<td>{r['mean_folding_pct']:.5f}%</td>"
                     f"<td>{r['worst_min_jac']:+.4f}</td>"
+                    f"<td>{r['mean_fd_folding_pct']:.5f}% ({r['worst_fd_min_jac']:+.3f})</td>"
                     f"<td>{max_j_s}</td>"
                     f"<td>{r['mean_harmonic_energy']:.4f} / {r['mean_bending_energy']:.4f}</td>"
                     f"<td>{r['mean_inv_mm']:.4f} / {r['mean_inv_p95_mm']:.4f}</td>"
@@ -2091,6 +2107,10 @@ def _write_reports(
         (
             "4panel_syn_beltrami",
             f"{viz_tag} Standard 4-Panel QC — syntx.syn Tuned Beltrami ([100, 100, 20], Shared Affine).",
+        ),
+        (
+            "4panel_syn_beltrami_proj",
+            f"{viz_tag} Standard 4-Panel QC — syntx.syn Tuned Beltrami + cfl_project_inverse=True ([100, 100, 20], Shared Affine).",
         ),
         (
             "4panel_sobolev",
@@ -2758,10 +2778,46 @@ def main(argv: Optional[Sequence[str]] = None) -> Dict[str, Any]:
             live_pair_minutes: List[float] = []
             json_p = md_p = html_p = ""
             summary_payload: Dict[str, Any] = {}
+            records_map: Dict[Tuple[str, int, str, int], Dict[str, Any]] = {}
+            preloaded_completed_pairs: set[int] = set()
+            if not args.force:
+                active_pair_specs: List[Tuple[str, str]] = (
+                    [("affine", a) for a in affine_arms_mps]
+                    + [("deformable", a) for a in syn_arms]
+                    + ([("e2e", "syntx_e2e_syn")] if run_e2e else [])
+                    + [("affine", a) for a in affine_arms_cpu]
+                    + [("deformable", a) for a in ants_deform_arms]
+                    + ([("e2e", "ants_e2e_syn")] if run_e2e else [])
+                )
+                for p_pre in pairs:
+                    ants_sentinel = runs_dir / f"deformable_pair{p_pre:03d}_ants_syn_matched_rep0.json"
+                    if not ants_sentinel.exists():
+                        continue
+                    for trk_pre, arm_pre in active_pair_specs:
+                        cand_p = runs_dir / f"{trk_pre}_pair{p_pre:03d}_{arm_pre}_rep0.json"
+                        if cand_p.exists():
+                            c_rec = json.loads(cand_p.read_text())
+                            if c_rec.get("status") == "SUCCESS":
+                                records_map[(trk_pre, int(p_pre), arm_pre, 0)] = c_rec
+                    preloaded_completed_pairs.add(int(p_pre))
+                if records_map:
+                    all_records[:] = list(records_map.values())
+
+            def _record_put(rec_item: Dict[str, Any]) -> None:
+                records_map[
+                    (
+                        str(rec_item["track"]),
+                        int(rec_item["pair_idx"]),
+                        str(rec_item["arm"]),
+                        int(rec_item["rep"]),
+                    )
+                ] = rec_item
+                all_records[:] = list(records_map.values())
 
             for step_idx, p_idx in enumerate(pairs, start=1):
                 t_p0 = time.perf_counter()
                 is_viz_target = (p_idx == repro_pair) or (step_idx == 1)
+                n_cached_in_pair = 0
                 print(
                     f"\n--- [PAIR {step_idx:02d}/{len(pairs):02d}] Subject Pair #{p_idx:02d} "
                     f"(MPS -> CPU sequential, live HTML update) ---",
@@ -2771,6 +2827,9 @@ def main(argv: Optional[Sequence[str]] = None) -> Dict[str, Any]:
                 # 1. MPS Arms for Pair p_idx (no concurrent CPU jobs)
                 for arm in affine_arms_mps:
                     persist = is_viz_target and arm == "syntx_affine_default"
+                    out_p = runs_dir / f"affine_pair{p_idx:03d}_{arm}_rep0.json"
+                    if not args.force and out_p.exists():
+                        n_cached_in_pair += 1
                     rec = _run_subprocess_job(
                         script_path,
                         [
@@ -2781,14 +2840,17 @@ def main(argv: Optional[Sequence[str]] = None) -> Dict[str, Any]:
                             "--rep", "0",
                             *_common_flags(p_idx, persist=persist),
                         ],
-                        runs_dir / f"affine_pair{p_idx:03d}_{arm}_rep0.json",
+                        out_p,
                         args.force,
                         f"[{step_idx}/{len(pairs)} Pair {p_idx:02d}] {arm}",
                         in_process=in_process,
                     )
-                    all_records.append(rec)
+                    _record_put(rec)
 
                 for arm in syn_arms:
+                    out_p = runs_dir / f"deformable_pair{p_idx:03d}_{arm}_rep0.json"
+                    if not args.force and out_p.exists():
+                        n_cached_in_pair += 1
                     rec = _run_subprocess_job(
                         script_path,
                         [
@@ -2799,14 +2861,17 @@ def main(argv: Optional[Sequence[str]] = None) -> Dict[str, Any]:
                             "--rep", "0",
                             *_common_flags(p_idx, persist=is_viz_target, regional=is_viz_target),
                         ],
-                        runs_dir / f"deformable_pair{p_idx:03d}_{arm}_rep0.json",
+                        out_p,
                         args.force,
                         f"[{step_idx}/{len(pairs)} Pair {p_idx:02d}] {arm}",
                         in_process=in_process,
                     )
-                    all_records.append(rec)
+                    _record_put(rec)
 
                 if run_e2e:
+                    out_p = runs_dir / f"e2e_pair{p_idx:03d}_syntx_e2e_syn_rep0.json"
+                    if not args.force and out_p.exists():
+                        n_cached_in_pair += 1
                     rec = _run_subprocess_job(
                         script_path,
                         [
@@ -2817,16 +2882,19 @@ def main(argv: Optional[Sequence[str]] = None) -> Dict[str, Any]:
                             "--rep", "0",
                             *_common_flags(p_idx, persist=is_viz_target),
                         ],
-                        runs_dir / f"e2e_pair{p_idx:03d}_syntx_e2e_syn_rep0.json",
+                        out_p,
                         args.force,
                         f"[{step_idx}/{len(pairs)} Pair {p_idx:02d}] syntx_e2e_syn",
                         in_process=in_process,
                     )
-                    all_records.append(rec)
+                    _record_put(rec)
 
                 # 2. Multi-Core CPU C++ Arms for Pair p_idx (after MPS subprocesses exited)
                 for arm in affine_arms_cpu:
                     persist = is_viz_target and arm == "ants_affine"
+                    out_p = runs_dir / f"affine_pair{p_idx:03d}_{arm}_rep0.json"
+                    if not args.force and out_p.exists():
+                        n_cached_in_pair += 1
                     rec = _run_subprocess_job(
                         script_path,
                         [
@@ -2837,14 +2905,17 @@ def main(argv: Optional[Sequence[str]] = None) -> Dict[str, Any]:
                             "--rep", "0",
                             *_common_flags(p_idx, persist=persist),
                         ],
-                        runs_dir / f"affine_pair{p_idx:03d}_{arm}_rep0.json",
+                        out_p,
                         args.force,
                         f"[{step_idx}/{len(pairs)} Pair {p_idx:02d}] {arm}",
                         in_process=in_process,
                     )
-                    all_records.append(rec)
+                    _record_put(rec)
 
                 for arm in ants_deform_arms:
+                    out_p = runs_dir / f"deformable_pair{p_idx:03d}_{arm}_rep0.json"
+                    if not args.force and out_p.exists():
+                        n_cached_in_pair += 1
                     rec = _run_subprocess_job(
                         script_path,
                         [
@@ -2855,14 +2926,17 @@ def main(argv: Optional[Sequence[str]] = None) -> Dict[str, Any]:
                             "--rep", "0",
                             *_common_flags(p_idx, persist=is_viz_target, regional=is_viz_target),
                         ],
-                        runs_dir / f"deformable_pair{p_idx:03d}_{arm}_rep0.json",
+                        out_p,
                         args.force,
                         f"[{step_idx}/{len(pairs)} Pair {p_idx:02d}] {arm}",
                         in_process=in_process,
                     )
-                    all_records.append(rec)
+                    _record_put(rec)
 
                 if run_e2e:
+                    out_p = runs_dir / f"e2e_pair{p_idx:03d}_ants_e2e_syn_rep0.json"
+                    if not args.force and out_p.exists():
+                        n_cached_in_pair += 1
                     rec = _run_subprocess_job(
                         script_path,
                         [
@@ -2873,30 +2947,45 @@ def main(argv: Optional[Sequence[str]] = None) -> Dict[str, Any]:
                             "--rep", "0",
                             *_common_flags(p_idx, persist=is_viz_target),
                         ],
-                        runs_dir / f"e2e_pair{p_idx:03d}_ants_e2e_syn_rep0.json",
+                        out_p,
                         args.force,
                         f"[{step_idx}/{len(pairs)} Pair {p_idx:02d}] ants_e2e_syn",
                         in_process=in_process,
                     )
-                    all_records.append(rec)
+                    _record_put(rec)
+
+                preloaded_completed_pairs.add(int(p_idx))
+                effective_done = len(preloaded_completed_pairs)
 
                 dt_pair_min = (time.perf_counter() - t_p0) / 60.0
-                if dt_pair_min > (0.03 if not in_process else 0.0):
+                if n_cached_in_pair == 0 and dt_pair_min > (0.03 if not in_process else 0.0):
                     live_pair_minutes.append(dt_pair_min)
 
-                rem = len(pairs) - step_idx
-                if rem > 0:
-                    avg_m = (
-                        float(statistics.mean(live_pair_minutes))
-                        if live_pair_minutes
-                        else ((time.perf_counter() - t_wall0) / 60.0) / max(1, step_idx)
-                    )
-                    eta_m: Optional[float] = avg_m * rem
+                rem = len(pairs) - effective_done
+                if rem > 0 or step_idx < len(pairs):
+                    if live_pair_minutes:
+                        avg_m = float(statistics.mean(live_pair_minutes))
+                    else:
+                        pair_solver_s: Dict[int, float] = {}
+                        for r_done in all_records:
+                            if r_done.get("rep") == 0 and "runtime_seconds" in r_done:
+                                pair_solver_s[int(r_done["pair_idx"])] = (
+                                    pair_solver_s.get(int(r_done["pair_idx"]), 0.0)
+                                    + float(r_done["runtime_seconds"])
+                                )
+                        overhead_mult = 1.0 if in_process else 1.34
+                        avg_m = (
+                            (float(statistics.mean(pair_solver_s.values())) * overhead_mult / 60.0)
+                            if pair_solver_s
+                            else ((time.perf_counter() - t_wall0) / 60.0) / max(1, step_idx)
+                        )
+                    backfill_left = max(0, effective_done - step_idx)
+                    eta_m: Optional[float] = avg_m * rem + backfill_left * (1.4 if not in_process else 0.0)
                 else:
                     eta_m = 0.0
 
                 json_p, md_p, html_p, summary_payload = _emit_snapshot(
-                    completed_n=step_idx,
+                    completed_n=effective_done,
                     total_n=len(pairs),
                     in_prog=(step_idx < len(pairs)),
                     eta_minutes=eta_m,
