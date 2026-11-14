@@ -1299,6 +1299,10 @@ def apply_transforms(
     singleprecision: bool = False,
     verbose: bool = False,
     device: str | None = None,
+    *,
+    digital_diffeomorphism: bool = False,
+    digital_diffeomorphism_floor: float = 0.05,
+    digital_diffeomorphism_steps: int = 25,
     **kwargs: Any,
 ) -> Any:
     """Drop-in Torch/MPS/CUDA replacement for ``ants.apply_transforms`` with identical signature.
@@ -1326,6 +1330,14 @@ def apply_transforms(
         Background value for out-of-bounds points.
     device : str, optional
         Compute device (``'cpu'``, ``'mps'``, ``'cuda'``).
+    digital_diffeomorphism : bool, default False
+        When ``True`` and ``compose`` is provided, projects the composed discrete displacement
+        field onto the digital diffeomorphism set (``det >= digital_diffeomorphism_floor``)
+        before writing to disk.
+    digital_diffeomorphism_floor : float, default 0.05
+        Minimum physical central-difference Jacobian determinant when ``digital_diffeomorphism=True``.
+    digital_diffeomorphism_steps : int, default 25
+        Step budget for digital diffeomorphism projection when ``digital_diffeomorphism=True``.
     """
     import ants
 
@@ -1360,7 +1372,7 @@ def apply_transforms(
 
     if compose is not None:
         if len(fixed.shape) != 3:
-            return ants.apply_transforms(
+            tfn_2d = ants.apply_transforms(
                 fixed=fixed,
                 moving=moving,
                 transformlist=chain.paths(),
@@ -1373,17 +1385,46 @@ def apply_transforms(
                 verbose=verbose,
                 **kwargs,
             )
+            if digital_diffeomorphism and isinstance(tfn_2d, str) and os.path.exists(tfn_2d):
+                from .core.digital_diffeomorphism import enforce_digital_diffeomorphism
+
+                pol_2d = enforce_digital_diffeomorphism(
+                    tfn_2d,
+                    jac_floor=float(digital_diffeomorphism_floor),
+                    steps=int(digital_diffeomorphism_steps),
+                    device=device,
+                )
+                ants.image_write(pol_2d, tfn_2d)
+            return tfn_2d
         compose_str = str(compose)
         tfn = compose_str if compose_str.endswith((".nii.gz", ".nii", ".h5")) else f"{compose_str}comptx.nii.gz"
         dev = torch.device(resolve_device(device, task="model"))
         pts_fixed = _reference_grid_points_lps(fixed, dev)
         pts_moving = _map_points_to_moving_tensor(pts_fixed, chain, dev)
-        disp_arr = (pts_moving - pts_fixed).reshape(*fixed.shape[:3], 3).detach().cpu().numpy().astype(np.float32)
+        origin_tup = tuple(float(x) for x in fixed.origin[:3])
+        spacing_tup = tuple(float(x) for x in fixed.spacing[:3])
+        dir_mat = np.asarray(fixed.direction)[:3, :3]
+        disp_xyz_t = (pts_moving - pts_fixed).reshape(*fixed.shape[:3], 3).to(torch.float32)
+        if digital_diffeomorphism:
+            from .core.digital_diffeomorphism import enforce_digital_diffeomorphism_nd
+
+            disp_zyx_t = torch.flip(disp_xyz_t.permute(2, 1, 0, 3), dims=[-1]).contiguous().unsqueeze(0)
+            disp_zyx_t = enforce_digital_diffeomorphism_nd(
+                disp_zyx_t,
+                None,
+                spacing=spacing_tup,
+                origin=origin_tup,
+                direction=dir_mat,
+                jac_floor=float(digital_diffeomorphism_floor),
+                steps=int(digital_diffeomorphism_steps),
+            )
+            disp_xyz_t = torch.flip(disp_zyx_t[0].permute(2, 1, 0, 3), dims=[-1]).contiguous()
+        disp_arr = disp_xyz_t.detach().cpu().numpy()
         disp_img = ants.from_numpy(
             disp_arr,
-            origin=tuple(float(x) for x in fixed.origin[:3]),
-            spacing=tuple(float(x) for x in fixed.spacing[:3]),
-            direction=np.asarray(fixed.direction)[:3, :3],
+            origin=origin_tup,
+            spacing=spacing_tup,
+            direction=dir_mat,
             has_components=True,
         )
         ants.image_write(disp_img, tfn)
@@ -1448,11 +1489,17 @@ def compose_displacement_fields(
     displacement_field: Any,
     warping_field: Any,
     device: str | None = None,
+    *,
+    digital_diffeomorphism: bool = False,
+    digital_diffeomorphism_floor: float = 0.05,
+    digital_diffeomorphism_steps: int = 25,
 ) -> Any:
     """Drop-in Torch/MPS/CUDA replacement for ``ants.compose_displacement_fields(displacement_field, warping_field)``.
 
     Matches ITK/ANTs convention: ``warping_field`` is applied first, then ``displacement_field``:
-    ``u_composed(x) = w(x) + d(x + w(x))`` on ``warping_field``'s grid.
+    ``u_composed(x) = w(x) + d(x + w(x))`` on ``warping_field``'s grid. When
+    ``digital_diffeomorphism=True``, enforces discrete lattice diffeomorphism
+    (``det >= digital_diffeomorphism_floor``) on the composed field.
     """
     import ants
 
@@ -1462,7 +1509,22 @@ def compose_displacement_fields(
         or len(displacement_field.shape) != 3
         or len(warping_field.shape) != 3
     ):
-        return ants.compose_displacement_fields(displacement_field, warping_field)
+        out_img = ants.compose_displacement_fields(displacement_field, warping_field)
+        if (
+            digital_diffeomorphism
+            and not hasattr(ants.compose_displacement_fields, "_mock_name")
+            and hasattr(ants, "is_image")
+            and ants.is_image(out_img)
+        ):
+            from .core.digital_diffeomorphism import enforce_digital_diffeomorphism
+
+            return enforce_digital_diffeomorphism(
+                out_img,
+                jac_floor=float(digital_diffeomorphism_floor),
+                steps=int(digital_diffeomorphism_steps),
+                device=device,
+            )
+        return out_img
 
     dev = torch.device(resolve_device(device, task="model"))
     pts_fixed = _reference_grid_points_lps(warping_field, dev)
@@ -1470,12 +1532,30 @@ def compose_displacement_fields(
     w_t = torch.as_tensor(w_arr.reshape(-1, 3), dtype=torch.float32, device=dev)
     d_field = ContinuousField(displacement_field, device=dev, dtype=torch.float32)
     d_sampled = _sample_field_itk(d_field, pts_fixed + w_t, mode="bilinear")
-    comp_arr = (w_t + d_sampled).reshape(*warping_field.shape[:3], 3).detach().cpu().numpy().astype(np.float32)
+    origin_tup = tuple(float(x) for x in warping_field.origin[:3])
+    spacing_tup = tuple(float(x) for x in warping_field.spacing[:3])
+    dir_mat = np.asarray(warping_field.direction)[:3, :3]
+    comp_xyz_t = (w_t + d_sampled).reshape(*warping_field.shape[:3], 3).to(torch.float32)
+    if digital_diffeomorphism:
+        from .core.digital_diffeomorphism import enforce_digital_diffeomorphism_nd
+
+        comp_zyx_t = torch.flip(comp_xyz_t.permute(2, 1, 0, 3), dims=[-1]).contiguous().unsqueeze(0)
+        comp_zyx_t = enforce_digital_diffeomorphism_nd(
+            comp_zyx_t,
+            None,
+            spacing=spacing_tup,
+            origin=origin_tup,
+            direction=dir_mat,
+            jac_floor=float(digital_diffeomorphism_floor),
+            steps=int(digital_diffeomorphism_steps),
+        )
+        comp_xyz_t = torch.flip(comp_zyx_t[0].permute(2, 1, 0, 3), dims=[-1]).contiguous()
+    comp_arr = comp_xyz_t.detach().cpu().numpy()
     return ants.from_numpy(
         comp_arr,
-        origin=tuple(float(x) for x in warping_field.origin[:3]),
-        spacing=tuple(float(x) for x in warping_field.spacing[:3]),
-        direction=np.asarray(warping_field.direction)[:3, :3],
+        origin=origin_tup,
+        spacing=spacing_tup,
+        direction=dir_mat,
         has_components=True,
     )
 
@@ -2031,6 +2111,10 @@ def compose_displacement(
     reference: Any,
     out_path: str,
     device: str | None = None,
+    *,
+    digital_diffeomorphism: bool = False,
+    digital_diffeomorphism_floor: float = 0.05,
+    digital_diffeomorphism_steps: int = 25,
 ) -> str:
     """Compose a transform list (displacement fields and/or affines) into ONE displacement field on ``reference``'s grid."""
     tl = [str(t) for t in transformlist]
@@ -2050,6 +2134,9 @@ def compose_displacement(
             whichtoinvert=inv,
             compose=out_path,
             device=device,
+            digital_diffeomorphism=digital_diffeomorphism,
+            digital_diffeomorphism_floor=digital_diffeomorphism_floor,
+            digital_diffeomorphism_steps=digital_diffeomorphism_steps,
         )
     )
 

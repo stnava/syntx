@@ -240,19 +240,30 @@ def export_ants_displacement_field(
         spacing = ref_image.spacing
         direction = ref_image.direction
 
-    disp_np = _to_numpy(disp)
-    dim = disp_np.shape[-1]
+    if torch is not None and isinstance(disp, torch.Tensor):
+        t = disp.detach()
+        dim = int(t.shape[-1])
+        while t.ndim > (dim + 1) and t.shape[0] == 1:
+            t = t[0]
+        if dim == 2 and t.ndim == 3:
+            t = t.permute(1, 0, 2)
+        elif dim == 3 and t.ndim == 4:
+            t = t.permute(2, 1, 0, 3)
+        disp_xyz = torch.flip(t, dims=[-1]).contiguous().cpu().numpy()
+    else:
+        disp_np = _to_numpy(disp)
+        dim = disp_np.shape[-1]
 
-    while disp_np.ndim > (dim + 1) and disp_np.shape[0] == 1:
-        disp_np = disp_np[0]
+        while disp_np.ndim > (dim + 1) and disp_np.shape[0] == 1:
+            disp_np = disp_np[0]
 
-    if dim == 2:
-        disp_np = np.transpose(disp_np, (1, 0, 2))
-    elif dim == 3:
-        disp_np = np.transpose(disp_np, (2, 1, 0, 3))
+        if dim == 2:
+            disp_np = np.transpose(disp_np, (1, 0, 2))
+        elif dim == 3:
+            disp_np = np.transpose(disp_np, (2, 1, 0, 3))
 
-    # Reverse vector components from PyTorch ZYX order [v_z, v_y, v_x] to ITK XYZ order [v_x, v_y, v_z]
-    disp_xyz = np.ascontiguousarray(disp_np[..., ::-1])
+        # Reverse vector components from PyTorch ZYX order [v_z, v_y, v_x] to ITK XYZ order [v_x, v_y, v_z]
+        disp_xyz = np.ascontiguousarray(disp_np[..., ::-1])
 
     return ants.from_numpy(
         disp_xyz,
@@ -290,7 +301,6 @@ def disp_tensor_to_itk(disp, ref_image):
     >>> warp_itk = syntx.spatial.disp_tensor_to_itk(model.warp_l2r, fixed)
     >>> ants.image_write(warp_itk, 'warp.nii.gz')
     """
-    arr = _to_numpy(disp)
     if isinstance(ref_image, dict):
         origin = ref_image.get("origin")
         spacing = ref_image.get("spacing")
@@ -300,14 +310,15 @@ def disp_tensor_to_itk(disp, ref_image):
         spacing = ref_image.spacing
         direction = ref_image.direction
 
-    dim = arr.shape[-1]
+    src = disp if (torch is not None and isinstance(disp, torch.Tensor)) else _to_numpy(disp)
+    dim = int(src.shape[-1])
     spatial_ndim = dim
 
-    if arr.ndim == spatial_ndim + 2:
-        batch_size = arr.shape[0]
+    if src.ndim == spatial_ndim + 2:
+        batch_size = int(src.shape[0])
         if batch_size == 1:
             return export_ants_displacement_field(
-                arr[0],
+                src[0],
                 origin=origin,
                 spacing=spacing,
                 direction=direction,
@@ -315,7 +326,7 @@ def disp_tensor_to_itk(disp, ref_image):
         else:
             return [
                 export_ants_displacement_field(
-                    arr[b],
+                    src[b],
                     origin=origin,
                     spacing=spacing,
                     direction=direction,
@@ -324,7 +335,7 @@ def disp_tensor_to_itk(disp, ref_image):
             ]
     else:
         return export_ants_displacement_field(
-            arr,
+            src,
             origin=origin,
             spacing=spacing,
             direction=direction,
@@ -338,13 +349,18 @@ def _single_disp_itk_to_tensor(disp_img, device="cpu"):
         disp_img = ants.image_read(str(disp_img))
     arr = disp_img.numpy() if hasattr(disp_img, "numpy") else np.asarray(disp_img)
     dim = arr.shape[-1]
+    dev = torch.device(device)
+    if dim in (2, 3) and not (dev.type == "mps" and arr.dtype == np.float64):
+        t = torch.from_numpy(np.ascontiguousarray(arr)).to(dev)
+        t = t.permute(1, 0, 2) if dim == 2 else t.permute(2, 1, 0, 3)
+        return torch.flip(t, dims=[-1]).contiguous().unsqueeze(0)
     if dim == 2:
         arr = np.transpose(arr, (1, 0, 2))
     elif dim == 3:
         arr = np.transpose(arr, (2, 1, 0, 3))
     arr = arr[..., ::-1]
 
-    tensor = torch.from_numpy(np.ascontiguousarray(arr)).unsqueeze(0).to(device)
+    tensor = torch.from_numpy(np.ascontiguousarray(arr)).unsqueeze(0).to(dev)
     return tensor
 
 

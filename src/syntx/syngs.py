@@ -1607,6 +1607,10 @@ def integrate_momentum(
     t_end: float = 1.0,
     return_trajectory: bool = False,
     device: str = None,
+    *,
+    digital_diffeomorphism: bool = True,
+    digital_diffeomorphism_floor: float = 0.05,
+    digital_diffeomorphism_steps: int = 25,
 ):
     """
     Turn a SyNGS initial velocity field (e.g. ``reg['fwd_momentum']``) back into a
@@ -1615,9 +1619,9 @@ def integrate_momentum(
 
     With the defaults (``t_end=1``, no trajectory) this is exactly ``syntx.syngs``'s forward
     shooting (smooth v0 once, ``n_steps`` Euler steps of the stationary field), so a saved
-    momentum reproduces the registration's warp when ``n_steps`` and ``alpha`` match.
-    ``return_trajectory`` / ``t_end`` use the same scheme with step ``t_end / n_steps``, so the
-    trajectory's last element equals the default result for ``t_end=1``.
+    momentum reproduces the registration's warp when ``n_steps`` and ``alpha`` match. When
+    ``digital_diffeomorphism=True`` and ``return_trajectory=False``, the shot endpoint field is
+    polished onto the digital diffeomorphism lattice (``det >= digital_diffeomorphism_floor``).
 
     Parameters
     ----------
@@ -1635,6 +1639,13 @@ def integrate_momentum(
         Return the displacement after every step instead of only the last.
     device : str, optional
         Default: CUDA, else MPS, else CPU.
+    digital_diffeomorphism : bool, default True
+        Project the shot displacement field onto the discrete diffeomorphism set when
+        ``return_trajectory=False``.
+    digital_diffeomorphism_floor : float, default 0.05
+        Minimum physical central-difference Jacobian determinant when ``digital_diffeomorphism=True``.
+    digital_diffeomorphism_steps : int, default 25
+        Step budget for digital diffeomorphism projection when ``digital_diffeomorphism=True``.
 
     Returns
     -------
@@ -1707,6 +1718,19 @@ def integrate_momentum(
     if not return_trajectory and math.isclose(t_end, 1.0):
         with torch.no_grad():
             disp_tensor = model.get_forward_warp(image_shape=grid_shape_zyx)
+            if digital_diffeomorphism:
+                from .core.digital_diffeomorphism import enforce_digital_diffeomorphism_nd
+
+                disp_tensor = enforce_digital_diffeomorphism_nd(
+                    disp_tensor,
+                    None,
+                    spacing=spacing,
+                    origin=origin,
+                    direction=direction,
+                    jac_floor=float(digital_diffeomorphism_floor),
+                    steps=int(digital_diffeomorphism_steps),
+                    stationary_boundary=True,
+                )
         return disp_tensor_to_itk(disp_tensor, reference_image)
 
     # Multi-step trajectory or custom t_end integration:
@@ -1738,8 +1762,20 @@ def integrate_momentum(
 
         if return_trajectory:
             return trajectory
-        else:
-            return disp_tensor_to_itk(disp, reference_image)
+        if digital_diffeomorphism:
+            from .core.digital_diffeomorphism import enforce_digital_diffeomorphism_nd
+
+            disp = enforce_digital_diffeomorphism_nd(
+                disp,
+                None,
+                spacing=spacing,
+                origin=origin,
+                direction=direction,
+                jac_floor=float(digital_diffeomorphism_floor),
+                steps=int(digital_diffeomorphism_steps),
+                stationary_boundary=True,
+            )
+        return disp_tensor_to_itk(disp, reference_image)
 
 
 shoot_geodesic = integrate_momentum

@@ -69,6 +69,7 @@ from .core import (
     compute_deviatoric_strain_penalty,
     digital_diffeomorphism_loss,
     digital_diffeomorphism_penalty,
+    enforce_digital_diffeomorphism,
     enforce_digital_diffeomorphism_jax,
     enforce_digital_diffeomorphism_nd,
     pullback_digital_diffeomorphism_to_halves,
@@ -366,7 +367,7 @@ from .liouville import liouville_determinant, determinant_summary
 syngs = syngs_registration
 affine_benchmark = evaluate_affine_benchmark
 
-__version__ = "6.36.0"
+__version__ = "6.37.0"
 
 
 
@@ -613,6 +614,7 @@ __all__ = [
     "compute_deviatoric_strain_penalty",
     "digital_diffeomorphism_loss",
     "digital_diffeomorphism_penalty",
+    "enforce_digital_diffeomorphism",
     "enforce_digital_diffeomorphism_jax",
     "enforce_digital_diffeomorphism_nd",
     "pullback_digital_diffeomorphism_to_halves",

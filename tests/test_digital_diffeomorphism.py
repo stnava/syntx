@@ -724,3 +724,372 @@ def test_top_level_exports_and_default_on_with_opt_out_across_all_models():
     )
     assert res_sc.jacobian_min > 0.04
 
+
+def test_adaptive_multipass_deep_crease_unfolds_both_stencils_oblique_3d():
+    """Item 1: Deep -18 physical crease on an anisotropic oblique 3-D grid converges via adaptive
+    shrinking-shell dual-stencil passes to strictly positive Jacobian (0.0000% folding) under BOTH
+    ants.create_jacobian_determinant_image (4th-order) and syntx.signed_jacobian_determinant (2nd-order)."""
+    import ants
+    from syntx.spatial import disp_tensor_to_itk
+    from syntx.transforms import signed_jacobian_determinant
+
+    spatial = (24, 24, 24)
+    spacing = (1.15, 0.95, 1.25)
+    origin = (-12.0, 15.0, 4.0)
+    direction = _oblique_3d_direction()
+    device = torch.device("cpu")
+    dtype = torch.float32
+
+    bmask = get_boundary_mask(spatial, device, dtype)
+    iz = torch.arange(spatial[0], dtype=dtype).view(1, -1, 1, 1) - 12.0
+    iy = torch.arange(spatial[1], dtype=dtype).view(1, 1, -1, 1) - 12.0
+    ix = torch.arange(spatial[2], dtype=dtype).view(1, 1, 1, -1) - 12.0
+    r2 = iz * iz + iy * iy + ix * ix
+
+    dir_rev = direction[::-1, ::-1].copy()
+    e0 = torch.tensor(dir_rev[:, 0], dtype=dtype).view(1, 1, 1, 1, 3)
+    e1 = torch.tensor(dir_rev[:, 1], dtype=dtype).view(1, 1, 1, 1, 3)
+    e2 = torch.tensor(dir_rev[:, 2], dtype=dtype).view(1, 1, 1, 1, 3)
+
+    env = torch.exp(-r2 / 3.5)
+    # Multi-axis deep compressive crease producing initial physical Jacobian < -15
+    w_fwd = (
+        (-5.6 * iz * env).unsqueeze(-1) * e0
+        + (-5.6 * iy * env).unsqueeze(-1) * e1
+        + (-5.6 * ix * env).unsqueeze(-1) * e2
+    ) * bmask
+    w_inv = -w_fwd.clone()
+
+    dom_img = ants.from_numpy(
+        np.zeros(tuple(reversed(spatial)), dtype=np.float32),
+        origin=origin,
+        spacing=spacing,
+        direction=direction,
+    )
+    fwd0_img = disp_tensor_to_itk(w_fwd, dom_img)
+    j_sig0 = signed_jacobian_determinant(fwd0_img, dom_img).numpy()
+    assert float(j_sig0.min()) < -15.0
+
+    stats: dict = {}
+    fwd_p, inv_p = enforce_digital_diffeomorphism_nd(
+        w_fwd,
+        w_inv,
+        spacing=spacing,
+        origin=origin,
+        direction=direction,
+        ice_tol=0.30,
+        jac_floor=0.05,
+        steps=25,
+        stats=stats,
+    )
+    assert stats["steps"] > 0
+
+    fwd_p_img = disp_tensor_to_itk(fwd_p, dom_img)
+    inv_p_img = disp_tensor_to_itk(inv_p, dom_img)
+    j_ants_f = ants.create_jacobian_determinant_image(dom_img, fwd_p_img, do_log=False).numpy()
+    j_ants_i = ants.create_jacobian_determinant_image(dom_img, inv_p_img, do_log=False).numpy()
+    j_sig_f = signed_jacobian_determinant(fwd_p_img, dom_img).numpy()
+    j_sig_i = signed_jacobian_determinant(inv_p_img, dom_img).numpy()
+
+    assert int((j_ants_f <= 0.0).sum()) == 0 and float(j_ants_f.min()) >= 0.049
+    assert int((j_ants_i <= 0.0).sum()) == 0 and float(j_ants_i.min()) >= 0.049
+    assert int((j_sig_f <= 0.0).sum()) == 0 and float(j_sig_f.min()) >= 0.049
+    assert int((j_sig_i <= 0.0).sum()) == 0 and float(j_sig_i.min()) >= 0.049
+
+    ice = calculate_inverse_identity_error(fwd_p, inv_p, spacing, origin, direction)
+    assert ice["max_error"] <= 0.75 * max(spacing)
+
+    # Re-running on already-repaired fields is strictly 0-step idempotent
+    stats_idem: dict = {}
+    fwd_p2, inv_p2 = enforce_digital_diffeomorphism_nd(
+        fwd_p,
+        inv_p,
+        spacing=spacing,
+        origin=origin,
+        direction=direction,
+        ice_tol=max(0.30, float(stats["final_max_ice_vox"]) + 1e-4),
+        jac_floor=0.05,
+        steps=25,
+        stats=stats_idem,
+    )
+    assert stats_idem["steps"] == 0
+    assert torch.equal(fwd_p2, fwd_p)
+    assert torch.equal(inv_p2, inv_p)
+
+
+def test_public_antsimage_enforce_digital_diffeomorphism_api(tmp_path):
+    """Item 2: Public ANTsImage / .nii.gz helper syntx.enforce_digital_diffeomorphism preserves
+    origin, spacing, and oblique direction cosines in both paired and unidirectional modes."""
+    import ants
+    import syntx
+    from syntx.spatial import disp_tensor_to_itk
+    from syntx.transforms import signed_jacobian_determinant
+
+    assert hasattr(syntx, "enforce_digital_diffeomorphism")
+    assert hasattr(syntx.core, "enforce_digital_diffeomorphism")
+
+    spatial = (16, 18, 20)
+    spacing = (1.2, 0.9, 1.3)
+    origin = (7.5, -14.0, 22.0)
+    direction = _oblique_3d_direction()
+    dtype = torch.float32
+
+    bmask = get_boundary_mask(spatial, torch.device("cpu"), dtype)
+    iz = torch.arange(spatial[0], dtype=dtype).view(1, -1, 1, 1) - 8.0
+    iy = torch.arange(spatial[1], dtype=dtype).view(1, 1, -1, 1) - 9.0
+    ix = torch.arange(spatial[2], dtype=dtype).view(1, 1, 1, -1) - 10.0
+    r2 = iz * iz + iy * iy + ix * ix
+    dir_rev = direction[::-1, ::-1].copy()
+    e2 = torch.tensor(dir_rev[:, 2], dtype=dtype).view(1, 1, 1, 1, 3)
+    w_fwd = ((-2.8 * ix * torch.exp(-r2 / 2.2)).unsqueeze(-1) * e2) * bmask
+    w_inv = -w_fwd.clone()
+
+    dom_img = ants.from_numpy(
+        np.zeros(tuple(reversed(spatial)), dtype=np.float32),
+        origin=origin,
+        spacing=spacing,
+        direction=direction,
+    )
+    fwd_img = disp_tensor_to_itk(w_fwd, dom_img)
+    inv_img = disp_tensor_to_itk(w_inv, dom_img)
+
+    fwd_path = tmp_path / "fwd_warp.nii.gz"
+    inv_path = tmp_path / "inv_warp.nii.gz"
+    ants.image_write(fwd_img, str(fwd_path))
+    ants.image_write(inv_img, str(inv_path))
+
+    # Paired mode from file paths + return_stats=True
+    pol_f, pol_i, st = syntx.enforce_digital_diffeomorphism(
+        fwd_path, inv_path, device="cpu", return_stats=True
+    )
+    assert st["steps"] > 0
+    assert np.allclose(pol_f.origin, origin, atol=1e-5)
+    assert np.allclose(pol_f.spacing, spacing, atol=1e-5)
+    assert np.allclose(pol_f.direction, direction, atol=1e-5)
+    assert np.allclose(pol_i.direction, direction, atol=1e-5)
+    assert float(ants.create_jacobian_determinant_image(dom_img, pol_f, do_log=False).numpy().min()) >= 0.049
+    assert float(signed_jacobian_determinant(pol_f, dom_img).numpy().min()) >= 0.049
+
+    # Paired mode without return_stats + idempotency
+    pol_f2, pol_i2, st2 = syntx.enforce_digital_diffeomorphism(
+        pol_f, pol_i, device="cpu", return_stats=True
+    )
+    assert st2["steps"] == 0
+    assert np.array_equal(pol_f2.numpy(), pol_f.numpy())
+    assert np.array_equal(pol_i2.numpy(), pol_i.numpy())
+
+    # Unidirectional mode (inv_warp=None) with ANTsImage
+    uni_f, st_u = syntx.enforce_digital_diffeomorphism(
+        fwd_img, None, device="cpu", return_stats=True
+    )
+    assert st_u["steps"] > 0
+    assert np.allclose(uni_f.direction, direction, atol=1e-5)
+    assert float(ants.create_jacobian_determinant_image(dom_img, uni_f, do_log=False).numpy().min()) >= 0.049
+
+    uni_f_nostats = syntx.enforce_digital_diffeomorphism(uni_f, device="cpu")
+    assert isinstance(uni_f_nostats, ants.ANTsImage)
+    assert np.array_equal(uni_f_nostats.numpy(), uni_f.numpy())
+
+
+def test_closure_under_warp_composition_and_template_update(tmp_path):
+    """Item 3: compose_displacement_fields, apply_transforms(..., compose=...), and build_template
+    enforce digital diffeomorphism when enabled while preserving default raw composition behavior."""
+    import ants
+    import syntx
+    from syntx.spatial import disp_tensor_to_itk
+    from syntx.transforms import signed_jacobian_determinant
+
+    spatial = (18, 18, 18)
+    spacing = (1.1, 1.0, 1.2)
+    origin = (-3.0, 5.0, 2.0)
+    direction = _oblique_3d_direction()
+    dtype = torch.float32
+    device = torch.device("cpu")
+
+    bmask = get_boundary_mask(spatial, device, dtype)
+    iz = torch.arange(spatial[0], dtype=dtype).view(1, -1, 1, 1) - 9.0
+    iy = torch.arange(spatial[1], dtype=dtype).view(1, 1, -1, 1) - 9.0
+    ix = torch.arange(spatial[2], dtype=dtype).view(1, 1, 1, -1) - 9.0
+    dir_rev = direction[::-1, ::-1].copy()
+    e1 = torch.tensor(dir_rev[:, 1], dtype=dtype).view(1, 1, 1, 1, 3)
+    e2 = torch.tensor(dir_rev[:, 2], dtype=dtype).view(1, 1, 1, 1, 3)
+    env_z = torch.exp(-(iz * iz) / 3.5)
+    f_iy = iy * torch.exp(-(iy * iy) / 0.8) * env_z * torch.exp(-(ix * ix) / 10.0)
+    f_ix = ix * torch.exp(-(ix * ix) / 0.8) * env_z * torch.exp(-(iy * iy) / 10.0)
+
+    # Two individually diffeomorphic shears whose discrete composition folds (< 0)
+    u_outer = ((+8.5 * float(spacing[1]) * f_ix).unsqueeze(-1) * e1) * bmask
+    u_inner = ((+8.5 * float(spacing[0]) * f_iy).unsqueeze(-1) * e2) * bmask
+
+    dom_img = ants.from_numpy(
+        np.ones(tuple(reversed(spatial)), dtype=np.float32),
+        origin=origin,
+        spacing=spacing,
+        direction=direction,
+    )
+    w_outer_img = disp_tensor_to_itk(u_outer, dom_img)
+    w_inner_img = disp_tensor_to_itk(u_inner, dom_img)
+    assert float(signed_jacobian_determinant(w_outer_img, dom_img).numpy().min()) > 0.25
+    assert float(signed_jacobian_determinant(w_inner_img, dom_img).numpy().min()) > 0.25
+
+    comp_raw = syntx.compose_displacement_fields(
+        w_outer_img, w_inner_img, device="cpu"
+    )
+    assert float(signed_jacobian_determinant(comp_raw, dom_img).numpy().min()) < 0.0
+
+    comp_dd = syntx.compose_displacement_fields(
+        w_outer_img,
+        w_inner_img,
+        device="cpu",
+        digital_diffeomorphism=True,
+        digital_diffeomorphism_floor=0.05,
+        digital_diffeomorphism_steps=25,
+    )
+    assert float(signed_jacobian_determinant(comp_dd, dom_img).numpy().min()) >= 0.049
+    assert float(ants.create_jacobian_determinant_image(dom_img, comp_dd, do_log=False).numpy().min()) >= 0.049
+
+    # apply_transforms(..., compose=...) with digital_diffeomorphism=True
+    p_outer = str(tmp_path / "outer.nii.gz")
+    p_inner = str(tmp_path / "inner.nii.gz")
+    ants.image_write(w_outer_img, p_outer)
+    ants.image_write(w_inner_img, p_inner)
+    comp_prefix = str(tmp_path / "composed_")
+    comp_path = syntx.apply_transforms(
+        fixed=dom_img,
+        moving=dom_img,
+        transformlist=[p_outer, p_inner],
+        compose=comp_prefix,
+        device="cpu",
+        digital_diffeomorphism=True,
+    )
+    comp_disk = ants.image_read(comp_path)
+    assert float(signed_jacobian_determinant(comp_disk, dom_img).numpy().min()) >= 0.049
+
+    # build_template with digital_diffeomorphism=True (default) vs False
+    yy, xx = np.meshgrid(np.linspace(-1.0, 1.0, 20), np.linspace(-1.0, 1.0, 20), indexing="ij")
+    c1 = ants.from_numpy(np.exp(-5.0 * ((xx - 0.15) ** 2 + yy ** 2)).astype(np.float32))
+    c2 = ants.from_numpy(np.exp(-5.0 * ((xx + 0.15) ** 2 + yy ** 2)).astype(np.float32))
+    t_dir = tmp_path / "tmpl_dd"
+    res_tmpl = syntx.build_template(
+        image_list=[c1, c2],
+        iterations=1,
+        type_of_transform="Greedy",
+        reg_iterations=[2],
+        scales=[1],
+        initial_transforms=["identity", "identity"],
+        output_dir=str(t_dir),
+        device="cpu",
+        digital_diffeomorphism=True,
+    )
+    avg_warp = ants.image_read(str(t_dir / "avgWarp_0.nii.gz"))
+    assert float(ants.create_jacobian_determinant_image(res_tmpl["template"], avg_warp, do_log=False).numpy().min()) >= 0.049
+
+
+def test_standalone_integrate_momentum_pytorch_and_jax_digital_diffeomorphism():
+    """Item 4: Standalone momentum shooting (integrate_momentum / shoot_geodesic /
+    momentum_to_deformation and JAX parity equivalents) enforces digital_diffeomorphism=True
+    by default while supporting opt-out digital_diffeomorphism=False and return_trajectory=True."""
+    import ants
+    from syntx.syngs import integrate_momentum, momentum_to_deformation, shoot_geodesic
+    from syntx.transforms import signed_jacobian_determinant
+
+    spatial_itk = (14, 14, 14)
+    spacing = (1.0, 1.0, 1.0)
+    origin = (0.0, 0.0, 0.0)
+    direction = np.eye(3)
+    ref_img = ants.from_numpy(
+        np.zeros(spatial_itk, dtype=np.float32),
+        origin=origin,
+        spacing=spacing,
+        direction=direction,
+    )
+
+    # Sharp opposing compressive 3-D momentum impulse that folds under raw 2-step shooting
+    ax = np.arange(14, dtype=np.float32) - 7.0
+    xx, yy, zz = np.meshgrid(ax, ax, ax, indexing="ij")
+    r2 = xx * xx + yy * yy + zz * zz
+    mom_arr = np.zeros((14, 14, 14, 3), dtype=np.float32)
+    mom_arr[..., 0] = -45.0 * xx * np.exp(-r2 / 1.5)
+    mom_arr[..., 1] = -45.0 * yy * np.exp(-r2 / 1.5)
+    mom_arr[..., 2] = -45.0 * zz * np.exp(-r2 / 1.5)
+    mom_img = ants.from_numpy(
+        mom_arr, origin=origin, spacing=spacing, direction=direction, has_components=True
+    )
+
+    disp_raw = integrate_momentum(
+        mom_img,
+        reference_image=ref_img,
+        alpha=0.1,
+        n_steps=2,
+        device="cpu",
+        digital_diffeomorphism=False,
+    )
+    assert float(signed_jacobian_determinant(disp_raw, ref_img).numpy().min()) < 0.0
+
+    disp_dd = integrate_momentum(
+        mom_img,
+        reference_image=ref_img,
+        alpha=0.1,
+        n_steps=2,
+        device="cpu",
+    )
+    assert float(signed_jacobian_determinant(disp_dd, ref_img).numpy().min()) >= 0.049
+    assert float(ants.create_jacobian_determinant_image(ref_img, disp_dd, do_log=False).numpy().min()) >= 0.049
+    assert np.allclose(
+        shoot_geodesic(mom_img, ref_img, alpha=0.1, n_steps=2, device="cpu").numpy(),
+        disp_dd.numpy(),
+    )
+    assert np.allclose(
+        momentum_to_deformation(mom_img, ref_img, alpha=0.1, n_steps=2, device="cpu").numpy(),
+        disp_dd.numpy(),
+    )
+
+    traj = integrate_momentum(
+        mom_img,
+        reference_image=ref_img,
+        alpha=0.1,
+        n_steps=2,
+        return_trajectory=True,
+        device="cpu",
+    )
+    assert len(traj) == 3
+
+    pytest.importorskip("jax")
+    from syntx.syngs_jax import (
+        integrate_momentum_jax,
+        momentum_to_deformation_jax,
+        shoot_geodesic_jax,
+    )
+
+    disp_jax_raw = integrate_momentum_jax(
+        mom_img,
+        reference_image=ref_img,
+        n_steps=2,
+        digital_diffeomorphism=False,
+    )
+    assert float(signed_jacobian_determinant(disp_jax_raw, ref_img).numpy().min()) < 0.0
+
+    disp_jax_dd = integrate_momentum_jax(
+        mom_img,
+        reference_image=ref_img,
+        n_steps=2,
+    )
+    assert float(signed_jacobian_determinant(disp_jax_dd, ref_img).numpy().min()) >= 0.049
+    assert float(ants.create_jacobian_determinant_image(ref_img, disp_jax_dd, do_log=False).numpy().min()) >= 0.049
+    assert np.allclose(
+        shoot_geodesic_jax(mom_img, ref_img, n_steps=2).numpy(),
+        disp_jax_dd.numpy(),
+    )
+    assert np.allclose(
+        momentum_to_deformation_jax(mom_img, ref_img, n_steps=2).numpy(),
+        disp_jax_dd.numpy(),
+    )
+    traj_jax = integrate_momentum_jax(
+        mom_img,
+        reference_image=ref_img,
+        n_steps=2,
+        return_trajectory=True,
+    )
+    assert len(traj_jax) == 3
+
+

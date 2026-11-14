@@ -1,12 +1,27 @@
 # Tracking Summary
-current phase: v6.36.0 (default-on sparse O(|active|) digital diffeomorphism finish polish across `syn`, `tvf`, `syngs`, `greedy`, and `syn_scattered` with opt-out `digital_diffeomorphism=False`, plus 2-rep confirmed `syn_beltrami` / `syn_beltrami_proj` presets)
-next WP: complete 90-pair Mindboggle population benchmark (`results/mindboggle_90pair_v6_36_0_2026-11-12`); per-run synthetic calibration of slice-set clock thresholds; fix opt-in `engine='projected'` motion regression
+current phase: v6.37.0 (dual-stencil 2h+4h & cell-secant digital diffeomorphism v2, coupled-from-0 GPU zero-transfer polish, public `syntx.enforce_digital_diffeomorphism` API, and composition/template/shooting closure)
+next WP: complete 90-pair Mindboggle population benchmark (`results/mindboggle_90pair_v6_37_0_2026-11-13`); per-run synthetic calibration of slice-set clock thresholds; fix opt-in `engine='projected'` motion regression
 blockers: none
-active work: resuming 90-pair Mindboggle benchmark (`40/90` cached -> `90/90`) with default `digital_diffeomorphism=True`
+active work: running clean 90-pair Mindboggle benchmark (`0/90 -> 90/90`) on `v6.37.0` (`dirty=False`)
 device: Apple Silicon MPS / CPU (macOS arm64)
 last updated: 2026-11-13
 
 ---
+
+## R37 (Dual-Stencil Digital Diffeomorphism v2, Coupled GPU Zero-Transfer Polish & Composition/Shooting Closure; v6.37.0, 2026-11-13)
+- **Dual-Stencil (`2h` + `4h`) & Cell-Secant Digital Diffeomorphism v2 (`src/syntx/core/digital_diffeomorphism.py`, `src/syntx/core/__init__.py`, `src/syntx/__init__.py`, `tests/test_digital_diffeomorphism.py`)**:
+  - Upgraded `enforce_digital_diffeomorphism_nd` from 3-point (`2h`) only to simultaneous 2nd-order (`syntx.signed_jacobian_determinant`) + 4th-order 5-point (`ants.create_jacobian_determinant_image`) central-difference and 1-voxel cell-secant (`D_h^+`, `D_h^-`) physical Jacobian enforcement (`min(det2, det4) >= jac_floor = 0.05`), eliminating Runge 4th-order stencil undershoot at sharp cortical sulcal pinches across oblique/anisotropic 2-D and 3-D grids.
+  - **Coupled-from-Iteration-0 Joint Symmetric Shrinking-Shell Polish & Zero-Transfer GPU Kernels**:
+    - Replaced uncoupled forward/inverse pre-passes and unguarded Newton/LM (`_pointwise_lm_refine_subset`) with coupled-from-iteration-0 `_joint_symmetric_shell_polish` (`(df, di)` optimized simultaneously with active chord coupling so trajectory inverses never drift apart), partner-coupled closure (`_unfold_field_adaptive_smooth`), and Jacobian-backtracking `_safe_lm_subset_backtrack`.
+    - Replaced 6-D `(..., dim, dim)` Jacobian/cofactor allocations and inner-loop `.item()` host syncs with exact row cross-product determinants (`det(I + G D_rev^-1) = det(D_rev^-1) * det(D_rev^T + G_ax)`, `_eval_dual_fd_det_min_fast`, `_precompute_sparse_row_bases`, `_eval_sparse_row_step`), static-active chord splitting (`_prepare_chord_eval_split`, `_eval_chord_split` dropping zero-gradient exterior queries), and device-side layout transposes in `src/syntx/spatial.py`.
+  - **Public API & End-to-End Composition / Template / Shooting Closure (`src/syntx/{transforms,template,syngs,syngs_jax}.py`)**:
+    - Added public `syntx.enforce_digital_diffeomorphism(fwd_warp, inv_warp=None, ...)` accepting `ANTsImage` or `.nii.gz` paths while preserving `origin`, `spacing`, and `direction` cosines.
+    - Closed discrete composition and integration pathways: `compose_displacement_fields(..., digital_diffeomorphism=...)`, `apply_transforms(..., compose=..., digital_diffeomorphism=...)`, `build_template(..., digital_diffeomorphism=...)`, `integrate_momentum(..., digital_diffeomorphism=True)`, and `integrate_momentum_jax(..., digital_diffeomorphism=True)`.
+- **Measured Mindboggle Pair 44 (`mbhard`: `NKI-TRT-20-2 <- MMRR-21-2`, `192x256x256` = `12.58M` voxels, Isolated MPS)**:
+  - **`syn_beltrami` (`10.2 s` MPS, `0`-step idempotent)**: Bidirectional Dice `0.6145 -> 0.6143` (`Δ = -0.02 pp`); whole-volume ANTs `4h` folds `49 -> 0` (`0.00000%`, `min = +0.0502`) fwd & `152 -> 0` (`+0.0511`) inv; `syntx` `2h` folds `18 (-1.11) -> 0` (`+0.0565`) fwd & `36 (-1.15) -> 0` (`+0.0519`) inv; `Max ICE = 0.74 -> 0.40 mm` (`-46%`), RMS shift `0.006 mm`.
+  - **`tvf_best` (`54.0 s` MPS, `0`-step idempotent)**: Bidirectional Dice `0.6279 -> 0.6261` (`Δ = -0.18 pp`); whole-volume ANTs `4h` folds `4,171 -> 0` (`0.00000%`, `min = +0.0506`) fwd & `4,292 -> 0` (`+0.0500`) inv; `syntx` `2h` folds `3,138 (-15.03) -> 0` (`+0.0615`) fwd & `2,596 (-5.82) -> 0` (`+0.0538`) inv; `Max ICE = 2.98 -> 1.43 mm` (`-52%`), RMS shift `0.039 mm`.
+  - **`syngs_beltrami` (`72.2 s` MPS)**: Bidirectional Dice `0.6220 -> 0.6202` (`Δ = -0.19 pp`); whole-volume ANTs `4h` folds `10,557 -> 0` (`0.00000%`, `min = +0.0527`) fwd & `9,732 -> 0` (`0.00000%`, `min = +0.0415`) inv; `syntx` `2h` folds `7,362 (-22.89) -> 0` (`0.00000%`, `min = +0.0515`) fwd & `5,780 (-11.77) -> 3` (`99.95%` removed, `-0.0156`) inv; `Max ICE = 1.94 -> 1.85 mm`, RMS shift `0.055 mm`.
+- **Verification**: `python3 -m antsxqc.lint src/syntx` (`0 finding(s)`), `pytest tests/test_digital_diffeomorphism.py` (`11 passed`), `pytest tests/test_transforms.py tests/test_spatial.py tests/test_implementation_standards.py tests/test_fast_syn_ants_benchmark.py` (`78 passed`), and `python3 benchmarks/fast_syn_ants_benchmark.py --smoke` (`exit 0`).
 
 ## R36 (Default-On Sparse Digital Diffeomorphism Finish Polish Across All Solvers & Tuned Beltrami Presets; v6.36.0, 2026-11-13)
 - **Model-Agnostic Digital Diffeomorphism Module (`src/syntx/core/digital_diffeomorphism.py`, `src/syntx/{__init__,syn,syn_jax,tvf,syngs,greedy}.py`, `src/syntx/scattered/solver.py`, `tests/test_digital_diffeomorphism.py`)**:

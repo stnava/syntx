@@ -908,6 +908,11 @@ def integrate_momentum_jax(
     momentum,
     reference_image=None,
     n_steps: int = 6,
+    return_trajectory: bool = False,
+    *,
+    digital_diffeomorphism: bool = True,
+    digital_diffeomorphism_floor: float = 0.05,
+    digital_diffeomorphism_steps: int = 25,
 ):
     """
     Shoot an initial velocity field v0 with ``GeodesicShootingModelJAX.shoot`` and return the
@@ -916,7 +921,9 @@ def integrate_momentum_jax(
 
     Uses a non-symmetric model with default ``fluid_sigma=1.0`` and ``solver='euler'`` (the
     EPDiff finite-difference scheme of this module), so the result is not the same as the
-    PyTorch ``syntx.integrate_momentum``.
+    PyTorch ``syntx.integrate_momentum``. When ``digital_diffeomorphism=True`` and
+    ``return_trajectory=False``, enforces discrete lattice diffeomorphism on the shot endpoint
+    field via ``enforce_digital_diffeomorphism_jax``.
 
     Parameters
     ----------
@@ -928,10 +935,19 @@ def integrate_momentum_jax(
         Grid and geometry; required for numpy input, defaults to ``momentum`` itself.
     n_steps : int, default 6
         Shooting steps (PyTorch ``integrate_momentum`` default is 8).
+    return_trajectory : bool, default False
+        If True, returns the list of intermediate ``ANTsImage`` displacement fields across steps.
+    digital_diffeomorphism : bool, default True
+        Project the shot displacement field onto the discrete diffeomorphism set when
+        ``return_trajectory=False``.
+    digital_diffeomorphism_floor : float, default 0.05
+        Minimum physical central-difference Jacobian determinant when ``digital_diffeomorphism=True``.
+    digital_diffeomorphism_steps : int, default 25
+        Step budget for digital diffeomorphism projection when ``digital_diffeomorphism=True``.
 
     Returns
     -------
-    ANTsImage
+    ANTsImage or list of ANTsImage
         Displacement field phi(1) - Id in ITK physical coordinates.
 
     Raises
@@ -996,7 +1012,42 @@ def integrate_momentum_jax(
     )
     model_jax.velocity_0_fwd = v0_j
 
-    disp_np = np.array(model_jax.shoot(v0_j, n_steps=n_steps, image_shape=grid_shape_zyx)).squeeze(0)
+    if return_trajectory:
+        traj = [
+            export_ants_displacement_field(
+                np.zeros((*grid_shape_zyx, dim), dtype=np.float32),
+                origin=origin,
+                spacing=spacing,
+                direction=direction,
+            )
+        ]
+        for k_step in range(1, n_steps + 1):
+            frac = float(k_step) / float(n_steps)
+            step_disp = np.array(
+                model_jax.shoot(v0_j * frac, n_steps=k_step, image_shape=grid_shape_zyx)
+            ).squeeze(0)
+            traj.append(
+                export_ants_displacement_field(
+                    step_disp, origin=origin, spacing=spacing, direction=direction
+                )
+            )
+        return traj
+
+    disp_jax = model_jax.shoot(v0_j, n_steps=n_steps, image_shape=grid_shape_zyx)
+    if digital_diffeomorphism:
+        from .core.digital_diffeomorphism import enforce_digital_diffeomorphism_jax
+
+        disp_jax = enforce_digital_diffeomorphism_jax(
+            disp_jax,
+            None,
+            spacing=spacing,
+            origin=origin,
+            direction=direction,
+            jac_floor=float(digital_diffeomorphism_floor),
+            steps=int(digital_diffeomorphism_steps),
+            stationary_boundary=True,
+        )
+    disp_np = np.array(disp_jax).squeeze(0)
     return export_ants_displacement_field(disp_np, origin=origin, spacing=spacing, direction=direction)
 
 

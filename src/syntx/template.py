@@ -128,10 +128,12 @@ def build_template(
     affine_drop_tolerance: Optional[float] = 0.1,
     backend: str = "pytorch",
     verbose: bool = False,
+    digital_diffeomorphism: bool = True,
+    digital_diffeomorphism_floor: float = 0.05,
+    digital_diffeomorphism_steps: int = 25,
     **kwargs
 ) -> Dict[str, Any]:
-    """
-    Build an unbiased group template -- ``syntx.build_template`` (a port of
+    """Build an unbiased group template -- ``syntx.build_template`` (a port of
     ``ants.build_template`` that also reports how much the template still moves).
 
     Each iteration registers every image to the current template, averages the warped
@@ -146,8 +148,7 @@ def build_template(
     Parameters
     ----------
     initial_template : ANTsImage, optional
-        Starting template. Default: the weighted average of ``image_list`` (resampled onto
-        the first image).
+        Starting template. Default: weighted average of ``image_list`` on the first image grid.
     image_list : list of ANTsImage
         The images (required, non-empty).
     iterations : int, default 3
@@ -220,18 +221,17 @@ def build_template(
         'pytorch': ``syntx.syn``; 'ants': ``ants.registration`` (``syn_metric='cc2'`` is
         mapped to 'mattes' there).
     verbose : bool, default False
+    digital_diffeomorphism : bool, default True
+        Project the scaled template mean-warp update step onto the digital diffeomorphism set.
     **kwargs
         Passed to the registration function.
 
     Returns
     -------
     dict
-        ``'template'``, ``'warped_images'`` (last iteration), ``'fwdtransforms'`` /
-        ``'invtransforms'`` (per image, last iteration), ``'convergence'`` (mean absolute
-        template change per iteration), ``'shape_residuals'`` (per iteration: ``l2_norm``
-        (RMS mm), ``membrane_energy``, ``bending_energy`` of the mean warp),
-        ``'n_iterations'``, ``'weights'``, ``'work_dir'``, ``'elapsed_sec'`` (total wall-clock
-        time of this call, including setup and validation).
+        ``'template'``, ``'warped_images'``, ``'fwdtransforms'`` / ``'invtransforms'``,
+        ``'convergence'``, ``'shape_residuals'`` (``l2_norm``, ``membrane_energy``,
+        ``bending_energy``), ``'n_iterations'``, ``'weights'``, ``'work_dir'``, ``'elapsed_sec'``.
     """
     t0_call = time.time()
     if image_list is None or len(image_list) == 0:
@@ -454,6 +454,15 @@ def build_template(
         if is_greedy:
             if has_field and wavg is not None:
                 wavgScaled = wavg * ((-1.0) * gradient_step)
+                if digital_diffeomorphism:
+                    from .core.digital_diffeomorphism import enforce_digital_diffeomorphism
+
+                    wavgScaled = enforce_digital_diffeomorphism(
+                        wavgScaled,
+                        jac_floor=float(digital_diffeomorphism_floor),
+                        steps=int(digital_diffeomorphism_steps),
+                        device=kwargs.get("device"),
+                    )
                 wavgfn = os.path.join(work_dir, f"avgWarp_{it}.nii.gz")
                 ants.image_write(wavgScaled, wavgfn)
                 xavg = _apply_transforms(
@@ -487,6 +496,15 @@ def build_template(
                     transformlist=afffn,
                     whichtoinvert=[1]
                 )
+                if digital_diffeomorphism:
+                    from .core.digital_diffeomorphism import enforce_digital_diffeomorphism
+
+                    wavgA = enforce_digital_diffeomorphism(
+                        wavgA,
+                        jac_floor=float(digital_diffeomorphism_floor),
+                        steps=int(digital_diffeomorphism_steps),
+                        device=kwargs.get("device"),
+                    )
                 wavgfn = os.path.join(work_dir, f"avgWarp_{it}.nii.gz")
                 ants.image_write(wavgA, wavgfn)
                 xavg = _apply_transforms(
