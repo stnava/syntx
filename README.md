@@ -93,18 +93,22 @@ python examples/run_auto_reg_example.py \
 
 ## 📊 Mindboggle-101 Population Benchmark Results (90-Pair Cohort Evaluation)
 
-Comprehensive evaluation across the standardized **90-pair Mindboggle-101 cohort** (40 intra-study longitudinal pairs + 50 inter-study cross-site pairs) with manually annotated **DKT31** cortical labels (`nearestNeighbor` label evaluation):
+Comprehensive evaluation across the standardized **90-pair Mindboggle-101 cohort** (40 intra-study pairs + 50 inter-study cross-site pairs, shuffled seed `20261112`, isolated sequential MPS-before-CPU subprocesses, shared canonical affine `syntx.robust_affine`, schedule `[100, 100, 20]`) with manually annotated **DKT31** cortical labels (`nearestNeighbor` bidirectional Sørensen–Dice):
 
-| Method / Transformation Paradigm | Mean Symmetric DICE | $\Delta$ vs. ANTs Baseline | Head-to-Head Win Rate vs ANTs | Mean Brain Folding ($\det J \le 0$) | Inverse Error ($\bar{e}$) | Mean Runtime (GPU / CPU) |
+| Method / Transformation Paradigm | Mean Symmetric DICE | $\Delta$ vs. ANTs Baseline | Head-to-Head Win Rate vs ANTs | Mean Liouville Folding ($\det J \le 0$) | Inverse Error ($P_{95}$) | Mean Solver Time (GPU / CPU) |
 | :--- | :---: | :---: | :---: | :---: | :---: | :---: |
-| **Dirichlet-Shield TVF** (`syntx.tvf` / `auto_reg`) | **`0.6466 ± 0.0202`** | **`+2.50%`** | 🏆 **`90 / 90` (`100.0%`)** | **`0.0007%`** | `0.0184 mm` | $160.4\text{ s}$ (Apple Silicon MPS) |
-| **Balanced SyNGS** (`syntx.syngs`, Initial Momentum) | **`0.6382 ± 0.0240`** | **`+1.66%`** | **`82 / 90` (`91.1%`)** | **`0.0618%`** | **`0.0303 mm`** | **`112.3 s`** ($1.2\times$ speedup) |
-| **Eulerian SyN** (`syntx.syn`, Sobolev $H^{1.5}$) | **`0.6342 ± 0.0198`** | **`+1.26%`** | **`83 / 90` (`92.2%`)** | **`0.0005%`** | `0.0271 mm` | **`48.8 s`** ($2.8\times$ speedup) |
-| **ANTs C++ SyN Baseline** (ITK Multi-threaded) | `0.6216 ± 0.0230` | Baseline | — | `0.0000%` | — | $135.2\text{ s}$ (C++ OpenMP CPU) |
+| **Beltrami TVF** (`syntx.tvf` / `tvf_best`, $\alpha=2.5$) | **`0.6440 ± 0.0217`** | **`+3.45 pp`** | 🏆 **`90 / 90` (`100.0%`, $p=1.74\times 10^{-16}$)** | **`0.0000%`** (`90/90` diffeo) | `0.0304 mm` | $184.6\text{ s}$ (Apple Silicon MPS) |
+| **Beltrami SyNGS** (`syntx.syngs` / `syngs_beltrami`, $\alpha=0.27$) | **`0.6417 ± 0.0215`** | **`+3.22 pp`** | 🏆 **`90 / 90` (`100.0%`, $p=1.74\times 10^{-16}$)** | **`0.0000%`** (`90/90` diffeo) | **`0.0137 mm`** | **`70.1 s`** ($1.71\times$ speedup) |
+| **Beltrami SyN** (`syntx.syn` / `syn_beltrami`, `grad_step=0.7`) | **`0.6373 ± 0.0207`** | **`+2.78 pp`** | 🏆 **`90 / 90` (`100.0%`, $p=1.74\times 10^{-16}$)** | **`0.0000%`** (`90/90` diffeo) | `0.0626 mm` | **`52.1 s`** ($2.30\times$ speedup) |
+| **Eulerian SyN** (`syntx.syn` / `syn_sobolev`, Sobolev $H^{1.5}$) | **`0.6341 ± 0.0213`** | **`+2.46 pp`** | 🏆 **`90 / 90` (`100.0%`, $p=1.74\times 10^{-16}$)** | **`0.0000%`** (`90/90` diffeo) | `0.0550 mm` | **`44.4 s`** ($2.70\times$ speedup) |
+| **Canonical SyNGS** (`syntx.syngs` / `syngs_best`, Sobolev $\alpha=0.448$) | **`0.6335 ± 0.0218`** | **`+2.40 pp`** | 🏆 **`90 / 90` (`100.0%`, $p=1.74\times 10^{-16}$)** | **`0.0000%`** (`90/90` diffeo) | **`0.0108 mm`** | **`62.5 s`** ($1.92\times$ speedup) |
+| **Gaussian SyN** (`syntx.syn` / `syn_gaussian`) | **`0.6328 ± 0.0219`** | **`+2.33 pp`** | 🏆 **`90 / 90` (`100.0%`, $p=1.74\times 10^{-16}$)** | **`0.0000%`** (`90/90` diffeo) | `0.0653 mm` | **`42.1 s`** ($2.85\times$ speedup) |
+| **Hyperelastic SyN** (`syntx.syn` / `syn_hyperelastic`, $K=5.0$) | **`0.6319 ± 0.0216`** | **`+2.24 pp`** | **`89 / 90` (`98.9%`, $p=1.93\times 10^{-16}$)** | **`0.0000%`** (`90/90` diffeo) | `0.0692 mm` | **`53.8 s`** ($2.23\times$ speedup) |
+| **ANTs C++ SyN Baseline** (`ants_syn_matched`, ITK Multi-threaded) | `0.6095 ± 0.0222` | Baseline | — | `0.0000%` (`90/90` diffeo) | `0.0353 mm` | $119.5\text{ s}$ (C++ OpenMP CPU) |
 
 > 🌐 **Interactive 90-Pair Benchmark Dashboards**:
-> - **[Mindboggle-101 Master 4-Paradigm Benchmark Report](docs/reports/mindboggle_90pair_master_report.html)**: Comprehensive 4-way head-to-head comparison (`tvf`, `syngs`, `syn`, `ants`) with interactive Plotly scatter plots and sortable 90-pair grid.
-> - **[SyNGS Balanced Sobolev Interactive Report](docs/reports/mindboggle_90pair_syngs_sobolev_report.html)**: Detailed metrology, deformation regularity, and Jacobian distributions for Geodesic Shooting.
+> - **[Mindboggle-101 Master 90-Pair Benchmark Report (`docs/reports/mindboggle_90pair_master_report.html`)](docs/reports/mindboggle_90pair_master_report.html)** ([Markdown summary](docs/reports/mindboggle_90pair_master_report.md)): Complete 10-deformable + 2-affine head-to-head cohort evaluation (`90/90` pairs, `1,080` runs, `syntx.viz` light-theme 4-panel diagnostics, intra/inter stratification, and Wilcoxon metrology).
+> - **[SyNGS Balanced Sobolev Interactive Report](docs/reports/mindboggle_90pair_syngs_sobolev_report.html)**: Historical metrology, deformation regularity, and Jacobian distributions for Geodesic Shooting.
 > - **[Step-by-Step Reproduction Guide (`docs/run_mb_eval.md`)](docs/run_mb_eval.md)**
 > - **[Deformation Energy, DICE, and Folding Analysis (`docs/syn_energy_dice_folding_analysis.md`)](docs/syn_energy_dice_folding_analysis.md)**
 > - **[Reproducible PyTorch Affine vs ANTs C++ — 10-pair cohort](docs/reports/affine_cohort10_report.html)** and the [affine guide (`docs/AFFINE_GUIDE.md`)](docs/AFFINE_GUIDE.md): `robust_affine(mode='pytorch')` equals or beats the ANTs affine on 10/10 Mindboggle pairs, bitwise reproducibly, in ~11 s.

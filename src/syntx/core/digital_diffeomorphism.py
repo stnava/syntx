@@ -42,6 +42,7 @@ from __future__ import annotations
 
 import os
 from typing import Optional
+
 import numpy as np
 import torch
 import torch.nn.functional as F
@@ -280,9 +281,9 @@ def _physical_fd_det_and_grad(
         adj = torch.zeros_like(p)
         sl_all = [slice(None)] * p.ndim
 
-        def _sl(start, stop):
-            s = list(sl_all)
-            s[ax + 1] = slice(start, stop)
+        def _sl(start, stop, _sl_all=sl_all, _ax=ax):
+            s = list(_sl_all)
+            s[_ax + 1] = slice(start, stop)
             return tuple(s)
 
         if n_ax == 2:
@@ -440,6 +441,7 @@ def _build_sparse_dual_fd_stencil(
     steps_fd: list[float],
     dtype: torch.dtype,
     include_4th: bool = True,
+    lut_buf: Optional[torch.Tensor] = None,
 ) -> dict:
     """Build exact sparse dual-order (2nd-order ``D_{2h}`` + 4th-order ``D^{(4)}_h``) finite-difference
     stencil tables around ``active_mask`` ``(B, *spatial)``.
@@ -467,22 +469,40 @@ def _build_sparse_dual_fd_stencil(
     sten_flat = _coords_to_flat_idx(sten_coords, spatial)
     pool_flat = _coords_to_flat_idx(pool_coords, spatial)
 
-    lut_pool = torch.full((B * n_full,), -1, dtype=torch.long, device=device)
+    own_lut = lut_buf is None or lut_buf.numel() != B * n_full
+    lut_pool = (
+        torch.full((B * n_full,), -1, dtype=torch.long, device=device)
+        if own_lut
+        else lut_buf
+    )
     lut_pool[pool_flat] = torch.arange(pool_flat.shape[0], device=device)
     act_in_pool = lut_pool[act_flat]
     sten_in_pool = lut_pool[sten_flat]
 
+    k_act = int(act_flat.shape[0])
+    pool_to_act = torch.full(
+        (pool_flat.shape[0],), k_act, dtype=torch.long, device=device
+    )
+    if k_act > 0:
+        pool_to_act[act_in_pool] = torch.arange(k_act, device=device)
+    sten_in_act = pool_to_act[sten_in_pool]
+
     im1_list, ip1_list, inv_span2_list = [], [], []
+    im1_act_list, ip1_act_list = [], []
     inv_span_fwd_list, inv_span_bwd_list = [], []
     im2_list, ip2_list, inv_12h_list = [], [], []
+    im2_act_list, ip2_act_list = [], []
     for ax in range(dim):
         n_ax = spatial[ax]
         h = float(steps_fd[ax])
         c_ax = sten_coords[:, ax + 1]
         if n_ax <= 1:
             z_idx = lut_pool[_coords_to_flat_idx(sten_coords, spatial)]
+            z_act = pool_to_act[z_idx]
             im1_list.append(z_idx)
             ip1_list.append(z_idx)
+            im1_act_list.append(z_act)
+            ip1_act_list.append(z_act)
             z_span = torch.zeros((sten_coords.shape[0],), device=device, dtype=dtype)
             inv_span2_list.append(z_span)
             inv_span_fwd_list.append(z_span)
@@ -490,6 +510,8 @@ def _build_sparse_dual_fd_stencil(
             if include_4th:
                 im2_list.append(z_idx)
                 ip2_list.append(z_idx)
+                im2_act_list.append(z_act)
+                ip2_act_list.append(z_act)
                 inv_12h_list.append(z_span)
         else:
             lo1 = (c_ax - 1).clamp(min=0)
@@ -504,8 +526,12 @@ def _build_sparse_dual_fd_stencil(
             inv_s2 = torch.where(span2 > 0.0, 1.0 / span2.clamp(min=1e-12), torch.zeros_like(span2))
             inv_sf = torch.where(span_f > 0.0, 1.0 / span_f.clamp(min=1e-12), torch.zeros_like(span_f))
             inv_sb = torch.where(span_b > 0.0, 1.0 / span_b.clamp(min=1e-12), torch.zeros_like(span_b))
-            im1_list.append(lut_pool[_coords_to_flat_idx(c_lo1, spatial)])
-            ip1_list.append(lut_pool[_coords_to_flat_idx(c_hi1, spatial)])
+            im1_p = lut_pool[_coords_to_flat_idx(c_lo1, spatial)]
+            ip1_p = lut_pool[_coords_to_flat_idx(c_hi1, spatial)]
+            im1_list.append(im1_p)
+            ip1_list.append(ip1_p)
+            im1_act_list.append(pool_to_act[im1_p])
+            ip1_act_list.append(pool_to_act[ip1_p])
             inv_span2_list.append(inv_s2)
             inv_span_fwd_list.append(inv_sf)
             inv_span_bwd_list.append(inv_sb)
@@ -516,8 +542,12 @@ def _build_sparse_dual_fd_stencil(
                 c_hi2 = sten_coords.clone()
                 c_lo2[:, ax + 1] = lo2
                 c_hi2[:, ax + 1] = hi2
-                im2_list.append(lut_pool[_coords_to_flat_idx(c_lo2, spatial)])
-                ip2_list.append(lut_pool[_coords_to_flat_idx(c_hi2, spatial)])
+                im2_p = lut_pool[_coords_to_flat_idx(c_lo2, spatial)]
+                ip2_p = lut_pool[_coords_to_flat_idx(c_hi2, spatial)]
+                im2_list.append(im2_p)
+                ip2_list.append(ip2_p)
+                im2_act_list.append(pool_to_act[im2_p])
+                ip2_act_list.append(pool_to_act[ip2_p])
                 inv_12h_list.append(
                     torch.full(
                         (sten_coords.shape[0],),
@@ -527,7 +557,10 @@ def _build_sparse_dual_fd_stencil(
                     )
                 )
 
-    del lut_pool
+    if own_lut:
+        del lut_pool
+    else:
+        lut_pool[pool_flat] = -1
     out = {
         "include_4th": include_4th,
         "sten_mask": sten_mask,
@@ -538,6 +571,7 @@ def _build_sparse_dual_fd_stencil(
         "pool_flat": pool_flat,
         "act_in_pool": act_in_pool,
         "sten_in_pool": sten_in_pool,
+        "sten_in_act": sten_in_act,
         "im1": torch.stack(im1_list, dim=-1),
         "ip1": torch.stack(ip1_list, dim=-1),
         "inv_span2": torch.stack(inv_span2_list, dim=-1),
@@ -545,6 +579,8 @@ def _build_sparse_dual_fd_stencil(
         "inv_span_bwd": torch.stack(inv_span_bwd_list, dim=-1),
         "im1_ax": im1_list,
         "ip1_ax": ip1_list,
+        "im1_act_ax": im1_act_list,
+        "ip1_act_ax": ip1_act_list,
         "inv_s2_ax": [s.unsqueeze(-1) for s in inv_span2_list],
         "inv_sf_ax": [s.unsqueeze(-1) for s in inv_span_fwd_list],
         "inv_sb_ax": [s.unsqueeze(-1) for s in inv_span_bwd_list],
@@ -556,6 +592,8 @@ def _build_sparse_dual_fd_stencil(
         out["inv_12h"] = torch.stack(inv_12h_list, dim=-1)
         out["im2_ax"] = im2_list
         out["ip2_ax"] = ip2_list
+        out["im2_act_ax"] = im2_act_list
+        out["ip2_act_ax"] = ip2_act_list
         out["inv_12h_s"] = [
             0.0 if spatial[ax] <= 1 else (1.0 / max(12.0 * float(steps_fd[ax]), 1e-12))
             for ax in range(dim)
@@ -600,7 +638,6 @@ def _precompute_sparse_row_bases(
 
 def _eval_sparse_row_step(
     delta: torch.Tensor,
-    z_pool: torch.Tensor,
     stencil: dict,
     row_bases: dict,
     s_D: float,
@@ -608,24 +645,25 @@ def _eval_sparse_row_step(
     include_cell: bool = False,
 ):
     """Single-gather fused evaluation of ``(det2, det4[, det_p, det_m])`` AND Dirichlet+Laplacian
-    smoothness ``sm`` from perturbation ``delta`` ``(K_act, dim)`` using contiguous row cross products."""
+    smoothness ``sm`` from perturbation ``delta`` ``(K_act, dim)`` using direct sentinel-row
+    active indexing (zero ``z_pool.index_add`` atomic scatter on forward/backward)."""
     d_fd = delta if use_physical else torch.flip(delta, dims=[-1])
-    dp = z_pool.index_add(0, stencil["act_in_pool"], d_fd)
-    dc = dp[stencil["sten_in_pool"]]
+    dp = torch.cat([d_fd, d_fd.new_zeros((1, d_fd.shape[-1]))], dim=0)
+    dc = dp[stencil["sten_in_act"]]
     dim = d_fd.shape[-1]
     inc4 = stencil["include_4th"]
     r2, r4, rp, rm = [], [], [], []
     sm = d_fd.new_zeros(())
     for ax in range(dim):
-        hi1 = dp[stencil["ip1_ax"][ax]]
-        lo1 = dp[stencil["im1_ax"][ax]]
+        hi1 = dp[stencil["ip1_act_ax"][ax]]
+        lo1 = dp[stencil["im1_act_ax"][ax]]
         fd = hi1 - dc
         bd = dc - lo1
         sm = sm + (fd.square() + bd.square() + 0.5 * (fd - bd).square()).sum()
         r2.append(row_bases["m2"][ax] + (hi1 - lo1) * stencil["inv_s2_ax"][ax])
         if inc4:
-            hi2 = dp[stencil["ip2_ax"][ax]]
-            lo2 = dp[stencil["im2_ax"][ax]]
+            hi2 = dp[stencil["ip2_act_ax"][ax]]
+            lo2 = dp[stencil["im2_act_ax"][ax]]
             r4.append(
                 row_bases["m4"][ax]
                 + (lo2 - 8.0 * lo1 + 8.0 * hi1 - hi2) * stencil["inv_12h_s"][ax]
@@ -706,69 +744,24 @@ def _gather_multilinear_sparse(
     ``align_corners=True``) of ``u = u0 + scatter(delta_act)`` at continuous spatial voxel
     coordinates ``vox_coords`` ``(M, dim)`` for batch indices ``batch_idx`` ``(M,)``.
 
-    Gathers only the ``2**dim`` corners for the ``M`` queried points directly from flat tensors
-    with zero 5-D ``grid_sample`` or bounding-box allocations (fast and deterministic on MPS/CPU).
+    Vectorized single-gather over all ``2**dim`` corners ``(M, 2**dim, dim)`` with sentinel zero-row
+    lookup (zero Python corner loop, zero 5-D ``grid_sample``, fast and deterministic on MPS/CPU).
     """
-    dim = len(spatial)
     dtype = u0_flat.dtype
     if vox_coords.shape[0] == 0:
         return vox_coords.new_zeros((0, u0_flat.shape[-1]))
-    n_full = max(int(np.prod(spatial)), 1)
-    base_off = batch_idx * n_full
-
-    if dim == 2:
-        H, W = spatial
-        vy = vox_coords[:, 0].clamp(0.0, float(max(H - 1, 0)))
-        vx = vox_coords[:, 1].clamp(0.0, float(max(W - 1, 0)))
-        iy0 = torch.floor(vy).long().clamp(0, max(H - 2, 0))
-        ix0 = torch.floor(vx).long().clamp(0, max(W - 2, 0))
-        iy1 = (iy0 + 1).clamp(max=max(H - 1, 0))
-        ix1 = (ix0 + 1).clamp(max=max(W - 1, 0))
-        ty = (vy - iy0.to(dtype)).unsqueeze(-1)
-        tx = (vx - ix0.to(dtype)).unsqueeze(-1)
-        omy, omx = 1.0 - ty, 1.0 - tx
-        corners = (
-            (base_off + iy0 * W + ix0, omy * omx),
-            (base_off + iy0 * W + ix1, omy * tx),
-            (base_off + iy1 * W + ix0, ty * omx),
-            (base_off + iy1 * W + ix1, ty * tx),
-        )
-    else:
-        Z, Y, X = spatial
-        vz = vox_coords[:, 0].clamp(0.0, float(max(Z - 1, 0)))
-        vy = vox_coords[:, 1].clamp(0.0, float(max(Y - 1, 0)))
-        vx = vox_coords[:, 2].clamp(0.0, float(max(X - 1, 0)))
-        iz0 = torch.floor(vz).long().clamp(0, max(Z - 2, 0))
-        iy0 = torch.floor(vy).long().clamp(0, max(Y - 2, 0))
-        ix0 = torch.floor(vx).long().clamp(0, max(X - 2, 0))
-        iz1 = (iz0 + 1).clamp(max=max(Z - 1, 0))
-        iy1 = (iy0 + 1).clamp(max=max(Y - 1, 0))
-        ix1 = (ix0 + 1).clamp(max=max(X - 1, 0))
-        tz = (vz - iz0.to(dtype)).unsqueeze(-1)
-        ty = (vy - iy0.to(dtype)).unsqueeze(-1)
-        tx = (vx - ix0.to(dtype)).unsqueeze(-1)
-        omz, omy, omx = 1.0 - tz, 1.0 - ty, 1.0 - tx
-        sz, sy = Y * X, X
-        corners = (
-            (base_off + iz0 * sz + iy0 * sy + ix0, omz * omy * omx),
-            (base_off + iz0 * sz + iy0 * sy + ix1, omz * omy * tx),
-            (base_off + iz0 * sz + iy1 * sy + ix0, omz * ty * omx),
-            (base_off + iz0 * sz + iy1 * sy + ix1, omz * ty * tx),
-            (base_off + iz1 * sz + iy0 * sy + ix0, tz * omy * omx),
-            (base_off + iz1 * sz + iy0 * sy + ix1, tz * omy * tx),
-            (base_off + iz1 * sz + iy1 * sy + ix0, tz * ty * omx),
-            (base_off + iz1 * sz + iy1 * sy + ix1, tz * ty * tx),
-        )
-
-    out = vox_coords.new_zeros((vox_coords.shape[0], u0_flat.shape[-1]))
-    has_delta = delta_act.shape[0] > 0
-    for c_flat, w_c in corners:
-        val = u0_flat[c_flat]
-        if has_delta:
-            a_idx = lut_act[c_flat]
-            is_act = (a_idx >= 0).to(dtype).unsqueeze(-1)
-            val = val + delta_act[a_idx.clamp_min(0)] * is_act
-        out = out + w_c * val
+    c_idx, w_c = _static_multilinear_corners(batch_idx, vox_coords, spatial, dtype)
+    val = u0_flat[c_idx]
+    k_act = int(delta_act.shape[0])
+    if k_act > 0 and lut_act.numel() > 0:
+        d_pad = torch.cat([delta_act, delta_act.new_zeros((1, delta_act.shape[-1]))], dim=0)
+        a_idx = lut_act[c_idx]
+        a_safe = torch.where(a_idx >= 0, a_idx, k_act)
+        val = val + d_pad[a_safe]
+    wv = w_c.unsqueeze(-1) * val
+    out = wv[:, 0]
+    for ci in range(1, wv.shape[1]):
+        out = out + wv[:, ci]
     return out
 
 
@@ -920,12 +913,9 @@ def _smooth_max_nd(
         return values.amax(dim=spatial_dims)
     flat = values.reshape(values.shape[0], -1)
     vmax = flat.amax(dim=1, keepdim=True)
-    # Subtract log(N)/beta from logsumexp and add log(N)/beta back -> (1/beta)*log(1 + sum_{v>0}(exp(beta*v)-1)/N),
-    # or equivalently (1/beta)*log(sum_i exp(beta*v_i) / N) + log(N)/beta = (1/beta)*logsumexp(beta*v) - log(N)/beta + log(N)/beta:
-    # Using (1/beta) * log(1 + (sum_i (exp(beta * v_i) - 1)) / N) — wait: standard shifted logsumexp:
-    #   lse_0(v) = (1/beta) * (log(sum_i exp(beta * v_i)) - log(N))
-    # Notice lse_0(0) == 0, lse_0(v) >= 0 for ALL v >= 0 (since exp(beta*v_i) >= 1 => sum >= N => log(sum) >= log(N)),
-    # AND grad_v lse_0(v) == softmax(beta * v) > 0 for ANY single violating voxel regardless of how small vmax is!
+    # Shifted logsumexp: lse_0(v) = (1/beta) * (log(sum_i exp(beta * v_i)) - log(N)).
+    # Notice lse_0(0) == 0, lse_0(v) >= 0 for ALL v >= 0 (since exp(beta*v_i) >= 1 => sum >= N),
+    # and grad_v lse_0(v) == softmax(beta * v) > 0 for ANY single violating voxel regardless of vmax.
     n_elem = float(max(flat.shape[1], 1))
     shifted = torch.exp(float(beta) * (flat - vmax))
     lse0 = vmax.squeeze(1) + (torch.log(shifted.sum(dim=1)) - float(np.log(n_elem))) / float(beta)
@@ -1149,7 +1139,9 @@ def _unfold_field_adaptive_smooth(
     A_to_vox: Optional[torch.Tensor] = None,
     b_to_vox: Optional[torch.Tensor] = None,
     ice_tol: float = 0.30,
+    ice_strict_tol: Optional[float] = None,
     extra_seed_mask: Optional[torch.Tensor] = None,
+    lut_buf: Optional[torch.Tensor] = None,
 ) -> tuple[torch.Tensor, torch.Tensor, float, int, torch.Tensor]:
     """Principled sparse shrinking-shell diffeomorphic projection solving:
 
@@ -1222,26 +1214,29 @@ def _unfold_field_adaptive_smooth(
             break
 
         stencil = _build_sparse_dual_fd_stencil(
-            act_mask, steps_fd, dtype, include_4th=include_4th
+            act_mask, steps_fd, dtype, include_4th=include_4th, lut_buf=lut_buf
         )
-        ext_mask = ~stencil["sten_mask"]
-        ext_min = (
-            float(det_min_cur[ext_mask].amin().item())
-            if bool(ext_mask.any().item())
-            else float("inf")
-        )
+        sten_flat = stencil["sten_flat"]
+        sten_prev = det_min_cur.view(-1)[sten_flat].clone()
+        init_min_sten = float(sten_prev.amin().item()) if sten_prev.numel() > 0 else float("inf")
+        if sten_flat.shape[0] < det_min_cur.numel():
+            det_min_cur.view(-1)[sten_flat] = float("inf")
+            ext_min = float(det_min_cur.amin().item())
+            det_min_cur.view(-1)[sten_flat] = sten_prev
+        else:
+            ext_min = float("inf")
 
         u_base_pool = u_cur.reshape(-1, dim)[stencil["pool_flat"]].clone()
-        z_pool = torch.zeros_like(u_base_pool)
         row_bases = _precompute_sparse_row_bases(
             u_base_pool, stencil, D_rev_T, use_physical, include_cell=not use_partner
         )
         act_flat = stencil["act_flat"]
         base_shift = (
-            u_cur.reshape(-1, dim)[act_flat] - u_orig.reshape(-1, dim)[act_flat]
+            u_cur.reshape(-1, dim)[act_flat] - orig_flat[act_flat]
         ).contiguous()
 
         init_v_ice = 0.0
+        strict_ice_u = float(ice_tol) if ice_strict_tol is None else float(ice_strict_tol)
         if use_partner:
             ice_flat = act_flat
             ice_batch = stencil["act_coords"][:, 0]
@@ -1255,22 +1250,32 @@ def _unfold_field_adaptive_smooth(
             )
             r0_p = (u_ice_base + py0_p) @ err_to_vox_mat
             n0_p = (torch.sqrt((r0_p * r0_p).sum(dim=-1) + 1e-12) - 1e-6) * iny0_p
-            init_v_ice = float(F.relu(n0_p - float(ice_tol)).amax().item()) if n0_p.numel() > 0 else 0.0
+            init_v_ice = float(F.relu(n0_p - strict_ice_u).amax().item()) if n0_p.numel() > 0 else 0.0
 
-        iters_p = (
-            max(int(steps) * 6, 160)
-            if (p_idx == 0 and int(steps) >= 8)
-            else (max(int(steps) * 4, 110) if int(steps) >= 8 else max(int(steps) * 8, 24))
-        )
+        n_act = int(act_flat.shape[0])
+        if int(steps) >= 8 and n_act > 40_000 and p_idx == 0:
+            iters_p = 44
+            eta_frac = 0.30
+        elif int(steps) >= 8 and n_act > 25_000 and p_idx >= 1:
+            iters_p = 90
+            eta_frac = 0.20
+        else:
+            iters_p = (
+                max(int(steps) * 6, 160)
+                if (p_idx == 0 and int(steps) >= 8)
+                else (max(int(steps) * 4, 110) if int(steps) >= 8 else max(int(steps) * 8, 24))
+            )
+            eta_frac = 0.15
         lr_p = lr_base * (1.10 if p_idx >= 2 else 1.0)
         mem_scale = 0.15 if use_partner else 0.35
         anc_scale = 0.25 * float(anchor_weight)
 
-        init_min_sten = float(det_min_cur[stencil["sten_mask"]].amin().item())
-        best_min_t = torch.tensor(init_min_sten, device=device, dtype=dtype)
-        best_feas_t = torch.tensor(init_min_sten >= float(jac_floor), device=device, dtype=torch.bool)
+        init_min_tot = min(ext_min, init_min_sten)
+        ext_min_u_t = torch.tensor(ext_min, device=device, dtype=dtype)
+        best_min_t = torch.tensor(init_min_tot, device=device, dtype=dtype)
+        best_feas_t = torch.tensor(init_min_tot >= float(jac_floor), device=device, dtype=torch.bool)
         best_vice_t = torch.tensor(
-            init_v_ice if (init_min_sten >= float(jac_floor)) else 1e9, device=device, dtype=dtype
+            init_v_ice if (init_min_tot >= float(jac_floor)) else 1e9, device=device, dtype=dtype
         )
         imp_t = torch.tensor(False, device=device, dtype=torch.bool)
         ever_done_u = torch.tensor(False, device=device, dtype=torch.bool)
@@ -1280,9 +1285,9 @@ def _unfold_field_adaptive_smooth(
             df = torch.zeros(
                 (act_flat.shape[0], dim), device=device, dtype=dtype, requires_grad=True
             )
-            opt = torch.optim.Adam([df], lr=max(lr_p, 1e-4))
+            opt = torch.optim.Adam([df], lr=max(lr_p, 1e-4), foreach=True)
             sched = torch.optim.lr_scheduler.CosineAnnealingLR(
-                opt, T_max=iters_p, eta_min=max(lr_p * 0.15, 1e-5)
+                opt, T_max=iters_p, eta_min=max(lr_p * eta_frac, 1e-5)
             )
             best_df = df.detach().clone()
 
@@ -1290,11 +1295,11 @@ def _unfold_field_adaptive_smooth(
                 opt.zero_grad(set_to_none=True)
                 if use_partner:
                     d2_s, d4_s, sm_df = _eval_sparse_row_step(
-                        df, z_pool, stencil, row_bases, s_D, use_physical, include_cell=False
+                        df, stencil, row_bases, s_D, use_physical, include_cell=False
                     )
                 else:
                     d2_s, d4_s, dp_s, dm_s, sm_df = _eval_sparse_row_step(
-                        df, z_pool, stencil, row_bases, s_D, use_physical, include_cell=True
+                        df, stencil, row_bases, s_D, use_physical, include_cell=True
                     )
                 dmin_s = torch.minimum(d2_s, d4_s) if include_4th else d2_s
 
@@ -1309,7 +1314,7 @@ def _unfold_field_adaptive_smooth(
                     )
                     r_vox = (u_ice + py) @ err_to_vox_mat
                     n_ice = (torch.sqrt((r_vox * r_vox).sum(dim=-1) + 1e-12) - 1e-6) * iny
-                    v_ice_strict = F.relu(n_ice - float(ice_tol))
+                    v_ice_strict = F.relu(n_ice - strict_ice_u)
                     v_ice_pen = F.relu(n_ice - local_ice_cap)
                     e_ice = (
                         28.0 * _active_lse(v_ice_pen, 25.0)
@@ -1318,7 +1323,11 @@ def _unfold_field_adaptive_smooth(
                     )
 
                 with torch.no_grad():
-                    s_min_t = dmin_s.amin() if dmin_s.numel() > 0 else best_min_t
+                    s_min_t = (
+                        torch.minimum(ext_min_u_t, dmin_s.amin())
+                        if dmin_s.numel() > 0
+                        else ext_min_u_t
+                    )
                     max_vi_t = (
                         v_ice_strict.amax()
                         if (v_ice_strict is not None and v_ice_strict.numel() > 0)
@@ -1412,7 +1421,7 @@ def _unfold_field_adaptive_smooth(
                 )
                 r_e = (u_ice_end + py_e) @ err_to_vox_mat
                 n_e = (torch.sqrt((r_e * r_e).sum(dim=-1) + 1e-12) - 1e-6) * iny_e
-                still_ice = n_e > float(ice_tol)
+                still_ice = n_e > strict_ice_u
                 cur_ice_defects.zero_()
                 if bool(still_ice.any().item()):
                     cur_ice_defects.view(-1)[ice_flat[still_ice]] = True
@@ -1449,6 +1458,7 @@ def _safe_lm_subset_backtrack(
     lm_steps: int,
     max_step_unit: float,
     warm_inv_field: Optional[torch.Tensor] = None,
+    lut_buf: Optional[torch.Tensor] = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Pointwise-monotone stencil-safe damped LM inverse sync: accepts updates only on voxels
     that strictly decrease their own squared chord residual (by ``>= 1e-5``) while keeping every
@@ -1466,7 +1476,7 @@ def _safe_lm_subset_backtrack(
     eye = torch.eye(dim, device=device, dtype=dtype)
 
     stencil = _build_sparse_dual_fd_stencil(
-        cand_mask, steps_fd, dtype, include_4th=include_4th
+        cand_mask, steps_fd, dtype, include_4th=include_4th, lut_buf=lut_buf
     )
     act_flat = stencil["act_flat"]
     if act_flat.shape[0] == 0:
@@ -1534,7 +1544,12 @@ def _safe_lm_subset_backtrack(
     )
 
     n_full = max(int(np.prod(spatial)), 1)
-    lut_act = torch.full((B * n_full,), -1, dtype=torch.long, device=device)
+    own_lut = lut_buf is None or lut_buf.numel() != B * n_full
+    lut_act = (
+        torch.full((B * n_full,), -1, dtype=torch.long, device=device)
+        if own_lut
+        else lut_buf
+    )
     lut_act[act_flat] = torch.arange(act_flat.shape[0], device=device)
 
     while True:
@@ -1576,7 +1591,10 @@ def _safe_lm_subset_backtrack(
         if not bool((scale_act > 0.0).any().item()):
             break
 
-    del lut_act
+    if own_lut:
+        del lut_act
+    else:
+        lut_act[act_flat] = -1
     used = (scale_act.squeeze(-1) > 0.0) & (delta_act.abs().amax(dim=-1) > 1e-7)
     if not bool(used.any().item()):
         return inv_field, det_min_inv, torch.zeros_like(cand_mask)
@@ -1803,6 +1821,7 @@ def _joint_symmetric_shell_polish(
     mean_sp: float,
     eval_chord_fn,
     scatter_fn,
+    lut_buf: Optional[torch.Tensor] = None,
 ):
     """Principled joint symmetric shrinking-shell projection optimizing ``(df, di)`` simultaneously
     on the sparse defect shell.
@@ -1827,8 +1846,8 @@ def _joint_symmetric_shell_polish(
     u_i = u_i_in.clone()
     det_min_f = det_min_f_in.clone()
     det_min_i = det_min_i_in.clone()
-    n_fi = n_fi_in
-    n_if = n_if_in
+    n_fi = n_fi_in.clone() if n_full > 65_536 else n_fi_in
+    n_if = n_if_in.clone() if n_full > 65_536 else n_if_in
     ever_f = torch.zeros_like(dom_b)
     ever_i = torch.zeros_like(dom_b)
     steps_taken = 0
@@ -1852,25 +1871,49 @@ def _joint_symmetric_shell_polish(
         torch.full_like(n_fi0, target_ice),
         torch.maximum(n_fi0 + 0.02, torch.full_like(n_fi0, float(ice_tol))),
     )
-    strict_fi_full = torch.where(
-        fold_shell,
-        torch.full_like(n_fi0, float(ice_tol)),
-        torch.maximum(n_fi0 + 0.05, torch.full_like(n_fi0, float(ice_tol))),
-    )
+    if n_full > 65_536:
+        init_ice_base = max(float(ice_tol), float(n_if_in.amax().item()))
+        strict_if_full = torch.where(
+            fold_shell,
+            torch.full_like(n_fi0, max(float(ice_tol), 0.65 * init_ice_base)),
+            torch.maximum(n_if_in + 0.05, torch.full_like(n_fi0, float(ice_tol))),
+        )
+        strict_fi_full = torch.where(
+            fold_shell,
+            torch.full_like(n_fi0, max(float(ice_tol), 0.75 * init_ice_base)),
+            torch.maximum(n_fi0 + 0.50, torch.full_like(n_fi0, 2.5 * float(ice_tol))),
+        )
+    else:
+        strict_if_full = torch.full_like(n_fi0, float(ice_tol))
+        strict_fi_full = torch.where(
+            fold_shell,
+            torch.full_like(n_fi0, float(ice_tol)),
+            torch.maximum(n_fi0 + 0.05, torch.full_like(n_fi0, float(ice_tol))),
+        )
 
-    max_passes = 8 if int(steps) >= 8 else 1
+    max_passes = (5 if n_full > 65_536 else 8) if int(steps) >= 8 else 1
     lr_base = 0.075 * mean_sp * max(min(float(step_size) / 0.30, 2.0), 0.25)
     target_det = float(jac_floor) + 0.045
     cell_floor = min(float(jac_floor), 0.02) + 0.01
     jac_fl_t = float(jac_floor)
+    chord_exact = True
 
     for p_idx in range(max_passes):
         fold_def = (det_min_f < jac_fl_t) | (det_min_i < jac_fl_t)
-        ice_def_if = dom_b & (n_if > float(ice_tol))
+        ice_def_if = dom_b & (n_if > strict_if_full)
         ice_def_fi = dom_b & (n_fi > strict_fi_full)
         rem_defects = fold_def | ice_def_if | ice_def_fi
         if not bool(rem_defects.any().item()):
-            break
+            if not chord_exact:
+                _, _, n_fi, n_if = eval_chord_fn(u_f, u_i)
+                chord_exact = True
+                ice_def_if = dom_b & (n_if > strict_if_full)
+                ice_def_fi = dom_b & (n_fi > strict_fi_full)
+                rem_defects = fold_def | ice_def_if | ice_def_fi
+                if not bool(rem_defects.any().item()):
+                    break
+            else:
+                break
 
         # Include mapped partner endpoints of active defects so both ends of every active chord
         # lie inside the joint active shell with full multi-voxel 5-point stencil clearance.
@@ -1887,26 +1930,40 @@ def _joint_symmetric_shell_polish(
             else (torch.zeros_like(dom_b), None)
         )
 
-        rad_p = int(dilation_radius) + min(p_idx // 2, 1)
-        act_mask = _dilate_mask_nd(rem_defects | tgt_from_f | tgt_from_i, rad_p) & dom_b
+        raw_seeds = rem_defects | tgt_from_f | tgt_from_i
+        n_seeds = int(raw_seeds.sum().item())
+        if n_full > 65_536:
+            if n_seeds > 2_000 and p_idx < 3:
+                rad_p = 1
+            elif n_seeds <= 600 and p_idx >= 2:
+                rad_p = int(dilation_radius) + 1
+            else:
+                rad_p = int(dilation_radius)
+        else:
+            rad_p = int(dilation_radius) + min(p_idx // 2, 1)
+        act_mask = _dilate_mask_nd(raw_seeds, rad_p) & dom_b
         if not bool(act_mask.any().item()):
             break
 
         stencil = _build_sparse_dual_fd_stencil(
-            act_mask, steps_fd, dtype, include_4th=include_4th
+            act_mask, steps_fd, dtype, include_4th=include_4th, lut_buf=lut_buf
         )
         act_flat = stencil["act_flat"]
-        ext_mask = ~stencil["sten_mask"]
-        ext_min_f = (
-            float(det_min_f[ext_mask].amin().item())
-            if bool(ext_mask.any().item())
-            else float("inf")
-        )
-        ext_min_i = (
-            float(det_min_i[ext_mask].amin().item())
-            if bool(ext_mask.any().item())
-            else float("inf")
-        )
+        sten_flat = stencil["sten_flat"]
+        sten_prev_f = det_min_f.view(-1)[sten_flat].clone()
+        sten_prev_i = det_min_i.view(-1)[sten_flat].clone()
+        sten_min_f = float(sten_prev_f.amin().item()) if sten_prev_f.numel() > 0 else float("inf")
+        sten_min_i = float(sten_prev_i.amin().item()) if sten_prev_i.numel() > 0 else float("inf")
+        if sten_flat.shape[0] < det_min_f.numel():
+            det_min_f.view(-1)[sten_flat] = float("inf")
+            ext_min_f = float(det_min_f.amin().item())
+            det_min_f.view(-1)[sten_flat] = sten_prev_f
+            det_min_i.view(-1)[sten_flat] = float("inf")
+            ext_min_i = float(det_min_i.amin().item())
+            det_min_i.view(-1)[sten_flat] = sten_prev_i
+        else:
+            ext_min_f = float("inf")
+            ext_min_i = float("inf")
 
         # Build sparse chord evaluation sets covering act_mask and its mapped preimages in O(|act_mask|)
         pre_if, _ = scatter_fn(act_mask, u_f, dilate_r=2)
@@ -1914,14 +1971,18 @@ def _joint_symmetric_shell_polish(
         eval_if_mask = (_dilate_mask_nd(act_mask, 1) | pre_if | ice_def_if) & dom_b
         eval_fi_mask = (_dilate_mask_nd(act_mask, 1) | pre_fi | ice_def_fi) & dom_b
 
-        lut_act = torch.full((B * n_full,), -1, dtype=torch.long, device=device)
+        own_lut = lut_buf is None or lut_buf.numel() != B * n_full
+        lut_act = (
+            torch.full((B * n_full,), -1, dtype=torch.long, device=device)
+            if own_lut
+            else lut_buf
+        )
         lut_act[act_flat] = torch.arange(act_flat.shape[0], device=device)
 
         uf_flat = u_f.reshape(-1, dim)
         ui_flat = u_i.reshape(-1, dim)
         uf_pool0 = uf_flat[stencil["pool_flat"]].clone()
         ui_pool0 = ui_flat[stencil["pool_flat"]].clone()
-        z_pool = torch.zeros_like(uf_pool0)
         row_bases_f = _precompute_sparse_row_bases(
             uf_pool0, stencil, D_rev_T, use_physical, include_cell=True
         )
@@ -1930,7 +1991,7 @@ def _joint_symmetric_shell_polish(
         )
         base_shift_f = (uf_flat[act_flat] - orig_f_flat[act_flat]).contiguous()
 
-        plan_if, _ = _prepare_chord_eval_split(
+        plan_if, (strict_if_sub,) = _prepare_chord_eval_split(
             eval_if_mask,
             act_mask,
             ui_flat,
@@ -1942,6 +2003,7 @@ def _joint_symmetric_shell_polish(
             err_to_vox_mat,
             vox_hi_t,
             spatial,
+            extra_full_tensors=(strict_if_full,),
         )
         plan_fi, (cap_fi_sub, strict_fi_sub) = _prepare_chord_eval_split(
             eval_fi_mask,
@@ -1958,14 +2020,14 @@ def _joint_symmetric_shell_polish(
             extra_full_tensors=(cap_fi_full, strict_fi_full),
         )
 
-        init_mf = min(ext_min_f, float(det_min_f[stencil["sten_mask"]].amin().item()))
-        init_mi = min(ext_min_i, float(det_min_i[stencil["sten_mask"]].amin().item()))
+        init_mf = min(ext_min_f, sten_min_f)
+        init_mi = min(ext_min_i, sten_min_i)
         init_feas = (init_mf >= jac_fl_t) and (init_mi >= jac_fl_t)
 
         if_ord = plan_if["order_flat"]
         fi_ord = plan_fi["order_flat"]
         init_vif = (
-            float(F.relu(n_if.reshape(-1)[if_ord] - float(ice_tol)).amax().item())
+            float(F.relu(n_if.reshape(-1)[if_ord] - strict_if_sub).amax().item())
             if if_ord.numel() > 0
             else 0.0
         )
@@ -1986,7 +2048,26 @@ def _joint_symmetric_shell_polish(
         imp_j_t = torch.tensor(False, device=device, dtype=torch.bool)
         ever_done_j = torch.tensor(False, device=device, dtype=torch.bool)
 
-        iters_p = max(int(steps) * 6, 160) if p_idx == 0 else max(int(steps) * 5, 130)
+        n_act = int(act_flat.shape[0])
+        if n_full > 65_536 and int(steps) >= 8:
+            if p_idx == 0 and n_act > 20_000:
+                iters_p = 40
+                eta_frac = 0.30
+            elif n_act > 120_000:
+                iters_p = 48
+                eta_frac = 0.25
+            elif n_act > 35_000:
+                iters_p = 64
+                eta_frac = 0.22
+            elif n_act > 10_000:
+                iters_p = 84
+                eta_frac = 0.18
+            else:
+                iters_p = 112
+                eta_frac = 0.15
+        else:
+            iters_p = max(int(steps) * 6, 160) if p_idx == 0 else max(int(steps) * 5, 130)
+            eta_frac = 0.15
         lr_p = lr_base * (1.10 if p_idx >= 2 else 1.0)
         anc_f_w = 0.20 * float(anchor_weight)
 
@@ -1999,18 +2080,18 @@ def _joint_symmetric_shell_polish(
             )
             best_df = df.detach().clone()
             best_di = di.detach().clone()
-            opt = torch.optim.Adam([df, di], lr=max(lr_p, 1e-4))
+            opt = torch.optim.Adam([df, di], lr=max(lr_p, 1e-4), foreach=True)
             sched = torch.optim.lr_scheduler.CosineAnnealingLR(
-                opt, T_max=iters_p, eta_min=max(lr_p * 0.15, 1e-5)
+                opt, T_max=iters_p, eta_min=max(lr_p * eta_frac, 1e-5)
             )
 
             for _it in range(iters_p):
                 opt.zero_grad(set_to_none=True)
                 d2f, d4f, dpf, dmf_cell, sm_f = _eval_sparse_row_step(
-                    df, z_pool, stencil, row_bases_f, s_D, use_physical, include_cell=True
+                    df, stencil, row_bases_f, s_D, use_physical, include_cell=True
                 )
                 d2i, d4i, sm_i = _eval_sparse_row_step(
-                    di, z_pool, stencil, row_bases_i, s_D, use_physical, include_cell=False
+                    di, stencil, row_bases_i, s_D, use_physical, include_cell=False
                 )
                 dmf = torch.minimum(d2f, d4f) if include_4th else d2f
                 dmi = torch.minimum(d2i, d4i) if include_4th else d2i
@@ -2048,7 +2129,7 @@ def _joint_symmetric_shell_polish(
                     cur_mi_t = torch.minimum(ext_mi_t, dmi.amin()) if dmi.numel() > 0 else ext_mi_t
                     cur_min_both_t = torch.minimum(cur_mf_t, cur_mi_t)
                     vif_s_max = (
-                        F.relu(nif_k - float(ice_tol)).amax()
+                        F.relu(nif_k - strict_if_sub).amax()
                         if nif_k.numel() > 0
                         else cur_mf_t.new_zeros(())
                     )
@@ -2130,13 +2211,44 @@ def _joint_symmetric_shell_polish(
                 opt.step()
                 sched.step()
 
-        del lut_act
         if bool(imp_j_t.item()):
             moved_f = best_df.abs().amax(dim=-1) > 1e-7
             moved_i = best_di.abs().amax(dim=-1) > 1e-7
             has_mf = bool(moved_f.any().item())
             has_mi = bool(moved_i.any().item())
             if has_mf or has_mi:
+                nif_best = (
+                    _eval_chord_split(
+                        plan_if,
+                        best_di,
+                        best_df,
+                        uf_flat,
+                        lut_act,
+                        A_to_vox,
+                        b_to_vox,
+                        err_to_vox_mat,
+                        vox_hi_t,
+                        spatial,
+                    )
+                    if n_full > 65_536
+                    else None
+                )
+                nfi_best = (
+                    _eval_chord_split(
+                        plan_fi,
+                        best_df,
+                        best_di,
+                        ui_flat,
+                        lut_act,
+                        A_to_vox,
+                        b_to_vox,
+                        err_to_vox_mat,
+                        vox_hi_t,
+                        spatial,
+                    )
+                    if n_full > 65_536
+                    else None
+                )
                 if has_mf:
                     u_f.view(-1, dim).index_add_(0, act_flat[moved_f], best_df[moved_f])
                     ever_f.view(-1)[act_flat[moved_f]] = True
@@ -2145,6 +2257,12 @@ def _joint_symmetric_shell_polish(
                     ever_i.view(-1)[act_flat[moved_i]] = True
                 steps_taken += 1
 
+                if own_lut:
+                    del lut_act
+                else:
+                    lut_act[act_flat] = -1
+
+                cur_min_df = ext_min_f
                 if has_mf:
                     d2f_e, d4f_e = _eval_sparse_dual_fd_det(
                         u_f.reshape(-1, dim)[stencil["pool_flat"]],
@@ -2153,9 +2271,13 @@ def _joint_symmetric_shell_polish(
                         eye,
                         use_physical,
                     )
-                    det_min_f.view(-1)[stencil["sten_flat"]] = (
-                        torch.minimum(d2f_e, d4f_e) if include_4th else d2f_e
-                    )
+                    dmf_e = torch.minimum(d2f_e, d4f_e) if include_4th else d2f_e
+                    det_min_f.view(-1)[stencil["sten_flat"]] = dmf_e
+                    cur_min_df = min(ext_min_f, float(dmf_e.amin().item()))
+                else:
+                    cur_min_df = init_mf
+
+                cur_min_di = ext_min_i
                 if has_mi:
                     d2i_e, d4i_e = _eval_sparse_dual_fd_det(
                         u_i.reshape(-1, dim)[stencil["pool_flat"]],
@@ -2164,21 +2286,58 @@ def _joint_symmetric_shell_polish(
                         eye,
                         use_physical,
                     )
-                    det_min_i.view(-1)[stencil["sten_flat"]] = (
-                        torch.minimum(d2i_e, d4i_e) if include_4th else d2i_e
+                    dmi_e = torch.minimum(d2i_e, d4i_e) if include_4th else d2i_e
+                    det_min_i.view(-1)[stencil["sten_flat"]] = dmi_e
+                    cur_min_di = min(ext_min_i, float(dmi_e.amin().item()))
+                else:
+                    cur_min_di = init_mi
+
+                if n_full <= 65_536:
+                    _, _, n_fi, n_if = eval_chord_fn(u_f, u_i)
+                    chord_exact = True
+                else:
+                    if if_ord.numel() > 0:
+                        n_if.view(-1)[if_ord] = nif_best
+                    if fi_ord.numel() > 0:
+                        n_fi.view(-1)[fi_ord] = nfi_best
+                    chord_exact = False
+
+                if cur_min_df >= jac_fl_t and cur_min_di >= jac_fl_t:
+                    sparse_ice_ok = (
+                        not bool((dom_b & (n_if > strict_if_full)).any().item())
+                        and not bool((dom_b & (n_fi > strict_fi_full)).any().item())
                     )
-                _, _, n_fi, n_if = eval_chord_fn(u_f, u_i)
-                if (
-                    float(det_min_f.amin().item()) >= jac_fl_t
-                    and float(det_min_i.amin().item()) >= jac_fl_t
-                    and not bool((dom_b & (n_if > float(ice_tol))).any().item())
-                    and not bool((dom_b & (n_fi > strict_fi_full)).any().item())
-                ):
-                    break
+                    if sparse_ice_ok:
+                        _, _, n_fi, n_if = eval_chord_fn(u_f, u_i)
+                        chord_exact = True
+                        if (
+                            not bool((dom_b & (n_if > strict_if_full)).any().item())
+                            and not bool((dom_b & (n_fi > strict_fi_full)).any().item())
+                        ):
+                            break
             else:
+                if own_lut:
+                    del lut_act
+                else:
+                    lut_act[act_flat] = -1
                 break
         else:
+            if own_lut:
+                del lut_act
+            else:
+                lut_act[act_flat] = -1
+            if not chord_exact:
+                _, _, n_fi, n_if = eval_chord_fn(u_f, u_i)
+                chord_exact = True
+                if n_full <= 65_536 and (
+                    bool((dom_b & (n_if > strict_if_full)).any().item())
+                    or bool((dom_b & (n_fi > strict_fi_full)).any().item())
+                ):
+                    continue
             break
+
+    if not chord_exact and steps_taken > 0:
+        _, _, n_fi, n_if = eval_chord_fn(u_f, u_i)
 
     return u_f, u_i, det_min_f, det_min_i, n_fi, n_if, steps_taken, ever_f, ever_i
 
@@ -2310,7 +2469,6 @@ def enforce_digital_diffeomorphism_nd(
         max_step_unit = (2.0 / float(max(max(spatial) - 1, 1))) * 2.0
 
     D_rev_T, s_D = _d_rev_t_and_scale(D_rev_inv)
-    eye = torch.eye(dim, device=device, dtype=dtype)
 
     def _eval_det_min(u_t: torch.Tensor) -> torch.Tensor:
         return _eval_dual_fd_det_min_fast(
@@ -2343,12 +2501,15 @@ def enforce_digital_diffeomorphism_nd(
         return r_fi, r_if, n_fi, n_if
 
     def _scatter_mapped_targets(
-        src_mask: torch.Tensor, disp_src: torch.Tensor, dilate_r: int = 1
+        src_mask: torch.Tensor,
+        disp_src: torch.Tensor,
+        dilate_r: int = 1,
+        need_warm: bool = False,
     ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
         """In ``O(|src_mask|)`` time, locate target grid voxels ``round(x + disp_src(x))``
         and build an optional ``-disp_src(x)`` warm-start field at those target voxels."""
         tgt = torch.zeros_like(dom_b)
-        warm = disp_src.new_zeros(disp_src.shape)
+        warm = disp_src.new_zeros(disp_src.shape) if need_warm else None
         any_hit = False
         for b_i in range(B):
             s_idx = torch.nonzero(src_mask[b_i], as_tuple=False)
@@ -2363,7 +2524,8 @@ def enforce_digital_diffeomorphism_nd(
                 yv[:, d_ax].clamp_(0, spatial[d_ax] - 1)
             ttup = tuple(yv[:, d] for d in range(dim))
             tgt[b_i][ttup] = True
-            warm[b_i][ttup] = -us
+            if warm is not None:
+                warm[b_i][ttup] = -us
         if not any_hit:
             return tgt, None
         if dilate_r > 0:
@@ -2376,6 +2538,7 @@ def enforce_digital_diffeomorphism_nd(
         dom_b = domain_mask.unsqueeze(0).expand(B, *spatial)
         det_f0 = _eval_det_min(W_fwd_in)
         init_min_det_f = float(det_f0.amin().item())
+        n_full_lut = B * max(int(np.prod(spatial)), 1)
 
         if unidirectional:
             if steps <= 0 or init_min_det_f >= float(jac_floor):
@@ -2388,6 +2551,7 @@ def enforce_digital_diffeomorphism_nd(
                     stats["final_max_ice_vox"] = 0.0
                 return W_fwd
 
+            lut_shared = torch.full((n_full_lut,), -1, dtype=torch.long, device=device)
             u_f, _, final_min_df, steps_taken, ever_f = _unfold_field_adaptive_smooth(
                 W_fwd_in,
                 det_f0,
@@ -2406,7 +2570,9 @@ def enforce_digital_diffeomorphism_nd(
                 dilation_radius,
                 mean_sp,
                 max_det_cap=None,
+                lut_buf=lut_shared,
             )
+            del lut_shared
             n_active = int(ever_f.sum().item())
             if steps_taken == 0 or n_active == 0:
                 if stats is not None:
@@ -2474,12 +2640,15 @@ def enforce_digital_diffeomorphism_nd(
             ((u_i - W_inv_in).abs().amax(dim=-1) > 0.0) if b_dirty_i else torch.zeros_like(dom_b)
         )
         steps_taken = 1 if (b_dirty_f or b_dirty_i) else 0
-        fold_shell = _dilate_mask_nd(init_fold_seed, int(dilation_radius) + 2) & dom_b
+        fs_rad = 1 if n_full_lut > 65_536 else (int(dilation_radius) + 2)
+        fold_shell = _dilate_mask_nd(init_fold_seed, fs_rad) & dom_b
         _, _, n_fi, n_if = (
             _eval_chord_errors_vox(u_f, u_i)
             if (b_dirty_f or b_dirty_i)
             else (None, None, n_fi0, n_if0)
         )
+
+        lut_shared = torch.full((n_full_lut,), -1, dtype=torch.long, device=device)
 
         # Step 1 (Coupled Joint Symmetric Shrinking-Shell Projection on (df, di) from iteration 0,
         # unfolding u_f and u_i together while keeping inverse chord coupling active throughout):
@@ -2530,6 +2699,7 @@ def enforce_digital_diffeomorphism_nd(
                 mean_sp,
                 _eval_chord_errors_vox,
                 _scatter_mapped_targets,
+                lut_buf=lut_shared,
             )
             if st_j > 0:
                 steps_taken += st_j
@@ -2562,6 +2732,7 @@ def enforce_digital_diffeomorphism_nd(
                 A_to_vox=A_to_vox,
                 b_to_vox=b_to_vox,
                 ice_tol=ice_tol,
+                lut_buf=lut_shared,
             )
             if st_f2 > 0:
                 steps_taken += st_f2
@@ -2592,6 +2763,7 @@ def enforce_digital_diffeomorphism_nd(
                 A_to_vox=A_to_vox,
                 b_to_vox=b_to_vox,
                 ice_tol=ice_tol,
+                lut_buf=lut_shared,
             )
             if st_i2 > 0:
                 steps_taken += st_i2
@@ -2618,11 +2790,14 @@ def enforce_digital_diffeomorphism_nd(
                     ice_tol,
                     lm_sync_steps,
                     max_step_unit,
+                    lut_buf=lut_shared,
                 )
                 if bool(mod_ie.any().item()):
                     ever_i = ever_i | mod_ie
                     steps_taken += 1
                     _, _, n_fi, n_if = _eval_chord_errors_vox(u_f, u_i)
+
+        del lut_shared
 
         n_active = int((ever_f | ever_i).sum().item())
         if steps_taken == 0 or n_active == 0:
@@ -2700,7 +2875,6 @@ def pullback_digital_diffeomorphism_to_halves(
         spatial = tuple(w_l2r.shape[1:-1])
         device = w_l2r.device
         dtype = w_l2r.dtype
-        n_full = max(int(np.prod(spatial)), 1)
 
         if spacing is not None and origin is None:
             origin = (0.0,) * dim

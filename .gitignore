@@ -58,6 +58,7 @@ benchmark_vis/*.json
 docs/*_report*.html
 docs/reports/*
 !docs/reports/mindboggle_90pair_master_report.html
+!docs/reports/mindboggle_90pair_master_report.md
 !docs/reports/mindboggle_90pair_syngs_sobolev_report.html
 !docs/reports/mindboggle_90pair_zero_folding_flow_sigma_report.html
 !docs/reports/mbhard_bspline_syn_report.html
@@ -106,6 +107,7 @@ run_*.py
 !benchmarks/run_complete_validation.py
 !benchmarks/run_parameter_sweep_10pairs.py
 !docs/reports/mindboggle_90pair_master_report.html
+!docs/reports/mindboggle_90pair_master_report.md
 !docs/reports/mindboggle_90pair_syngs_sobolev_report.html
 test_parallel_runner.py
 scripts/benchmark_jlf_vs_antspy.py

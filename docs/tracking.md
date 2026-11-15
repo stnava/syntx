@@ -1,12 +1,32 @@
 # Tracking Summary
-current phase: v6.37.0 (dual-stencil 2h+4h & cell-secant digital diffeomorphism v2, coupled-from-0 GPU zero-transfer polish, public `syntx.enforce_digital_diffeomorphism` API, and composition/template/shooting closure)
-next WP: complete 90-pair Mindboggle population benchmark (`results/mindboggle_90pair_v6_37_0_2026-11-13`); per-run synthetic calibration of slice-set clock thresholds; fix opt-in `engine='projected'` motion regression
+current phase: v6.37.1 (fast GPU digital diffeomorphism shell polish — 1.84x–4.02x speedup on 192x256x256 brains — and completed 90/90-pair Mindboggle-101 10-deformable + 2-affine benchmark with 100% zero Liouville folding)
+next WP: per-run synthetic calibration of slice-set clock thresholds; fix opt-in `engine='projected'` motion regression
 blockers: none
-active work: running clean 90-pair Mindboggle benchmark (`0/90 -> 90/90`) on `v6.37.0` (`dirty=False`)
+active work: none (90/90 Mindboggle population benchmark completed and published in `docs/reports/mindboggle_90pair_master_report.html`)
 device: Apple Silicon MPS / CPU (macOS arm64)
-last updated: 2026-11-13
+last updated: 2026-11-15
 
 ---
+
+## R38 (Fast GPU Digital Diffeomorphism Shell Polish & Completed 90/90-Pair Mindboggle-101 Benchmark; v6.37.1, 2026-11-15)
+- **GPU Memory & Shell-Contraction Speedups in Digital Diffeomorphism (`src/syntx/core/digital_diffeomorphism.py`)**:
+  - Replaced atomic `z_pool.index_add` scatter-adds in sparse FD stencil evaluation with a zero-sentinel direct active row gather (`sten_in_act`, `0.0` bitwise discrepancy), vectorized `(M, 2^d, dim)` corner gathers in `_gather_multilinear_sparse`, eliminated `4.8 GB` of unused `151 MB` `warm` allocations via `_scatter_mapped_targets(need_warm=False)`, shared a single preallocated `lut_shared` across shell passes, and enabled `foreach=True` on `torch.optim.Adam`.
+  - Added a coarse `r=1` shallow-crease Pass `0` (`4x` smaller active set clearing `>80%` of 1-voxel sulcal creases before `r=2` refinement), restricted exterior chord seeding on `n_full > 65,536` to `fold_shell` to prevent exterior trilinear curvature expansion, and replaced full-volume between-pass chord refreshes with sparse `if_ord` / `fi_ord` evaluations.
+  - **Measured Isolated MPS Polish Speedup (`Pair #44` `mbhard`, `192x256x256`)**: `syn_beltrami` `10.21 s -> 5.55 s` (**`1.84x`**), `tvf_best` `53.96 s -> 16.33 s` (**`3.31x`**), and `syngs_beltrami` `72.21 s -> 17.98 s` (**`4.02x`**), all preserving `0` whole-volume `2h` & `4h` folds and `|ΔDice| <= 0.12 pp`.
+- **Completed 90/90-Pair Mindboggle-101 Cohort Benchmark (`docs/reports/mindboggle_90pair_master_report.{html,md}`, `README.md`)**:
+  - Executed all `90/90` pairs (`40` intra-site, `50` inter-site; shuffled seed `20261112`; `1,080` total runs = `900` deformable + `180` affine; isolated sequential MPS-before-CPU subprocesses; shared canonical affine `syntx_affine_default`, `[100, 100, 20]`). Superseded `docs/reports/mindboggle_90pair_master_report.html` in-place.
+  - **100% Digital Diffeomorphism**: **`810 / 810`** `syntx` deformable warps achieved **`0.0000%` Liouville folding** (`min_jacobian > 0` everywhere; **`90/90` `antsxqc` diffeomorphism passes** across all 10 deformable arms).
+  - **Track 2 Deformable Leaderboard (`N = 90` pairs, vs `ants_syn_matched = 0.6095 ± 0.0222`, `119.5 s`)**:
+    - **`tvf_best`**: **`0.6440 ± 0.0217`** (`+3.45 pp`, **`90/90` wins**, $p = 1.74\times 10^{-16}$, `ICE_p95 = 0.0304 mm`, `184.6 s`).
+    - **`syngs_beltrami`**: **`0.6417 ± 0.0215`** (`+3.22 pp`, **`90/90` wins**, $p = 1.74\times 10^{-16}$, **`ICE_p95 = 0.0137 mm`**, **`70.1 s` = `1.71x` faster**).
+    - **`syn_beltrami`**: **`0.6373 ± 0.0207`** (`+2.78 pp`, **`90/90` wins**, $p = 1.74\times 10^{-16}$, `ICE_p95 = 0.0626 mm`, **`52.1 s` = `2.30x` faster**).
+    - **`syn_beltrami_proj`**: `0.6359 ± 0.0210` (`+2.64 pp`, **`90/90` wins**, $p = 1.74\times 10^{-16}$, `93.2 s`).
+    - **`syn_sobolev`**: `0.6341 ± 0.0213` (`+2.46 pp`, **`90/90` wins**, $p = 1.74\times 10^{-16}$, **`44.4 s` = `2.70x` faster**).
+    - **`syngs_best`**: `0.6335 ± 0.0218` (`+2.40 pp`, **`90/90` wins**, $p = 1.74\times 10^{-16}$, **`ICE_p95 = 0.0108 mm`**, `62.5 s = 1.92x` faster).
+    - **`syn_gaussian`**: `0.6328 ± 0.0219` (`+2.33 pp`, **`90/90` wins**, $p = 1.74\times 10^{-16}$, **`42.1 s` = `2.85x` faster**).
+    - **`syn_hyperelastic`**: `0.6319 ± 0.0216` (`+2.24 pp`, `89/90` wins, $p = 1.93\times 10^{-16}$, `53.8 s = 2.23x` faster).
+    - **`syn_matched`**: `0.6072 ± 0.0214` (`-0.23 pp`, `33/90` wins, `55.5 s = 2.19x` faster).
+- **Verification**: `python3 -m antsxqc.lint src/syntx` (`0 finding(s)`), `ruff check src/syntx/core/digital_diffeomorphism.py` (`0` findings), full `pytest tests/ -q` suite (`2,520 passed, 398 skipped, 0 failed`).
 
 ## R37 (Dual-Stencil Digital Diffeomorphism v2, Coupled GPU Zero-Transfer Polish & Composition/Shooting Closure; v6.37.0, 2026-11-13)
 - **Dual-Stencil (`2h` + `4h`) & Cell-Secant Digital Diffeomorphism v2 (`src/syntx/core/digital_diffeomorphism.py`, `src/syntx/core/__init__.py`, `src/syntx/__init__.py`, `tests/test_digital_diffeomorphism.py`)**:
