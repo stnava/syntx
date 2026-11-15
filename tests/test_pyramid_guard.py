@@ -58,7 +58,6 @@ ALLOW = {
     # ---- ANTs resampling
     ("dewarp.py", "ants_resample_image"): (1, "isotropic motion reference for the dewarp (a registration target, not a pyramid level)"),
     ("dewarp.py", "ants_resample_to_target"): (1, "_apply_optional_mask: nearest-neighbour resampling of a caller mask onto the image grid (not a pyramid level)"),
-    ("benchmark/msd.py", "ants_resample_image"): (2, "benchmark data loader: resamples MSD volumes to the benchmark spacing"),
     ("data/msd.py", "ants_resample_image"): (2, "data loader: resamples to the target shape"),
     ("transforms.py", "ants_resample_to_target"): (4, "resample_image_to_target's ANTs fallbacks and the identity-chain resamples of TransformChain.apply and resample_series: geometry onto a target grid, not a pyramid level"),
     ("viz/figures.py", "zoom"): (1, "figure compositing: shape-match for display"),

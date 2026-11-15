@@ -140,7 +140,7 @@ from .benchmark import (
     high_level_benchmark_run,
     evaluate_affine_benchmark,
 )
-from .pyramid import build_pyramid, plan_levels
+from .pyramid import build_pyramid, plan_levels, plan_scale_space_levels, scale_space_iterations
 from .deformation_metrics import (
     compute_harmonic_energy,
     compute_bending_energy,
@@ -367,7 +367,7 @@ from .liouville import liouville_determinant, determinant_summary
 syngs = syngs_registration
 affine_benchmark = evaluate_affine_benchmark
 
-__version__ = "6.37.1"
+__version__ = "6.37.2"
 
 
 

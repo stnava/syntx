@@ -56,7 +56,9 @@ def test_diagnose_ct_thorax():
     policy = synthesize_policy(pair)
 
     assert policy.transform_type == "TVF"
+    assert policy.similarity_metric == "cc"
     assert policy.ct_window == (-1000.0, 400.0)
+    assert policy.coarse_spacing_mm == 10.0
 
 
 def test_diagnose_ct_abdomen():
@@ -74,7 +76,9 @@ def test_diagnose_ct_abdomen():
     policy = synthesize_policy(pair)
 
     assert policy.transform_type == "SyN"
+    assert policy.similarity_metric == "cc"
     assert policy.ct_window == (-150.0, 250.0)
+    assert policy.coarse_spacing_mm == 10.0
 
 
 def test_diagnose_cross_modality_mri_ct():

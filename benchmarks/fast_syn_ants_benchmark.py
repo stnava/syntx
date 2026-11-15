@@ -2464,6 +2464,11 @@ def build_parser() -> argparse.ArgumentParser:
         help="Evaluate primary affine & deformable models only (skips *_fast, ants_syn_quick, and Track 3 E2E).",
     )
     p.add_argument(
+        "--affine-only",
+        action="store_true",
+        help="Evaluate Track 1 affine arms only (skips Track 2 deformable and Track 3 E2E).",
+    )
+    p.add_argument(
         "--smoke",
         action="store_true",
         help=(
@@ -2615,6 +2620,10 @@ def main(argv: Optional[Sequence[str]] = None) -> Dict[str, Any]:
             for extra_arm in ("syngs_best", "tvf_best"):
                 if extra_arm not in syn_arms:
                     syn_arms.append(extra_arm)
+        if args.affine_only:
+            syn_arms = []
+            ants_deform_arms = ()
+            run_e2e = False
 
         cs = code_state(include_diff=False)
         env_snapshot = environment()
@@ -3205,8 +3214,9 @@ def main(argv: Optional[Sequence[str]] = None) -> Dict[str, Any]:
             if args.with_reproducibility:
                 cpu_repro_targets: List[Tuple[str, str]] = [
                     ("affine", "ants_affine"),
-                    ("deformable", "ants_syn_matched"),
                 ]
+                if ants_deform_arms:
+                    cpu_repro_targets.append(("deformable", "ants_syn_matched"))
                 if run_e2e:
                     cpu_repro_targets.append(("e2e", "ants_e2e_syn"))
                 for trk, arm in cpu_repro_targets:

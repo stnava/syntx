@@ -2409,6 +2409,37 @@ class SyNTo(nn.Module):
                     _zero_boundary_inplace(w_l2r_inv)
                     _zero_boundary_inplace(w_r2l_inv)
 
+                if _run_deformable_polish:
+                    _dd_ice_tol = (
+                        float(compose_polish_tol)
+                        if compose_polish_tol is not None and float(compose_polish_tol) > 0.0
+                        else 0.30
+                    )
+                    w_l2r, w_l2r_inv = enforce_digital_diffeomorphism_nd(
+                        w_l2r,
+                        w_l2r_inv,
+                        spacing=fixed_spacing,
+                        origin=fixed_origin,
+                        direction=fixed_direction,
+                        X_phys=X_phys,
+                        ice_tol=_dd_ice_tol,
+                        jac_floor=_dd_floor,
+                        steps=_dd_steps,
+                        stationary_boundary=self.stationary_boundary,
+                    )
+                    w_r2l, w_r2l_inv = enforce_digital_diffeomorphism_nd(
+                        w_r2l,
+                        w_r2l_inv,
+                        spacing=fixed_spacing,
+                        origin=fixed_origin,
+                        direction=fixed_direction,
+                        X_phys=X_phys,
+                        ice_tol=_dd_ice_tol,
+                        jac_floor=_dd_floor,
+                        steps=_dd_steps,
+                        stationary_boundary=self.stationary_boundary,
+                    )
+
                 comp_spacing_rev, comp_origin_rev, comp_direction_rev = reverse_metadata(
                     fixed_spacing, fixed_origin, fixed_direction
                 )
@@ -2817,7 +2848,7 @@ SYN_ADVANCED_OPTIONS = frozenset({
     # SyNTo._apply_bspline_operator()
     'enforce_stationary_boundary', 'spline_order',
     # Continuum mechanics regularizers
-    'beta', 'gamma', 'poisson_ratio', 'darcy_permeability', 'bulk_modulus', 'num_iters', 'dilatation_weight', 'mask',
+    'beta', 'gamma', 'poisson_ratio', 'darcy_permeability', 'bulk_modulus', 'num_iters', 'dilatation_weight', 'beltrami_dilation', 'mask',
     's', 'h3_envelope', 'sobolev_envelope', 'envelope_power',
 })
 # set internally by registration() for fit()
@@ -3078,6 +3109,10 @@ def registration(
         raise TypeError(f"syntx.syn has no {_not_syn} (they belong to syntx.tvf / syntx.syngs)")
     _greedy = (str(type_of_transform).lower() in ('greedy', 'greedy_compositive')
                or str(kwargs.get('formulation', '')).lower() == 'greedy')
+    if 'beltrami_dilation' in kwargs and 'dilatation_weight' not in kwargs:
+        kwargs['dilatation_weight'] = kwargs.pop('beltrami_dilation')
+    elif 'beltrami_dilation' in kwargs:
+        kwargs.pop('beltrami_dilation')
     _unknown = sorted(set(kwargs) - SYN_ADVANCED_OPTIONS - {'affine_iterations', 'aff_metric', 'aff_sampling'})
     if _unknown and not _greedy:        # the greedy delegation validates its own keywords
         raise TypeError(f"syntx.syn() got unexpected keyword(s) {_unknown}; see the docstring and "
@@ -3959,6 +3994,25 @@ def auto_reg(
     fixed_proc = fixed
     moving_proc = moving
 
+    # Slice 4D ANTsImage inputs to 3D for processing while preserving diagnosis capability
+    if hasattr(fixed_proc, 'dimension') and fixed_proc.dimension > 3:
+        import warnings
+        warnings.warn(f"auto_reg: 4D fixed image (dimension={fixed_proc.dimension}) detected; slicing axis=3, idx=0 to 3D.")
+        fixed_proc = ants.slice_image(fixed_proc, axis=3, idx=0)
+    if hasattr(moving_proc, 'dimension') and moving_proc.dimension > 3:
+        import warnings
+        warnings.warn(f"auto_reg: 4D moving image (dimension={moving_proc.dimension}) detected; slicing axis=3, idx=0 to 3D.")
+        moving_proc = ants.slice_image(moving_proc, axis=3, idx=0)
+    if fixed_label is not None and hasattr(fixed_label, 'dimension') and fixed_label.dimension > 3:
+        import warnings
+        warnings.warn(f"auto_reg: 4D fixed_label (dimension={fixed_label.dimension}) detected; slicing axis=3, idx=0 to 3D.")
+        fixed_label = ants.slice_image(fixed_label, axis=3, idx=0)
+    if moving_label is not None and hasattr(moving_label, 'dimension') and moving_label.dimension > 3:
+        import warnings
+        warnings.warn(f"auto_reg: 4D moving_label (dimension={moving_label.dimension}) detected; slicing axis=3, idx=0 to 3D.")
+        moving_label = ants.slice_image(moving_label, axis=3, idx=0)
+    dim = fixed_proc.dimension if hasattr(fixed_proc, 'dimension') else (fixed_proc.ndim if hasattr(fixed_proc, 'ndim') else 3)
+
     # 2. Autonomous Diagnosis & Policy Synthesis
     pair_diag = None
     policy = None
@@ -3992,11 +4046,14 @@ def auto_reg(
                          if 'similarity_metric' not in kwargs and 'syn_metric' not in kwargs else None)
         # CT Windowing if diagnosed CT
         if policy.ct_window is not None and pair_diag is not None and pair_diag.fixed.is_ct():
-            w_min, w_max = policy.ct_window
-            arr_f = np.clip((fixed_proc.numpy() - w_min) / max(w_max - w_min, 1e-4), 0.0, 1.0).astype(np.float32)
-            arr_m = np.clip((moving_proc.numpy() - w_min) / max(w_max - w_min, 1e-4), 0.0, 1.0).astype(np.float32)
-            fixed_proc = fixed_proc.new_image_like(arr_f)
-            moving_proc = moving_proc.new_image_like(arr_m)
+            if policy.ct_window == (-1000.0, 400.0) and not pair_diag.fixed.is_thorax():
+                pass
+            else:
+                w_min, w_max = policy.ct_window
+                arr_f = np.clip((fixed_proc.numpy() - w_min) / max(w_max - w_min, 1e-4), 0.0, 1.0).astype(np.float32)
+                arr_m = np.clip((moving_proc.numpy() - w_min) / max(w_max - w_min, 1e-4), 0.0, 1.0).astype(np.float32)
+                fixed_proc = fixed_proc.new_image_like(arr_f)
+                moving_proc = moving_proc.new_image_like(arr_m)
 
     # 3. Adaptive Preprocessing: Non-local means Rician denoising
     if denoise in (True, 'auto') and dim == 3 and hasattr(fixed, 'dimension'):
@@ -4052,6 +4109,34 @@ def auto_reg(
         initial_transform = aff_res['fwdtransforms']
 
     # 6. Execute Registration with Proven Best Parameters
+    eff_levels = levels
+    eff_iters = reg_iterations
+    if not is_affine_only:
+        from .pyramid import plan_scale_space_levels, scale_space_iterations
+        if eff_levels is None and eff_iters is None:
+            if hasattr(fixed_proc, 'spacing') and hasattr(fixed_proc, 'shape') and dim in (2, 3):
+                sp_xyz = tuple(float(s) for s in fixed_proc.spacing[:dim])
+                sh_zyx = tuple(int(n) for n in fixed_proc.shape[:dim])[::-1]
+                ext_sorted = sorted(float(n) * float(s) for n, s in zip(fixed_proc.shape[:dim], sp_xyz))
+                transverse_ext = ext_sorted[-2] if dim == 3 else ext_sorted[-1]
+                pol_coarse_mm = float(policy.coarse_spacing_mm) if policy is not None else 4.0
+                eff_coarse_mm = max(pol_coarse_mm, transverse_ext / 64.0)
+                eff_levels = plan_scale_space_levels(sh_zyx, sp_xyz, coarse_spacing_mm=eff_coarse_mm)
+                eff_iters = scale_space_iterations(eff_levels)
+            else:
+                eff_levels = [4, 2, 1]
+                eff_iters = [100, 100, 20]
+        elif eff_levels is None and eff_iters is not None:
+            if isinstance(eff_iters, (list, tuple)):
+                eff_levels = [1 << i for i in range(len(eff_iters) - 1, -1, -1)]
+            else:
+                eff_levels = [4, 2, 1]
+        elif eff_levels is not None and eff_iters is None:
+            if isinstance(eff_levels, (list, tuple)):
+                eff_iters = scale_space_iterations(eff_levels)
+            else:
+                eff_iters = [100, 100, 20]
+
     if is_affine_only:
         from .robust_affine import robust_affine as run_robust_affine
         aff_params = {
@@ -4068,31 +4153,29 @@ def auto_reg(
         transform_label = f"Robust Affine ({transform_type})"
     elif is_tvf:
         from .tvf import tvf_registration
-        # syntx.tvf's own defaults; only routing and the benchmark schedule here
+        # syntx.tvf's own defaults; only routing and the scale-space schedule here
         tvf_params = {
             'backend': target_backend,
             'device': target_device,
-            'reg_iterations': reg_iterations if reg_iterations is not None else [100, 100, 20],
+            'levels': eff_levels,
+            'reg_iterations': eff_iters,
             'initial_transform': initial_transform,
             'verbose': verbose
         }
-        if levels is not None:
-            tvf_params['levels'] = levels
         tvf_params.update(kwargs)
         res = tvf_registration(fixed=fixed_proc, moving=moving_proc, **tvf_params)
         transform_label = "TVF"
     elif is_syngs:
         from .syngs import syngs_registration
-        # syngs's own (canonical, tuned) defaults; only routing and the benchmark schedule here
+        # syngs's own (canonical, tuned) defaults; only routing and the scale-space schedule here
         syngs_params = {
             'backend': target_backend,
             'device': target_device,
-            'reg_iterations': reg_iterations if reg_iterations is not None else [100, 100, 20],
+            'levels': eff_levels,
+            'reg_iterations': eff_iters,
             'initial_transform': initial_transform,
             'verbose': verbose
         }
-        if levels is not None:
-            syngs_params['levels'] = levels
         syngs_params.update(kwargs)
         res = syngs_registration(fixed=fixed_proc, moving=moving_proc, **syngs_params)
         transform_label = "SyNGS (Riemannian Geodesic)"
@@ -4101,8 +4184,8 @@ def auto_reg(
             'backend': target_backend,
             'device': target_device,
             'type_of_transform': transform_type if transform_type else 'SyN',
-            'levels': levels if levels is not None else [4, 2, 1],
-            'reg_iterations': reg_iterations if reg_iterations is not None else [100, 100, 20],
+            'levels': eff_levels,
+            'reg_iterations': eff_iters,
             # regularisation / optimiser parameters: syntx.syn's (tuned, canonical) defaults
             'interpolator': 'linear',
             'bootstrap_mode': 'antithetic',
@@ -4119,11 +4202,17 @@ def auto_reg(
         }
         syn_params.update(kwargs)
         res = registration(fixed=fixed_proc, moving=moving_proc, **syn_params)
-        transform_label = "SyN (Eulerian Sobolev Guided)" if guided in (True, 'sulcal') else "SyN (Eulerian Sobolev)"
+        reg_used = str(syn_params.get('regularizer', 'sobolev')).lower()
+        if guided in (True, 'sulcal'):
+            transform_label = "SyN (Eulerian Sobolev Guided)" if reg_used == 'sobolev' else f"SyN ({reg_used.capitalize()} Guided)"
+        else:
+            transform_label = "SyN (Eulerian Sobolev)" if reg_used == 'sobolev' else f"SyN ({reg_used.capitalize()})"
 
     t_elapsed = time.time() - t0
 
     # 5. Compute Comprehensive Metrics
+    if 'warpedfixout' not in res:
+        res['warpedfixout'] = fixed_proc
     warpedmovout = res['warpedmovout']
     fwd_tx = res['fwdtransforms']
 
@@ -4153,10 +4242,10 @@ def auto_reg(
             # Folding: the per-method determinant (syntx.liouville_determinant) when the result
             # supports it, else the finite-difference Jacobian; the FD values are kept as fd_*
             from .deformation_metrics import compute_jacobian_metrics, flow_jacobian_metrics
-            fd = compute_jacobian_metrics(fixed, warp_file)
+            fd = compute_jacobian_metrics(fixed_proc, warp_file)
             metrics['fd_jac_min'] = fd['min']
             metrics['fd_folding_pct'] = fd['folding_pct']
-            flow = flow_jacobian_metrics(fixed, res)
+            flow = flow_jacobian_metrics(fixed_proc, res)
             src = flow if flow is not None else dict(fd, measure="finite difference of the exported field")
             metrics['jac_mean'] = float(src['mean'])
             metrics['jac_min'] = float(src['min'])
@@ -4199,9 +4288,9 @@ def auto_reg(
     # Image similarity scores via image_compare
     try:
         from .image_compare import image_compare
-        metrics['lncc_score'] = float(image_compare(fixed, warpedmovout, metricname='lncc'))
-        metrics['mse_score'] = float(image_compare(fixed, warpedmovout, metricname='mse'))
-        metrics['mattes_mi_score'] = float(image_compare(fixed, warpedmovout, metricname='mattes_mi'))
+        metrics['lncc_score'] = float(image_compare(fixed_proc, warpedmovout, metricname='lncc'))
+        metrics['mse_score'] = float(image_compare(fixed_proc, warpedmovout, metricname='mse'))
+        metrics['mattes_mi_score'] = float(image_compare(fixed_proc, warpedmovout, metricname='mattes_mi'))
     except Exception as e:
         if verbose:
             print(f"[auto_reg] Image similarity calculation skipped: {e}")

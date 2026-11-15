@@ -180,13 +180,14 @@ def diagnose_image(image: Union[ants.ANTsImage, torch.Tensor, np.ndarray], fast:
 
     Tier 1, HU-like data: modality "CT"; body part from voxel fractions -- centre-box (middle
     half of each axis) air fraction >= 0.20 -> THORAX; else centre soft tissue [15, 85] HU >=
-    0.35 -> ABDOMEN; else bone >= 0.04, soft tissue >= 0.15 and centre air < 0.10 -> BRAIN; else
+    0.35 -> ABDOMEN; else bone >= 0.04, soft tissue >= 0.15, centre air < 0.10 and cranial spatial extent
+    (min >= 110 mm, max in [140, 260) mm) -> BRAIN; else
     soft tissue >= 0.15 and fat [-120, -40] >= 0.02 -> ABDOMEN; else ABDOMEN (3-D) / UNKNOWN.
 
     Tier 1, otherwise: modality "MRI_T2" if, over foreground voxels (> 2 % of max) and when
     there are more than 100 of them, (p98 - p50) / (p50 - p25) > 3, else "MRI_T1". Body part
-    from the shape only: 4-D with >= 4 last-axis entries -> BRAIN; 4-D with exactly 2 -> PELVIS;
-    2-D -> BRAIN; 3-D with largest extent < 260 mm -> BRAIN; else UNKNOWN.
+    from the shape and extent: 4-D with >= 4 last-axis entries -> BRAIN; 4-D with exactly 2 -> PELVIS;
+    2-D -> BRAIN; 3-D with min extent >= 110 mm and max extent in [140, 260) mm -> BRAIN; else UNKNOWN.
 
     Parameters
     ----------
@@ -305,7 +306,7 @@ def diagnose_image(image: Union[ants.ANTsImage, torch.Tensor, np.ndarray], fast:
         elif center_soft >= 0.35:
             body_part = "ABDOMEN"
             confidence = 0.90
-        elif (bone_vox >= 0.04) and (soft_tissue_vox >= 0.15) and (center_air < 0.10):
+        elif (bone_vox >= 0.04) and (soft_tissue_vox >= 0.15) and (center_air < 0.10) and (dim == 3) and (max(spatial_extent[:3]) < 260.0) and (max(spatial_extent[:3]) >= 140.0) and (min(spatial_extent[:3]) >= 110.0):
             body_part = "BRAIN"
             confidence = 0.85
         elif (soft_tissue_vox >= 0.15) and (fat_vox >= 0.02):
@@ -371,8 +372,14 @@ def diagnose_image(image: Union[ants.ANTsImage, torch.Tensor, np.ndarray], fast:
         body_part = "BRAIN"
         confidence = 0.85
     else:
-        body_part = "BRAIN" if dim == 3 and max(spatial_extent) < 260.0 else "UNKNOWN"
-        confidence = 0.70
+        is_brain_3d = (
+            dim == 3
+            and max(spatial_extent[:3]) < 260.0
+            and max(spatial_extent[:3]) >= 140.0
+            and min(spatial_extent[:3]) >= 110.0
+        )
+        body_part = "BRAIN" if is_brain_3d else "UNKNOWN"
+        confidence = 0.75 if is_brain_3d else 0.70
 
     return ImageDiagnosis(
         modality=modality,

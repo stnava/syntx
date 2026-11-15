@@ -61,8 +61,10 @@ from syntx.landmarks import (
     ransac_filter,
     match_sift3d_with_rotation_search,
 )
+from syntx.landmarks.matcher import compute_tre
 from syntx.landmarks import spatial as S
 from syntx.robust_affine import robust_affine
+from syntx.deformation_metrics import compute_bidirectional_dice
 
 REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 DECATHLON_DIR = os.environ.get("DECATHLON_DIR", os.path.expanduser("~/data/decathlon"))
@@ -262,20 +264,39 @@ def run_benchmark():
 
         c_rot, d_rot = detect_sift3d(img_rot, preprocess=False, max_keypoints=300)
         m_rot = match_landmarks(c0_pts, c_rot, d0_desc, d_rot, ratio_thresh=0.85, mutual=True)
-        mf_rot, M_rot = ransac_filter(c0_pts, c_rot, m_rot, model="rigid", inlier_thresh_mm=3.0)
 
-        if len(mf_rot) >= 4:
-            R_inv = np.linalg.inv(R_known)
-            truth_pts = (R_inv @ (c0_pts[mf_rot[:, 0], :3] - ctr - t_known).T).T + ctr
-            pred_pts = (M_rot[:3, :3] @ c0_pts[mf_rot[:, 0], :3].T).T + M_rot[:3, 3]
-            tre_vals = np.linalg.norm(pred_pts - truth_pts, axis=1)
-            mean_tre = float(tre_vals.mean())
-            median_tre = float(np.median(tre_vals))
-            n_tre_inliers = len(mf_rot)
-        else:
-            mean_tre = -1.0
-            median_tre = -1.0
-            n_tre_inliers = len(mf_rot)
+        # Bug H4: Disjoint fit and hold-out sets for unbiased TRE evaluation
+        mean_tre = -1.0
+        median_tre = -1.0
+        n_tre_inliers = 0
+        if len(m_rot) >= 8:
+            m_fit = m_rot[::2]
+            m_holdout = m_rot[1::2]
+            mf_rot, M_rot = ransac_filter(c0_pts, c_rot, m_fit, model="rigid", inlier_thresh_mm=3.0)
+            if len(mf_rot) >= 4 and len(m_holdout) > 0:
+                R_inv = np.linalg.inv(R_known)
+                pts_holdout_f0 = c0_pts[m_holdout[:, 0], :3]
+                truth_holdout = (R_inv @ (pts_holdout_f0 - ctr - t_known).T).T + ctr
+                pred_holdout = (M_rot[:3, :3] @ pts_holdout_f0.T).T + M_rot[:3, 3]
+                mean_tre = compute_tre(truth_holdout, pred_holdout)
+                tre_vals = np.linalg.norm(pred_holdout - truth_holdout, axis=1)
+                median_tre = float(np.median(tre_vals))
+                n_tre_inliers = len(m_holdout)
+        elif len(m_rot) >= 4:
+            mf_rot, M_rot = ransac_filter(c0_pts, c_rot, m_rot, model="rigid", inlier_thresh_mm=3.0)
+            if len(mf_rot) >= 4:
+                # Fallback hold-out: sample independent foreground keypoints not in inliers
+                R_inv = np.linalg.inv(R_known)
+                used_idx = set(mf_rot[:, 0])
+                holdout_idx = [i for i in range(len(c0_pts)) if i not in used_idx]
+                if holdout_idx:
+                    pts_holdout_f0 = c0_pts[holdout_idx, :3]
+                    truth_holdout = (R_inv @ (pts_holdout_f0 - ctr - t_known).T).T + ctr
+                    pred_holdout = (M_rot[:3, :3] @ pts_holdout_f0.T).T + M_rot[:3, 3]
+                    mean_tre = compute_tre(truth_holdout, pred_holdout)
+                    tre_vals = np.linalg.norm(pred_holdout - truth_holdout, axis=1)
+                    median_tre = float(np.median(tre_vals))
+                    n_tre_inliers = len(holdout_idx)
 
         # 8. Inter-Subject Pairwise Matching & Alignment
         m_pair = match_landmarks(c0_pts, c1_pts, d0_desc, d1_desc, ratio_thresh=0.90, mutual=True)
@@ -295,10 +316,17 @@ def run_benchmark():
                 lbl0 = ants.image_read(l0_path)
                 lbl1 = ants.image_read(l1_path)
 
-                # Initial overlap
-                lbl1_init = ants.apply_transforms(fixed=lbl0, moving=lbl1, transformlist=[], interpolator="nearestNeighbor")
-                df_init = ants.label_overlap_measures(lbl0, lbl1_init)
-                dice_init = float(df_init.loc[df_init["Label"] == "All", "MeanOverlap"].iloc[0])
+                # Bug H5: Combine parenchyma labels for Liver and Pancreas to avoid cancer carve-out penalties
+                if task_name in ("Task03_Liver", "Task07_Pancreas"):
+                    lbl0 = ants.from_numpy(((lbl0.numpy() == 1) | (lbl0.numpy() == 2)).astype(np.float32), origin=lbl0.origin, spacing=lbl0.spacing, direction=lbl0.direction)
+                    lbl1 = ants.from_numpy(((lbl1.numpy() == 1) | (lbl1.numpy() == 2)).astype(np.float32), origin=lbl1.origin, spacing=lbl1.spacing, direction=lbl1.direction)
+                elif task_name == "Task05_Prostate":
+                    # Whole gland combination (PZ + TZ)
+                    lbl0 = ants.from_numpy(((lbl0.numpy() == 1) | (lbl0.numpy() == 2)).astype(np.float32), origin=lbl0.origin, spacing=lbl0.spacing, direction=lbl0.direction)
+                    lbl1 = ants.from_numpy(((lbl1.numpy() == 1) | (lbl1.numpy() == 2)).astype(np.float32), origin=lbl1.origin, spacing=lbl1.spacing, direction=lbl1.direction)
+
+                # Bug H1: Initial bidirectional overlap with compute_bidirectional_dice
+                _, _, dice_init = compute_bidirectional_dice(lbl0, lbl1, pre0, pre1, [], [], [])
 
                 if len(mf_pair) >= 4:
                     with tempfile.NamedTemporaryFile(suffix=".mat") as tmp_mat:
@@ -306,24 +334,30 @@ def run_benchmark():
                         tx_pair.set_parameters(np.concatenate([M_pair[:3, :3].ravel(), M_pair[:3, 3]]))
                         ants.write_transform(tx_pair, tmp_mat.name)
 
-                        warped_lbl = ants.apply_transforms(
-                            fixed=lbl0, moving=lbl1, transformlist=[tmp_mat.name],
-                            whichtoinvert=[False], interpolator="nearestNeighbor"
+                        # Bug H1: whichtoinvert_inv=[True] for affine inverse transform in compute_bidirectional_dice
+                        _, _, dice_aligned = compute_bidirectional_dice(
+                            lbl0, lbl1, pre0, pre1,
+                            [tmp_mat.name], [tmp_mat.name],
+                            whichtoinvert_inv=[True]
                         )
-                        df_aligned = ants.label_overlap_measures(lbl0, warped_lbl)
-                        dice_aligned = float(df_aligned.loc[df_aligned["Label"] == "All", "MeanOverlap"].iloc[0])
                         delta_dice = dice_aligned - dice_init
 
                         # For organ tasks, benchmark robust_affine and landmark-seeded robust_affine
                         if task_name in ORGAN_TASKS:
                             try:
                                 res_def = robust_affine(pre0, pre1, mode="auto", verbose=False)
-                                l1_def = ants.apply_transforms(fixed=lbl0, moving=lbl1, transformlist=res_def["fwdtransforms"], whichtoinvert=[False], interpolator="nearestNeighbor")
-                                dice_robust_affine = float(ants.label_overlap_measures(lbl0, l1_def).loc[lambda df: df["Label"] == "All", "MeanOverlap"].iloc[0])
+                                _, _, dice_robust_affine = compute_bidirectional_dice(
+                                    lbl0, lbl1, pre0, pre1,
+                                    res_def["fwdtransforms"], res_def["invtransforms"],
+                                    whichtoinvert_inv=[True]
+                                )
 
                                 res_seed = robust_affine(pre0, pre1, mode="auto", initial_transform=tmp_mat.name, verbose=False)
-                                l1_seed = ants.apply_transforms(fixed=lbl0, moving=lbl1, transformlist=res_seed["fwdtransforms"], whichtoinvert=[False], interpolator="nearestNeighbor")
-                                dice_seeded_affine = float(ants.label_overlap_measures(lbl0, l1_seed).loc[lambda df: df["Label"] == "All", "MeanOverlap"].iloc[0])
+                                _, _, dice_seeded_affine = compute_bidirectional_dice(
+                                    lbl0, lbl1, pre0, pre1,
+                                    res_seed["fwdtransforms"], res_seed["invtransforms"],
+                                    whichtoinvert_inv=[True]
+                                )
                             except Exception as ex:
                                 print(f"    robust_affine comparison warning: {ex}")
             except Exception as e:

@@ -385,57 +385,86 @@ def _phase_correlation_translation_candidates(
     dev = torch.device('cpu')  # one-time, small-tensor cost -- CPU avoids MPS per-call
     # overhead documented elsewhere in this codebase as dominant at this problem size.
 
-    from .transforms import resample_image_to_target as _resample_image_to_target
-    moving_native = moving
-    fixed_aniso = _spacing_ratio(fixed.spacing) > ANISOTROPY_RESAMPLE_RATIO
-    if not fixed_aniso and (moving.shape != fixed.shape or tuple(moving.spacing) != tuple(fixed.spacing)):
-        moving = _resample_image_to_target(moving, fixed, interp_type=0)   # linear (1 was nearest-neighbour: aliased the pooled image)
+    from syntx.core.utils import normalize_image
+    from .pyramid import warp_to_moving_norm
+    fn = normalize_image(fixed, method='auto', force=True)
+    mn = normalize_image(moving, method='auto', force=True)
+    fov_f = np.asarray(compute_fov_center(fn), dtype=np.float64)
+    fov_m = np.asarray(compute_fov_center(mn), dtype=np.float64)
+    t_fov = fov_m - fov_f
 
-    fixed_t = image_to_tensor(fixed, device=dev, to_zyx=True)[0, 0]
-    shape = fixed_t.shape
-    if fixed_aniso:
-        ext_mm = [n * float(sp_) for n, sp_ in zip(fixed.shape, fixed.spacing)]
-        tgt_mm = max(min(float(x) for x in fixed.spacing), max(ext_mm) / target_size)
-        n_out = [max(1, int(round(e / tgt_mm))) for e in ext_mm]
-        _lvl_f = build_pyramid(fixed_t.unsqueeze(0).unsqueeze(0), fixed.spacing, [tgt_mm / min(float(x) for x in fixed.spacing)],
-                               policy='mm_iso', centre_to_centre=False, n_out_xyz=n_out)[0]
-        fixed_pool, f_xyz = _lvl_f.tensor, list(_lvl_f.f)
-        fine = max(min(float(x) for x in moving_native.spacing), min(ext_mm) / 64.0)
-        n_fine = [max(1, int(round(e / fine))) for e in ext_mm]
-        sp_fine = tuple(e / n for e, n in zip(ext_mm, n_fine))
-        dirm = np.array(fixed.direction, dtype=np.float64)
-        org_fine = np.array(fixed.origin, dtype=np.float64) + dirm @ np.array(
-            [(sf - sx) / 2.0 for sf, sx in zip(sp_fine, fixed.spacing)])
-        tpl = ants.make_image(tuple(n_fine), spacing=sp_fine, origin=tuple(org_fine), direction=fixed.direction)
-        mov_fine = _resample_image_to_target(moving_native, tpl, interp_type=0)
-        mov_t = image_to_tensor(mov_fine, device=dev, to_zyx=True)
-        moving_pool = build_pyramid(mov_t, sp_fine, [tgt_mm / min(float(x) for x in fixed.spacing)], policy='mm_iso',
-                                    reference_spacing=fixed.spacing, centre_to_centre=False, n_out_xyz=n_out)[0].tensor
-        fixed_pool, moving_pool = fixed_pool[0, 0], moving_pool[0, 0]
-        level_xyz = np.array(f_xyz, dtype=np.float64)
-    else:
-        moving_t = image_to_tensor(moving, device=dev, to_zyx=True)[0, 0]
-        level = max(1, int(round(max(shape) / target_size)))
-        # central pyramid (preset mm_iso: area average by the level); the per-axis factor actually used is returned, so a short axis that
-        # cannot be pooled by `level` is reported as such instead of making the voxel-to-mm conversion wrong
-        lv_f = build_pyramid(fixed_t.unsqueeze(0).unsqueeze(0), fixed.spacing, [level], policy='mm_iso')[0]
-        lv_m = build_pyramid(moving_t.unsqueeze(0).unsqueeze(0), fixed.spacing, [level], policy='mm_iso')[0]
-        fixed_pool, moving_pool = lv_f.tensor[0, 0], lv_m.tensor[0, 0]
-        level_xyz = np.array(lv_f.f, dtype=np.float64)
-    shape_p = fixed_pool.shape
+    ext_f = np.asarray(fn.shape, dtype=np.float64) * np.asarray(fn.spacing, dtype=np.float64)
+    ext_m = np.asarray(mn.shape, dtype=np.float64) * np.asarray(mn.spacing, dtype=np.float64)
+    # Union physical box + 25% zero-pad margin eliminates truncation on slab-vs-torso pairs and circular FFT wrap-around
+    ext_union = np.maximum(ext_f, ext_m) * 1.25
+    sp_min_fn = min(float(x) for x in fn.spacing)
+    sp_min_mn = min(float(x) for x in mn.spacing)
+    sp_iso = max(float(np.max(ext_union)) / float(target_size), sp_min_fn)
+    n_xyz = tuple(max(16, int(round(e / sp_iso))) for e in ext_union)
+    sp_xyz = np.array([float(e) / float(n) for e, n in zip(ext_union, n_xyz)], dtype=np.float64)
+    dir_f = np.asarray(fn.direction, dtype=np.float64).reshape(3, 3)
 
-    def hann(n):
-        return torch.hann_window(n, periodic=False, dtype=torch.float32)
+    # Anti-alias through the central pyramid before sampling onto the common physical-frame FFT box
+    lvl_f = build_pyramid(
+        image_to_tensor(fn, device=dev, to_zyx=True),
+        fn.spacing,
+        [max(1.0, 0.5 * sp_iso / max(sp_min_fn, 1e-6))],
+        policy='mm_iso',
+        origin=fn.origin,
+        direction=fn.direction,
+    )[0]
+    lvl_m = build_pyramid(
+        image_to_tensor(mn, device=dev, to_zyx=True),
+        mn.spacing,
+        [max(1.0, 0.5 * sp_iso / max(sp_min_mn, 1e-6))],
+        policy='mm_iso',
+        origin=mn.origin,
+        direction=mn.direction,
+    )[0]
 
-    win = hann(shape_p[0]).view(-1, 1, 1) * hann(shape_p[1]).view(1, -1, 1) * hann(shape_p[2]).view(1, 1, -1)
-    F_fixed = torch.fft.rfftn(fixed_pool * win)
-    F_moving = torch.fft.rfftn(moving_pool * win, dim=(-3, -2, -1))
+    # Taper each volume smoothly on its own native support (3D Hann window) and blend non-negative
+    # support with interior gradient magnitude so phase correlation is invariant to cross-modal
+    # contrast inversion (e.g. T1 vs T2 / inverted slab) and free of rectangular slab-edge cliffs.
+    def _hann_3d(shape_zyx, dev_):
+        ws = [torch.hann_window(n, periodic=False, dtype=torch.float32, device=dev_) if n > 2
+              else torch.ones(n, dtype=torch.float32, device=dev_) for n in shape_zyx]
+        return (ws[0].view(-1, 1, 1) * ws[1].view(1, -1, 1) * ws[2].view(1, 1, -1)).unsqueeze(0).unsqueeze(0)
+
+    def _modality_invariant_feature(lvl_obj):
+        u = lvl_obj.tensor
+        gz = F.pad(u[:, :, 1:, :, :] - u[:, :, :-1, :, :], (0, 0, 0, 0, 0, 1))
+        gy = F.pad(u[:, :, :, 1:, :] - u[:, :, :, :-1, :], (0, 0, 0, 1, 0, 0))
+        gx = F.pad(u[:, :, :, :, 1:] - u[:, :, :, :, :-1], (0, 1, 0, 0, 0, 0))
+        gmag = torch.sqrt(gz * gz + gy * gy + gx * gx + 1e-12)
+        gmax = float(gmag.max().item())
+        if gmax > 1e-6:
+            gmag = gmag / gmax
+        feat = 0.35 * u + 0.65 * gmag
+        return feat * _hann_3d(u.shape[2:], dev)
+
+    t_f_tap = _modality_invariant_feature(lvl_f)
+    t_m_tap = _modality_invariant_feature(lvl_m)
+
+    axes_zyx = [torch.arange(n, dtype=torch.float32, device=dev) - 0.5 * (n - 1.0) for n in reversed(n_xyz)]
+    mesh_zyx = torch.meshgrid(*axes_zyx, indexing='ij')
+    rel_xyz = torch.stack(list(reversed(mesh_zyx)), dim=-1) * torch.tensor(sp_xyz, dtype=torch.float32, device=dev)
+    offsets_phys = rel_xyz @ torch.tensor(dir_f, dtype=torch.float32, device=dev).t()
+
+    pts_f = offsets_phys + torch.tensor(fov_f, dtype=torch.float32, device=dev)
+    pts_m = offsets_phys + torch.tensor(fov_m, dtype=torch.float32, device=dev)
+    grid_f = warp_to_moving_norm(pts_f, lvl_f).unsqueeze(0)
+    grid_m = warp_to_moving_norm(pts_m, lvl_m).unsqueeze(0)
+    ft_c = F.grid_sample(t_f_tap, grid_f, mode='bilinear', padding_mode='zeros', align_corners=True)[0, 0]
+    mt_c = F.grid_sample(t_m_tap, grid_m, mode='bilinear', padding_mode='zeros', align_corners=True)[0, 0]
+
+    shape_p = ft_c.shape
+    F_fixed = torch.fft.rfftn(ft_c)
+    F_moving = torch.fft.rfftn(mt_c, dim=(-3, -2, -1))
     Rspec = F_fixed * torch.conj(F_moving)
-    Rspec = Rspec / (Rspec.abs() + 1e-8)
+    # SCOT / generalized phase correlation (alpha=0.5) suppresses slab cutoff ringing while sharpening organ peaks
+    Rspec = Rspec / (Rspec.abs().pow(0.5) + 1e-6)
     r = torch.fft.irfftn(Rspec, s=shape_p, dim=(-3, -2, -1))
 
-    sp = np.array(fixed.spacing, dtype=np.float64)
-    orig_direction = np.array(fixed.direction, dtype=np.float64)
     min_sep = 2
     work = r.clone()
     out = []
@@ -451,9 +480,9 @@ def _phase_correlation_translation_candidates(
             return v - size if v > size / 2 else v
 
         vox_shift_xyz = np.array([unwrap(px, shape_p[2]), unwrap(py, shape_p[1]),
-                                   unwrap(pz, shape_p[0])], dtype=np.float64) * level_xyz
-        phys_shift = orig_direction @ (vox_shift_xyz * sp)
-        out.append(-phys_shift)  # phase correlation gives moving->fixed; candidates need fixed->moving
+                                   unwrap(pz, shape_p[0])], dtype=np.float64)
+        phys_shift = dir_f @ (vox_shift_xyz * sp_xyz)
+        out.append(t_fov - phys_shift)  # centered around fov_m - fov_f; candidates map fixed -> moving
         z0, z1 = max(0, pz - min_sep), min(shape_p[0], pz + min_sep + 1)
         y0, y1 = max(0, py - min_sep), min(shape_p[1], py + min_sep + 1)
         x0, x1 = max(0, px - min_sep), min(shape_p[2], px + min_sep + 1)
@@ -649,47 +678,46 @@ def _default_affine_schedule(dim: int, preset: str = 'default', dof: str = 'affi
         if dof == 'rigid':
             if preset == 'accurate':
                 return [
-                    dict(level=4, iters=50, dof='rigid',  step=(0.02, 0.24, 0.0, 0.0),         eta_frac=0.05, select=False, full_grid=True, sampling=1.0),
-                    dict(level=2, iters=100, dof='rigid', step=(0.0075, 0.15, 0.0675, 0.045), eta_frac=0.067, select=True,  full_grid=True, sampling=0.5),
-                    dict(level=1, iters=40, dof='rigid',  step=(0.0025, 0.06, 0.0225, 0.0225),  optimizer='lbfgs', select=False, sampling=0.10),
+                    dict(level=4, iters=50, dof='rigid',  step=(0.50, 0.24, 0.0, 0.0),       eta_frac=0.05,  select=False, full_grid=True, sampling=1.0),
+                    dict(level=2, iters=100, dof='rigid', step=(0.15, 0.15, 0.0675, 0.045),  eta_frac=0.067, select=True,  full_grid=True, sampling=0.5),
+                    dict(level=1, iters=40, dof='rigid',  step=(0.02, 0.06, 0.0225, 0.0225), optimizer='lbfgs', select=False, sampling=0.10),
                 ]
             if preset == 'fast':
                 return [
-                    dict(level=4, iters=50, dof='rigid',  step=(0.02, 0.24, 0.0, 0.0),         eta_frac=0.05, select=False, sampling=0.50),
-                    dict(level=2, iters=50, dof='rigid',  step=(0.0075, 0.15, 0.0675, 0.045),  eta_frac=0.067, select=True,  sampling=0.05),
-                    dict(level=1, iters=30, dof='rigid',  step=(0.0025, 0.06, 0.0225, 0.0225),  eta_frac=0.02,  select=False, sampling=0.01),
+                    dict(level=4, iters=50, dof='rigid',  step=(0.50, 0.24, 0.0, 0.0),       eta_frac=0.05,  select=False, sampling=0.50),
+                    dict(level=2, iters=50, dof='rigid',  step=(0.15, 0.15, 0.0675, 0.045),  eta_frac=0.067, select=True,  sampling=0.05),
+                    dict(level=1, iters=30, dof='rigid',  step=(0.02, 0.06, 0.0225, 0.0225), eta_frac=0.02,  select=False, sampling=0.01),
                 ]
             return [
-                dict(level=4, iters=50, dof='rigid',  step=(0.02, 0.24, 0.0, 0.0),         eta_frac=0.05, select=False, sampling=1.0),
-                dict(level=2, iters=100, dof='rigid', step=(0.0075, 0.15, 0.0675, 0.045), eta_frac=0.067, select=True,  sampling=0.10),
-                dict(level=1, iters=40, dof='rigid',  step=(0.0025, 0.06, 0.0225, 0.0225),  optimizer='lbfgs', select=False, sampling=0.10),
+                dict(level=4, iters=50, dof='rigid',  step=(0.50, 0.24, 0.0, 0.0),       eta_frac=0.05,  select=False, sampling=1.0),
+                dict(level=2, iters=100, dof='rigid', step=(0.15, 0.15, 0.0675, 0.045),  eta_frac=0.067, select=True,  sampling=0.10),
+                dict(level=1, iters=40, dof='rigid',  step=(0.02, 0.06, 0.0225, 0.0225), optimizer='lbfgs', select=False, sampling=0.10),
             ]
         if preset == 'accurate':
             return [
-                dict(level=4, iters=50,  dof='rigid',  step=(0.04, 0.375, 0.0, 0.0),     eta_frac=0.05,  select=False, full_grid=True, sampling=1.0),
-                dict(level=3, iters=100, dof='affine', step=(0.015, 0.235, 0.10, 0.066), eta_frac=0.067, select=True,  full_grid=True, sampling=1.0),
-                dict(level=2, iters=100, dof='affine', step=(0.015, 0.235, 0.10, 0.066), eta_frac=0.067, select=False, full_grid=True, sampling=0.50),
-                dict(level=1, iters=40,  dof='affine', step=(0.005, 0.094, 0.033, 0.033), eta_frac=0.02, select=False, full_grid=True, sampling=0.10),
+                dict(level=8, iters=50,  dof='rigid',  step=(1.20, 0.375, 0.0, 0.0),    eta_frac=0.05,  select=False, full_grid=True, sampling=1.0),
+                dict(level=4, iters=50,  dof='rigid',  step=(0.50, 0.375, 0.0, 0.0),    eta_frac=0.05,  select=False, full_grid=True, sampling=1.0),
+                dict(level=3, iters=100, dof='affine', step=(0.45, 0.320, 0.28, 0.200), eta_frac=0.067, select=True,  full_grid=True, sampling=1.0),
+                dict(level=2, iters=100, dof='affine', step=(0.15, 0.180, 0.10, 0.080), eta_frac=0.067, select=False, full_grid=True, sampling=0.50),
+                dict(level=1, iters=40,  dof='affine', step=(0.02, 0.060, 0.030, 0.030), eta_frac=0.02, select=False, full_grid=True, sampling=0.10),
             ]
         if preset == 'fast':
             return [
-                dict(level=4, iters=50, dof='rigid',  step=(0.04, 0.375, 0.0, 0.0),     eta_frac=0.05,  select=True,  full_grid=True, sampling=0.50),
-                dict(level=2, iters=50, dof='affine', step=(0.015, 0.235, 0.10, 0.066), eta_frac=0.067, select=False, full_grid=True, sampling=0.05),
-                dict(level=1, iters=30, dof='affine', step=(0.005, 0.094, 0.033, 0.033), eta_frac=0.02, select=False, full_grid=True, sampling=0.01),
+                dict(level=8, iters=40, dof='rigid',  step=(1.20, 0.375, 0.0, 0.0),    eta_frac=0.05,  select=False, full_grid=True, sampling=0.50),
+                dict(level=4, iters=50, dof='rigid',  step=(0.50, 0.375, 0.0, 0.0),    eta_frac=0.05,  select=True,  full_grid=True, sampling=0.50),
+                dict(level=2, iters=60, dof='affine', step=(0.25, 0.220, 0.20, 0.150), eta_frac=0.067, select=False, full_grid=True, sampling=0.05),
+                dict(level=1, iters=30, dof='affine', step=(0.02, 0.060, 0.030, 0.030), eta_frac=0.02, select=False, full_grid=True, sampling=0.01),
             ]
-        # Default 3-D 12-DOF affine schedule (C3): 4-level strided full-grid pyramid (L4 -> L3 -> L2 -> L1)
-        # with foreground-calibrated physical parameter scales (core.parameter_scales).
-        # Selecting the winning multi-start path at L4 (select=True) avoids running multiple paths through
-        # dense L3 (~6.2 s saved), while retaining dense L3 for the winning path separates global 12-DOF
-        # scale/shear from translation/rotation before fine cortical detail enters at L2/L1.
-        # Deterministic strided voxel-centre subsampling (full_grid=True) at L2 (10%) and L1 (2%) avoids both
-        # the 12-DOF L-BFGS line-search stall and sub-voxel random jitter noise, beating ANTs C++ on 8/10
-        # Mindboggle pairs (0.3524 vs 0.3503, 2026-10-21).
+        # Default 3-D 12-DOF affine schedule: coarse-to-fine strided full-grid pyramid (L8 -> L4 -> L3 -> L2 -> L1)
+        # with foreground-calibrated physical parameter scales (core.parameter_scales) and stage-voxel-proportional
+        # step sizes so large partial-FOV / body translations (20-80 mm) and inter-subject organ/torso scale differences
+        # (10-25%) converge cleanly while preserving sub-tenth-millimetre final polish at L1.
         return [
-            dict(level=4, iters=50,  dof='rigid',  lr=(0.04, 0.008, 0.0, 0.0),      eta_min=0.002, select=True,  full_grid=True, sampling=1.0),
-            dict(level=3, iters=100, dof='affine', lr=(0.015, 0.005, 0.003, 0.002), eta_min=0.001, select=False, full_grid=True, sampling=1.0),
-            dict(level=2, iters=50,  dof='affine', lr=(0.015, 0.005, 0.003, 0.002), eta_min=0.001, select=False, full_grid=True, sampling=0.10),
-            dict(level=1, iters=30,  dof='affine', lr=(0.005, 0.002, 0.001, 0.001), eta_min=1e-4,  select=False, full_grid=True, sampling=0.02),
+            dict(level=8, iters=50,  dof='rigid',  step=(1.20, 0.35, 0.0, 0.0),     eta_frac=0.05,  select=False, full_grid=True, sampling=1.0),
+            dict(level=4, iters=50,  dof='rigid',  step=(0.50, 0.30, 0.0, 0.0),     eta_frac=0.05,  select=True,  full_grid=True, sampling=1.0),
+            dict(level=3, iters=100, dof='affine', step=(0.45, 0.32, 0.28, 0.200),  eta_frac=0.067, select=False, full_grid=True, sampling=1.0),
+            dict(level=2, iters=60,  dof='affine', step=(0.15, 0.18, 0.10, 0.080),  eta_frac=0.067, select=False, full_grid=True, sampling=0.10),
+            dict(level=1, iters=30,  dof='affine', step=(0.02, 0.06, 0.03, 0.030),  eta_frac=0.02,  select=False, full_grid=True, sampling=0.02),
         ]
     return [
         # 2-D keeps the validated absolute learning rates and fixed Adam blocks (scattered SyN, dewarp, 2-D benchmarks were tuned on them)
@@ -781,22 +809,25 @@ def _build_schedule_from_levels(
                 sampling = 0.02
 
         if stage_dof == 'rigid':
-            lr = (0.04, 0.008, 0.0, 0.0)
-            eta_min = 0.002
+            step = (0.15 * float(max(lvl, 1)), 0.30, 0.0, 0.0)
+            eta_frac = 0.05
         else:
-            if lvl >= 2:
-                lr = (0.015, 0.005, 0.003, 0.002)
-                eta_min = 0.001
+            if lvl >= 3:
+                step = (0.20, 0.22, 0.10, 0.07)
+                eta_frac = 0.067
+            elif lvl >= 2:
+                step = (0.08, 0.15, 0.07, 0.05)
+                eta_frac = 0.067
             else:
-                lr = (0.005, 0.002, 0.001, 0.001)
-                eta_min = 1e-4
+                step = (0.02, 0.06, 0.03, 0.03)
+                eta_frac = 0.02
 
         stage = dict(
             level=lvl,
             iters=int(iters),
             dof=stage_dof,
-            lr=lr,
-            eta_min=eta_min,
+            step=step,
+            eta_frac=eta_frac,
             select=select,
             sampling=sampling,
         )
@@ -1191,7 +1222,25 @@ def _run_pytorch_affine_solver(fixed: ants.ANTsImage, moving: ants.ANTsImage, in
     if _clamp_rule == 'none':
         max_level = max(int(s_['level']) for s_ in schedule)
     if any(int(s_['level']) > max_level for s_ in schedule):
-        schedule = [dict(s_, level=min(int(s_['level']), max_level)) for s_ in schedule]
+        clamped = []
+        for s_ in schedule:
+            orig_lvl = max(1, int(s_['level']))
+            new_lvl = min(orig_lvl, max_level)
+            ns_ = dict(s_, level=new_lvl)
+            if new_lvl < orig_lvl and ns_.get('step') is not None:
+                st = list(ns_['step'])
+                st[0] = float(st[0]) * (float(new_lvl) / float(orig_lvl))
+                ns_['step'] = tuple(st)
+            clamped.append(ns_)
+        dedup = []
+        for s_ in clamped:
+            if dedup and int(dedup[-1]['level']) == int(s_['level']) and dedup[-1].get('dof') == s_.get('dof'):
+                merged = dict(s_)
+                merged['select'] = bool(dedup[-1].get('select', False) or s_.get('select', False))
+                dedup[-1] = merged
+            else:
+                dedup.append(s_)
+        schedule = dedup
     if sampling_percentage is None and n_sample_points is None:
         if preset == 'fast':
             sampling_percentage = 0.01
@@ -1214,6 +1263,12 @@ def _run_pytorch_affine_solver(fixed: ants.ANTsImage, moving: ants.ANTsImage, in
     com_f = np.asarray(com_f_pos if com_f_pos is not None else (com_f_neg if com_f_neg is not None else compute_center_of_mass(fixed_norm, weighted=False)), dtype=np.float64)
     com_m = np.asarray(com_m_pos if com_m_pos is not None else (com_m_neg if com_m_neg is not None else compute_center_of_mass(moving_norm, weighted=False)), dtype=np.float64)
     t_init = com_m - com_f
+    fov_f = np.asarray(compute_fov_center(fixed_norm), dtype=np.float64)
+    fov_m = np.asarray(compute_fov_center(moving_norm), dtype=np.float64)
+    t_fov = fov_m - fov_f
+    ext_f_world = np.abs(np.asarray(fixed.direction, dtype=np.float64).reshape(dim, dim)) @ (np.asarray(fixed.shape[:dim], dtype=np.float64) * np.asarray(fixed.spacing[:dim], dtype=np.float64))
+    ext_m_world = np.abs(np.asarray(moving.direction, dtype=np.float64).reshape(dim, dim)) @ (np.asarray(moving.shape[:dim], dtype=np.float64) * np.asarray(moving.spacing[:dim], dtype=np.float64))
+    expected_ov = float(np.clip(np.prod(np.minimum(1.0, ext_m_world / np.maximum(ext_f_world, 1e-3))), 0.05, 1.0))
     fi_arr = image_to_tensor(fixed_norm, device=device_obj, to_zyx=True)
     mi_arr = image_to_tensor(moving_norm, device=device_obj, to_zyx=True)
 
@@ -1349,10 +1404,16 @@ def _run_pytorch_affine_solver(fixed: ants.ANTsImage, moving: ants.ANTsImage, in
                 entry['points'] = dict(phys=entry['points_jit']['phys'][pos], fvals=entry['points_jit']['fvals'][pos])
         pyr[level] = entry
 
-    # Gate default Tikhonov scale/shear shrinkage by anisotropy so isotropic 3-D inter-subject brain scaling (5-12%)
-    # is not penalised unless the caller explicitly passes non-default regularization weights.
-    eff_lambda_shear = float(lambda_shear) if (aniso_f or aniso_m or lambda_shear != 0.02) else 0.0
-    eff_lambda_scale = float(lambda_scale) if (aniso_f or aniso_m or lambda_scale != 0.01) else 0.0
+    # Gate default Tikhonov scale/shear shrinkage to genuinely thin anisotropic slabs (<90 mm or <24 slices)
+    # so full-FOV inter-subject brain and body scaling (5-20%) is not penalised unless explicitly requested.
+    is_thin_slab = dim == 3 and (
+        min(float(n) * float(s) for n, s in zip(fixed.shape[:dim], fixed.spacing[:dim])) < 90.0
+        or min(float(n) * float(s) for n, s in zip(moving.shape[:dim], moving.spacing[:dim])) < 90.0
+        or min(int(n) for n in fixed.shape[:dim]) < 24
+        or min(int(n) for n in moving.shape[:dim]) < 24
+    )
+    eff_lambda_shear = float(lambda_shear) if (((aniso_f or aniso_m) and is_thin_slab) or lambda_shear != 0.02) else 0.0
+    eff_lambda_scale = float(lambda_scale) if (((aniso_f or aniso_m) and is_thin_slab) or lambda_scale != 0.01) else 0.0
 
     def objective(path: '_AffinePath', dof: str, level: int, full: bool = False, sampling: float = None):
         e = pyr[level]
@@ -1382,6 +1443,12 @@ def _run_pytorch_affine_solver(fixed: ants.ANTsImage, moving: ants.ANTsImage, in
             loss = loss + fg_dice_weight * soft_dice_loss_nd(fm, wm)
         if eff_lambda_shear > 0 or eff_lambda_scale > 0:
             loss = loss + path.regularization_loss(dof, lambda_shear=eff_lambda_shear, lambda_scale=eff_lambda_scale)
+        # Guard against slab-amputation poses where >45% of expected fixed-in-moving overlap falls outside the acquired volume
+        max_abs_y = y.abs().amax(dim=-1)
+        smooth_in = torch.sigmoid(20.0 * (1.02 - max_abs_y)).mean()
+        ov_deficit = F.relu(0.55 * expected_ov - smooth_in)
+        if float(ov_deficit.detach().item()) > 0.0:
+            loss = loss + 1.5 * ov_deficit + 0.05 * F.relu(max_abs_y - 1.0).mean()
         return loss
 
     # 3. candidate starts, scored at the coarsest level -------------------------------------
@@ -1393,30 +1460,17 @@ def _run_pytorch_affine_solver(fixed: ants.ANTsImage, moving: ants.ANTsImage, in
             # re-centre: y = A0 (x - c0) + c0 + t0  ==  A0 (x - C) + C + t  with t = A0 (C - c0) + c0 + t0 - C
             cands.append(('Provided_Initial_Transform', A0, A0 @ (com_f - c0) + c0 + t0_ - com_f))
 
-    # Phase-correlation translation candidates: a second, INDEPENDENT estimator alongside
-    # CoM (see _phase_correlation_translation_candidates's docstring for why -- CoM is
-    # outlier-sensitive to bias fields/asymmetric content in a way phase correlation isn't,
-    # and the two failure modes are unrelated, so this is complementary, not redundant).
-    # topk=2 (not the default 3) and reusing the SAME cone_angles_deg sweep as CoM below,
-    # rather than a separate search, to keep the added candidate-pool cost modest -- this
-    # already-validated coarse-level scoring step evaluates every candidate before
-    # clustering down to n_starts, so candidate count directly drives cost.
     t_phase_corr = []
     if multi_start and dim == 3:
         try:
-            t_phase_corr = _phase_correlation_translation_candidates(fixed, moving, topk=2)
+            t_phase_corr = _phase_correlation_translation_candidates(fixed, moving, topk=3)
         except Exception as e:
             logger.warning("robust_affine: phase-correlation candidate generation failed (%s); "
                             "continuing with CoM candidates only", e)
 
-    # Translation scan (anisotropic fixed image): the capture range of the metric in every translation axis is about one coarse voxel
-    # (measured, docs/PYRAMID.md Section 13), so a start whose translation is several coarse voxels off (CoM or a phase-correlation
-    # peak on a thin slab) never reaches the right basin. Score a lattice of translations (step = one coarse voxel, +-translation_scan_steps
-    # steps along the fixed image's own axes) around every translation base with the identity rotation at the coarse level, and
-    # add the best well-separated lattice points as further bases of the rotation-cone sweep.
+    coarse_mm = float(levels[0]) * sp_min_f
     scan_bases = []
     if translation_scan_steps > 0 and multi_start and dim == 3 and aniso_f:
-        coarse_mm = float(levels[0]) * sp_min_f
         Dm = np.asarray(fixed.direction, dtype=np.float64).reshape(3, 3)
         rng_k = range(-translation_scan_steps, translation_scan_steps + 1)
         lattice = [Dm @ (coarse_mm * np.array([i, j, k], dtype=np.float64)) for i in rng_k for j in rng_k for k in rng_k]
@@ -1436,6 +1490,8 @@ def _run_pytorch_affine_solver(fixed: ants.ANTsImage, moving: ants.ANTsImage, in
 
     if not cands or multi_start:
         cands.append(('Identity_CoM', np.eye(dim), t_init))
+        if np.linalg.norm(t_fov - t_init) >= 1.0:
+            cands.append(('Identity_FOV', np.eye(dim), t_fov))
         # The self-check below uses plain Identity as a baseline, so it must also be a start: a pair that is already
         # aligned in physical space (shared origin, e.g. synthetic or same-scanner data) has its optimum AT identity
         # and a CoM offset is then a worse start than doing nothing. Skipped when CoM coincides with identity.
@@ -1480,7 +1536,9 @@ def _run_pytorch_affine_solver(fixed: ants.ANTsImage, moving: ants.ANTsImage, in
                     cone_angles_deg = [-180.0, -90.0, -45.0, -24.0, -18.0, -12.0, -6.0, 6.0, 12.0, 18.0, 24.0, 45.0, 90.0, 180.0]
                 else:
                     cone_angles_deg = [-24.0, -18.0, -12.0, -6.0, 6.0, 12.0, 18.0, 24.0]
-            rot_sweep_bases = ([('CoM', t_init)] + [(f'PhaseCorr{k}', t_pc) for k, t_pc in enumerate(t_phase_corr)]
+            fov_sweep = [('FOV', t_fov)] if np.linalg.norm(t_fov - t_init) >= 1.5 * coarse_mm else []
+            rot_sweep_bases = ([('CoM', t_init)] + fov_sweep
+                               + [(f'PhaseCorr{k}', t_pc) for k, t_pc in enumerate(t_phase_corr)]
                                + [(f'Scan{k}', t_sc) for k, t_sc in enumerate(scan_bases)])
             for base_name, t_base in rot_sweep_bases:
                 for deg in cone_angles_deg:
@@ -1509,18 +1567,23 @@ def _run_pytorch_affine_solver(fixed: ants.ANTsImage, moving: ants.ANTsImage, in
     domain_diam = 200.0
     if hasattr(fixed, 'spacing') and hasattr(fixed, 'shape'):
         domain_diam = float(np.linalg.norm(np.array(fixed.spacing) * np.array(fixed.shape)))
+    trans_basin_diam = min(domain_diam, max(80.0, 8.0 * coarse_mm))
 
     prov = [s for s in scored if s[1] == 'Provided_Initial_Transform']
     if prov:
         others = [s for s in scored if s[1] != 'Provided_Initial_Transform']
         clustered_others = _cluster_candidates_se3(others, n_starts - len(prov),
                                                    cluster_threshold=cluster_threshold,
-                                                   domain_diam=domain_diam)
+                                                   domain_diam=trans_basin_diam)
         keep = (prov + clustered_others)[:n_starts]
     else:
         keep = _cluster_candidates_se3(scored, n_starts,
                                        cluster_threshold=cluster_threshold,
-                                       domain_diam=domain_diam)
+                                       domain_diam=trans_basin_diam)
+        if n_starts >= 2 and not any(s[1] in ('Identity', 'Identity_CoM') or s[1].startswith('CoM_') for s in keep):
+            com_pool = [s for s in scored if s[1] in ('Identity', 'Identity_CoM') or s[1].startswith('CoM_')]
+            if com_pool:
+                keep = list(keep[:-1]) + [com_pool[0]]
 
     if verbose:
         print(f"[robust_affine mode='pytorch'] {len(cands)} start candidates scored at level {coarse}; "
@@ -1739,7 +1802,7 @@ def _run_pytorch_affine_solver(fixed: ants.ANTsImage, moving: ants.ANTsImage, in
             with torch.no_grad():
                 retry_loss = float(objective(retry, coarse_dof, coarse, full=True, sampling=1.0).item())
             if np.isfinite(retry_loss) and retry_loss < final_coarse:
-                winner, final_coarse = retry, retry_loss
+                winner, final_coarse, pre_final = retry, retry_loss, retry_pre
             if not _fails(final_coarse):
                 break
     if _fails(final_coarse) and pre_final is not None:
@@ -2098,6 +2161,12 @@ def _run_tournament_affine(
     }
 
 
+def _cap_anisotropic_working_image(image: ants.ANTsImage, max_resolution_mm: float = 1.0) -> ants.ANTsImage:
+    """Anisotropy-safe working-image capping: coarsens sub-millimeter axes to max_resolution_mm
+    while preserving native resolution on axes that are already >= max_resolution_mm (e.g. z-slices)."""
+    return cap_ants_image(image, max_resolution_mm=max_resolution_mm, policy='deformable')
+
+
 def _robust_affine_impl(
     fixed: ants.ANTsImage,
     moving: ants.ANTsImage,
@@ -2252,6 +2321,34 @@ def _robust_affine_impl(
     dim = fixed.dimension
     temp_dirs = []
 
+    fixed_native = fixed
+    moving_native = moving
+
+    from .landmarks.preprocess import is_ct_image
+    is_large_submm_ct = (
+        dim == 3
+        and (min(fixed.spacing[:3]) < 1.0 or min(moving.spacing[:3]) < 1.0)
+        and (is_ct_image(fixed) or is_ct_image(moving))
+    )
+    if is_large_submm_ct:
+        fixed = _cap_anisotropic_working_image(fixed, 1.0)
+        moving = _cap_anisotropic_working_image(moving, 1.0)
+
+    def _finalize_result(res: dict) -> dict:
+        if is_large_submm_ct and (fixed is not fixed_native or moving is not moving_native):
+            from .transforms import apply_transforms as _apply_transforms
+            warped_mov = _apply_transforms(
+                fixed=fixed_native,
+                moving=moving_native,
+                transformlist=res['fwdtransforms'],
+                interpolator='linear'
+            )
+            res['warpedmovout'] = warped_mov
+            res['warpedfixout'] = fixed_native
+        elif 'warpedfixout' not in res:
+            res['warpedfixout'] = fixed_native
+        return res
+
     if iterations is None:
         iterations = reg_iterations
     if iterations is None and 'reg_iterations' in kwargs:
@@ -2280,8 +2377,8 @@ def _robust_affine_impl(
         if levels is not None or iterations is not None or 'schedule' in kwargs:
             raise ValueError("robust_affine(setting='intermodality_slab') does not take levels / iterations / schedule")
         try:
-            return run_slab_capture(fixed, moving, initial_tx_path=initial_transform, device=device, verbose=verbose, seed=seed,
-                                    dof=dof, **kwargs)
+            return _finalize_result(run_slab_capture(fixed, moving, initial_tx_path=initial_transform, device=device, verbose=verbose, seed=seed,
+                                    dof=dof, **kwargs))
         except (RobustAffineSolverError, ValueError):
             raise
         except Exception as e:
@@ -2290,7 +2387,7 @@ def _robust_affine_impl(
 
     # 0. Mode: 'tournament' (General-purpose multi-modal / multi-candidate affine)
     if tournament or mode in ['tournament', 'auto_tournament']:
-        return _run_tournament_affine(
+        return _finalize_result(_run_tournament_affine(
             fixed, moving,
             initial_transform=initial_transform,
             device=device,
@@ -2305,7 +2402,7 @@ def _robust_affine_impl(
             levels=levels,
             iterations=iterations,
             **kwargs
-        )
+        ))
 
     # 1. Mode: 'com_only'
     if mode in ['com_only', 'translation_only']:
@@ -2314,13 +2411,13 @@ def _robust_affine_impl(
         t_com = com_m - com_f
         tx_path, temp_dir = create_translation_transform(fixed, moving, t_com)
         from .transforms import apply_transforms as _apply_transforms
-        warped_mov = _apply_transforms(fixed=fixed, moving=moving, transformlist=[tx_path])
+        warped_mov = _apply_transforms(fixed=fixed_native, moving=moving_native, transformlist=[tx_path])
         return {
             'fwdtransforms': [tx_path],
             'invtransforms': [tx_path],
             'whichtoinvert_inv': [True],
             'warpedmovout': warped_mov,
-            'warpedfixout': fixed,
+            'warpedfixout': fixed_native,
             'time': time.time() - t0,
             'solver': 'com_only',
         }
@@ -2341,15 +2438,16 @@ def _robust_affine_impl(
             elif iterations is not None:
                 base_schedule = _default_affine_schedule(dim, preset, dof=dof)
                 iters_list = [iterations] * len(base_schedule) if isinstance(iterations, (int, np.integer)) else list(iterations)
-                kwargs['schedule'] = [dict(s_, iters=int(it)) for s_, it in zip(base_schedule, iters_list)]
+                stages_used = base_schedule[-len(iters_list):] if 0 < len(iters_list) < len(base_schedule) else base_schedule
+                kwargs['schedule'] = [dict(s_, iters=int(it)) for s_, it in zip(stages_used, iters_list)]
         elif dof not in ('rigid', 'affine'):
             raise ValueError(f"dof must be 'rigid' or 'affine', got {dof!r}.")
         try:
-            return _run_pytorch_affine_solver(fixed, moving, initial_tx_path=initial_transform, device=device, verbose=verbose,
+            return _finalize_result(_run_pytorch_affine_solver(fixed, moving, initial_tx_path=initial_transform, device=device, verbose=verbose,
                                               multi_start=multi_start, n_starts=n_starts, cone_angles_deg=cone_angles_deg,
                                               seed=seed, enable_landmarks=enable_landmarks, lambda_shear=lambda_shear,
                                               lambda_scale=lambda_scale, cluster_threshold=cluster_threshold,
-                                              wide_angles=wide_angles, levels=levels, iterations=iterations, dof=dof, **kwargs)
+                                              wide_angles=wide_angles, levels=levels, iterations=iterations, dof=dof, **kwargs))
         except Exception as e:
             # No silent fallback: a solver failure is the caller's information, whatever the mode.
             # The ANTs path is reachable only by asking for it (mode='ants' / 'ants_fast').
@@ -2488,7 +2586,7 @@ def _robust_affine_impl(
         warpedmovout = reg_a['warpedmovout']
         warpedfixout = reg_a.get('warpedfixout', fixed)
 
-        return {
+        return _finalize_result({
             'fwdtransforms': fwdtransforms,
             'invtransforms': invtransforms,
             'whichtoinvert_inv': [True],
@@ -2496,7 +2594,7 @@ def _robust_affine_impl(
             'warpedfixout': warpedfixout,
             'time': time.time() - t0,
             'solver': 'ants',
-        }
+        })
     finally:
         # Clean up temporary candidate directories that are not returned in output
         for d in temp_dirs:

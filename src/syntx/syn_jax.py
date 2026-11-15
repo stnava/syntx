@@ -4280,6 +4280,49 @@ class SyNJAX:
                 spacing=fixed_spacing, origin=fixed_origin, direction=fixed_direction
             )
         
+        _use_dd = bool(kwargs.get('digital_diffeomorphism', True)) and _run_deformable_polish
+        if _use_dd:
+            from .core.digital_diffeomorphism import (
+                enforce_digital_diffeomorphism_jax,
+                pullback_digital_diffeomorphism_to_halves,
+            )
+            _dd_floor = float(kwargs.get('digital_diffeomorphism_floor', 0.05))
+            _dd_steps = int(kwargs.get('digital_diffeomorphism_steps', compose_polish_steps))
+            _dd_ice_tol = (
+                float(compose_polish_tol)
+                if compose_polish_tol is not None and float(compose_polish_tol) > 0.0
+                else 0.30
+            )
+            _stat_b = getattr(self, 'stationary_boundary', True)
+            if _stat_b:
+                b_mask_mid = get_boundary_mask_jax(self.grid_shape)
+                w_l2r = w_l2r * b_mask_mid
+                w_r2l = w_r2l * b_mask_mid
+                w_l2r_inv = w_l2r_inv * b_mask_mid
+                w_r2l_inv = w_r2l_inv * b_mask_mid
+            w_l2r, w_l2r_inv = enforce_digital_diffeomorphism_jax(
+                w_l2r,
+                w_l2r_inv,
+                spacing=fixed_spacing,
+                origin=fixed_origin,
+                direction=fixed_direction,
+                ice_tol=_dd_ice_tol,
+                jac_floor=_dd_floor,
+                steps=_dd_steps,
+                stationary_boundary=_stat_b,
+            )
+            w_r2l, w_r2l_inv = enforce_digital_diffeomorphism_jax(
+                w_r2l,
+                w_r2l_inv,
+                spacing=fixed_spacing,
+                origin=fixed_origin,
+                direction=fixed_direction,
+                ice_tol=_dd_ice_tol,
+                jac_floor=_dd_floor,
+                steps=_dd_steps,
+                stationary_boundary=_stat_b,
+            )
+
         # Preserve uncomposed half-warp fields for midpoint image export.
         # w_l2r maps midpoint→fixed, w_r2l maps midpoint→(affine)moving.
         # These are destroyed by the full composition below.
@@ -4313,19 +4356,7 @@ class SyNJAX:
                 spacing=fixed_spacing, origin=fixed_origin, direction=fixed_direction,
                 stationary_boundary=getattr(self, 'stationary_boundary', True)
             )
-        if bool(kwargs.get('digital_diffeomorphism', True)) and _run_deformable_polish:
-            from .core.digital_diffeomorphism import (
-                enforce_digital_diffeomorphism_jax,
-                pullback_digital_diffeomorphism_to_halves,
-            )
-            _dd_floor = float(kwargs.get('digital_diffeomorphism_floor', 0.05))
-            _dd_steps = int(kwargs.get('digital_diffeomorphism_steps', compose_polish_steps))
-            _dd_ice_tol = (
-                float(compose_polish_tol)
-                if compose_polish_tol is not None and float(compose_polish_tol) > 0.0
-                else 0.30
-            )
-            _stat_b = getattr(self, 'stationary_boundary', True)
+        if _use_dd:
             _fwd_pre_dd = fwd_composed_jax
             fwd_composed_jax, algebraic_inv_jax = enforce_digital_diffeomorphism_jax(
                 fwd_composed_jax,

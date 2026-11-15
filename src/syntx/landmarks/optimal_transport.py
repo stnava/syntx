@@ -80,9 +80,10 @@ def sinkhorn_matching(
         Cost of sending a point to the dustbin; pairs with a higher cost tend to be
         routed there.
     spatial_weight : float, default 0.5
-        Weight of the distance term (cost units per 100 mm). The distance is between raw
-        physical coordinates of the two images, so it favours correspondences close to the
-        identity mapping. 0 or missing coordinates disable it.
+        Weight of the distance term (cost units per 100 mm). The distance is computed
+        between demeaned (centered) physical coordinates of the two images to prevent
+        arbitrary scanner table origin offsets (such as clinical CT table z-offsets) from
+        overflowing into the dustbin. 0 or missing coordinates disable it.
     n_iters : int, default 50
         Number of Sinkhorn iterations (no convergence check).
 
@@ -105,8 +106,14 @@ def sinkhorn_matching(
     cost = 1.0 - sim
 
     # Optional physical spatial distance penalty (scaled to decimetres = 100mm)
+    # Demean coordinate sets to prevent arbitrary CT scanner z-offsets from overflowing dustbin
     if coords_src is not None and coords_dst is not None and spatial_weight > 0.0:
-        dist_spatial = torch.cdist(coords_src, coords_dst) / 100.0
+        if coords_src.shape[0] > 0 and coords_dst.shape[0] > 0:
+            c_src = coords_src.mean(dim=0, keepdim=True)
+            c_dst = coords_dst.mean(dim=0, keepdim=True)
+            dist_spatial = torch.cdist(coords_src - c_src, coords_dst - c_dst) / 100.0
+        else:
+            dist_spatial = torch.cdist(coords_src, coords_dst) / 100.0
         cost = cost + spatial_weight * dist_spatial
 
     # Augmented cost matrix with dustbin: [N+1, M+1]

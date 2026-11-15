@@ -152,8 +152,10 @@ def code_state(root: Optional[str] = None, include_diff: bool = True,
     dict
         ``syntx_version``, ``syntx_path`` and ``git`` (None when not in a git checkout). ``git``
         has ``root``, ``commit`` (full hash), ``branch``, ``describe`` (``--tags --always
-        --dirty``), ``dirty`` (tracked changes per ``git status``, or untracked ``.py`` files
-        under ``pkg_dir``), ``diff_sha256`` / ``diff_bytes`` (over ``git diff HEAD --binary``
+        --dirty``), ``dirty`` (tracked non-report changes per ``git status``, or untracked
+        ``.py`` files under ``pkg_dir``; generated report artifacts under ``docs/reports`` are
+        excluded so rendered HTML/PNG outputs do not mark code dirty or exceed the text cap),
+        ``diff_sha256`` / ``diff_bytes`` (over ``git diff HEAD --binary`` outside ``docs/reports``
         plus those untracked sources), ``untracked`` (first 500 untracked paths, whole repo),
         ``untracked_package_files``; with ``include_diff`` also ``diff`` (None when longer
         than 2,000,000 bytes), ``diff_truncated`` and ``untracked_package_sources``
@@ -171,9 +173,9 @@ def code_state(root: Optional[str] = None, include_diff: bool = True,
     if top is None:
         return state
     top = top.strip()
-    diff = _git(top, "diff", "HEAD", "--binary") or ""
+    diff = _git(top, "diff", "HEAD", "--binary", "--", ".", ":(exclude)docs/reports") or ""
     untracked = [p for p in (_git(top, "ls-files", "-z", "--others", "--exclude-standard") or "").split("\0") if p]
-    status = _git(top, "status", "--porcelain", "--untracked-files=no") or ""
+    status = _git(top, "status", "--porcelain", "--untracked-files=no", "--", ".", ":(exclude)docs/reports") or ""
     # Untracked source files inside the imported package change behaviour but are not in
     # `git diff`: they make the checkout dirty and their contents are embedded.
     pkg_rel = os.path.relpath(pkg_dir, top)

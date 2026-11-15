@@ -561,7 +561,12 @@ def build_pyramid_jax(image, spacing: Sequence[float], levels: Sequence[float], 
 
 
 # ---------------------------------------------------------------------------------------------- ANTs wrapper
-def cap_ants_image(image, max_resolution_mm: float, min_voxels_per_axis: int = MIN_VOXELS_PER_AXIS):
+def cap_ants_image(
+    image,
+    max_resolution_mm: float,
+    min_voxels_per_axis: int = MIN_VOXELS_PER_AXIS,
+    policy: Union[str, PyramidPolicy] = DEFAULT_POLICY,
+):
     """Planner implementation of ``imaging_utils.cap_resolution_for_registration`` (2-D or 3-D ANTs image, linear interpolation).
 
     The target spacing is ``min(max_resolution_mm, shortest extent / min_voxels_per_axis)`` exactly as before (so every existing
@@ -569,7 +574,9 @@ def cap_ants_image(image, max_resolution_mm: float, min_voxels_per_axis: int = M
     finest spacing (a thin slab: the shortest extent is under ``min_voxels_per_axis`` finest voxels) the old code returned the image
     untouched and the cap was silently defeated; now the cap itself (``max_resolution_mm``) is planned and the floor is applied per
     axis (``plan_resample``: an axis never drops below ``min(min_voxels_per_axis, n)`` samples, so the thin axis keeps its native
-    sampling). An image whose finest spacing already reaches the cap is returned unchanged (as before)."""
+    sampling). An image whose finest spacing already reaches the cap is returned unchanged (as before).
+    When ``policy='deformable'`` (or any policy where ``resample_finer=False``), axes already coarser than ``target`` (such as thick
+    z-slices in CT) remain untouched at native resolution."""
     import ants
     dim = image.dimension
     if dim not in (2, 3):
@@ -580,11 +587,85 @@ def cap_ants_image(image, max_resolution_mm: float, min_voxels_per_axis: int = M
     shape = tuple(int(n) for n in image.shape[:dim])
     safe = min(max_resolution_mm, min(n * s for n, s in zip(shape, spc)) / min_voxels_per_axis)
     target = safe if safe > min(spc) else float(max_resolution_mm)
-    plan = plan_resample(shape[::-1], spc, target, floor=min_voxels_per_axis)
+    pol = get_policy(policy)
+    if pol.resample_finer:
+        plan = plan_resample(shape[::-1], spc, target, floor=min_voxels_per_axis)
+    else:
+        axes = _plan_axes(shape, spc, target, floor_eff=min_voxels_per_axis, align_corners=pol.align_corners, resample_finer=pol.resample_finer)
+        if all(a[3] == 'identity' for a in axes):
+            return image
+        f_xyz = tuple(a[1] for a in axes)
+        plan = LevelPlan(
+            level=target,
+            shape_zyx=tuple(a[0] for a in axes)[::-1],
+            spacing_xyz=tuple(f * s for f, s in zip(f_xyz, spc)),
+            f_xyz=f_xyz,
+            off_xyz=tuple(a[2] for a in axes),
+            modes_xyz=tuple(a[3] for a in axes),
+            sigma_vox_zyx=(0.0,) * dim,
+            native_shape_zyx=shape[::-1],
+            native_spacing_xyz=spc,
+            is_identity=all(a[3] == 'identity' for a in axes),
+        )
     if plan.is_identity:
         return image
     perm = tuple(range(dim))[::-1]                                    # ANTs (x, y[, z]) <-> tensor (z, y, x)
     arr = torch.from_numpy(np.ascontiguousarray(image.numpy().astype(np.float32).transpose(perm)))[None, None]
     out = _apply_torch(arr, plan)[0, 0].numpy().transpose(perm)
+    new_origin = tuple(
+        float(x) for x in (
+            np.asarray(image.origin, dtype=np.float64)[:dim]
+            + np.asarray(image.direction, dtype=np.float64)[:dim, :dim]
+            @ (np.asarray(plan.off_xyz, dtype=np.float64) * np.asarray(spc, dtype=np.float64))
+        )
+    )
     return ants.from_numpy(np.ascontiguousarray(out).astype(image.numpy().dtype),
-                           origin=image.origin, spacing=plan.spacing_xyz, direction=image.direction)
+                           origin=new_origin, spacing=plan.spacing_xyz, direction=image.direction)
+
+
+def plan_scale_space_levels(
+    shape_zyx: Sequence[int],
+    spacing_xyz: Sequence[float],
+    coarse_spacing_mm: float = 4.0,
+    min_levels: int = 3,
+    max_level: int = 16,
+) -> List[int]:
+    """Plan dyadic deformable shrink factors from physical millimeter scale-space resolution.
+
+    Chooses coarsest factor ``L_max = 2^k`` (at least ``2^(min_levels - 1)``, at most ``max_level``)
+    so that the coarsest isotropic target spacing ``L_max * min(spacing_xyz)`` reaches
+    ``coarse_spacing_mm`` while at least two spatial axes still coarsen above ``MIN_VOXELS_PER_AXIS``.
+    """
+    n_zyx = tuple(int(x) for x in shape_zyx)
+    sp = tuple(float(x) for x in spacing_xyz)
+    dim = len(n_zyx)
+    if dim not in (2, 3) or len(sp) != dim:
+        raise PyramidLevelError(f"expected 2 or 3 spatial axes and matching spacing, got shape {n_zyx} spacing {sp}")
+    s_min = min(sp)
+    if not (s_min > 0.0 and math.isfinite(s_min)):
+        raise PyramidLevelError(f"spacing must be finite and > 0, got {sp}")
+    k_min = max(0, int(min_levels) - 1)
+    L = 1 << k_min
+    while L < int(max_level) and (L * s_min) < float(coarse_spacing_mm) - 1e-6:
+        sh_curr = plan_levels(n_zyx, sp, [L], policy='deformable')[0].shape_zyx
+        sh_next = plan_levels(n_zyx, sp, [2 * L], policy='deformable')[0].shape_zyx
+        if sum(1 for a, b in zip(sh_curr, sh_next) if b < a) < 2:
+            break
+        L *= 2
+    k_max = int(round(math.log2(L)))
+    return [1 << k for k in range(k_max, -1, -1)]
+
+
+def scale_space_iterations(
+    levels: Sequence[float],
+    base_iterations: Sequence[int] = (100, 100, 20),
+) -> List[int]:
+    """Canonical iteration schedule matched to ``plan_scale_space_levels``."""
+    n = len(levels)
+    base = [int(x) for x in base_iterations]
+    if n == len(base):
+        return base
+    if n < len(base):
+        return base[-n:]
+    # Extra coarse dyadic levels converge rapidly on small coarse grids; taper L2 from 100 -> 50
+    return [100] * (n - 3) + [100, 50, base[-1]]

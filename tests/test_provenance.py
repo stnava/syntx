@@ -69,6 +69,33 @@ def test_code_state_records_tracked_diff_and_untracked_package_sources(tmp_path)
     assert dirty["diff_sha256"] != clean["diff_sha256"]
 
 
+def test_code_state_ignores_large_rendered_docs_reports(tmp_path):
+    repo = tmp_path / "repo"
+    pkg = repo / "src" / "pkg"
+    reports = repo / "docs" / "reports"
+    pkg.mkdir(parents=True)
+    reports.mkdir(parents=True)
+    (pkg / "a.py").write_text("x = 1\n")
+    (reports / "big.html").write_text("<html>old</html>\n")
+    _git(repo.parent, "init", "-q", str(repo))
+    _git(repo, "-c", "user.email=t@t", "-c", "user.name=t", "add", ".")
+    _git(repo, "-c", "user.email=t@t", "-c", "user.name=t", "commit", "-q", "-m", "init")
+
+    # Regenerating a >2 MB HTML report alone must not mark code dirty or truncate diff
+    (reports / "big.html").write_text("A" * 2_500_000)
+    report_only = code_state(root=str(repo), pkg_dir=str(pkg))["git"]
+    assert report_only["dirty"] is False
+    assert report_only["diff"] == ""
+    assert report_only["diff_truncated"] is False
+
+    # When code is also modified alongside a >2 MB report, code diff stays intact and complete
+    (pkg / "a.py").write_text("x = 2\n")
+    both = code_state(root=str(repo), pkg_dir=str(pkg))["git"]
+    assert both["dirty"] is True
+    assert "+x = 2" in both["diff"]
+    assert both["diff_truncated"] is False
+
+
 # ----------------------------------------------------------------------------------------
 # call capture
 # ----------------------------------------------------------------------------------------

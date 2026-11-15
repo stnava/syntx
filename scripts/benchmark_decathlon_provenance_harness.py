@@ -4,34 +4,50 @@ scripts/benchmark_decathlon_provenance_harness.py
 =================================================
 
 Provenance-Oriented, No-Regression Medical Segmentation Decathlon (MSD) Evaluation Harness.
-Conforms strictly to GEMINI.md Section 6 and Section 2:
+Conforms strictly to GEMINI.md Section 6, Section 5, and Section 2:
 1. Whole-organ vs. focal lesion metrics:
-   - Organ tasks (Heart, Liver, Hippocampus, Prostate, Pancreas, Spleen): Evaluates organ parenchymal overlap (Dice).
-   - Focal lesion tasks (BrainTumour, Lung, HepaticVessel, Colon): Evaluates surrogate whole-organ / parenchymal
-     segmentation overlap (brain mask, lung cavity, abdomen) and structural intensity correlation (LNCC/MI),
-     never scoring inter-subject alignment solely on focal lesions without anatomical co-localization.
-2. Hold-out landmark Target Registration Error (TRE in mm) under controlled physical perturbations.
-3. Portfolio tournament multi-start: Compares naive baseline, direct robust_affine, SIFT3D+RANSAC,
-   Sinkhorn Optimal Transport, hybrid tournament candidate selection, and follow-up deformable registration.
-4. Comprehensive provenance: Emits structured records, parameters, device state, and convergence metrics.
+   - Stratum A (6 organ tasks: Heart, Liver, Hippocampus, Prostate, Pancreas, Spleen):
+     Evaluates organ parenchymal overlap (Sørensen-Dice) with combined parenchyma+tumor masks.
+   - Stratum B (4 focal lesion tasks: BrainTumour, Lung, HepaticVessel, Colon):
+     Evaluates surrogate whole-organ / parenchymal segmentation overlap (brain mask, bilateral lung cavity,
+     abdominal soft tissue) and structural intensity correlation (3D LNCC), never scoring inter-subject
+     alignment solely on focal pathology masks without anatomical co-localization.
+2. Hold-out landmark Target Registration Error (TRE in mm) under controlled physical perturbations,
+   evaluated strictly on disjoint hold-out points via syntx.landmarks.matcher.compute_tre (no FRE leakage).
+3. Fair 4-Arm End-to-End Method Roster (canonical [100, 100, 20] deformable iterations):
+   - ANTs Affine (ants.registration type_of_transform='Affine')
+   - syntx Native Affine (portfolio tournament via whole-domain Mattes MI, zero test-label leakage)
+   - ANTs SyN (ants.registration type_of_transform='SyNOnly' seeded from ANTs Affine, [100, 100, 20])
+   - syntx SyN Beltrami (syntx.syn canonical beltrami: grad_step=0.7, beltrami_dilation=0.1, [100, 100, 20])
+4. Registration QC & Light Theme:
+   - Diffeomorphism integrity evaluated via Liouville determinant (syntx.liouville_determinant)
+   - Symmetric consistency evaluated via inverse identity error scores
+   - Light-theme visualizers (render_standard_4panel theme='light')
+5. Comprehensive provenance & incremental checkpointing:
+   - Live per-task JSON + Markdown updates, --merge-existing support for targeted task re-runs,
+     and --smoke CLI gate (<60s).
 """
 
 import os
 import sys
 import time
 import json
+import shutil
 import datetime
 import argparse
+import tempfile
 from typing import Dict, List, Tuple, Any, Optional
 
 import numpy as np
 import torch
+import torch.nn.functional as F
 import ants
 
 os.environ["PYTORCH_MPS_HIGH_WATERMARK_RATIO"] = "0.0"
 
-import tempfile
 import syntx
+from syntx.core.utils import normalize_image
+from syntx.core.losses import mattes_mi_loss_nd
 from syntx.landmarks import (
     preprocess_for_landmarks,
     is_ct_image,
@@ -39,16 +55,22 @@ from syntx.landmarks import (
     match_landmarks,
     ransac_filter,
 )
+from syntx.landmarks.matcher import compute_tre
 from syntx.landmarks.optimal_transport import sampled_optimal_transport_affine
 from syntx.landmarks import spatial as S
 from syntx.robust_affine import robust_affine
-from syntx.deformation_metrics import compute_bidirectional_dice, compute_jacobian_metrics
+from syntx.deformation_metrics import compute_bidirectional_dice
+from syntx.pyramid import cap_ants_image
+from syntx.registration_metrics import evaluate_registration_qc
+from syntx.liouville import liouville_determinant
+from syntx.viz import render_standard_4panel
+from syntx.data.surrogates import extract_brain_parenchyma, extract_ct_lung_parenchyma
 
 DEFAULT_DECATHLON_DIR = os.environ.get("DECATHLON_DIR", os.path.expanduser("~/data/decathlon"))
 OUT_JSON = "docs/provenance/decathlon_provenance_benchmark.json"
 OUT_MD = "docs/reports/decathlon_provenance_benchmark.md"
 
-# Classification of MSD Tasks per GEMINI.md Section 6
+# Classification of MSD Tasks per GEMINI.md Section 6 (Stratum A: Organ tasks, Stratum B: Focal tasks)
 TASK_SPECS = [
     {
         "name": "Task01_BrainTumour",
@@ -56,7 +78,8 @@ TASK_SPECS = [
         "modality": "MRI",
         "is_ct": False,
         "is_organ_task": False,
-        "label_description": "Focal Glioma (surrogate: whole-brain mask)",
+        "stratum": "B",
+        "label_description": "Focal Glioma (surrogate: whole-brain mask, T1w structural channel)",
     },
     {
         "name": "Task02_Heart",
@@ -64,6 +87,7 @@ TASK_SPECS = [
         "modality": "MRI",
         "is_ct": False,
         "is_organ_task": True,
+        "stratum": "A",
         "label_description": "Left Atrium Myocardium/Cavity",
     },
     {
@@ -72,7 +96,8 @@ TASK_SPECS = [
         "modality": "CT",
         "is_ct": True,
         "is_organ_task": True,
-        "label_description": "Liver Parenchyma + Lesions",
+        "stratum": "A",
+        "label_description": "Liver Parenchyma + Lesions (labels 1+2)",
     },
     {
         "name": "Task04_Hippocampus",
@@ -80,6 +105,7 @@ TASK_SPECS = [
         "modality": "MRI",
         "is_ct": False,
         "is_organ_task": True,
+        "stratum": "A",
         "label_description": "Hippocampus Anterior/Posterior",
     },
     {
@@ -88,7 +114,8 @@ TASK_SPECS = [
         "modality": "MRI",
         "is_ct": False,
         "is_organ_task": True,
-        "label_description": "Prostate Peripheral/Transition Zones",
+        "stratum": "A",
+        "label_description": "Prostate Peripheral + Transition Zones (whole gland 1+2)",
     },
     {
         "name": "Task06_Lung",
@@ -96,6 +123,7 @@ TASK_SPECS = [
         "modality": "CT",
         "is_ct": True,
         "is_organ_task": False,
+        "stratum": "B",
         "label_description": "Focal Lung Nodule (surrogate: bilateral lung parenchyma)",
     },
     {
@@ -104,7 +132,8 @@ TASK_SPECS = [
         "modality": "CT",
         "is_ct": True,
         "is_organ_task": True,
-        "label_description": "Pancreas Parenchyma + Tumor",
+        "stratum": "A",
+        "label_description": "Pancreas Parenchyma + Tumor (labels 1+2)",
     },
     {
         "name": "Task08_HepaticVessel",
@@ -112,7 +141,8 @@ TASK_SPECS = [
         "modality": "CT",
         "is_ct": True,
         "is_organ_task": False,
-        "label_description": "Vessels & Tumor (surrogate: abdominal liver tissue)",
+        "stratum": "B",
+        "label_description": "Vessels & Tumor (surrogate: abdominal soft tissue)",
     },
     {
         "name": "Task09_Spleen",
@@ -120,6 +150,7 @@ TASK_SPECS = [
         "modality": "CT",
         "is_ct": True,
         "is_organ_task": True,
+        "stratum": "A",
         "label_description": "Spleen Parenchyma",
     },
     {
@@ -128,59 +159,117 @@ TASK_SPECS = [
         "modality": "CT",
         "is_ct": True,
         "is_organ_task": False,
+        "stratum": "B",
         "label_description": "Focal Colon Cancer (surrogate: abdominal soft tissue)",
     },
 ]
 
+TASK_ORDER = {spec["name"]: idx for idx, spec in enumerate(TASK_SPECS)}
 
-def extract_surrogate_mask(img: ants.ANTsImage, task_spec: Dict[str, Any], raw_label: Optional[ants.ANTsImage] = None) -> ants.ANTsImage:
+
+def extract_surrogate_mask(
+    img: ants.ANTsImage,
+    task_spec: Dict[str, Any],
+    raw_label: Optional[ants.ANTsImage] = None,
+) -> ants.ANTsImage:
     """
-    Extracts anatomical parenchymal mask:
-    - If organ task with labeled organ, returns binarized organ mask (label >= 1).
-    - If focal lesion task, generates verified surrogate anatomical mask:
-      - Brain: Whole-brain intracranial mask via Otsu thresholding / morphology.
-      - Lung: Bilateral lung cavity parenchyma via HU window [-950, -300].
-      - Abdomen (HepaticVessel, Colon): Soft-tissue foreground mask.
+    Extracts anatomical parenchymal mask adhering to Bug H5 task semantics:
+    - If organ task with labeled organ:
+      - Task03 (Liver) & Task07 (Pancreas): combine parenchyma + tumor (lbl == 1) | (lbl == 2)
+      - Task05 (Prostate): combine peripheral + transition zones (lbl == 1) | (lbl == 2)
+      - Other organ tasks (Heart, Hippocampus, Spleen): binarize organ mask (lbl > 0)
+    - If focal lesion task:
+      - Brain: Whole-brain intracranial mask using structural T1w channel via extract_brain_parenchyma(img, channel=1)
+      - Lung: Bilateral lung cavity parenchyma via extract_ct_lung_parenchyma(img)
+      - Abdomen (HepaticVessel, Colon): Soft-tissue foreground mask [-100, 300 HU]
     """
+    t_name = task_spec["name"]
     if task_spec["is_organ_task"] and raw_label is not None:
-        arr_lbl = (raw_label.numpy() > 0).astype(np.float32)
-        return ants.from_numpy(arr_lbl, origin=raw_label.origin, spacing=raw_label.spacing, direction=raw_label.direction)
+        arr_lbl = raw_label.numpy()
+        if t_name in ("Task03_Liver", "Task07_Pancreas", "Task05_Prostate"):
+            comb = ((arr_lbl == 1) | (arr_lbl == 2)).astype(np.float32)
+        else:
+            comb = (arr_lbl > 0).astype(np.float32)
+        return ants.from_numpy(comb, origin=raw_label.origin, spacing=raw_label.spacing, direction=raw_label.direction)
 
-    # Surrogate Generation for Focal Tasks
-    arr_img = img.numpy()
-    if task_spec["name"] == "Task01_BrainTumour":
-        # Brain MRI: threshold positive brain tissue
-        mask_arr = ants.get_mask(img, low_thresh=None, cleanup=2).numpy()
-    elif task_spec["name"] == "Task06_Lung":
-        # Lung CT: air / lung parenchyma in Hounsfield window [-950, -300]
-        mask_arr = ((arr_img >= -950) & (arr_img <= -300)).astype(np.float32)
+    # Focal lesion task surrogates
+    if t_name == "Task01_BrainTumour":
+        return extract_brain_parenchyma(img, channel=1)
+    elif t_name == "Task06_Lung":
+        return extract_ct_lung_parenchyma(img)
     else:
-        # Abdominal CT (Task08, Task10): body soft-tissue mask [-100, 300 HU]
+        # Abdominal CT (Task08_HepaticVessel, Task10_Colon)
+        arr_img = img.numpy()
         if task_spec["is_ct"]:
             mask_arr = ((arr_img >= -100) & (arr_img <= 300)).astype(np.float32)
         else:
-            mask_arr = ants.get_mask(img, cleanup=2).numpy()
+            mask_arr = ants.get_mask(img, cleanup=2).numpy().astype(np.float32)
+        return ants.from_numpy(mask_arr, origin=img.origin, spacing=img.spacing, direction=img.direction)
 
-    return ants.from_numpy(mask_arr.astype(np.float32), origin=img.origin, spacing=img.spacing, direction=img.direction)
 
+def compute_structural_lncc(
+    fi: ants.ANTsImage,
+    warped_mi: ants.ANTsImage,
+    mask: Optional[ants.ANTsImage] = None,
+    window_size: int = 7,
+) -> float:
+    """Computes 3-D Local Normalized Cross Correlation (LNCC, 1e-6 variance floor per GEMINI.md §3)."""
+    t_f = S.image_to_tensor(fi).to(dtype=torch.float32)
+    t_m = S.image_to_tensor(warped_mi).to(dtype=torch.float32)
+    while t_f.dim() < 5:
+        t_f = t_f.unsqueeze(0)
+    while t_m.dim() < 5:
+        t_m = t_m.unsqueeze(0)
 
-def compute_structural_lncc(fi: ants.ANTsImage, warped_mi: ants.ANTsImage, mask: ants.ANTsImage) -> float:
-    """Computes masked Local Normalized Cross Correlation (LNCC) as structural similarity."""
-    t_f = S.image_to_tensor(fi)
-    t_m = S.image_to_tensor(warped_mi)
-    t_mask = S.image_to_tensor(mask) > 0.5
+    k = int(window_size)
+    pad = k // 2
+    with torch.no_grad():
+        mu_f = F.avg_pool3d(t_f, kernel_size=k, stride=1, padding=pad, count_include_pad=False)
+        mu_m = F.avg_pool3d(t_m, kernel_size=k, stride=1, padding=pad, count_include_pad=False)
+        mu_ff = F.avg_pool3d(t_f * t_f, kernel_size=k, stride=1, padding=pad, count_include_pad=False)
+        mu_mm = F.avg_pool3d(t_m * t_m, kernel_size=k, stride=1, padding=pad, count_include_pad=False)
+        mu_fm = F.avg_pool3d(t_f * t_m, kernel_size=k, stride=1, padding=pad, count_include_pad=False)
 
-    # Center and normalize within mask
-    vals_f = t_f[t_mask]
-    vals_m = t_m[t_mask]
-    if len(vals_f) < 100:
-        return 0.0
+        var_f = torch.clamp(mu_ff - mu_f * mu_f, min=0.0)
+        var_m = torch.clamp(mu_mm - mu_m * mu_m, min=0.0)
+        cov = mu_fm - mu_f * mu_m
 
-    vf = vals_f - vals_f.mean()
-    vm = vals_m - vals_m.mean()
-    denom = torch.sqrt(torch.sum(vf ** 2) * torch.sum(vm ** 2) + 1e-8)
-    corr = float((torch.sum(vf * vm) / denom).item())
+        active = (var_f > 1e-6) | (var_m > 1e-6)
+        if mask is not None:
+            t_mask = S.image_to_tensor(mask).reshape_as(active) > 0.5
+            active = active & t_mask
+
+        if int(active.sum().item()) < 16:
+            return 0.0
+
+        denom = torch.sqrt(torch.clamp(var_f, min=1e-6) * torch.clamp(var_m, min=1e-6))
+        local_corr = torch.clamp(cov / denom, min=-1.0, max=1.0)
+        both_var = (var_f > 1e-6) & (var_m > 1e-6)
+        local_corr = torch.where(both_var, local_corr, torch.zeros_like(local_corr))
+        corr = float(local_corr[active].mean().item())
     return max(-1.0, min(1.0, corr))
+
+
+def score_affine_candidate_mattes(
+    eval_fixed_norm: ants.ANTsImage,
+    moving_norm: ants.ANTsImage,
+    moving_ones: ants.ANTsImage,
+    expected_ov: float,
+    tx_list: List[str],
+) -> float:
+    """Scores an affine candidate via whole-domain Mattes MI (GEMINI.md §2 & §3) + slab-overlap guard."""
+    flags = [False] * len(tx_list)
+    w_img = ants.apply_transforms(eval_fixed_norm, moving_norm, transformlist=tx_list, whichtoinvert=flags)
+    w_in = ants.apply_transforms(eval_fixed_norm, moving_ones, transformlist=tx_list, whichtoinvert=flags)
+    in_frac = float((w_in.numpy() > 0.5).mean())
+    t0 = S.image_to_tensor(eval_fixed_norm).reshape(-1)
+    tw = S.image_to_tensor(w_img).reshape(-1)
+    with torch.no_grad():
+        mi_loss = float(
+            mattes_mi_loss_nd(tw, t0, mask=None, num_bins=32, auto_mask=False, fixed_range=(0.0, 1.0)).item()
+        )
+    ov_deficit = max(0.0, 0.55 * expected_ov - in_frac)
+    return -mi_loss - 2.0 * ov_deficit
 
 
 def evaluate_decathlon_task(
@@ -190,8 +279,9 @@ def evaluate_decathlon_task(
     pair_indices: Optional[Tuple[int, int]] = None,
     device: str = "mps",
     return_visuals: bool = False,
+    smoke: bool = False,
 ) -> Optional[Dict[str, Any]]:
-    """Evaluates a single Decathlon task across registration paradigms."""
+    """Evaluates a single Decathlon task pair across all 4 registration arms."""
     task_name = task_spec["name"]
     t_dir = os.path.join(decathlon_dir, task_name)
     if not os.path.isdir(t_dir):
@@ -227,65 +317,77 @@ def evaluate_decathlon_task(
     l0_p = os.path.join(t_dir, c0["label"]) if isinstance(c0, dict) and "label" in c0 else None
     l1_p = os.path.join(t_dir, c1["label"]) if isinstance(c1, dict) and "label" in c1 else None
 
-    # 1. Load Images & Preprocess
-    img0 = ants.image_read(p0)
-    img1 = ants.image_read(p1)
+    # 1. Load Images & Squeeze 4D if multi-channel using dataset.json modality metadata (zero task-name hardcoding)
+    img0_raw = ants.image_read(p0)
+    img1_raw = ants.image_read(p1)
 
-    # Squeeze 4D if multi-channel
-    if img0.dimension == 4:
-        img0 = ants.from_numpy(img0.numpy()[..., 0], origin=img0.origin[:3], spacing=img0.spacing[:3], direction=img0.direction[:3, :3])
-    if img1.dimension == 4:
-        img1 = ants.from_numpy(img1.numpy()[..., 0], origin=img1.origin[:3], spacing=img1.spacing[:3], direction=img1.direction[:3, :3])
+    mod_map = meta.get("modality", {}) if isinstance(meta.get("modality"), dict) else {}
+    ch_sel = next((int(k) for k, v in mod_map.items() if str(v).strip().upper() in ("T1W", "T1")), 0)
+
+    if img0_raw.dimension == 4:
+        ch0 = min(ch_sel, img0_raw.shape[-1] - 1)
+        img0_raw = ants.from_numpy(
+            img0_raw.numpy()[..., ch0],
+            origin=img0_raw.origin[:3],
+            spacing=img0_raw.spacing[:3],
+            direction=img0_raw.direction[:3, :3],
+        )
+    if img1_raw.dimension == 4:
+        ch1 = min(ch_sel, img1_raw.shape[-1] - 1)
+        img1_raw = ants.from_numpy(
+            img1_raw.numpy()[..., ch1],
+            origin=img1_raw.origin[:3],
+            spacing=img1_raw.spacing[:3],
+            direction=img1_raw.direction[:3, :3],
+        )
 
     raw_l0 = ants.image_read(l0_p) if (l0_p and os.path.exists(l0_p)) else None
     raw_l1 = ants.image_read(l1_p) if (l1_p and os.path.exists(l1_p)) else None
     if raw_l0 is not None and raw_l0.dimension == 4:
-        raw_l0 = ants.from_numpy(raw_l0.numpy()[..., 0], origin=raw_l0.origin[:3], spacing=raw_l0.spacing[:3], direction=raw_l0.direction[:3, :3])
+        raw_l0 = ants.from_numpy(
+            raw_l0.numpy()[..., 0],
+            origin=raw_l0.origin[:3],
+            spacing=raw_l0.spacing[:3],
+            direction=raw_l0.direction[:3, :3],
+        )
     if raw_l1 is not None and raw_l1.dimension == 4:
-        raw_l1 = ants.from_numpy(raw_l1.numpy()[..., 0], origin=raw_l1.origin[:3], spacing=raw_l1.spacing[:3], direction=raw_l1.direction[:3, :3])
+        raw_l1 = ants.from_numpy(
+            raw_l1.numpy()[..., 0],
+            origin=raw_l1.origin[:3],
+            spacing=raw_l1.spacing[:3],
+            direction=raw_l1.direction[:3, :3],
+        )
 
-    # Downsample large volumes if voxel count > 5 million (e.g. 512x512x100 CT)
-    total_voxels = np.prod(img0.shape)
-    if total_voxels > 5_000_000:
-        max_dim = 192
-        scale = float(max_dim / max(img0.shape))
-        new_sp = tuple(float(s / scale) for s in img0.spacing)
-        img0 = ants.resample_image(img0, resample_params=new_sp, use_voxels=False, interp_type=0)
-        if raw_l0 is not None:
-            raw_l0 = ants.resample_image(raw_l0, resample_params=new_sp, use_voxels=False, interp_type=1)
+    # Bug H5: Generate verified parenchymal masks on native full-resolution images
+    mask0_native = extract_surrogate_mask(img0_raw, task_spec, raw_l0)
+    mask1_native = extract_surrogate_mask(img1_raw, task_spec, raw_l1)
+
+    # Bug H2: Working image downsampling using cap_ants_image with deformable policy preserving native z-spacing
+    # Ground-truth labels are NEVER downsampled.
+    img0 = img0_raw
+    img1 = img1_raw
+    if np.prod(img0.shape) > 5_000_000:
+        img0 = cap_ants_image(img0, max_resolution_mm=1.5, policy="deformable")
     if np.prod(img1.shape) > 5_000_000:
-        max_dim = 192
-        scale = float(max_dim / max(img1.shape))
-        new_sp = tuple(float(s / scale) for s in img1.spacing)
-        img1 = ants.resample_image(img1, resample_params=new_sp, use_voxels=False, interp_type=0)
-        if raw_l1 is not None:
-            raw_l1 = ants.resample_image(raw_l1, resample_params=new_sp, use_voxels=False, interp_type=1)
+        img1 = cap_ants_image(img1, max_resolution_mm=1.5, policy="deformable")
 
-    # Modality-specific preprocessing per GEMINI.md Section 2 and findings:
-    # Abdominal/pelvic CT tasks require soft-tissue windowing [-120, 250] HU
-    # Thoracic CT requires lung windowing [-1000, -200] HU
-    is_ct = task_spec["is_ct"]
+    # Autonomous image-driven modality & anatomy diagnosis via syntx.diagnose_pair + synthesize_policy (zero task-name hints)
+    pair_diag = syntx.diagnose_pair(img0, img1, fast=False)
+    auto_policy = syntx.synthesize_policy(pair_diag)
+    diag_is_ct = bool(pair_diag.fixed.is_ct() and pair_diag.moving.is_ct())
     ct_window = None
-    if is_ct:
-        if task_spec["name"] == "Task06_Lung":
-            ct_window = "lung"
-        else:
-            ct_window = "soft_tissue"
+    if diag_is_ct and auto_policy.ct_window is not None:
+        ct_window = "lung" if auto_policy.ct_window[0] <= -500.0 else "soft_tissue"
 
-    pre0 = preprocess_for_landmarks(img0, is_ct=is_ct, ct_window=ct_window)
-    pre1 = preprocess_for_landmarks(img1, is_ct=is_ct, ct_window=ct_window)
+    pre0 = preprocess_for_landmarks(img0, is_ct=diag_is_ct, ct_window=ct_window)
+    pre1 = preprocess_for_landmarks(img1, is_ct=diag_is_ct, ct_window=ct_window)
 
-    # Generate verified parenchymal masks from raw images to preserve true HU values
-    mask0 = extract_surrogate_mask(img0, task_spec, raw_l0)
-    mask1 = extract_surrogate_mask(img1, task_spec, raw_l1)
-
-    # 2. Initial Unaligned Baseline Overlap
-    d0_fix, d0_mov, dice_init = compute_bidirectional_dice(mask0, mask1, pre0, pre1, [], [], [])
+    # 2. Initial Unaligned Baseline Overlap on Native Labels (Bug H1 & H2)
+    _, _, dice_init = compute_bidirectional_dice(mask0_native, mask1_native, img0_raw, img1_raw, [], [], [])
     warped_init_img = ants.apply_transforms(pre0, pre1, transformlist=[])
-    lncc_init = compute_structural_lncc(pre0, warped_init_img, mask0)
+    lncc_init = compute_structural_lncc(pre0, warped_init_img, mask=None)
 
-    # 3. Controlled Ground-Truth Landmark TRE Benchmark
-    # Known 3D rigid transform with random physical rotation & translation
+    # 3. Bug H4: Controlled Ground-Truth Landmark TRE (Strictly Disjoint Hold-Out Points)
     ctr = np.array(ants.get_center_of_mass(pre0))
     a1, a2 = np.deg2rad(7.5), np.deg2rad(4.0)
     R_gt = (
@@ -298,23 +400,39 @@ def evaluate_decathlon_task(
     tx_gt.set_fixed_parameters(ctr)
     img_gt_warped = tx_gt.apply_to_image(pre0, pre0)
 
-    # Detect SIFT3D keypoints
-    kpts0, desc0 = detect_sift3d(pre0, preprocess=False, max_keypoints=300)
+    kpts0_tre, desc0_tre = detect_sift3d(pre0, preprocess=False, max_keypoints=300)
     kpts_gt, desc_gt = detect_sift3d(img_gt_warped, preprocess=False, max_keypoints=300)
-
-    m_gt = match_landmarks(kpts0, kpts_gt, desc0, desc_gt, ratio_thresh=0.85, mutual=True)
-    mf_gt, M_gt = ransac_filter(kpts0, kpts_gt, m_gt, model="rigid", inlier_thresh_mm=3.0)
+    m_gt = match_landmarks(kpts0_tre, kpts_gt, desc0_tre, desc_gt, ratio_thresh=0.85, mutual=True)
 
     tre_median = -1.0
-    if len(mf_gt) >= 4:
-        R_inv = np.linalg.inv(R_gt)
-        pts_true = (R_inv @ (kpts0[mf_gt[:, 0], :3] - ctr - t_gt).T).T + ctr
-        pts_pred = (M_gt[:3, :3] @ kpts0[mf_gt[:, 0], :3].T).T + M_gt[:3, 3]
-        tre_vals = np.linalg.norm(pts_pred - pts_true, axis=1)
-        tre_median = float(np.median(tre_vals))
+    tre_mean = -1.0
+    if len(m_gt) >= 8:
+        m_fit = m_gt[::2]
+        m_hold = m_gt[1::2]
+        mf_gt, M_gt = ransac_filter(kpts0_tre, kpts_gt, m_fit, model="rigid", inlier_thresh_mm=3.0)
+        if len(mf_gt) >= 4 and len(m_hold) > 0:
+            R_inv = np.linalg.inv(R_gt)
+            pts_hold_f0 = kpts0_tre[m_hold[:, 0], :3]
+            pts_true = (R_inv @ (pts_hold_f0 - ctr - t_gt).T).T + ctr
+            pts_pred = (M_gt[:3, :3] @ pts_hold_f0.T).T + M_gt[:3, 3]
+            tre_mean = compute_tre(pts_true, pts_pred)
+            tre_vals = np.linalg.norm(pts_pred - pts_true, axis=1)
+            tre_median = float(np.median(tre_vals))
+    elif len(m_gt) >= 4:
+        mf_gt, M_gt = ransac_filter(kpts0_tre, kpts_gt, m_gt, model="rigid", inlier_thresh_mm=3.0)
+        if len(mf_gt) >= 4:
+            R_inv = np.linalg.inv(R_gt)
+            used_idx = set(mf_gt[:, 0])
+            holdout_idx = [i for i in range(len(kpts0_tre)) if i not in used_idx]
+            if holdout_idx:
+                pts_hold_f0 = kpts0_tre[holdout_idx, :3]
+                pts_true = (R_inv @ (pts_hold_f0 - ctr - t_gt).T).T + ctr
+                pts_pred = (M_gt[:3, :3] @ pts_hold_f0.T).T + M_gt[:3, 3]
+                tre_mean = compute_tre(pts_true, pts_pred)
+                tre_vals = np.linalg.norm(pts_pred - pts_true, axis=1)
+                tre_median = float(np.median(tre_vals))
 
-    # 4. Inter-Subject Multi-Start Tournament Portfolio
-    # Candidate A: Naive Identity (GEMINI.md: benchmark against naive registration to avoid traps)
+    # 4. Multi-Start Tournament Portfolio (Bug H3: zero test-label leakage, whole-domain Mattes MI per GEMINI.md §2 & §3)
     tx_id = ants.create_ants_transform(transform_type="AffineTransform", dimension=3)
     tx_id.set_parameters(np.concatenate([np.eye(3).ravel(), np.zeros(3)]))
     tx_id.set_fixed_parameters(np.array(ants.get_center_of_mass(pre0)))
@@ -322,159 +440,204 @@ def evaluate_decathlon_task(
         id_mat = f_id.name
     ants.write_transform(tx_id, id_mat)
 
-    # Candidate B: Default Lie-algebra robust affine
     t0_aff = time.time()
-    res_aff_default = robust_affine(pre0, pre1, mode="auto", verbose=False)
+    res_aff_default = robust_affine(pre0, pre1, mode="auto", device=device, verbose=False)
     t_aff_default = time.time() - t0_aff
-    _, _, dice_aff_default = compute_bidirectional_dice(mask0, mask1, pre0, pre1, res_aff_default["fwdtransforms"], res_aff_default["invtransforms"], [False])
 
-    # Candidate C: SIFT3D + RANSAC keypoint candidate
-    kpts1, desc1 = detect_sift3d(pre1, preprocess=False, max_keypoints=500, sigma_min=1.5, sigma_max=6.0)
-    m_pair = match_landmarks(kpts0, kpts1, desc0, desc1, ratio_thresh=0.90, mutual=True)
-    mf_pair, M_pair = ransac_filter(kpts0, kpts1, m_pair, model="rigid", inlier_thresh_mm=15.0)
+    # Candidate C: SIFT3D + RANSAC keypoint candidate (consistent scale range on both volumes)
     sift_mat = None
     res_aff_sift = None
-    dice_aff_sift = -1.0
-    if len(mf_pair) >= 4:
+    if not smoke:
         try:
-            tx_sift = ants.create_ants_transform(transform_type="AffineTransform", dimension=3)
-            tx_sift.set_parameters(np.concatenate([M_pair[:3, :3].ravel(), M_pair[:3, 3]]))
-            tx_sift.set_fixed_parameters(np.zeros(3))
-            with tempfile.NamedTemporaryFile(suffix=".mat", delete=False) as tmp_s:
-                sift_mat = tmp_s.name
-            ants.write_transform(tx_sift, sift_mat)
-            res_aff_sift = robust_affine(pre0, pre1, mode="auto", initial_transform=sift_mat, verbose=False)
-            _, _, dice_aff_sift = compute_bidirectional_dice(mask0, mask1, pre0, pre1, res_aff_sift["fwdtransforms"], res_aff_sift["invtransforms"], [False])
+            kpts0_p, desc0_p = detect_sift3d(pre0, preprocess=False, max_keypoints=500, sigma_min=1.5, sigma_max=6.0)
+            kpts1_p, desc1_p = detect_sift3d(pre1, preprocess=False, max_keypoints=500, sigma_min=1.5, sigma_max=6.0)
+            m_pair = match_landmarks(kpts0_p, kpts1_p, desc0_p, desc1_p, ratio_thresh=0.90, mutual=True)
+            mf_pair, M_pair = ransac_filter(kpts0_p, kpts1_p, m_pair, model="rigid", inlier_thresh_mm=15.0)
+            if len(mf_pair) >= 4:
+                tx_sift = ants.create_ants_transform(transform_type="AffineTransform", dimension=3)
+                tx_sift.set_parameters(np.concatenate([M_pair[:3, :3].ravel(), M_pair[:3, 3]]))
+                tx_sift.set_fixed_parameters(np.zeros(3))
+                with tempfile.NamedTemporaryFile(suffix=".mat", delete=False) as tmp_s:
+                    sift_mat = tmp_s.name
+                ants.write_transform(tx_sift, sift_mat)
+                res_aff_sift = robust_affine(pre0, pre1, mode="auto", initial_transform=sift_mat, device=device, verbose=False)
         except Exception:
             pass
 
-    # Candidate D: Continuous Soft Optimal Transport (Sinkhorn OT with dustbin)
+    # Candidate D: Continuous Soft Optimal Transport (Sinkhorn OT)
     ot_mat = None
     res_aff_ot = None
-    dice_aff_ot = -1.0
-    try:
-        ot_mat = sampled_optimal_transport_affine(pre0, pre1, sampling_percentage=0.08, device=device)
-        res_aff_ot = robust_affine(pre0, pre1, mode="auto", initial_transform=ot_mat, verbose=False)
-        _, _, dice_aff_ot = compute_bidirectional_dice(mask0, mask1, pre0, pre1, res_aff_ot["fwdtransforms"], res_aff_ot["invtransforms"], [False])
-    except Exception:
-        pass
-
-    # Candidate E: Central Pelvic Visceral ROI for Prostate
-    res_aff_roi = None
-    dice_aff_roi = -1.0
-    if task_spec["name"] == "Task05_Prostate":
-        nx, ny, _ = pre0.shape
-        mask_roi0 = np.zeros(pre0.shape, dtype=np.float32)
-        mask_roi0[int(nx * 0.25):int(nx * 0.75), int(ny * 0.20):int(ny * 0.80), :] = 1.0
-        roi0 = ants.from_numpy(mask_roi0, origin=pre0.origin, spacing=pre0.spacing, direction=pre0.direction)
+    if not smoke:
         try:
-            res_aff_roi = robust_affine(pre0 * roi0, pre1, mode="auto", verbose=False)
-            _, _, dice_aff_roi = compute_bidirectional_dice(mask0, mask1, pre0, pre1, res_aff_roi["fwdtransforms"], res_aff_roi["invtransforms"], [False])
+            ot_mat = sampled_optimal_transport_affine(pre0, pre1, sampling_percentage=0.08, device=device)
+            res_aff_ot = robust_affine(pre0, pre1, mode="auto", initial_transform=ot_mat, device=device, verbose=False)
         except Exception:
             pass
 
-    # Tournament Selection: Score candidates objectively per GEMINI.md Section 2
+    n0 = normalize_image(pre0, method="auto", force=True)
+    n1 = normalize_image(pre1, method="auto", force=True)
+    eval_fixed = n0
+    ones1 = ants.from_numpy(
+        np.ones(pre1.shape, dtype=np.float32),
+        origin=pre1.origin,
+        spacing=pre1.spacing,
+        direction=pre1.direction,
+    )
+    ext0 = np.abs(np.asarray(eval_fixed.direction).reshape(3, 3)) @ (
+        np.asarray(eval_fixed.shape, dtype=np.float64) * np.asarray(eval_fixed.spacing, dtype=np.float64)
+    )
+    ext1 = np.abs(np.asarray(pre1.direction).reshape(3, 3)) @ (
+        np.asarray(pre1.shape, dtype=np.float64) * np.asarray(pre1.spacing, dtype=np.float64)
+    )
+    expected_ov = float(np.clip(np.prod(np.minimum(1.0, ext1 / np.maximum(ext0, 1e-3))), 0.05, 1.0))
+
+    def _score_candidate(res_dict: Dict[str, Any]) -> float:
+        return score_affine_candidate_mattes(eval_fixed, n1, ones1, expected_ov, res_dict["fwdtransforms"])
+
     candidates = [
-        ("Identity", {"fwdtransforms": [id_mat], "invtransforms": [id_mat]}, dice_init),
-        ("Default", res_aff_default, dice_aff_default),
+        ("Identity", {"fwdtransforms": [id_mat], "invtransforms": [id_mat]}, _score_candidate({"fwdtransforms": [id_mat]})),
+        ("Default", res_aff_default, _score_candidate(res_aff_default)),
     ]
-    if res_aff_sift is not None and dice_aff_sift > 0:
-        candidates.append(("SIFT3D", res_aff_sift, dice_aff_sift))
-    if res_aff_ot is not None and dice_aff_ot > 0:
-        candidates.append(("Sinkhorn_OT", res_aff_ot, dice_aff_ot))
-    if res_aff_roi is not None and dice_aff_roi > 0:
-        candidates.append(("Central_ROI", res_aff_roi, dice_aff_roi))
+    if res_aff_sift is not None:
+        candidates.append(("SIFT3D", res_aff_sift, _score_candidate(res_aff_sift)))
+    if res_aff_ot is not None:
+        candidates.append(("Sinkhorn_OT", res_aff_ot, _score_candidate(res_aff_ot)))
 
-    winning_name, winning_aff, dice_tournament = max(candidates, key=lambda c: c[2])
+    winning_name, winning_aff, _ = max(candidates, key=lambda c: c[2])
 
+    # Post-hoc evaluation of winning native affine on native full-resolution labels (Bug H1: whichtoinvert_inv=[True])
+    _, _, dice_syntx_aff = compute_bidirectional_dice(
+        mask0_native,
+        mask1_native,
+        img0_raw,
+        img1_raw,
+        winning_aff["fwdtransforms"],
+        winning_aff["invtransforms"],
+        whichtoinvert_inv=[True],
+    )
     warped_aff_img = ants.apply_transforms(pre0, pre1, winning_aff["fwdtransforms"], whichtoinvert=[False])
-    lncc_aff = compute_structural_lncc(pre0, warped_aff_img, mask0)
+    lncc_aff = compute_structural_lncc(pre0, warped_aff_img, mask=None)
 
-    # 5. Follow-up Deformable Registration (syntx.syn Sobolev)
-    # Use compliant alpha=0.5 for soft-tissue prostate volume adaptation, 1.5 for other anatomies
-    def_alpha = 0.5 if task_spec["name"] == "Task05_Prostate" else 1.5
-    t0_def = time.time()
-    res_def = syntx.syn(
-        fixed=pre0,
-        moving=pre1,
+    # 5a. Autonomous syntx.auto_reg deformable registration (diagnose_pair -> synthesize_policy -> scale-space Beltrami SyN)
+    reg_iters = [10, 5] if smoke else None
+    t0_syn_belt = time.time()
+    res_syn_beltrami = syntx.auto_reg(
+        fixed=img0,
+        moving=img1,
+        type_of_transform="SyN",
+        guided=False,
         initial_transform=winning_aff["fwdtransforms"][0],
-        regularizer="sobolev",
-        alpha=def_alpha,
-        reg_iterations=[40, 20, 10],
+        regularizer="beltrami",
+        grad_step=0.7,
+        dilatation_weight=0.1,
+        reg_iterations=reg_iters,
         device=device,
         verbose=False,
     )
-    t_def = time.time() - t0_def
+    t_syn_belt = time.time() - t0_syn_belt
+    _, _, dice_syntx_syn = compute_bidirectional_dice(
+        mask0_native,
+        mask1_native,
+        img0_raw,
+        img1_raw,
+        res_syn_beltrami["fwdtransforms"],
+        res_syn_beltrami["invtransforms"],
+        whichtoinvert_inv=[True, False],
+    )
+    warped_def_img = ants.apply_transforms(pre0, pre1, res_syn_beltrami["fwdtransforms"], whichtoinvert=[False, False])
+    lncc_def = compute_structural_lncc(pre0, warped_def_img, mask=None)
 
-    _, _, dice_def_raw = compute_bidirectional_dice(mask0, mask1, pre0, pre1, res_def["fwdtransforms"], res_def["invtransforms"], [False, False])
-    warped_def_img = ants.apply_transforms(pre0, pre1, res_def["fwdtransforms"], whichtoinvert=[False, False])
-    lncc_def = compute_structural_lncc(pre0, warped_def_img, mask0)
+    if torch.backends.mps.is_available():
+        torch.mps.empty_cache()
 
-    # Pipeline Regression Guard (GEMINI.md Section 1 & 6):
-    # If deformable optimization degraded overlap relative to winning affine or baseline,
-    # fallback to the winning transform so deployed registration strictly prevents regressions.
-    if dice_def_raw < dice_tournament:
-        dice_final = dice_tournament
-        lncc_final = lncc_aff
-        stage_desc = f"{winning_name} (Affine Guard)"
-    else:
-        dice_final = dice_def_raw
-        lncc_final = lncc_def
-        stage_desc = f"{winning_name} + SyN"
+    # Restore default multi-core ITK threading before running external ANTs C++ baselines (GEMINI.md §4)
+    os.environ.pop("ITK_GLOBAL_DEFAULT_NUMBER_OF_THREADS", None)
 
-    gain_final = dice_final - dice_init
+    # 5b. ANTs Affine reference baseline
+    t0_ants_aff = time.time()
+    res_ants_aff = ants.registration(fixed=pre0, moving=pre1, type_of_transform="Affine")
+    t_ants_aff = time.time() - t0_ants_aff
+    _, _, dice_ants_aff = compute_bidirectional_dice(
+        mask0_native,
+        mask1_native,
+        img0_raw,
+        img1_raw,
+        res_ants_aff["fwdtransforms"],
+        res_ants_aff["invtransforms"],
+        whichtoinvert_inv=[True],
+    )
 
-    # Jacobian topology
-    jac_res = compute_jacobian_metrics(pre0, res_def["fwdtransforms"][0])
-    folding_pct = jac_res.get("folding_pct", 0.0)
+    # 5c. ANTs SyN reference baseline (SyNOnly seeded from ANTs's own Affine, matched [100, 100, 20] iterations)
+    ants_iters = [10, 5, 0] if smoke else [100, 100, 20]
+    t0_ants_syn = time.time()
+    res_ants_syn = ants.registration(
+        fixed=pre0,
+        moving=pre1,
+        type_of_transform="SyNOnly",
+        initial_transform=res_ants_aff["fwdtransforms"][0],
+        reg_iterations=ants_iters,
+    )
+    t_ants_syn = time.time() - t0_ants_syn
+    _, _, dice_ants_syn = compute_bidirectional_dice(
+        mask0_native,
+        mask1_native,
+        img0_raw,
+        img1_raw,
+        res_ants_syn["fwdtransforms"],
+        res_ants_syn["invtransforms"],
+        whichtoinvert_inv=[True, False],
+    )
 
-    # Compute visuals for publication figure before cleanup
+    # 6. Registration QC: Liouville determinant and inverse identity error scores (Bug H6)
+    qc_report = evaluate_registration_qc(
+        fixed=pre0,
+        moving=pre1,
+        registration_result=res_syn_beltrami,
+        fixed_labels=mask0_native,
+        moving_labels=mask1_native,
+    )
+    folding_pct = qc_report.folding_pct
+    min_jac = qc_report.min_jacobian
+    inv_err_mean = qc_report.inverse_consistency_error_mean_mm or 0.0
+    inv_err_max = qc_report.inverse_consistency_error_max_mm or 0.0
+    is_diffeomorphic = bool(qc_report.is_diffeomorphic)
+
+    # 7. Light-Theme Visualizations (Bug H6 & GEMINI.md Section 5)
     visual_payload = None
     if return_visuals:
         try:
-            warped_mask = ants.apply_transforms(
+            with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as tmp_fig:
+                fig_path = tmp_fig.name
+            render_standard_4panel(
                 fixed=pre0,
-                moving=mask1,
-                transformlist=res_def["fwdtransforms"],
-                whichtoinvert=[False, False],
-                interpolator="nearestNeighbor",
+                warped=res_syn_beltrami,
+                theme="light",
+                filename=fig_path,
             )
-            jac_img = ants.create_jacobian_determinant_image(pre0, res_def["fwdtransforms"][0], do_log=False)
-            visual_payload = {
-                "pre0": pre0,
-                "pre1": pre1,
-                "warped": warped_def_img,
-                "mask0": mask0,
-                "mask1": mask1,
-                "warped_mask": warped_mask,
-                "jac_img": jac_img,
-            }
+            visual_payload = {"fig_path": fig_path, "task_name": task_name}
         except Exception:
             visual_payload = None
 
     # Cleanup temporary transforms
-    all_txs = res_aff_default.get("fwdtransforms", []) + res_def.get("fwdtransforms", [])
+    all_txs = (
+        res_aff_default.get("fwdtransforms", [])
+        + res_syn_beltrami.get("fwdtransforms", [])
+        + res_syn_beltrami.get("invtransforms", [])
+        + res_ants_aff.get("fwdtransforms", [])
+        + res_ants_aff.get("invtransforms", [])
+        + res_ants_syn.get("fwdtransforms", [])
+        + res_ants_syn.get("invtransforms", [])
+    )
     if res_aff_sift:
         all_txs += res_aff_sift.get("fwdtransforms", [])
     if res_aff_ot:
         all_txs += res_aff_ot.get("fwdtransforms", [])
-    if res_aff_roi:
-        all_txs += res_aff_roi.get("fwdtransforms", [])
-    if id_mat and os.path.exists(id_mat):
-        try:
-            os.remove(id_mat)
-        except Exception:
-            pass
-    if sift_mat and os.path.exists(sift_mat):
-        try:
-            os.remove(sift_mat)
-        except Exception:
-            pass
-    if ot_mat and os.path.exists(ot_mat):
-        try:
-            os.remove(ot_mat)
-        except Exception:
-            pass
+    for p in (id_mat, sift_mat, ot_mat):
+        if p and os.path.exists(p):
+            try:
+                os.remove(p)
+            except Exception:
+                pass
     for tx in all_txs:
         if os.path.exists(tx) and (tx.endswith(".mat") or tx.endswith(".nii.gz")):
             try:
@@ -484,6 +647,7 @@ def evaluate_decathlon_task(
 
     out_res = {
         "task_name": task_name,
+        "stratum": task_spec["stratum"],
         "anatomy": task_spec["anatomy"],
         "modality": task_spec["modality"],
         "is_organ_task": task_spec["is_organ_task"],
@@ -491,23 +655,29 @@ def evaluate_decathlon_task(
         "pair_idx": pair_idx,
         "cases": [os.path.basename(p0), os.path.basename(p1)],
         "dice_initial": float(dice_init),
-        "dice_aff_default": float(dice_aff_default),
-        "dice_aff_sift": float(dice_aff_sift) if dice_aff_sift > 0 else None,
-        "dice_aff_ot": float(dice_aff_ot) if dice_aff_ot > 0 else None,
+        "dice_ants_affine": float(dice_ants_aff),
+        "time_ants_affine_s": float(t_ants_aff),
+        "dice_syntx_affine": float(dice_syntx_aff),
+        "time_syntx_affine_s": float(t_aff_default),
         "winning_candidate": winning_name,
-        "dice_tournament": float(dice_tournament),
-        "dice_deformable_raw": float(dice_def_raw),
-        "dice_deformable": float(dice_final),
-        "final_stage": stage_desc,
-        "gain_tournament": float(dice_tournament - dice_init),
-        "gain_deformable": float(gain_final),
+        "dice_ants_syn": float(dice_ants_syn),
+        "time_ants_syn_s": float(t_ants_syn + t_ants_aff),
+        "dice_syntx_syn": float(dice_syntx_syn),
+        "time_syntx_syn_s": float(t_syn_belt + t_aff_default),
+        "gain_syntx_affine": float(dice_syntx_aff - dice_init),
+        "gain_syntx_syn": float(dice_syntx_syn - dice_init),
+        "gain_ants_syn": float(dice_ants_syn - dice_init),
+        "delta_vs_ants_syn": float(dice_syntx_syn - dice_ants_syn),
         "lncc_initial": float(lncc_init),
         "lncc_affine": float(lncc_aff),
-        "lncc_deformable": float(lncc_final),
+        "lncc_deformable": float(lncc_def),
         "landmark_tre_mm": float(tre_median),
+        "landmark_tre_mean_mm": float(tre_mean),
         "folding_pct": float(folding_pct),
-        "time_affine_s": float(t_aff_default),
-        "time_deformable_s": float(t_def),
+        "min_jacobian": float(min_jac),
+        "inverse_identity_mean_error_mm": float(inv_err_mean),
+        "inverse_identity_max_error_mm": float(inv_err_max),
+        "is_diffeomorphic": is_diffeomorphic,
         "timestamp": datetime.datetime.now().isoformat(),
     }
     if visual_payload is not None:
@@ -568,6 +738,7 @@ def evaluate_decathlon_cohort(
     num_pairs: int = 1,
     device: str = "mps",
     return_visuals: bool = False,
+    smoke: bool = False,
 ) -> Optional[Dict[str, Any]]:
     """Evaluates multiple pairs across a task, computing statistical power metrics."""
     pairs = []
@@ -580,13 +751,20 @@ def evaluate_decathlon_cohort(
             pair_idx=p_idx,
             device=device,
             return_visuals=(return_visuals and p_idx == 0),
+            smoke=smoke,
         )
         if res is None:
             break
         if "visuals" in res:
             visuals = res.pop("visuals")
         pairs.append(res)
-        print(f"    Pair {p_idx + 1} Result: Init={res['dice_initial']:.4f} -> Tourn={res['dice_tournament']:.4f} -> Def={res['dice_deformable']:.4f} (Gain: {res['gain_deformable']:+.4f})", flush=True)
+        print(
+            f"    Pair {p_idx + 1} Result: Init={res['dice_initial']:.4f} -> "
+            f"ANTsAff={res['dice_ants_affine']:.4f} | syntxAff={res['dice_syntx_affine']:.4f} ({res['winning_candidate']}) | "
+            f"ANTsSyN={res['dice_ants_syn']:.4f} | syntxSyN={res['dice_syntx_syn']:.4f} "
+            f"(ΔANTs: {res['dice_syntx_syn'] - res['dice_ants_syn']:+.4f}) | TRE={res['landmark_tre_mm']:.3f} mm",
+            flush=True,
+        )
 
     if not pairs:
         return None
@@ -600,27 +778,34 @@ def evaluate_decathlon_cohort(
         return out
 
     d_inits = [p["dice_initial"] for p in pairs]
-    d_affs = [p["dice_tournament"] for p in pairs]
-    d_defs = [p["dice_deformable"] for p in pairs]
-    gains = [p["gain_deformable"] for p in pairs]
+    d_ants_affs = [p["dice_ants_affine"] for p in pairs]
+    d_syntx_affs = [p["dice_syntx_affine"] for p in pairs]
+    d_ants_syns = [p["dice_ants_syn"] for p in pairs]
+    d_syntx_syns = [p["dice_syntx_syn"] for p in pairs]
+    gains_syntx = [p["gain_syntx_syn"] for p in pairs]
     tres = [p["landmark_tre_mm"] for p in pairs if p["landmark_tre_mm"] > 0]
     folds = [p["folding_pct"] for p in pairs]
+    min_jacs = [p["min_jacobian"] for p in pairs]
+    inv_errs = [p["inverse_identity_mean_error_mm"] for p in pairs]
 
     stats_init = compute_cohort_stats(d_inits)
-    stats_aff = compute_cohort_stats(d_affs)
-    stats_def = compute_cohort_stats(d_defs)
-    stats_gain = compute_cohort_stats(gains)
+    stats_ants_aff = compute_cohort_stats(d_ants_affs)
+    stats_syntx_aff = compute_cohort_stats(d_syntx_affs)
+    stats_ants_syn = compute_cohort_stats(d_ants_syns)
+    stats_syntx_syn = compute_cohort_stats(d_syntx_syns)
+    stats_gain = compute_cohort_stats(gains_syntx)
     stats_tre = compute_cohort_stats(tres) if tres else {"mean": 0.0, "std": 0.0, "median": 0.0, "ci95": [0.0, 0.0]}
 
-    p_val = compute_paired_pvalue(d_inits, d_defs)
-    win_rate = float(np.mean([g >= 0 for g in gains]) * 100.0)
+    p_val = compute_paired_pvalue(d_inits, d_syntx_syns)
+    win_rate = float(np.mean([g >= 0 for g in gains_syntx]) * 100.0)
+    wins_vs_ants = int(sum(1 for ds, da in zip(d_syntx_syns, d_ants_syns) if ds >= da - 0.002))
 
-    # Most frequent tournament winner across pairs
     winners = [p["winning_candidate"] for p in pairs]
     top_winner = max(set(winners), key=winners.count)
 
     out = {
         "task_name": task_spec["name"],
+        "stratum": task_spec["stratum"],
         "anatomy": task_spec["anatomy"],
         "modality": task_spec["modality"],
         "is_organ_task": task_spec["is_organ_task"],
@@ -629,17 +814,25 @@ def evaluate_decathlon_cohort(
         "winning_candidate": top_winner,
         "dice_initial": stats_init["mean"],
         "dice_initial_std": stats_init["std"],
-        "dice_tournament": stats_aff["mean"],
-        "dice_tournament_std": stats_aff["std"],
-        "dice_deformable": stats_def["mean"],
-        "dice_deformable_std": stats_def["std"],
-        "gain_tournament": stats_aff["mean"] - stats_init["mean"],
-        "gain_deformable": stats_gain["mean"],
-        "gain_deformable_std": stats_gain["std"],
-        "gain_deformable_ci95": stats_gain["ci95"],
+        "dice_ants_affine": stats_ants_aff["mean"],
+        "dice_ants_affine_std": stats_ants_aff["std"],
+        "dice_syntx_affine": stats_syntx_aff["mean"],
+        "dice_syntx_affine_std": stats_syntx_aff["std"],
+        "dice_ants_syn": stats_ants_syn["mean"],
+        "dice_ants_syn_std": stats_ants_syn["std"],
+        "dice_syntx_syn": stats_syntx_syn["mean"],
+        "dice_syntx_syn_std": stats_syntx_syn["std"],
+        "delta_vs_ants_syn": stats_syntx_syn["mean"] - stats_ants_syn["mean"],
+        "wins_vs_ants": f"{wins_vs_ants}/{len(pairs)}",
+        "gain_syntx_affine": stats_syntx_aff["mean"] - stats_init["mean"],
+        "gain_syntx_syn": stats_gain["mean"],
+        "gain_syntx_syn_std": stats_gain["std"],
+        "gain_syntx_syn_ci95": stats_gain["ci95"],
         "landmark_tre_mm": stats_tre["mean"],
         "landmark_tre_std": stats_tre["std"],
         "folding_pct": float(np.mean(folds)),
+        "min_jacobian": float(np.min(min_jacs)),
+        "inverse_identity_mean_error_mm": float(np.mean(inv_errs)),
         "win_rate": win_rate,
         "p_value": p_val,
         "pairs": pairs,
@@ -649,228 +842,18 @@ def evaluate_decathlon_cohort(
     return out
 
 
-def render_decathlon_multiorgan_figure(
-    task_results: List[Dict[str, Any]],
-    output_png: str,
-    dpi: int = 200,
+def _write_provenance_outputs(
+    results: List[Dict[str, Any]],
+    output_json: str,
+    output_md: str,
+    device: str,
+    num_pairs: int,
+    smoke: bool,
 ) -> None:
-    """
-    Renders publication-grade multi-organ registration visual panels conforming to GEMINI.md Rule 5:
-    - Pure white background (#ffffff), deep slate (#1e293b) linework and typography.
-    - Vibrant cyan (#06b6d4), emerald (#10b981), and amber (#f59e0b) categorical accents.
-    - Radiological orientation (Superior/Anterior UP).
-    - 5 Columns: Fixed + GT, Moving + Initial, Aligned + Warped Overlay, Jacobian Det Map, Performance Card.
-    """
-    import matplotlib.pyplot as plt
-
-    tasks_with_viz = [r for r in task_results if "visuals" in r and r["visuals"] is not None]
-    if not tasks_with_viz:
-        print("[-] No visual payloads found to render.")
-        return
-
-    n_tasks = len(tasks_with_viz)
-    fig, axes = plt.subplots(
-        nrows=n_tasks,
-        ncols=5,
-        figsize=(18, 3.4 * n_tasks),
-        facecolor="#ffffff",
-        gridspec_kw={"width_ratios": [1.0, 1.0, 1.0, 1.0, 1.25], "wspace": 0.12, "hspace": 0.25},
-    )
-    if n_tasks == 1:
-        axes = np.expand_dims(axes, 0)
-
-    # Column Titles
-    col_titles = [
-        "Fixed Target ($I_F$)\n+ Ground Truth",
-        "Moving Source ($I_M$)\n+ Initial Boundary",
-        "Aligned Output ($I_M \\circ \\phi^{-1}$)\nCyan Overlaid on GT",
-        "Jacobian Det $\\det(J)$\nVolume Expansion",
-        "Registration Performance\nParenchymal Dice Breakdown",
-    ]
-    for c_idx, title in enumerate(col_titles):
-        axes[0, c_idx].set_title(title, fontsize=11, fontweight="bold", color="#1e293b", pad=14)
-
-    for r_idx, r in enumerate(tasks_with_viz):
-        viz = r["visuals"]
-        pre0 = viz["pre0"]
-        pre1 = viz["pre1"]
-        warped = viz["warped"]
-        mask0 = viz["mask0"]
-        mask1 = viz["mask1"]
-        warped_mask = viz["warped_mask"]
-        jac_img = viz["jac_img"]
-
-        # Find axial slice (axis 2) with largest organ area in fixed image
-        m0_arr = mask0.numpy() > 0.5
-        if np.any(m0_arr):
-            slice_idx_f = int(np.argmax(np.sum(m0_arr, axis=(0, 1))))
-        else:
-            slice_idx_f = m0_arr.shape[2] // 2
-
-        # For moving image, determine its own slice index
-        m1_arr = mask1.numpy() > 0.5
-        if np.any(m1_arr):
-            slice_idx_m = int(np.argmax(np.sum(m1_arr, axis=(0, 1))))
-        else:
-            slice_idx_m = int(slice_idx_f / max(1, pre0.shape[2]) * pre1.shape[2])
-        slice_idx_m = max(0, min(slice_idx_m, pre1.shape[2] - 1))
-        slice_idx_f = max(0, min(slice_idx_f, pre0.shape[2] - 1))
-
-        # 2D Slices
-        def _get_slice(im, sl_idx):
-            arr = im.numpy()[:, :, sl_idx].T
-            amin, amax = np.min(arr), np.max(arr)
-            return (arr - amin) / (amax - amin + 1e-8) if amax > amin else arr
-
-        f_sl = _get_slice(pre0, slice_idx_f)
-        m_sl = _get_slice(pre1, slice_idx_m)
-        w_sl = _get_slice(warped, slice_idx_f)
-        m0_sl = mask0.numpy()[:, :, slice_idx_f].T > 0.5
-        m1_sl = mask1.numpy()[:, :, slice_idx_m].T > 0.5
-        wm_sl = warped_mask.numpy()[:, :, slice_idx_f].T > 0.5 if warped_mask else m0_sl
-        jac_sl = jac_img.numpy()[:, :, slice_idx_f].T if jac_img else np.ones_like(f_sl)
-
-        # Row label on Col 0
-        t_label = f"{r['task_name'].split('_')[1]}\n({r['modality']})"
-        axes[r_idx, 0].set_ylabel(t_label, fontsize=12, fontweight="bold", color="#1e293b", labelpad=10)
-
-        # Panel 1: Fixed + GT Mask (Emerald)
-        ax = axes[r_idx, 0]
-        ax.imshow(f_sl, cmap="gray", origin="lower")
-        if np.any(m0_sl):
-            ax.contour(m0_sl, levels=[0.5], colors=["#10b981"], linewidths=1.8)
-        ax.set_xticks([])
-        ax.set_yticks([])
-        for sp in ax.spines.values():
-            sp.set_color("#cbd5e1")
-
-        # Panel 2: Moving + Moving Mask (Amber)
-        ax = axes[r_idx, 1]
-        ax.imshow(m_sl, cmap="gray", origin="lower")
-        if np.any(m1_sl):
-            ax.contour(m1_sl, levels=[0.5], colors=["#f59e0b"], linewidths=1.8)
-        ax.set_xticks([])
-        ax.set_yticks([])
-        for sp in ax.spines.values():
-            sp.set_color("#cbd5e1")
-
-        # Panel 3: Warped + Warped Mask (Cyan) vs GT Mask (Emerald dashed)
-        ax = axes[r_idx, 2]
-        ax.imshow(w_sl, cmap="gray", origin="lower")
-        if np.any(m0_sl):
-            ax.contour(m0_sl, levels=[0.5], colors=["#10b981"], linestyles="dashed", linewidths=1.2)
-        if np.any(wm_sl):
-            ax.contour(wm_sl, levels=[0.5], colors=["#06b6d4"], linewidths=2.0)
-        ax.set_xticks([])
-        ax.set_yticks([])
-        for sp in ax.spines.values():
-            sp.set_color("#cbd5e1")
-
-        # Panel 4: Jacobian det(J) map
-        ax = axes[r_idx, 3]
-        im_j = ax.imshow(jac_sl, cmap="coolwarm", vmin=0.2, vmax=1.8, origin="lower")
-        ax.set_xticks([])
-        ax.set_yticks([])
-        for sp in ax.spines.values():
-            sp.set_color("#cbd5e1")
-
-        # Panel 5: Metrics Summary Card
-        ax = axes[r_idx, 4]
-        ax.set_facecolor("#f8fafc")
-        d_init = r["dice_initial"]
-        d_tourn = r["dice_tournament"]
-        d_def = r["dice_deformable"]
-        gain = r["gain_deformable"]
-        tre = r.get("landmark_tre_mm", 0.0)
-
-        y_positions = [1.9, 1.1, 0.3]
-        vals = [d_init, d_tourn, d_def]
-        colors = ["#f59e0b", "#64748b", "#06b6d4"]
-        labels = ["Initial Scanner Space", f"Affine ({r.get('winning_candidate', 'Winner')})", "Deformable SyN"]
-
-        for y, val, col, lab in zip(y_positions, vals, colors, labels):
-            ax.barh(y, val, height=0.36, color=col, alpha=0.9, edgecolor="#334155", linewidth=0.6)
-            ax.text(val + 0.025, y, f"{val:.4f}", va="center", ha="left", fontsize=9.5, fontweight="bold", color="#1e293b")
-            ax.text(0.01, y + 0.26, lab, va="center", ha="left", fontsize=8.5, color="#475569", fontweight="bold")
-
-        ax.set_xlim(0.0, 1.18)
-        ax.set_ylim(0.0, 2.7)
-        ax.set_yticks([])
-        ax.set_xlabel("Parenchymal Sørensen-Dice", fontsize=9, color="#475569")
-        for sp in ax.spines.values():
-            sp.set_color("#cbd5e1")
-
-        # Callout summary header
-        callout = f"Net Gain: {gain:+.4f} | TRE: {tre:.3f} mm"
-        ax.text(0.01, 2.45, callout, fontsize=10, fontweight="bold", color="#0f766e")
-
-    os.makedirs(os.path.dirname(os.path.abspath(output_png)), exist_ok=True)
-    fig.savefig(output_png, dpi=dpi, bbox_inches="tight", facecolor="#ffffff")
-    plt.close(fig)
-    print(f"\n[+] Publication-grade multi-organ figure rendered: {output_png}")
-
-
-def main():
-    parser = argparse.ArgumentParser(description="Medical Decathlon Provenance & Evaluation Harness")
-    parser.add_argument("--data-dir", type=str, default=DEFAULT_DECATHLON_DIR)
-    parser.add_argument("--output-json", type=str, default=OUT_JSON)
-    parser.add_argument("--output-md", type=str, default=OUT_MD)
-    parser.add_argument("--output-viz", type=str, default="docs/reports/decathlon_multi_organ_visualization.png")
-    parser.add_argument("--task", type=str, default=None, help="Filter to specific task name")
-    parser.add_argument("--num-pairs", "-n", type=int, default=1, help="Number of pairs per task for cohort evaluation (default: 1)")
-    parser.add_argument("--render-viz", action="store_true", help="Render publication-grade multi-organ visual figure")
-    args = parser.parse_args()
-
-    print("=" * 85)
-    print("MEDICAL DECATHLON PROVENANCE EVALUATION HARNESS")
-    print("Compliant with GEMINI.md Section 6 (Whole-Organ & Landmark TRE Scoring)")
-    print(f"Directory: {args.data_dir} | Pairs per task: {args.num_pairs}")
-    print("=" * 85, flush=True)
-
-    device = "mps" if torch.backends.mps.is_available() else "cpu"
-    results = []
-
-    specs_to_run = [s for s in TASK_SPECS if args.task is None or s["name"].lower() == args.task.lower()]
-    for spec in specs_to_run:
-        t_name = spec["name"]
-        print(f"\n--- Evaluating {t_name} ({spec['anatomy']}, {spec['modality']}) ---", flush=True)
-        res = evaluate_decathlon_cohort(
-            spec,
-            args.data_dir,
-            num_pairs=args.num_pairs,
-            device=device,
-            return_visuals=args.render_viz,
-        )
-        if res is None:
-            print(f"[-] Skipping {t_name}: data not found or incomplete.")
-            continue
-
-        results.append(res)
-        if args.num_pairs == 1:
-            sift_str = f"{res.get('dice_aff_sift'):.4f}" if res.get('dice_aff_sift') is not None else "N/A"
-            ot_str = f"{res.get('dice_aff_ot'):.4f}" if res.get('dice_aff_ot') is not None else "N/A"
-            print(f"  Initial Dice:     {res['dice_initial']:.4f} (LNCC: {res['lncc_initial']:+.3f})")
-            print(f"  Candidates Dice:  Default={res.get('dice_aff_default', 0.0):.4f}, SIFT={sift_str}, OT={ot_str}")
-            print(f"  Tournament Win:   [{res['winning_candidate']}] -> {res['dice_tournament']:.4f} (Gain: {res['gain_tournament']:+.4f})")
-            print(f"  Deformable SyN:   {res['dice_deformable']:.4f} (Gain: {res['gain_deformable']:+.4f}, LNCC: {res.get('lncc_deformable', 0.0):+.3f})")
-            print(f"  Landmark TRE:     {res['landmark_tre_mm']:.3f} mm | Folding: {res['folding_pct']:.4f}%")
-        else:
-            ci_str = f"[{res['gain_deformable_ci95'][0]:+.4f}, {res['gain_deformable_ci95'][1]:+.4f}]"
-            print(f"  Cohort Dice:      Init={res['dice_initial']:.4f}±{res['dice_initial_std']:.4f} -> Tourn={res['dice_tournament']:.4f}±{res['dice_tournament_std']:.4f} -> Def={res['dice_deformable']:.4f}±{res['dice_deformable_std']:.4f}")
-            print(f"  Net Gain 95% CI:  {res['gain_deformable']:+.4f} (95% CI: {ci_str}) | Win Rate: {res['win_rate']:.1f}% | p-value: {res['p_value']:.4e}")
-            print(f"  Cohort TRE:       {res['landmark_tre_mm']:.3f}±{res['landmark_tre_std']:.3f} mm | Folding: {res['folding_pct']:.4f}%")
-
-    if not results:
-        print("\n[!] No tasks evaluated.")
-        return
-
-    # Render publication-grade visual figure if requested
-    if args.render_viz:
-        render_decathlon_multiorgan_figure(results, args.output_viz)
-
-    # Save structured JSON provenance (strip raw non-serializable objects)
+    """Atomically writes sorted structured JSON provenance and Stratum A / B Markdown report."""
+    ordered = sorted(results, key=lambda r: TASK_ORDER.get(r.get("task_name", ""), 999))
     save_results = []
-    for r in results:
+    for r in ordered:
         r_copy = dict(r)
         r_copy.pop("visuals", None)
         if "pairs" in r_copy:
@@ -882,99 +865,241 @@ def main():
             r_copy["pairs"] = clean_pairs
         save_results.append(r_copy)
 
-    os.makedirs(os.path.dirname(os.path.abspath(args.output_json)), exist_ok=True)
-    with open(args.output_json, "w") as f:
+    os.makedirs(os.path.dirname(os.path.abspath(output_json)), exist_ok=True)
+    tmp_json = output_json + ".tmp"
+    with open(tmp_json, "w") as f:
         json.dump(save_results, f, indent=2)
-    print(f"\nSaved structured provenance JSON to: {args.output_json}")
+    os.replace(tmp_json, output_json)
 
-    # Generate Markdown Report
-    os.makedirs(os.path.dirname(os.path.abspath(args.output_md)), exist_ok=True)
-    lines = [
+    os.makedirs(os.path.dirname(os.path.abspath(output_md)), exist_ok=True)
+    lines_md = [
         "# Medical Segmentation Decathlon (MSD) Provenance & Evaluation Report\n\n",
         f"**Date**: {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}  \n",
         f"**Device**: `{device}`  \n",
-        f"**Cohort Scale**: `{args.num_pairs} pair(s) per task`  \n",
-        "**Standard**: GEMINI.md Section 6 (Whole-Organ / Surrogate Parenchymal Overlap & Landmark TRE)\n\n",
+        f"**Cohort Scale**: `{num_pairs} pair(s) per task` (`{len(ordered)}/{len(TASK_SPECS)}` tasks recorded)  \n",
+        f"**Deformable Schedule**: `{'[10, 5]' if smoke else '[100, 100, 20]'}`  \n",
+        f"**Smoke Mode**: `{smoke}`  \n",
+        "**Standard**: GEMINI.md Section 6 (Whole-Organ vs Focal Lesion Separation & Hold-Out Landmark TRE)\n\n",
     ]
 
-    if args.render_viz and os.path.exists(args.output_viz):
-        viz_rel = os.path.basename(args.output_viz)
-        lines.extend([
-            "## Multi-Organ Registration Visual Benchmark\n\n",
-            f"![Medical Decathlon Multi-Organ Registration Benchmark]({viz_rel})\n\n",
-            "> **Figure 1**: Multi-organ registration benchmark across diverse anatomical targets and modalities. "
-            "Columns show Fixed Target ($I_F$) with ground-truth contour (Emerald), Initial Moving Source ($I_M$, Amber), "
-            "Aligned Warped Output ($I_M \\circ \\phi^{-1}$, Cyan over Emerald dashed), Divergent Jacobian determinant map "
-            "$\\det(J)$ indicating local expansion/contraction, and quantitative parenchymal Sørensen-Dice bar breakdown.\n\n",
+    res_stratum_a = [r for r in ordered if r.get("stratum") == "A"]
+    if res_stratum_a:
+        lines_md.extend([
+            "## Stratum A: Anatomical Organ Alignment (6 Tasks)\n\n",
+            "Evaluates whole-organ parenchymal overlap (Sørensen-Dice) with combined parenchymal and lesion coverage.\n\n",
+            "| Task Name | Anatomy | Modality | Init Dice | ANTs Affine | syntx Native Affine | Winner | ANTs SyN | syntx SyN Beltrami | Δ vs ANTs SyN | Net Gain (syntx) | Hold-Out TRE | Folding % | Min Jac (Liouville) |\n",
+            "| :--- | :--- | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: |\n",
+        ])
+        for r in res_stratum_a:
+            delta_ants = r["dice_syntx_syn"] - r["dice_ants_syn"]
+            lines_md.append(
+                f"| **{r['task_name']}** | {r['anatomy']} | {r['modality']} | "
+                f"{r['dice_initial']:.4f} | {r['dice_ants_affine']:.4f} | {r['dice_syntx_affine']:.4f} | "
+                f"**{r['winning_candidate']}** | {r['dice_ants_syn']:.4f} | **{r['dice_syntx_syn']:.4f}** | "
+                f"**{delta_ants:+.4f}** | **{r['gain_syntx_syn']:+.4f}** | "
+                f"{r['landmark_tre_mm']:.3f} mm | {r['folding_pct']:.4f}% | {r['min_jacobian']:.4f} |\n"
+            )
+        lines_md.append("\n")
+
+    res_stratum_b = [r for r in ordered if r.get("stratum") == "B"]
+    if res_stratum_b:
+        lines_md.extend([
+            "## Stratum B: Surrogate Parenchymal Alignment for Focal Pathology (4 Tasks)\n\n",
+            "Evaluates surrogate parenchymal overlap (brain mask, lung cavity, abdominal soft tissue) and structural correlation.\n\n",
+            "| Task Name | Anatomy | Modality | Surrogate Definition | Init Dice | ANTs Affine | syntx Native Affine | ANTs SyN | syntx SyN Beltrami | Δ vs ANTs SyN | Net Gain (syntx) | Hold-Out TRE | Folding % | Min Jac (Liouville) |\n",
+            "| :--- | :--- | :---: | :--- | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: |\n",
+        ])
+        for r in res_stratum_b:
+            delta_ants = r["dice_syntx_syn"] - r["dice_ants_syn"]
+            lines_md.append(
+                f"| **{r['task_name']}** | {r['anatomy']} | {r['modality']} | {r['label_description'].split('(')[-1].rstrip(')')} | "
+                f"{r['dice_initial']:.4f} | {r['dice_ants_affine']:.4f} | {r['dice_syntx_affine']:.4f} | "
+                f"{r['dice_ants_syn']:.4f} | **{r['dice_syntx_syn']:.4f}** | **{delta_ants:+.4f}** | "
+                f"**{r['gain_syntx_syn']:+.4f}** | {r['landmark_tre_mm']:.3f} mm | {r['folding_pct']:.4f}% | {r['min_jacobian']:.4f} |\n"
+            )
+        lines_md.append("\n")
+
+    lines_md.append("## Stratum Summaries & Power Analysis\n\n")
+    if res_stratum_a:
+        mean_init_a = float(np.mean([r["dice_initial"] for r in res_stratum_a]))
+        mean_ants_aff_a = float(np.mean([r["dice_ants_affine"] for r in res_stratum_a]))
+        mean_aff_a = float(np.mean([r["dice_syntx_affine"] for r in res_stratum_a]))
+        mean_ants_syn_a = float(np.mean([r["dice_ants_syn"] for r in res_stratum_a]))
+        mean_syn_a = float(np.mean([r["dice_syntx_syn"] for r in res_stratum_a]))
+        mean_gain_a = float(np.mean([r["gain_syntx_syn"] for r in res_stratum_a]))
+        tres_a = [r["landmark_tre_mm"] for r in res_stratum_a if r["landmark_tre_mm"] > 0]
+        mean_tre_a = float(np.mean(tres_a)) if tres_a else 0.0
+        lines_md.extend([
+            "### Stratum A Summary (Anatomical Organ Tasks):\n",
+            f"- **Mean Initial Dice**: `{mean_init_a:.4f}`\n",
+            f"- **Mean Affine Dice**: `syntx` **`{mean_aff_a:.4f}`** vs `ANTs` `{mean_ants_aff_a:.4f}` (`{mean_aff_a - mean_ants_aff_a:+.4f}`)\n",
+            f"- **Mean Deformable Dice**: `syntx SyN Beltrami` **`{mean_syn_a:.4f}`** vs `ANTs SyN` `{mean_ants_syn_a:.4f}` (**`{mean_syn_a - mean_ants_syn_a:+.4f}`**, net gain **`{mean_gain_a:+.4f}`**)\n",
+            f"- **Mean Hold-Out Target Registration Error**: **`{mean_tre_a:.3f} mm`**\n\n",
+        ])
+    if res_stratum_b:
+        mean_init_b = float(np.mean([r["dice_initial"] for r in res_stratum_b]))
+        mean_ants_aff_b = float(np.mean([r["dice_ants_affine"] for r in res_stratum_b]))
+        mean_aff_b = float(np.mean([r["dice_syntx_affine"] for r in res_stratum_b]))
+        mean_ants_syn_b = float(np.mean([r["dice_ants_syn"] for r in res_stratum_b]))
+        mean_syn_b = float(np.mean([r["dice_syntx_syn"] for r in res_stratum_b]))
+        mean_gain_b = float(np.mean([r["gain_syntx_syn"] for r in res_stratum_b]))
+        tres_b = [r["landmark_tre_mm"] for r in res_stratum_b if r["landmark_tre_mm"] > 0]
+        mean_tre_b = float(np.mean(tres_b)) if tres_b else 0.0
+        lines_md.extend([
+            "### Stratum B Summary (Focal Lesion Tasks with Surrogates):\n",
+            f"- **Mean Initial Surrogate Dice**: `{mean_init_b:.4f}`\n",
+            f"- **Mean Affine Dice**: `syntx` **`{mean_aff_b:.4f}`** vs `ANTs` `{mean_ants_aff_b:.4f}` (`{mean_aff_b - mean_ants_aff_b:+.4f}`)\n",
+            f"- **Mean Deformable Dice**: `syntx SyN Beltrami` **`{mean_syn_b:.4f}`** vs `ANTs SyN` `{mean_ants_syn_b:.4f}` (**`{mean_syn_b - mean_ants_syn_b:+.4f}`**, net gain **`{mean_gain_b:+.4f}`**)\n",
+            f"- **Mean Hold-Out Target Registration Error**: **`{mean_tre_b:.3f} mm`**\n\n",
         ])
 
-    if args.num_pairs == 1:
-        lines.extend([
-            "## Multi-Task Benchmark Results\n\n",
-            "| Task Name | Anatomy | Modality | Standard | Init Dice | Default Affine | SIFT3D Affine | OT Affine | Winner | Tournament Affine | Deformable SyN | Net Gain | Struct LNCC | Landmark TRE | Folding % |\n",
-            "| :--- | :--- | :---: | :--- | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: |\n",
-        ])
-        for r in results:
-            std_desc = "Organ GT" if r["is_organ_task"] else "Surrogate"
-            sift_d = f"{r.get('dice_aff_sift'):.4f}" if r.get("dice_aff_sift") is not None else "—"
-            ot_d = f"{r.get('dice_aff_ot'):.4f}" if r.get("dice_aff_ot") is not None else "—"
-            lncc_d = f"{r['lncc_deformable']:+.3f}" if "lncc_deformable" in r else "—"
-            lines.append(
-                f"| **{r['task_name']}** | {r['anatomy']} | {r['modality']} | {std_desc} | "
-                f"{r['dice_initial']:.4f} | {r.get('dice_aff_default', 0.0):.4f} | {sift_d} | {ot_d} | "
-                f"**{r['winning_candidate']}** | {r['dice_tournament']:.4f} | **{r['dice_deformable']:.4f}** | "
-                f"**{r['gain_deformable']:+.4f}** | {lncc_d} | {r['landmark_tre_mm']:.3f} mm | {r['folding_pct']:.4f}% |\n"
-            )
+    tmp_md = output_md + ".tmp"
+    with open(tmp_md, "w") as f:
+        f.writelines(lines_md)
+    os.replace(tmp_md, output_md)
+
+
+def _compose_light_theme_mosaic(panel_paths: List[Tuple[str, str]], output_viz: str) -> None:
+    """Stitches pre-rendered syntx.viz 4-panel PNGs (never raw medical arrays) into a light-theme report figure."""
+    if not panel_paths:
+        return
+    try:
+        from PIL import Image, ImageDraw
+        imgs = []
+        for tname, p in panel_paths:
+            if p and os.path.exists(p):
+                imgs.append((tname, Image.open(p).convert("RGB")))
+        if not imgs:
+            return
+        w_max = max(im.width for _, im in imgs)
+        pad_top = 36
+        total_h = sum(im.height + pad_top for _, im in imgs)
+        canvas = Image.new("RGB", (w_max, total_h), (255, 255, 255))
+        draw = ImageDraw.Draw(canvas)
+        y = 0
+        for tname, im in imgs:
+            draw.text((16, y + 10), f"{tname} — syntx.viz Standard 4-Panel QC (Light Theme)", fill=(30, 41, 59))
+            canvas.paste(im, (0, y + pad_top))
+            y += im.height + pad_top
+        os.makedirs(os.path.dirname(os.path.abspath(output_viz)), exist_ok=True)
+        canvas.save(output_viz)
+    finally:
+        for _, p in panel_paths:
+            if p and os.path.exists(p):
+                try:
+                    os.remove(p)
+                except Exception:
+                    pass
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Medical Decathlon Provenance & Evaluation Harness")
+    parser.add_argument("--data-dir", type=str, default=DEFAULT_DECATHLON_DIR)
+    parser.add_argument("--output-json", type=str, default=OUT_JSON)
+    parser.add_argument("--output-md", type=str, default=OUT_MD)
+    parser.add_argument("--output-viz", type=str, default="docs/reports/decathlon_multi_organ_visualization.png")
+    parser.add_argument("--task", type=str, default=None, help="Filter to specific task name")
+    parser.add_argument("--tasks", type=str, default=None, help="Comma-separated task names")
+    parser.add_argument("--num-pairs", "-n", "--pairs-per-task", dest="num_pairs", type=int, default=1, help="Pairs per task")
+    parser.add_argument("--device", type=str, default=None, help="Device ('mps' or 'cpu')")
+    parser.add_argument("--smoke", action="store_true", help="Run fast single-pair smoke test (<60s)")
+    parser.add_argument("--render-viz", action="store_true", help="Render light-theme visual figure")
+    parser.add_argument("--merge-existing", action="store_true", help="Merge newly evaluated tasks into existing output JSON")
+    args = parser.parse_args()
+
+    print("=" * 85)
+    print("MEDICAL DECATHLON PROVENANCE EVALUATION HARNESS")
+    print("Compliant with GEMINI.md Section 6 (Whole-Organ & Landmark TRE Scoring)")
+    print(f"Directory: {args.data_dir} | Pairs per task: {args.num_pairs} | Smoke: {args.smoke}")
+    print("=" * 85, flush=True)
+
+    if args.device:
+        device = args.device
     else:
-        lines.extend([
-            "## Multi-Pair Statistical Power & Cohort Evaluation\n\n",
-            "| Task Name | Anatomy | Modality | Pairs | Initial Dice | Affine Dice | Deformable SyN | Net Gain (95% CI) | Landmark TRE | Win Rate | p-value |\n",
-            "| :--- | :--- | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: |\n",
-        ])
-        for r in results:
-            ci_str = f"[{r['gain_deformable_ci95'][0]:+.4f}, {r['gain_deformable_ci95'][1]:+.4f}]"
-            pval_str = f"{r['p_value']:.4e}" if r['p_value'] < 0.001 else f"{r['p_value']:.4f}"
-            lines.append(
-                f"| **{r['task_name']}** | {r['anatomy']} | {r['modality']} | {r['num_pairs']} | "
-                f"{r['dice_initial']:.4f} ± {r['dice_initial_std']:.4f} | "
-                f"{r['dice_tournament']:.4f} ± {r['dice_tournament_std']:.4f} | "
-                f"**{r['dice_deformable']:.4f} ± {r['dice_deformable_std']:.4f}** | "
-                f"**{r['gain_deformable']:+.4f}** {ci_str} | "
-                f"{r['landmark_tre_mm']:.3f} mm | **{r['win_rate']:.1f}%** | `{pval_str}` |\n"
-            )
+        device = "mps" if torch.backends.mps.is_available() else "cpu"
 
-        # Expandable Granular Records
-        lines.append("\n<details>\n<summary><b>Click to expand granular per-pair cohort records</b></summary>\n\n")
-        lines.append("| Task Name | Pair # | Fixed Case | Moving Case | Initial Dice | Tourn Dice | Def Dice | Net Gain | TRE (mm) |\n")
-        lines.append("| :--- | :---: | :--- | :--- | :---: | :---: | :---: | :---: | :---: |\n")
-        for r in results:
-            for p in r.get("pairs", []):
-                cases_str = p.get("cases", ["-", "-"])
-                lines.append(
-                    f"| {r['task_name']} | #{p.get('pair_idx', 0)+1} | `{cases_str[0]}` | `{cases_str[1]}` | "
-                    f"{p['dice_initial']:.4f} | {p['dice_tournament']:.4f} | {p['dice_deformable']:.4f} | "
-                    f"{p['gain_deformable']:+.4f} | {p['landmark_tre_mm']:.3f} mm |\n"
-                )
-        lines.append("\n</details>\n")
+    if args.smoke:
+        smoke_tasks = ["Task04_Hippocampus", "Task01_BrainTumour"]
+        specs_to_run = [s for s in TASK_SPECS if s["name"] in smoke_tasks]
+        if args.task:
+            specs_to_run = [s for s in TASK_SPECS if s["name"].lower() == args.task.lower()]
+        args.num_pairs = 1
+        if args.output_json == OUT_JSON:
+            args.output_json = os.path.join(tempfile.gettempdir(), "decathlon_smoke_provenance.json")
+        if args.output_md == OUT_MD:
+            args.output_md = os.path.join(tempfile.gettempdir(), "decathlon_smoke_provenance.md")
+    else:
+        specs_to_run = TASK_SPECS
+        if args.task:
+            specs_to_run = [s for s in TASK_SPECS if s["name"].lower() == args.task.lower()]
+        elif args.tasks:
+            task_list = [t.strip().lower() for t in args.tasks.split(",")]
+            specs_to_run = [s for s in TASK_SPECS if s["name"].lower() in task_list]
 
-    mean_init = np.mean([r["dice_initial"] for r in results])
-    mean_aff = np.mean([r["dice_tournament"] for r in results])
-    mean_def = np.mean([r["dice_deformable"] for r in results])
-    mean_gain = np.mean([r["gain_deformable"] for r in results])
-    mean_tre = np.mean([r["landmark_tre_mm"] for r in results if r["landmark_tre_mm"] > 0])
-    wins = sum(r["gain_deformable"] >= 0 for r in results)
+    results_by_task: Dict[str, Dict[str, Any]] = {}
+    if args.merge_existing and not args.smoke and os.path.isfile(args.output_json):
+        try:
+            with open(args.output_json) as f:
+                existing = json.load(f)
+            if isinstance(existing, list):
+                for entry in existing:
+                    if isinstance(entry, dict) and "task_name" in entry:
+                        results_by_task[entry["task_name"]] = entry
+            print(f"[+] Loaded {len(results_by_task)} existing task record(s) from {args.output_json}", flush=True)
+        except Exception as exc:
+            print(f"[!] Warning: could not read existing {args.output_json} ({exc})", flush=True)
 
-    lines.extend([
-        "\n## Aggregate Decathlon Summary\n\n",
-        f"- **Mean Initial Parenchymal Dice**: `{mean_init:.4f}`\n",
-        f"- **Mean Tournament Affine Dice**: `{mean_aff:.4f}` (`{mean_aff - mean_init:+.4f}` gain)\n",
-        f"- **Mean Deformable SyN Dice**: **`{mean_def:.4f}`** (**`{mean_gain:+.4f}`** gain)\n",
-        f"- **Mean Target Registration Error (TRE)**: **`{mean_tre:.3f} mm`** (Target < 1.0 mm achieved across all tasks)\n",
-        f"- **Overall Win Rate**: **{wins} / {len(results)} ({wins / len(results) * 100.0:.1f}%)**\n",
-    ])
+    panel_paths: List[Tuple[str, str]] = []
+    evaluated_any = False
+    for spec in specs_to_run:
+        t_name = spec["name"]
+        print(f"\n--- Evaluating {t_name} (Stratum {spec['stratum']}, {spec['anatomy']}, {spec['modality']}) ---", flush=True)
+        res = evaluate_decathlon_cohort(
+            spec,
+            args.data_dir,
+            num_pairs=args.num_pairs,
+            device=device,
+            return_visuals=args.render_viz,
+            smoke=args.smoke,
+        )
+        if res is None:
+            print(f"[-] Skipping {t_name}: data not found or incomplete.")
+            continue
 
-    with open(args.output_md, "w") as f:
-        f.writelines(lines)
+        evaluated_any = True
+        vis = res.pop("visuals", None)
+        if vis and vis.get("fig_path"):
+            panel_paths.append((t_name, vis["fig_path"]))
+
+        results_by_task[t_name] = res
+        print(
+            f"  [Summary] Init={res['dice_initial']:.4f} | "
+            f"ANTsAff={res['dice_ants_affine']:.4f} | syntxAff={res['dice_syntx_affine']:.4f} | "
+            f"ANTsSyN={res['dice_ants_syn']:.4f} | syntxSyN={res['dice_syntx_syn']:.4f} "
+            f"(ΔANTs: {res['dice_syntx_syn'] - res['dice_ants_syn']:+.4f}, Gain: {res['gain_syntx_syn']:+.4f}) | "
+            f"TRE={res['landmark_tre_mm']:.3f} mm | MinJac={res['min_jacobian']:.4f} | Folds={res['folding_pct']:.4f}%",
+            flush=True,
+        )
+
+        # Checkpoint immediately after every completed task
+        _write_provenance_outputs(
+            list(results_by_task.values()),
+            args.output_json,
+            args.output_md,
+            device=device,
+            num_pairs=args.num_pairs,
+            smoke=args.smoke,
+        )
+
+    if not evaluated_any:
+        print("\n[!] No tasks evaluated.")
+        return
+
+    if args.render_viz and panel_paths:
+        _compose_light_theme_mosaic(panel_paths, args.output_viz)
+        print(f"Saved light-theme visualization figure to: {args.output_viz}")
+
+    print(f"\nSaved structured provenance JSON to: {args.output_json}")
     print(f"Generated Markdown report to: {args.output_md}")
 
 

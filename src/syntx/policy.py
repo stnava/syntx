@@ -22,7 +22,7 @@ class RegistrationPolicy:
     transform_type : str, default "SyN"
         "SyN" or "TVF" in the current rules (``auto_reg``'s ``type_of_transform``).
     similarity_metric : str, default "cc2"
-        "cc2" or "mattes_mi" (forwarded as ``syn_metric``).
+        "cc", "cc2" or "mattes_mi" (forwarded as ``syn_metric``).
     guided : str or None, default None
         "sulcal" for whole-brain mono-modal MRI, else None.
     cohort_type : str, default "auto"
@@ -34,6 +34,10 @@ class RegistrationPolicy:
     ct_window : (float, float) or None
         HU window (min, max) mapped linearly to [0, 1] and clipped (applied when the fixed
         image is diagnosed CT).
+    coarse_spacing_mm : float, default 4.0
+        Target coarsest isotropic pyramid spacing in millimeters for scale-space level planning
+        in ``auto_reg`` (4.0 mm for cranial/pelvic/general; 10.0 mm for thoraco-abdominal
+        respiratory/visceral cavities).
     explanation : str
         Human-readable reason for the choice.
     """
@@ -44,6 +48,7 @@ class RegistrationPolicy:
     robust_affine: Union[bool, str] = "auto"
     denoise: bool = False
     ct_window: Optional[Tuple[float, float]] = None
+    coarse_spacing_mm: float = 4.0
     explanation: str = ""
 
     def to_dict(self) -> Dict[str, Any]:
@@ -68,12 +73,15 @@ def synthesize_policy(pair_diag: PairDiagnosis) -> RegistrationPolicy:
 
     1. Both BRAIN: same modality -> SyN, cc2, ``guided="sulcal"``, ``denoise=True``;
        different modality -> SyN, mattes_mi, ``denoise=True``.
-    2. Either THORAX and both CT -> TVF, cc2, ``ct_window=(-1000, 400)``.
-    3. Either ABDOMEN and both CT -> SyN, cc2, ``ct_window=(-150, 250)``.
-    4. Either HEART (only the classifier produces it) -> SyN, cc2, ``denoise=True``.
-    5. Either PELVIS -> SyN, cc2.
+    2. Fixed THORAX and both CT -> TVF, cc (signed LNCC), ``ct_window=(-1000, 400)``,
+       ``coarse_spacing_mm=10.0``.
+    3. Either ABDOMEN and both CT -> SyN, cc (signed LNCC), ``ct_window=(-150, 250)``,
+       ``coarse_spacing_mm=10.0``.
+    4. Either HEART (only the classifier produces it) -> SyN, cc2, ``denoise=True``,
+       ``coarse_spacing_mm=10.0``.
+    5. Either PELVIS -> SyN, cc2 (``denoise=True`` for 3-D MRI).
     6. ``relationship == "CROSS_MODAL"`` -> SyN, mattes_mi.
-    7. Otherwise -> SyN, cc2.
+    7. Otherwise -> SyN, cc2 (``denoise=True`` for 3-D MRI).
 
     Parameters
     ----------
@@ -98,24 +106,29 @@ def synthesize_policy(pair_diag: PairDiagnosis) -> RegistrationPolicy:
             transform_type="SyN", similarity_metric="mattes_mi", denoise=True,
             explanation="Brain MRI, different contrasts: SyN, Mattes MI, Rician denoising.")
 
-    if (fix.is_thorax() or mov.is_thorax()) and fix.is_ct() and mov.is_ct():
+    if fix.is_thorax() and fix.is_ct() and mov.is_ct():
         return RegistrationPolicy(
-            transform_type="TVF", similarity_metric="cc2", ct_window=(-1000.0, 400.0),
-            explanation="Thorax CT: TVF, cc2, lung HU window [-1000, 400].")
+            transform_type="TVF", similarity_metric="cc", ct_window=(-1000.0, 400.0),
+            coarse_spacing_mm=10.0,
+            explanation="Thorax CT: TVF, signed cc, lung HU window [-1000, 400], 10 mm coarse scale.")
 
     if (fix.is_abdomen() or mov.is_abdomen()) and fix.is_ct() and mov.is_ct():
         return RegistrationPolicy(
-            transform_type="SyN", similarity_metric="cc2", ct_window=(-150.0, 250.0),
-            explanation="Abdomen CT: SyN, cc2, soft-tissue HU window [-150, 250].")
+            transform_type="SyN", similarity_metric="cc", ct_window=(-150.0, 250.0),
+            coarse_spacing_mm=10.0,
+            explanation="Abdomen CT: SyN, signed cc, soft-tissue HU window [-150, 250], 10 mm coarse scale.")
 
     if fix.is_heart() or mov.is_heart():
         return RegistrationPolicy(
             transform_type="SyN", similarity_metric="cc2", denoise=True,
-            explanation="Cardiac MRI: SyN, cc2, Rician denoising.")
+            coarse_spacing_mm=10.0,
+            explanation="Cardiac MRI: SyN, cc2, Rician denoising, 10 mm coarse scale.")
+
+    denoise_3d_mri = bool(fix.is_mri() and mov.is_mri() and fix.dimension >= 3)
 
     if fix.is_pelvis() or mov.is_pelvis():
         return RegistrationPolicy(
-            transform_type="SyN", similarity_metric="cc2",
+            transform_type="SyN", similarity_metric="cc2", denoise=denoise_3d_mri,
             explanation="Pelvis: SyN, cc2.")
 
     if pair_diag.relationship == "CROSS_MODAL":
@@ -124,6 +137,7 @@ def synthesize_policy(pair_diag: PairDiagnosis) -> RegistrationPolicy:
             explanation="Cross-modality: SyN, Mattes MI.")
 
     return RegistrationPolicy(transform_type="SyN", similarity_metric="cc2",
+                              denoise=denoise_3d_mri,
                               explanation="Default: SyN, cc2.")
 
 def auto_policy_for_images(fixed, moving, fast: bool = True) -> RegistrationPolicy:

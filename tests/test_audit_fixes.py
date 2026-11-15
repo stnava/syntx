@@ -117,7 +117,7 @@ def test_policy_has_only_applied_fields():
     from syntx.policy import RegistrationPolicy
     names = {f.name for f in dataclasses.fields(RegistrationPolicy)}
     assert names == {"transform_type", "similarity_metric", "guided", "cohort_type",
-                     "robust_affine", "denoise", "ct_window", "explanation"}
+                     "robust_affine", "denoise", "ct_window", "coarse_spacing_mm", "explanation"}
 
 
 def test_auto_reg_thorax_ct_policy_runs_tvf(monkeypatch):
@@ -142,7 +142,7 @@ def test_auto_reg_thorax_ct_policy_runs_tvf(monkeypatch):
     fi = ants.resample_image(ants.image_read(ants.get_data("r16")), (64, 64), use_voxels=True)
     mi = ants.resample_image(ants.image_read(ants.get_data("r64")), (64, 64), use_voxels=True)
     res = syntx.auto_reg(fi, mi, device="cpu", reg_iterations=[2, 0, 0])
-    assert seen["syn_metric"] == "cc2" and "similarity_metric" not in seen
+    assert seen["syn_metric"] == "cc" and "similarity_metric" not in seen
     assert res["metrics"]["type_of_transform_used"] == "TVF"
 
 

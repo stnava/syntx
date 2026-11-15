@@ -18,30 +18,80 @@ import ants
 import syntx
 from syntx.provenance import with_provenance
 from syntx.deformation_metrics import compute_bidirectional_dice
+from syntx.pyramid import cap_ants_image
 
 
-def _prepare_image_and_label(img_path: str, lbl_path: str, channel: int = 0, max_dimension: Optional[int] = 256) -> Tuple[ants.ANTsImage, ants.ANTsImage]:
-    """Read an image and its label map; a 4-D image keeps volume ``channel`` (a 4-D label map
-    volume 0). If the image's largest dimension exceeds ``max_dimension``, both are resampled
-    to isotropically scaled spacing (image linear, labels nearest neighbour) so that the
-    largest dimension becomes about ``max_dimension``. Returns (image, labels)."""
+STRATUM_A_TASKS = [
+    "Task02_Heart",
+    "Task03_Liver",
+    "Task04_Hippocampus",
+    "Task05_Prostate",
+    "Task07_Pancreas",
+    "Task09_Spleen",
+]
+
+STRATUM_B_TASKS = [
+    "Task01_BrainTumour",
+    "Task06_Lung",
+    "Task08_HepaticVessel",
+    "Task10_Colon",
+]
+
+
+def _prepare_image_and_label(
+    img_path: str,
+    lbl_path: Optional[str] = None,
+    channel: Optional[int] = None,
+    max_dimension: Optional[int] = 256,
+    task_name: Optional[str] = None,
+    combine_parenchyma: bool = True,
+) -> Tuple[ants.ANTsImage, Optional[ants.ANTsImage]]:
+    """Read an image and its label map.
+
+    - 4-D image: defaults to channel 1 (T1w structural channel) for BrainTumour (Task01),
+      and channel 0 for other tasks unless ``channel`` is explicitly specified.
+    - 4-D label: volume 0 is used.
+    - Task-specific semantics:
+      - Task03 (Liver) and Task07 (Pancreas): combine parenchymal and tumor labels
+        ((lbl == 1) | (lbl == 2)) when ``combine_parenchyma=True`` to avoid cancer carve-out penalties.
+      - Task05 (Prostate): combine peripheral and transition zones ((lbl == 1) | (lbl == 2))
+        for whole gland overlap.
+    - Anisotropy-preserving capping:
+      If ``max_dimension`` is specified and max(img.shape) > max_dimension, downsamples the
+      working image using ``cap_ants_image(img, ..., policy='deformable')`` to preserve native
+      thick-slice z spacing. Labels are NEVER downsampled, preserving native full resolution.
+    """
     img = ants.image_read(img_path)
-    lbl = ants.image_read(lbl_path)
+    lbl = ants.image_read(lbl_path) if (lbl_path and os.path.exists(lbl_path)) else None
 
+    # Determine default channel for 4D images
     if img.dimension == 4:
-        # Extract specific 3D channel
-        arr = img.numpy()[..., channel]
+        if channel is not None:
+            ch_idx = int(channel)
+        elif task_name is not None and ("BrainTumour" in task_name or "Task01" in task_name):
+            ch_idx = 1  # T1w structural channel
+        else:
+            ch_idx = 0
+        arr = img.numpy()[..., ch_idx]
         img = ants.from_numpy(arr, origin=img.origin[:3], spacing=img.spacing[:3], direction=img.direction[:3, :3])
 
-    if lbl.dimension == 4:
+    if lbl is not None and lbl.dimension == 4:
         arr_l = lbl.numpy()[..., 0]
         lbl = ants.from_numpy(arr_l, origin=lbl.origin[:3], spacing=lbl.spacing[:3], direction=lbl.direction[:3, :3])
 
+    # Apply task-specific parenchymal label combinations
+    if lbl is not None and combine_parenchyma and task_name is not None:
+        arr_l = lbl.numpy()
+        if any(k in task_name for k in ("Liver", "Task03", "Pancreas", "Task07", "Prostate", "Task05")):
+            # Combine label 1 and label 2 for whole-organ / parenchymal coverage
+            combined = np.where((arr_l == 1) | (arr_l == 2), 1.0, 0.0).astype(np.float32)
+            lbl = ants.from_numpy(combined, origin=lbl.origin, spacing=lbl.spacing, direction=lbl.direction)
+
+    # Anisotropy-preserving downsampling for working image (policy='deformable' preserves native z)
     if max_dimension is not None and max(img.shape) > max_dimension:
         scale = float(max_dimension / max(img.shape))
-        new_spacing = tuple(float(s / scale) for s in img.spacing)
-        img = ants.resample_image(img, resample_params=new_spacing, use_voxels=False, interp_type=0)
-        lbl = ants.resample_image(lbl, resample_params=new_spacing, use_voxels=False, interp_type=1)
+        max_res = float(min(img.spacing) / scale)
+        img = cap_ants_image(img, max_resolution_mm=max_res, policy="deformable")
 
     return img, lbl
 
@@ -57,10 +107,9 @@ def evaluate_msd_pair(
 ) -> Dict[str, Any]:
     """Register MSD training case ``moving_idx`` to case ``fixed_idx`` with ``syntx.auto_reg``.
 
-    Images and labels are read with ``_prepare_image_and_label`` (channel 0 of 4-D images).
-    The initial Dice is ``compute_bidirectional_dice`` with no transforms (labels resampled
-    into the other image's grid). ``auto_reg`` is called with both label maps, so its
-    reported metrics include Dice.
+    Images and labels are read with ``_prepare_image_and_label``.
+    Initial and final Dice are evaluated on native full-resolution labels and images with
+    ``compute_bidirectional_dice`` using exact transform inversion (whichtoinvert_inv=[True, False]).
 
     Parameters
     ----------
@@ -72,7 +121,8 @@ def evaluate_msd_pair(
         Deformable iterations; default [40, 20, 10]. (The affine stage is ``auto_reg``'s
         ``robust_affine``; it has no iteration schedule here.)
     max_dimension : int or None, default 256
-        Downsample cases whose largest dimension exceeds this; None keeps full resolution.
+        Downsample working image when largest dimension exceeds this (using anisotropy-preserving
+        cap_ants_image); labels remain at native full resolution.
     verbose : bool, default False
         Passed to ``auto_reg``.
 
@@ -80,19 +130,10 @@ def evaluate_msd_pair(
     -------
     dict
         'task_name', 'fixed_case', 'moving_case' (image file names), 'initial_dice_sym',
-        'final_dice_sym', 'final_dice_fixed', 'final_dice_moving' (NaN if ``auto_reg``
-        reported none), 'dice_gain' (final - initial), 'folding_pct', 'min_jac'
-        (``metrics['jac_min']``; both NaN if ``auto_reg`` reported none), 'time_seconds',
-        'diagnosed_relationship', 'diagnosed_fixed_anatomy', 'diagnosed_fixed_modality'
-        ('UNKNOWN' without a diagnosis), 'policy_explanation', 'fwdtransforms',
-        'invtransforms', plus 'provenance' added by the ``with_provenance`` decorator.
-
-    Raises
-    ------
-    FileNotFoundError
-        No ``dataset.json`` in ``task_dir``.
-    IndexError
-        An index is beyond the number of training cases.
+        'final_dice_sym', 'final_dice_fixed', 'final_dice_moving', 'dice_gain' (final - initial),
+        'folding_pct', 'min_jac', 'time_seconds', 'diagnosed_relationship',
+        'diagnosed_fixed_anatomy', 'diagnosed_fixed_modality', 'policy_explanation',
+        'fwdtransforms', 'invtransforms', plus 'provenance' added by the ``with_provenance`` decorator.
     """
     meta_path = os.path.join(task_dir, "dataset.json")
     if not os.path.exists(meta_path):
@@ -114,28 +155,42 @@ def evaluate_msd_pair(
     mov_img_p = os.path.normpath(os.path.join(task_dir, mov_case["image"]))
     mov_lbl_p = os.path.normpath(os.path.join(task_dir, mov_case["label"]))
 
-    fi, fl = _prepare_image_and_label(fix_img_p, fix_lbl_p, max_dimension=max_dimension)
-    mi, ml = _prepare_image_and_label(mov_img_p, mov_lbl_p, max_dimension=max_dimension)
+    # Load native full-resolution images and labels
+    fi_native, fl_native = _prepare_image_and_label(fix_img_p, fix_lbl_p, max_dimension=None, task_name=task_name)
+    mi_native, ml_native = _prepare_image_and_label(mov_img_p, mov_lbl_p, max_dimension=None, task_name=task_name)
 
-    # Initial overlap (unaligned baseline)
-    d_fix_0, d_mov_0, d_sym_0 = compute_bidirectional_dice(fl, ml, fi, mi, [], [], [])
+    # Working images for registration (anisotropy-preserving capping if requested)
+    if max_dimension is not None and (max(fi_native.shape) > max_dimension or max(mi_native.shape) > max_dimension):
+        fi, _ = _prepare_image_and_label(fix_img_p, None, max_dimension=max_dimension, task_name=task_name)
+        mi, _ = _prepare_image_and_label(mov_img_p, None, max_dimension=max_dimension, task_name=task_name)
+    else:
+        fi, mi = fi_native, mi_native
+
+    # Initial overlap on native full-resolution images (unaligned baseline)
+    d_fix_0, d_mov_0, d_sym_0 = compute_bidirectional_dice(fl_native, ml_native, fi_native, mi_native, [], [], [])
 
     # Run auto_reg with autonomous diagnosis & policy synthesis
     t0 = time.time()
     res = syntx.auto_reg(
         fixed=fi,
         moving=mi,
-        fixed_label=fl,
-        moving_label=ml,
         reg_iterations=reg_iterations or [40, 20, 10],
         verbose=verbose
     )
     t_elapsed = time.time() - t0
 
+    # Evaluate final composite transforms on native full-resolution labels and images
+    fwd_tx = res.get("fwdtransforms", [])
+    inv_tx = res.get("invtransforms", [])
+    n_inv = len(inv_tx)
+    whichtoinvert_inv = [True] if n_inv == 1 else ([True, False] if n_inv == 2 else [True] + [False] * (n_inv - 1)) if n_inv > 0 else []
+
+    d_fix_final, d_mov_final, d_sym_final = compute_bidirectional_dice(
+        fl_native, ml_native, fi_native, mi_native,
+        fwd_tx, inv_tx, whichtoinvert_inv
+    )
+
     metrics = res.get("metrics", {})
-    dice_sym = metrics.get("dice_sym", float("nan"))
-    dice_fix = metrics.get("dice_fixed", float("nan"))
-    dice_mov = metrics.get("dice_moving", float("nan"))
     folding_pct = metrics.get("folding_pct", float("nan"))
     min_jac = metrics.get("jac_min", float("nan"))
     diag = metrics.get("diagnosis", {})
@@ -145,10 +200,10 @@ def evaluate_msd_pair(
         "fixed_case": os.path.basename(fix_img_p),
         "moving_case": os.path.basename(mov_img_p),
         "initial_dice_sym": float(d_sym_0),
-        "final_dice_sym": float(dice_sym),
-        "final_dice_fixed": float(dice_fix),
-        "final_dice_moving": float(dice_mov),
-        "dice_gain": float(dice_sym - d_sym_0),
+        "final_dice_sym": float(d_sym_final),
+        "final_dice_fixed": float(d_fix_final),
+        "final_dice_moving": float(d_mov_final),
+        "dice_gain": float(d_sym_final - d_sym_0),
         "folding_pct": float(folding_pct),
         "min_jac": float(min_jac),
         "time_seconds": float(t_elapsed),
@@ -156,8 +211,8 @@ def evaluate_msd_pair(
         "diagnosed_fixed_anatomy": diag.get("fixed_anatomy", "UNKNOWN"),
         "diagnosed_fixed_modality": diag.get("fixed_modality", "UNKNOWN"),
         "policy_explanation": metrics.get("policy_explanation", ""),
-        "fwdtransforms": res.get("fwdtransforms", []),
-        "invtransforms": res.get("invtransforms", [])
+        "fwdtransforms": fwd_tx,
+        "invtransforms": inv_tx,
     }
 
 
