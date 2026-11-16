@@ -1277,6 +1277,7 @@ def syngs_registration(
             **kwargs
         )
 
+        del I_tensor, J_tensor
         with torch.no_grad():
             fwd_disp = model.get_forward_warp(image_shape=grid_shape_zyx)
             inv_disp = model.get_inverse_warp(image_shape=grid_shape_zyx)
@@ -1322,6 +1323,9 @@ def syngs_registration(
             inv_err_calc = calculate_inverse_identity_error(
                 fwd_disp, inv_disp, spacing=spacing, origin=origin, direction=direction
             )
+            _err_map = inv_err_calc.get('error_map')
+            if isinstance(_err_map, torch.Tensor):
+                _err_map = _err_map.cpu()
             inv_err_dict = {
                 'mean': float(inv_err_calc['mean_error']),
                 'max': float(inv_err_calc['max_error']),
@@ -1331,7 +1335,7 @@ def syngs_registration(
                     # like registration(): lets benchmarks report interior / p95 statistics
                     'max_error': float(inv_err_calc['max_error']),
                     'mean_error': float(inv_err_calc['mean_error']),
-                    'error_map': inv_err_calc.get('error_map'),
+                    'error_map': _err_map,
                 }
             }
 
@@ -1496,17 +1500,13 @@ def syngs_registration(
         raise ValueError(f"Unknown backend: {backend}")
 
     # Export displacement fields using standardized ITK components via syntx.spatial
-    from .transforms import _cache_disp_image_and_field, apply_transforms as _apply_transforms
+    from .transforms import _cache_disp_image_and_field, _write_ants_images_fast, apply_transforms as _apply_transforms
     _apply_dev = str(device_str) if backend.lower() == 'pytorch' else None
     fwd_img = disp_tensor_to_itk(fwd_disp, fixed)
     inv_img = disp_tensor_to_itk(inv_disp, fixed)
 
     fwd_file = tempfile.NamedTemporaryFile(suffix='_syngs_fwd_Warp.nii.gz', delete=False).name
     inv_file = tempfile.NamedTemporaryFile(suffix='_syngs_inv_Warp.nii.gz', delete=False).name
-    ants.image_write(fwd_img, fwd_file)
-    ants.image_write(inv_img, inv_file)
-    _cache_disp_image_and_field(fwd_file, fwd_img, _apply_dev)
-    _cache_disp_image_and_field(inv_file, inv_img, _apply_dev)
 
     # Export initial momentum vector fields (v_0 at t=0)
     v0_inv_disp = model.velocity_0_inv if (getattr(model, 'symmetric', False) and getattr(model, 'velocity_0_inv', None) is not None) else -model.velocity_0_fwd
@@ -1515,8 +1515,17 @@ def syngs_registration(
 
     fwd_mom_file = tempfile.NamedTemporaryFile(suffix='_syngs_fwd_Momentum.nii.gz', delete=False).name
     inv_mom_file = tempfile.NamedTemporaryFile(suffix='_syngs_inv_Momentum.nii.gz', delete=False).name
-    ants.image_write(fwd_mom_img, fwd_mom_file)
-    ants.image_write(inv_mom_img, inv_mom_file)
+    _write_ants_images_fast(
+        [
+            (fwd_img, fwd_file),
+            (inv_img, inv_file),
+            (fwd_mom_img, fwd_mom_file),
+            (inv_mom_img, inv_mom_file),
+        ],
+        compresslevel=1,
+    )
+    _cache_disp_image_and_field(fwd_file, fwd_img, _apply_dev)
+    _cache_disp_image_and_field(inv_file, inv_img, _apply_dev)
 
     # Export affine transform using standardized reference matrix conversion
     M_phys, t_phys = grid_to_physical_affine(T_grid, fixed, moving)

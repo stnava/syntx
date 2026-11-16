@@ -129,6 +129,73 @@ def clear_k_mesh_cache() -> None:
     """Clear the frequency grid cache (thread-safe)."""
     with _K_MESH_LOCK:
         _K_MESH_CACHE.clear()
+        _INV_KSQ_CACHE.clear()
+        _SOBOLEV_ENVELOPE_CACHE.clear()
+
+
+_INV_KSQ_CACHE: collections.OrderedDict = collections.OrderedDict()
+_SOBOLEV_ENVELOPE_CACHE: collections.OrderedDict = collections.OrderedDict()
+
+
+def _get_inv_ksq_cached(
+    spatial_shape: Sequence[int],
+    spacing: Optional[Sequence[float]],
+    device: torch.device,
+    relative_spacing: bool = True,
+) -> Tuple[List[torch.Tensor], torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Return cached ``(k_mesh, k_sq, k_sq_safe, inv_ksq_true_zero_dc, inv_ksq_diff_zero_dc)``."""
+    k_mesh, k_sq, k_sq_safe = _get_k_mesh_rfft(spatial_shape, spacing, device, relative_spacing=relative_spacing)
+    if spacing is not None and relative_spacing:
+        valid_sp = [float(s) for s in spacing if float(s) > 0]
+        min_sp = min(valid_sp) if valid_sp else 1.0
+        norm_sp = tuple(float(s) / max(min_sp, 1e-6) for s in spacing)
+    else:
+        norm_sp = tuple(float(x) for x in spacing) if spacing is not None else None
+    key = (tuple(spatial_shape), norm_sp, str(device), relative_spacing)
+    with _K_MESH_LOCK:
+        if key in _INV_KSQ_CACHE:
+            _INV_KSQ_CACHE.move_to_end(key)
+            inv_true, inv_diff = _INV_KSQ_CACHE[key]
+            return k_mesh, k_sq, k_sq_safe, inv_true, inv_diff
+
+    inv_true = torch.where(k_sq == 0.0, torch.zeros_like(k_sq), 1.0 / k_sq_safe)
+    k_sq_diff = k_mesh[0].square()
+    for d in range(1, len(k_mesh)):
+        k_sq_diff = k_sq_diff + k_mesh[d].square()
+    inv_diff = torch.where(k_sq_diff == 0.0, torch.zeros_like(k_sq_diff), 1.0 / k_sq_diff.clamp(min=1e-30))
+    with _K_MESH_LOCK:
+        _INV_KSQ_CACHE[key] = (inv_true, inv_diff)
+        if len(_INV_KSQ_CACHE) > _MAX_K_MESH_CACHE_SIZE:
+            _INV_KSQ_CACHE.popitem(last=False)
+    return k_mesh, k_sq, k_sq_safe, inv_true, inv_diff
+
+
+def _get_sobolev_envelope_cached(
+    spatial_shape: Sequence[int],
+    spacing: Optional[Sequence[float]],
+    alpha_val: float,
+    s_val: float,
+    device: torch.device,
+) -> torch.Tensor:
+    """Return cached ``(1.0 / (1.0 + alpha * k_sq)).pow(s)`` float32 spectral envelope."""
+    if spacing is not None:
+        valid_sp = [float(s) for s in spacing if float(s) > 0]
+        min_sp = min(valid_sp) if valid_sp else 1.0
+        norm_sp = tuple(float(s) / max(min_sp, 1e-6) for s in spacing)
+    else:
+        norm_sp = None
+    key = (tuple(spatial_shape), norm_sp, float(alpha_val), float(s_val), str(device))
+    with _K_MESH_LOCK:
+        if key in _SOBOLEV_ENVELOPE_CACHE:
+            _SOBOLEV_ENVELOPE_CACHE.move_to_end(key)
+            return _SOBOLEV_ENVELOPE_CACHE[key]
+    _, k_sq, _ = _get_k_mesh_rfft(spatial_shape, spacing, device, relative_spacing=True)
+    env = (1.0 / (1.0 + float(alpha_val) * k_sq)).pow(float(s_val))
+    with _K_MESH_LOCK:
+        _SOBOLEV_ENVELOPE_CACHE[key] = env
+        if len(_SOBOLEV_ENVELOPE_CACHE) > _MAX_K_MESH_CACHE_SIZE:
+            _SOBOLEV_ENVELOPE_CACHE.popitem(last=False)
+    return env
 
 
 # -----------------------------------------------------------------------------
@@ -282,27 +349,25 @@ def project_solenoidal(
     device, dtype = v.device, v.dtype
     spatial_dims = tuple(range(2, 2 + dim))
 
-    v_cf = torch.movedim(v, -1, 1).to(torch.float32)
+    v_cf = torch.movedim(v, -1, 1).to(torch.float32).contiguous()
     v_fft = torch.fft.rfftn(v_cf, dim=spatial_dims)
+    del v_cf
 
-    k_mesh, k_sq, k_sq_safe = _get_k_mesh_rfft(spatial_shape, spacing, device)
+    k_mesh, _, _, _, inv_ksq_diff = _get_inv_ksq_cached(spatial_shape, spacing, device)
 
-    # Compute longitudinal component: (k . v_hat) / |k|^2
-    k_dot_v = torch.zeros_like(v_fft[:, 0, ...])
+    # Compute longitudinal component: (k . v_hat) / |k|^2 and subtract in-place
+    k_dot_v = v_fft[:, 0, ...] * k_mesh[0]
+    for d in range(1, dim):
+        k_dot_v = k_dot_v + v_fft[:, d, ...] * k_mesh[d]
+    k_dot_v.mul_(inv_ksq_diff)
+
     for d in range(dim):
-        k_dot_v = k_dot_v + k_mesh[d] * v_fft[:, d, ...]
+        v_fft[:, d, ...].sub_(k_dot_v * k_mesh[d])
+    del k_dot_v
 
-    k_sq_diff = sum(k_mesh[d] ** 2 for d in range(dim))
-    k_sq_diff_safe = torch.where(k_sq_diff == 0.0, torch.ones_like(k_sq_diff), k_sq_diff)
-    factor = torch.where(k_sq_diff == 0.0, torch.zeros_like(k_dot_v), k_dot_v / k_sq_diff_safe)
-
-    # Subtract longitudinal component along each coordinate axis
-    v_sol_fft = torch.stack([
-        v_fft[:, d, ...] - factor * k_mesh[d] for d in range(dim)
-    ], dim=1)
-
-    v_sol_cf = torch.fft.irfftn(v_sol_fft, s=spatial_shape, dim=spatial_dims).to(dtype=dtype)
-    v_sol = torch.movedim(v_sol_cf, 1, -1)
+    v_sol_cf = torch.fft.irfftn(v_fft, s=spatial_shape, dim=spatial_dims)
+    del v_fft
+    v_sol = torch.movedim(v_sol_cf, 1, -1).to(dtype=dtype)
     return v_sol[0] if unbatched else v_sol
 
 
@@ -345,29 +410,26 @@ def apply_solenoidal_sobolev_operator(
         v_sol = project_solenoidal(m, spacing=spacing)
         return v_sol[0] if unbatched else v_sol
 
-    m_cf = torch.movedim(m, -1, 1).to(torch.float32)
+    m_cf = torch.movedim(m, -1, 1).to(torch.float32).contiguous()
     m_fft = torch.fft.rfftn(m_cf, dim=spatial_dims)
+    del m_cf
 
-    k_mesh, k_sq, k_sq_safe = _get_k_mesh_rfft(spatial_shape, spacing, device)
+    k_mesh, _, _, _, inv_ksq_diff = _get_inv_ksq_cached(spatial_shape, spacing, device)
+    K_sobolev = _get_sobolev_envelope_cached(spatial_shape, spacing, alpha_val, float(s), device)
 
-    # Sobolev filter
-    K_sobolev = 1.0 / ((1.0 + alpha_val * k_sq) ** float(s))
+    # Solenoidal projection + Sobolev filter in-place on m_fft
+    k_dot_m = m_fft[:, 0, ...] * k_mesh[0]
+    for d in range(1, dim):
+        k_dot_m = k_dot_m + m_fft[:, d, ...] * k_mesh[d]
+    k_dot_m.mul_(inv_ksq_diff * K_sobolev)
 
-    # Solenoidal projection factor
-    k_dot_m = torch.zeros_like(m_fft[:, 0, ...])
     for d in range(dim):
-        k_dot_m = k_dot_m + k_mesh[d] * m_fft[:, d, ...]
+        m_fft[:, d, ...].mul_(K_sobolev).sub_(k_dot_m * k_mesh[d])
+    del k_dot_m
 
-    k_sq_diff = sum(k_mesh[d] ** 2 for d in range(dim))
-    k_sq_diff_safe = torch.where(k_sq_diff == 0.0, torch.ones_like(k_sq_diff), k_sq_diff)
-    factor = torch.where(k_sq_diff == 0.0, torch.zeros_like(k_dot_m), k_dot_m / k_sq_diff_safe)
-
-    v_sol_fft = torch.stack([
-        K_sobolev * (m_fft[:, d, ...] - factor * k_mesh[d]) for d in range(dim)
-    ], dim=1)
-
-    v_sol_cf = torch.fft.irfftn(v_sol_fft, s=spatial_shape, dim=spatial_dims).to(dtype=dtype)
-    v_sol = torch.movedim(v_sol_cf, 1, -1)
+    v_sol_cf = torch.fft.irfftn(m_fft, s=spatial_shape, dim=spatial_dims)
+    del m_fft
+    v_sol = torch.movedim(v_sol_cf, 1, -1).to(dtype=dtype)
     return v_sol[0] if unbatched else v_sol
 
 
@@ -433,10 +495,11 @@ def apply_div_curl_green_operator(
         ratio = 1.0 + (float(sig) if sig is not None and sig > 0 else 4.0)
         beta_val = alpha_val * ratio
 
-    m_cf = torch.movedim(m, -1, 1).to(torch.float32)
+    m_cf = torch.movedim(m, -1, 1).to(torch.float32).contiguous()
     m_fft = torch.fft.rfftn(m_cf, dim=spatial_dims)
+    del m_cf
 
-    k_mesh, k_sq, k_sq_safe = _get_k_mesh_rfft(spatial_shape, spacing, device)
+    k_mesh, k_sq, k_sq_safe, _, inv_ksq_diff = _get_inv_ksq_cached(spatial_shape, spacing, device)
 
     # Eigenvalue filters: filt_div for longitudinal (k-parallel), filt_curl for transverse (k-perp)
     filt_div = 1.0 / (alpha_val + beta_val * k_sq_safe)
@@ -444,31 +507,28 @@ def apply_div_curl_green_operator(
 
     # Apply multiscale Sobolev envelope if requested
     if h3_envelope and envelope_power > 0:
-        K_sobolev = 1.0 / ((1.0 + alpha_val * k_sq) ** float(envelope_power))
+        K_sobolev = _get_sobolev_envelope_cached(spatial_shape, spacing, alpha_val, float(envelope_power), device)
         filt_div = filt_div * K_sobolev
         filt_curl = filt_curl * K_sobolev
 
-    k_dot_m = torch.zeros_like(m_fft[:, 0, ...])
-    for d in range(dim):
-        k_dot_m = k_dot_m + k_mesh[d] * m_fft[:, d, ...]
-
-    k_sq_diff = sum(k_mesh[d] ** 2 for d in range(dim))
-    k_sq_diff_safe = torch.where(k_sq_diff == 0.0, torch.ones_like(k_sq_diff), k_sq_diff)
-    factor = torch.where(k_sq_diff == 0.0, torch.zeros_like(k_dot_m), k_dot_m / k_sq_diff_safe)
+    k_dot_m = m_fft[:, 0, ...] * k_mesh[0]
+    for d in range(1, dim):
+        k_dot_m = k_dot_m + m_fft[:, d, ...] * k_mesh[d]
 
     # At DC (k=0), both filters give 1 / alpha_val
     mask_zero = (k_sq == 0.0)
     dc_val = 1.0 / alpha_val
     filt_curl_safe = torch.where(mask_zero, torch.full_like(filt_curl, dc_val), filt_curl)
     filt_div_safe = torch.where(mask_zero, torch.full_like(filt_div, dc_val), filt_div)
+    k_dot_m.mul_((filt_div_safe - filt_curl_safe) * inv_ksq_diff)
 
-    v_fft = torch.stack([
-        filt_curl_safe * m_fft[:, d, ...] + (filt_div_safe - filt_curl_safe) * factor * k_mesh[d]
-        for d in range(dim)
-    ], dim=1)
+    for d in range(dim):
+        m_fft[:, d, ...].mul_(filt_curl_safe).add_(k_dot_m * k_mesh[d])
+    del k_dot_m
 
-    v_cf = torch.fft.irfftn(v_fft, s=spatial_shape, dim=spatial_dims).to(dtype=dtype)
-    v_out = torch.movedim(v_cf, 1, -1)
+    v_cf = torch.fft.irfftn(m_fft, s=spatial_shape, dim=spatial_dims)
+    del m_fft
+    v_out = torch.movedim(v_cf, 1, -1).to(dtype=dtype)
     return v_out[0] if unbatched else v_out
 
 
@@ -521,27 +581,25 @@ def apply_navier_green_operator(
     nu = max(0.0, min(0.50, nu))
     kappa = 1.0 if nu >= 0.4999 else (1.0 / (2.0 * (1.0 - nu)))
 
-    m_cf = torch.movedim(m, -1, 1).to(torch.float32)
+    m_cf = torch.movedim(m, -1, 1).to(torch.float32).contiguous()
     m_fft = torch.fft.rfftn(m_cf, dim=spatial_dims)
+    del m_cf
 
-    k_mesh, k_sq, k_sq_safe = _get_k_mesh_rfft(spatial_shape, spacing, device)
+    k_mesh, _, _, _, inv_ksq_diff = _get_inv_ksq_cached(spatial_shape, spacing, device)
+    K_base = _get_sobolev_envelope_cached(spatial_shape, spacing, alpha_val, float(s), device)
 
-    K_base = 1.0 / ((1.0 + alpha_val * k_sq) ** float(s))
+    k_dot_m = m_fft[:, 0, ...] * k_mesh[0]
+    for d in range(1, dim):
+        k_dot_m = k_dot_m + m_fft[:, d, ...] * k_mesh[d]
+    k_dot_m.mul_(kappa * K_base * inv_ksq_diff)
 
-    k_dot_m = torch.zeros_like(m_fft[:, 0, ...])
     for d in range(dim):
-        k_dot_m = k_dot_m + k_mesh[d] * m_fft[:, d, ...]
+        m_fft[:, d, ...].mul_(K_base).sub_(k_dot_m * k_mesh[d])
+    del k_dot_m
 
-    k_sq_diff = sum(k_mesh[d] ** 2 for d in range(dim))
-    k_sq_diff_safe = torch.where(k_sq_diff == 0.0, torch.ones_like(k_sq_diff), k_sq_diff)
-    factor = torch.where(k_sq_diff == 0.0, torch.zeros_like(k_dot_m), k_dot_m / k_sq_diff_safe)
-
-    v_fft = torch.stack([
-        K_base * (m_fft[:, d, ...] - kappa * factor * k_mesh[d]) for d in range(dim)
-    ], dim=1)
-
-    v_cf = torch.fft.irfftn(v_fft, s=spatial_shape, dim=spatial_dims).to(dtype=dtype)
-    v_out = torch.movedim(v_cf, 1, -1)
+    v_cf = torch.fft.irfftn(m_fft, s=spatial_shape, dim=spatial_dims)
+    del m_fft
+    v_out = torch.movedim(v_cf, 1, -1).to(dtype=dtype)
     return v_out[0] if unbatched else v_out
 
 
@@ -710,7 +768,7 @@ def apply_beltrami_regularizer(
     if alpha is None:
         alpha = float(fluid_sigma) ** 2 / 2.0
 
-    k_mesh, k_sq, k_sq_safe = _get_k_mesh_rfft(spatial_shape, spacing, device)
+    k_mesh, _, _, inv_ksq_true, _ = _get_inv_ksq_cached(spatial_shape, spacing, device)
 
     # Conformal shear factor: eta = (d - 2) / (2 * (d - 1))
     # d=2 -> 0.0, d=3 -> 0.25
@@ -719,24 +777,26 @@ def apply_beltrami_regularizer(
     else:
         eta = (float(dim) - 2.0) / (2.0 * (float(dim) - 1.0)) if dim > 1 else 0.0
 
-    K_base = (1.0 / (1.0 + alpha * k_sq)).pow(s)
+    K_base = _get_sobolev_envelope_cached(spatial_shape, spacing, float(alpha), float(s), device)
 
-    v_cf = torch.movedim(v, -1, 1).to(torch.float32)
+    v_cf = torch.movedim(v, -1, 1).to(torch.float32).contiguous()
     v_fft = torch.fft.rfftn(v_cf, dim=spatial_dims)
+    del v_cf
 
-    k_dot_v = torch.zeros_like(v_fft[:, 0, ...])
-    for d in range(dim):
-        k_dot_v = k_dot_v + k_mesh[d] * v_fft[:, d, ...]
+    if eta != 0.0:
+        k_dot_v = v_fft[:, 0, ...] * k_mesh[0]
+        for d in range(1, dim):
+            k_dot_v = k_dot_v + v_fft[:, d, ...] * k_mesh[d]
+        k_dot_v.mul_(eta * K_base * inv_ksq_true)
+        for d in range(dim):
+            v_fft[:, d, ...].mul_(K_base).sub_(k_dot_v * k_mesh[d])
+        del k_dot_v
+    else:
+        v_fft.mul_(K_base)
 
-    mask_zero = (k_sq == 0.0)
-    factor = torch.where(mask_zero, torch.zeros_like(k_dot_v), k_dot_v / k_sq_safe)
-
-    v_out_fft = torch.stack([
-        K_base * (v_fft[:, d, ...] - eta * factor * k_mesh[d]) for d in range(dim)
-    ], dim=1)
-
-    v_out_cf = torch.fft.irfftn(v_out_fft, s=spatial_shape, dim=spatial_dims).to(dtype=dtype)
-    v_out = torch.movedim(v_out_cf, 1, -1)
+    v_out_cf = torch.fft.irfftn(v_fft, s=spatial_shape, dim=spatial_dims)
+    del v_fft
+    v_out = torch.movedim(v_out_cf, 1, -1).to(dtype=dtype)
     return v_out[0] if unbatched else v_out
 
 

@@ -283,25 +283,36 @@ def separable_gaussian_filter(
         sig = sigma_list[i]
         if sig <= 0.0:
             continue
-            
+
         kernel = get_cached_gaussian_kernel_1d(sig, device, dtype)
         kernel_size = kernel.shape[-1]
         pad_size = kernel_size // 2
-        
+
         target_dim = i + 2
-        dims = list(range(v.ndim))
-        dims[-1], dims[target_dim] = dims[target_dim], dims[-1]
-        v_permuted = v.permute(*dims).contiguous()
-        
-        last_dim_size = v_permuted.shape[-1]
-        v_reshaped = v_permuted.view(-1, 1, last_dim_size)
-        v_padded = F.pad(v_reshaped, (pad_size, pad_size), **pad_kwargs)
-        
-        v_conv = F.conv1d(v_padded, kernel)
-        v_conv_reshaped = v_conv.view(*v_permuted.shape)
-        v_out = v_conv_reshaped.permute(*dims).contiguous()
-        v = v_out
-        
+        if target_dim == v.ndim - 1:
+            v_contig = v if v.is_contiguous() else v.contiguous()
+            last_dim_size = v_contig.shape[-1]
+            v_reshaped = v_contig.view(-1, 1, last_dim_size)
+            v_padded = F.pad(v_reshaped, (pad_size, pad_size), **pad_kwargs)
+            v_conv = F.conv1d(v_padded, kernel)
+            del v_padded
+            v = v_conv.view(*v_contig.shape)
+            del v_contig, v_conv
+        else:
+            dims = list(range(v.ndim))
+            dims[-1], dims[target_dim] = dims[target_dim], dims[-1]
+            v_permuted = v.permute(*dims).contiguous()
+            del v
+            last_dim_size = v_permuted.shape[-1]
+            v_reshaped = v_permuted.view(-1, 1, last_dim_size)
+            v_padded = F.pad(v_reshaped, (pad_size, pad_size), **pad_kwargs)
+            v_conv = F.conv1d(v_padded, kernel)
+            del v_padded
+            v_conv_reshaped = v_conv.view(*v_permuted.shape)
+            del v_permuted, v_conv
+            v = v_conv_reshaped.permute(*dims).contiguous()
+            del v_conv_reshaped
+
     return torch.movedim(v, 1, -1).contiguous()
 
 _SOBOLEV_FILTER_CACHE = {}
@@ -436,11 +447,13 @@ def apply_sobolev_green_operator(m, fluid_sigma=3.0, alpha=None, spacing=None):
     m_cf = torch.movedim(m, -1, 1).to(torch.float32).contiguous()
     
     K_bc = _get_sobolev_filter_cached(spatial_shape, alpha_val, s, spacing, device, dtype)
-    
+
     m_fft = torch.fft.rfftn(m_cf, dim=spatial_dims)
-    v_fft = m_fft * K_bc
-    v_cf = torch.fft.irfftn(v_fft, s=spatial_shape, dim=spatial_dims).to(dtype=dtype)
-    
+    del m_cf
+    m_fft.mul_(K_bc)
+    v_cf = torch.fft.irfftn(m_fft, s=spatial_shape, dim=spatial_dims).to(dtype=dtype)
+    del m_fft
+
     return torch.movedim(v_cf, 1, -1)
 
 

@@ -838,6 +838,9 @@ class TVFModel(nn.Module):
             log_jac = torch.zeros(phi_t.shape[:-1], device=device, dtype=dtype)
             n_neg = torch.zeros(phi_t.shape[:-1], device=device, dtype=dtype)
             h = 0.5 * float(spacing_t.min())
+            q_buf = torch.empty_like(phi_t)
+        else:
+            q_buf = None
 
         use_adjoint = (solver.startswith('adjoint') or getattr(self, 'adjoint', False)) and not return_log_jacobian
         if use_adjoint and velocity_fine_cf is not None:
@@ -867,18 +870,17 @@ class TVFModel(nn.Module):
                         v_sampled = torch.movedim(v_fine_cf, 1, -1)
                     else:
                         phi_norm = physical_to_normalized_fast(phi_t, M_f_norm, b_f_norm)
-                        v_sampled_cf = grid_sample_nd(v_fine_cf, phi_norm, mode='bilinear', padding_mode='border')
-                        v_sampled = torch.movedim(v_sampled_cf, 1, -1)
+                        if step == 0:
+                            v_sampled = torch.movedim(v_fine_cf, 1, -1)
+                        else:
+                            v_sampled_cf = grid_sample_nd(v_fine_cf, phi_norm, mode='bilinear', padding_mode='border')
+                            v_sampled = torch.movedim(v_sampled_cf, 1, -1)
                     if return_log_jacobian:
-                        from .liouville import velocity_gradient_at, step_log_det
-                        grad_v = velocity_gradient_at(
-                            lambda p: torch.movedim(grid_sample_nd(
-                                v_fine_cf, physical_to_normalized_fast(p, M_f_norm, b_f_norm),
-                                mode='bilinear', padding_mode='border'), 1, -1),
-                            phi_t, h)
-                        ld, neg = step_log_det(grad_v, dt)
-                        log_jac = log_jac + ld
-                        n_neg = n_neg + neg
+                        from .liouville import step_log_det_at_norm
+                        ld, neg = step_log_det_at_norm(v_fine_cf, phi_norm, M_f_norm, h, dt, q_buf=q_buf)
+                        log_jac.add_(ld)
+                        n_neg.add_(neg)
+                        del ld, neg
                     phi_t = phi_t + v_sampled * dt
                 
             elif solver == 'rk4':
@@ -1651,8 +1653,6 @@ class TVFModel(nn.Module):
                         if not hasattr(self, '_bmask_pre_cache') or getattr(self, '_bmask_pre_cache_key', None) != bmask_pre_key:
                             self._bmask_pre_cache = self._create_boundary_mask(g_process.shape[1:-1], device, dtype, border_width=4)
                             self._bmask_pre_cache_key = bmask_pre_key
-                        g_process_tapered = g_process * self._bmask_pre_cache
-
                         # Adjust physical spacing if downsampled so physical scale remains correct
                         if vel_spacing is not None:
                             adj_spacing = [sp * 2.0 for sp in vel_spacing] if do_fast else vel_spacing
@@ -1660,11 +1660,14 @@ class TVFModel(nn.Module):
                             adj_spacing = [sp * 2.0 for sp in getattr(self, 'spacing', [1.0] * self.dim)] if do_fast else getattr(self, 'spacing', [1.0] * self.dim)
 
                         if regularizer_mode == 'sobolev':
-                            g_smoothed = self._apply_sobolev_green_operator(g_process_tapered, fluid_sigma=1.0, alpha=fluid_alpha, spacing=adj_spacing)
+                            g_process.mul_(self._bmask_pre_cache)
+                            g_smoothed = self._apply_sobolev_green_operator(g_process, fluid_sigma=1.0, alpha=fluid_alpha, spacing=adj_spacing)
                         elif regularizer_mode == 'dsti':
-                            g_smoothed = self._apply_dsti_green_operator(g_process_tapered, fluid_sigma=1.0, alpha=fluid_alpha)
+                            g_process.mul_(self._bmask_pre_cache)
+                            g_smoothed = self._apply_dsti_green_operator(g_process, fluid_sigma=1.0, alpha=fluid_alpha)
                         elif regularizer_mode == 'dsti1':
-                            g_smoothed = self._apply_dsti1_green_operator(g_process_tapered, fluid_sigma=1.0, alpha=fluid_alpha)
+                            g_process.mul_(self._bmask_pre_cache)
+                            g_smoothed = self._apply_dsti1_green_operator(g_process, fluid_sigma=1.0, alpha=fluid_alpha)
                         elif regularizer_mode in ['bspline', 'bsplinesyn']:
                             from .core.smoothing import smooth_displacement_field_bspline
                             g_smoothed = smooth_displacement_field_bspline(
@@ -1679,14 +1682,20 @@ class TVFModel(nn.Module):
                             )
                         elif regularizer_mode in _TVF_CONTINUUM:
                             from .core.regularizers import get_regularizer
-                            reg_fn = get_regularizer(
-                                regularizer_mode,
-                                alpha=fluid_alpha,
-                                spacing=adj_spacing,
-                                fluid_sigma=sigma_val or 3.0,
-                                **{k: kwargs[k] for k in _TVF_EXTRA_REG_KEYS if k in kwargs},
-                            )
-                            g_smoothed = reg_fn(g_process_tapered)
+                            g_process.mul_(self._bmask_pre_cache)
+                            _extra_tvf = {k: kwargs[k] for k in _TVF_EXTRA_REG_KEYS if k in kwargs}
+                            _reg_key = (regularizer_mode, float(fluid_alpha) if fluid_alpha is not None else None, tuple(float(x) for x in adj_spacing), float(sigma_val or 3.0))
+                            if getattr(self, '_tvf_reg_cache_key', None) != _reg_key or not _extra_tvf == getattr(self, '_tvf_reg_extra', None):
+                                self._tvf_reg_fn = get_regularizer(
+                                    regularizer_mode,
+                                    alpha=fluid_alpha,
+                                    spacing=adj_spacing,
+                                    fluid_sigma=sigma_val or 3.0,
+                                    **_extra_tvf,
+                                )
+                                self._tvf_reg_cache_key = _reg_key
+                                self._tvf_reg_extra = _extra_tvf
+                            g_smoothed = self._tvf_reg_fn(g_process)
                         else:
                             g_smoothed = separable_gaussian_filter(
                                 g_process, sigma=sigma_val, spacing=adj_spacing, sigma_mode=sigma_mode
@@ -1704,19 +1713,17 @@ class TVFModel(nn.Module):
                         if not hasattr(self, '_bmask_cache') or getattr(self, '_bmask_cache_key', None) != bmask_key:
                             self._bmask_cache = self._create_boundary_mask(spatial_shape, device, dtype, border_width=4)
                             self._bmask_cache_key = bmask_key
-                        grad_smoothed_tapered = grad_smoothed * self._bmask_cache
-                        self.velocity.grad.copy_(grad_smoothed_tapered.unsqueeze(1))
+                        grad_smoothed.mul_(self._bmask_cache)
+                        self.velocity.grad.copy_(grad_smoothed.unsqueeze(1))
+                        del grad_smoothed
                             
                 if opt_type == 'cfl':
                     with torch.no_grad():
                         if self.velocity.grad is not None:
+                            from .core.inverse import _scaled_sq_sum
                             grad = self.velocity.grad
                             # ITK-style CFL: compute max norm in VOXEL space (divide by spacing)
-                            # This matches ITK's ScaleUpdateField() exactly:
-                            #   localNorm += sqr(vector[d] / spacing[d])
-                            #   scale = learningRate / maxNorm
-                            grad_voxel = grad / sp_t_xyz  # convert to voxel units (ZYX)
-                            max_g_voxel = torch.amax(torch.sqrt(torch.sum(grad_voxel**2, dim=-1)))
+                            max_g_voxel = _scaled_sq_sum(grad.squeeze(1), sp_t_xyz.reshape(-1), divide=True).amax().sqrt()
                             cfl_step_val = float(kwargs.get('cfl_step', kwargs.get('grad_step', 0.25)))
                             effective_cfl = float(cfl_step_val) * math.sqrt(shrink_ratio)
                             # Compute CFL update on device: scaledUpdate = (learningRate / maxNorm) * gradient
@@ -2398,6 +2405,7 @@ def tvf_registration(
             **fit_kwargs
         )
 
+        del I_tensor, J_tensor
         with torch.no_grad():
             fwd_disp_gpu = model.get_forward_warp(image_shape=grid_shape_zyx)
             inv_disp_gpu = model.get_inverse_warp(image_shape=grid_shape_zyx)
@@ -2447,6 +2455,8 @@ def tvf_registration(
                 origin=origin,
                 direction=direction,
             )
+            if isinstance(inv_err_dict.get('error_map'), torch.Tensor):
+                inv_err_dict['error_map'] = inv_err_dict['error_map'].cpu()
             fwd_disp = fwd_disp_gpu.cpu()
             inv_disp = inv_disp_gpu.cpu()
             del fwd_disp_gpu, inv_disp_gpu
@@ -2603,15 +2613,14 @@ def tvf_registration(
 
     else:
         raise ValueError(f"Unknown backend: {backend}")
-    from .transforms import _cache_disp_image_and_field, apply_transforms as _apply_transforms
+    from .transforms import _cache_disp_image_and_field, _write_ants_images_fast, apply_transforms as _apply_transforms
     _apply_dev = str(device) if backend.lower() == 'pytorch' else None
     fwd_img = disp_tensor_to_itk(fwd_disp, fixed_primary)
     inv_img = disp_tensor_to_itk(inv_disp, fixed_primary)
 
     fwd_file = tempfile.NamedTemporaryFile(suffix='_tvf_fwd_Warp.nii.gz', delete=False).name
     inv_file = tempfile.NamedTemporaryFile(suffix='_tvf_inv_Warp.nii.gz', delete=False).name
-    ants.image_write(fwd_img, fwd_file)
-    ants.image_write(inv_img, inv_file)
+    _write_ants_images_fast([(fwd_img, fwd_file), (inv_img, inv_file)], compresslevel=1)
     _cache_disp_image_and_field(fwd_file, fwd_img, _apply_dev)
     _cache_disp_image_and_field(inv_file, inv_img, _apply_dev)
 

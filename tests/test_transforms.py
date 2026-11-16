@@ -975,3 +975,85 @@ def test_bspline_and_fieldless_resample_series_parity_vs_ants(tmp_path):
                 * scales[k]
             )
             np.testing.assert_allclose(res_4d[..., k], exp_k, rtol=1e-4, atol=5e-4)
+
+
+def test_write_ants_images_fast_bitwise_parity_and_oblique_signed_jacobian(tmp_path):
+    """Verify _write_ants_images_fast produces bitwise-identical ANTsImage arrays and headers
+    to ants.image_write across >=65536-voxel .nii.gz vector fields, and signed_jacobian_determinant
+    matches exact analytic and reference finite-difference determinants on oblique anisotropic grids."""
+    from syntx.transforms import _write_ants_images_fast
+
+    rng = np.random.default_rng(901)
+    # 42 * 42 * 40 = 70,560 >= 65,536 voxels -> exercises parallel .nii + zlib streaming path
+    shape = (42, 42, 40)
+    origin = (-18.5, 22.3, -9.7)
+    spacing = (1.15, 0.92, 1.65)
+    direction = _rot_matrix(17.0, -13.0, 24.0)
+
+    vec_arr1 = rng.normal(0.0, 2.0, size=shape + (3,)).astype(np.float32)
+    vec_arr2 = rng.normal(0.0, 1.5, size=shape + (3,)).astype(np.float32)
+    w1 = ants.from_numpy(vec_arr1, origin=origin, spacing=spacing, direction=direction, has_components=True)
+    w2 = ants.from_numpy(vec_arr2, origin=origin, spacing=spacing, direction=direction, has_components=True)
+
+    fast_p1 = str(tmp_path / "fast_1Warp.nii.gz")
+    fast_p2 = str(tmp_path / "fast_1InverseWarp.nii.gz")
+    ref_p1 = str(tmp_path / "ref_1Warp.nii.gz")
+    ref_p2 = str(tmp_path / "ref_1InverseWarp.nii.gz")
+
+    _write_ants_images_fast([(w1, fast_p1), (w2, fast_p2)])
+    ants.image_write(w1, ref_p1)
+    ants.image_write(w2, ref_p2)
+
+    # Ensure no temporary .nii or .tmp_* files remain in tmp_path
+    leftover = [p.name for p in tmp_path.iterdir() if ".tmp_" in p.name]
+    assert leftover == []
+
+    for fp, rp in ((fast_p1, ref_p1), (fast_p2, ref_p2)):
+        img_fast = ants.image_read(fp)
+        img_ref = ants.image_read(rp)
+        assert img_fast.components == img_ref.components == 3
+        np.testing.assert_allclose(img_fast.origin, img_ref.origin, atol=1e-6)
+        np.testing.assert_allclose(img_fast.spacing, img_ref.spacing, atol=1e-6)
+        np.testing.assert_allclose(img_fast.direction, img_ref.direction, atol=1e-6)
+        np.testing.assert_array_equal(img_fast.numpy(), img_ref.numpy())
+
+    # Analytic linear displacement u(x) = A x + b on oblique anisotropic grid -> det(I + grad u) = det(I + A)
+    obl_cfg = SPACE_CONFIGS["oblique_b"]
+    ref_img = _make_smooth_image(obl_cfg, seed=902)
+    ii, jj, kk = np.meshgrid(
+        np.arange(obl_cfg["shape"][0], dtype=np.float64),
+        np.arange(obl_cfg["shape"][1], dtype=np.float64),
+        np.arange(obl_cfg["shape"][2], dtype=np.float64),
+        indexing="ij",
+    )
+    idx = np.stack([ii, jj, kk], axis=-1)
+    ds_mat = obl_cfg["direction"] @ np.diag(obl_cfg["spacing"])
+    phys_pts = idx @ ds_mat.T + np.asarray(obl_cfg["origin"])
+    a_lin = np.array([[0.12, -0.05, 0.03], [0.04, -0.08, 0.06], [-0.02, 0.07, 0.15]], dtype=np.float64)
+    u_lin = (phys_pts @ a_lin.T + np.array([1.5, -2.0, 0.7])).astype(np.float32)
+    u_lin_img = ants.from_numpy(
+        u_lin,
+        origin=obl_cfg["origin"],
+        spacing=obl_cfg["spacing"],
+        direction=obl_cfg["direction"],
+        has_components=True,
+    )
+    det_lin = signed_jacobian_determinant(u_lin_img, ref_img).numpy()
+    expected_const_det = float(np.linalg.det(np.eye(3) + a_lin))
+    np.testing.assert_allclose(det_lin, expected_const_det, rtol=1e-4, atol=1e-4)
+
+    # Non-linear random displacement field vs reference np.gradient + np.linalg.det
+    u_nl = rng.normal(0.0, 0.35, size=obl_cfg["shape"] + (3,)).astype(np.float32)
+    u_nl_img = ants.from_numpy(
+        u_nl,
+        origin=obl_cfg["origin"],
+        spacing=obl_cfg["spacing"],
+        direction=obl_cfg["direction"],
+        has_components=True,
+    )
+    det_act = signed_jacobian_determinant(u_nl_img, ref_img).numpy()
+    du_ref = np.stack(np.gradient(u_nl.astype(np.float64), axis=(0, 1, 2)), axis=-1)
+    jac_ref = np.eye(3) + du_ref @ np.linalg.inv(ds_mat)
+    det_ref = np.linalg.det(jac_ref).astype(np.float32)
+    np.testing.assert_allclose(det_act, det_ref, rtol=1e-5, atol=1e-5)
+

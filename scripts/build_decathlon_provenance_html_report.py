@@ -125,6 +125,9 @@ PRE_REMEDIATION_N5_MEASURED: Dict[str, Tuple[float, str]] = {
 }
 
 
+_HTML_IMAGE_FORMAT: str = "webp"
+
+
 def _fig_to_png_bytes(fig: Figure, dpi: int = 150) -> bytes:
     buf = io.BytesIO()
     fig.savefig(buf, format="png", dpi=dpi, bbox_inches="tight", facecolor="#FFFFFF")
@@ -136,17 +139,38 @@ def _fig_to_png_bytes(fig: Figure, dpi: int = 150) -> bytes:
     return out.getvalue()
 
 
+def _encode_pil_data_uri(im: Image.Image, fmt: Optional[str] = None) -> str:
+    mode = (fmt or _HTML_IMAGE_FORMAT).lower()
+    rgb = im.convert("RGB")
+    out = io.BytesIO()
+    if mode == "webp":
+        rgb.save(out, format="WEBP", quality=92, method=4)
+        mime = "image/webp"
+    elif mode == "webp-lossless":
+        rgb.save(out, format="WEBP", lossless=True, method=4)
+        mime = "image/webp"
+    else:
+        rgb.save(out, format="PNG", optimize=True)
+        mime = "image/png"
+    return f"data:{mime};base64," + base64.b64encode(out.getvalue()).decode("ascii")
+
+
 def _fig_to_b64(fig: Figure, dpi: int = 175) -> str:
-    return "data:image/png;base64," + base64.b64encode(_fig_to_png_bytes(fig, dpi=dpi)).decode("ascii")
+    return _bytes_to_b64(_fig_to_png_bytes(fig, dpi=dpi))
 
 
 def _bytes_to_b64(raw: bytes) -> str:
-    return "data:image/png;base64," + base64.b64encode(raw).decode("ascii")
+    if _HTML_IMAGE_FORMAT == "png":
+        return "data:image/png;base64," + base64.b64encode(raw).decode("ascii")
+    return _encode_pil_data_uri(Image.open(io.BytesIO(raw)))
 
 
 def _file_to_b64(path: Path) -> str:
-    with open(path, "rb") as f:
-        return "data:image/png;base64," + base64.b64encode(f.read()).decode("ascii")
+    if _HTML_IMAGE_FORMAT == "png":
+        with open(path, "rb") as f:
+            return "data:image/png;base64," + base64.b64encode(f.read()).decode("ascii")
+    with Image.open(path) as im:
+        return _encode_pil_data_uri(im)
 
 
 def _git_sha() -> str:
@@ -2355,9 +2379,18 @@ def main() -> None:
     parser.add_argument("--data-dir", type=str, default=DEFAULT_DECATHLON_DIR)
     parser.add_argument("--device", type=str, default="mps" if torch.backends.mps.is_available() else "cpu")
     parser.add_argument("--cache-dir", type=Path, default=None, help="Optional directory to cache rendered per-task PNG figures")
+    parser.add_argument(
+        "--image-format",
+        choices=["webp", "webp-lossless", "png"],
+        default="webp",
+        help="Inline image encoding for self-contained HTML ('webp' q=92 default ~14 MB, 'webp-lossless', or 'png')",
+    )
     parser.add_argument("--no-spotlight", action="store_true", help="Skip live 10-organ before/after rendering")
     parser.add_argument("--smoke", action="store_true", help="Fast smoke validation (<15s) executing full stats, figures, and HTML assembly")
     args = parser.parse_args()
+
+    global _HTML_IMAGE_FORMAT
+    _HTML_IMAGE_FORMAT = str(args.image_format).lower()
 
     out_path = args.output
     mosaic_path = args.mosaic

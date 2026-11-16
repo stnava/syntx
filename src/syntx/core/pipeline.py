@@ -153,7 +153,10 @@ def cleanup_gpu(device, backend='pytorch'):
     """
     if backend == 'pytorch':
         import torch
+        from .regularizers import clear_k_mesh_cache
         dev_str = str(device).lower() if device is not None else ''
+        if ('mps' in dev_str) or ('cuda' in dev_str):
+            clear_k_mesh_cache()
         gc.collect()
         if 'mps' in dev_str and hasattr(torch.mps, 'empty_cache'):
             torch.mps.empty_cache()

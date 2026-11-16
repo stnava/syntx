@@ -1602,10 +1602,11 @@ class SyNTo(nn.Module):
                     # Rescaling by (shape - 1) * spacing / 2 converts back to consistent physical displacement gradient:
                     autograd_scale_fixed = compute_autograd_physical_scale(fixed_shape_t, fixed_spacing_t, device=device, dtype=dtype)
                     autograd_scale_moving = compute_autograd_physical_scale(moving_shape_t, moving_spacing_t, device=device, dtype=dtype)
-                    if warp_l2r.grad is not None:
-                        warp_l2r.grad = warp_l2r.grad * autograd_scale_fixed
-                    if warp_r2l.grad is not None:
-                        warp_r2l.grad = warp_r2l.grad * autograd_scale_moving
+                    with torch.no_grad():
+                        if warp_l2r.grad is not None:
+                            warp_l2r.grad.mul_(autograd_scale_fixed)
+                        if warp_r2l.grad is not None:
+                            warp_r2l.grad.mul_(autograd_scale_moving)
                         
                     self.syn_losses.append(loss_t)
                     level_syn_losses.append(loss_t)
@@ -1641,52 +1642,70 @@ class SyNTo(nn.Module):
                     _fs_raw = kwargs.get('fast_smooth', False)
                     fast_smooth = bool(_fs_raw) if _fs_raw is not None else False
 
+                    warp_l2r.grad.mul_(b_mask)
+                    warp_r2l.grad.mul_(b_mask)
                     if regularizer in ('compact', 'compact_gaussian', 'erf') or kernel_type in ('compact', 'compact_gaussian', 'erf'):
                         # Compact erf-based Gaussian kernel: always uses compact spatial erf filter (bypassing FFT spectral smoothing)
-                        grad_l = separable_gaussian_filter(warp_l2r.grad * b_mask, curr_fluid_sig, kernel_type='compact')
-                        grad_r = separable_gaussian_filter(warp_r2l.grad * b_mask, curr_fluid_sig, kernel_type='compact')
+                        grad_l = separable_gaussian_filter(warp_l2r.grad, curr_fluid_sig, kernel_type='compact')
+                        warp_l2r.grad = None
+                        grad_r = separable_gaussian_filter(warp_r2l.grad, curr_fluid_sig, kernel_type='compact')
+                        warp_r2l.grad = None
                     elif regularizer == 'sobolev':
                         if fast_smooth:
                             # FFT Sobolev Green's operator only (standard mode)
-                            grad_l = self._apply_sobolev_green_operator(warp_l2r.grad * b_mask, fluid_sigma=curr_fluid_sig, alpha=alpha_sobolev)
-                            grad_r = self._apply_sobolev_green_operator(warp_r2l.grad * b_mask, fluid_sigma=curr_fluid_sig, alpha=alpha_sobolev)
+                            grad_l = self._apply_sobolev_green_operator(warp_l2r.grad, fluid_sigma=curr_fluid_sig, alpha=alpha_sobolev)
+                            warp_l2r.grad = None
+                            grad_r = self._apply_sobolev_green_operator(warp_r2l.grad, fluid_sigma=curr_fluid_sig, alpha=alpha_sobolev)
+                            warp_r2l.grad = None
                         else:
                             # FFT Sobolev Green's operator + spatial Gaussian post-filter (conservative mode)
-                            grad_l = separable_gaussian_filter(self._apply_sobolev_green_operator(warp_l2r.grad * b_mask, fluid_sigma=curr_fluid_sig, alpha=alpha_sobolev), curr_fluid_sig * 0.5, kernel_type=kernel_type)
-                            grad_r = separable_gaussian_filter(self._apply_sobolev_green_operator(warp_r2l.grad * b_mask, fluid_sigma=curr_fluid_sig, alpha=alpha_sobolev), curr_fluid_sig * 0.5, kernel_type=kernel_type)
+                            grad_l = separable_gaussian_filter(self._apply_sobolev_green_operator(warp_l2r.grad, fluid_sigma=curr_fluid_sig, alpha=alpha_sobolev), curr_fluid_sig * 0.5, kernel_type=kernel_type)
+                            warp_l2r.grad = None
+                            grad_r = separable_gaussian_filter(self._apply_sobolev_green_operator(warp_r2l.grad, fluid_sigma=curr_fluid_sig, alpha=alpha_sobolev), curr_fluid_sig * 0.5, kernel_type=kernel_type)
+                            warp_r2l.grad = None
                     elif regularizer in ['dsti', 'dst1', 'dst_i']:
                         if fast_smooth:
                             # FFT DST-I Green's operator only (standard mode)
-                            grad_l = self._apply_dsti_green_operator(warp_l2r.grad * b_mask, fluid_sigma=curr_fluid_sig, alpha=alpha_sobolev)
-                            grad_r = self._apply_dsti_green_operator(warp_r2l.grad * b_mask, fluid_sigma=curr_fluid_sig, alpha=alpha_sobolev)
+                            grad_l = self._apply_dsti_green_operator(warp_l2r.grad, fluid_sigma=curr_fluid_sig, alpha=alpha_sobolev)
+                            warp_l2r.grad = None
+                            grad_r = self._apply_dsti_green_operator(warp_r2l.grad, fluid_sigma=curr_fluid_sig, alpha=alpha_sobolev)
+                            warp_r2l.grad = None
                         else:
                             # FFT DST-I Green's operator + spatial Gaussian post-filter (conservative mode)
-                            grad_l = separable_gaussian_filter(self._apply_dsti_green_operator(warp_l2r.grad * b_mask, fluid_sigma=curr_fluid_sig, alpha=alpha_sobolev), curr_fluid_sig * 0.5, kernel_type=kernel_type)
-                            grad_r = separable_gaussian_filter(self._apply_dsti_green_operator(warp_r2l.grad * b_mask, fluid_sigma=curr_fluid_sig, alpha=alpha_sobolev), curr_fluid_sig * 0.5, kernel_type=kernel_type)
+                            grad_l = separable_gaussian_filter(self._apply_dsti_green_operator(warp_l2r.grad, fluid_sigma=curr_fluid_sig, alpha=alpha_sobolev), curr_fluid_sig * 0.5, kernel_type=kernel_type)
+                            warp_l2r.grad = None
+                            grad_r = separable_gaussian_filter(self._apply_dsti_green_operator(warp_r2l.grad, fluid_sigma=curr_fluid_sig, alpha=alpha_sobolev), curr_fluid_sig * 0.5, kernel_type=kernel_type)
+                            warp_r2l.grad = None
                     elif regularizer == 'dsti1':
                         if fast_smooth:
                             # Separable 1D DST-I Green's operator only (MPS-safe mode)
-                            grad_l = self._apply_dsti1_green_operator(warp_l2r.grad * b_mask, fluid_sigma=curr_fluid_sig, alpha=alpha_sobolev)
-                            grad_r = self._apply_dsti1_green_operator(warp_r2l.grad * b_mask, fluid_sigma=curr_fluid_sig, alpha=alpha_sobolev)
+                            grad_l = self._apply_dsti1_green_operator(warp_l2r.grad, fluid_sigma=curr_fluid_sig, alpha=alpha_sobolev)
+                            warp_l2r.grad = None
+                            grad_r = self._apply_dsti1_green_operator(warp_r2l.grad, fluid_sigma=curr_fluid_sig, alpha=alpha_sobolev)
+                            warp_r2l.grad = None
                         else:
                             # Separable 1D DST-I + spatial Gaussian post-filter
-                            grad_l = separable_gaussian_filter(self._apply_dsti1_green_operator(warp_l2r.grad * b_mask, fluid_sigma=curr_fluid_sig, alpha=alpha_sobolev), curr_fluid_sig * 0.5, kernel_type=kernel_type)
-                            grad_r = separable_gaussian_filter(self._apply_dsti1_green_operator(warp_r2l.grad * b_mask, fluid_sigma=curr_fluid_sig, alpha=alpha_sobolev), curr_fluid_sig * 0.5, kernel_type=kernel_type)
+                            grad_l = separable_gaussian_filter(self._apply_dsti1_green_operator(warp_l2r.grad, fluid_sigma=curr_fluid_sig, alpha=alpha_sobolev), curr_fluid_sig * 0.5, kernel_type=kernel_type)
+                            warp_l2r.grad = None
+                            grad_r = separable_gaussian_filter(self._apply_dsti1_green_operator(warp_r2l.grad, fluid_sigma=curr_fluid_sig, alpha=alpha_sobolev), curr_fluid_sig * 0.5, kernel_type=kernel_type)
+                            warp_r2l.grad = None
                     elif regularizer in ['bspline', 'bsplinesyn']:
                         grad_l = self._apply_bspline_operator(
-                            warp_l2r.grad * b_mask,
+                            warp_l2r.grad,
                             spacing=curr_spacing_fixed,
                             origin=fixed_origin,
                             fluid_sigma=curr_fluid_sig,
                             **kwargs,
                         )
+                        warp_l2r.grad = None
                         grad_r = self._apply_bspline_operator(
-                            warp_r2l.grad * b_mask,
+                            warp_r2l.grad,
                             spacing=curr_spacing_fixed,
                             origin=fixed_origin,
                             fluid_sigma=curr_fluid_sig,
                             **kwargs,
                         )
+                        warp_r2l.grad = None
                     elif regularizer in _CONTINUUM_REGS:
                         f_mask = kwargs.get('fixed_mask', kwargs.get('mask', None))
                         if f_mask is not None and not isinstance(f_mask, torch.Tensor):
@@ -1694,30 +1713,37 @@ class SyNTo(nn.Module):
                                 f_mask = torch.from_numpy(f_mask.numpy().astype(np.float32)).to(device)
                             else:
                                 f_mask = torch.as_tensor(f_mask, dtype=dtype, device=device)
-                        extra_kwargs = {k: v for k, v in kwargs.items() if k not in ('fixed_mask', 'mask', 'regularizer', 'alpha', 'sobolev_alpha', 'spacing', 'fluid_sigma')}
-                        reg_fn = get_regularizer(
-                            regularizer,
-                            alpha=alpha_sobolev,
-                            sobolev_alpha=alpha_sobolev,
-                            spacing=curr_spacing_fixed,
-                            fluid_sigma=curr_fluid_sig,
-                            fixed_mask=f_mask,
-                            mask=f_mask,
-                            **extra_kwargs,
-                        )
-                        grad_l = reg_fn(warp_l2r.grad * b_mask)
-                        grad_r = reg_fn(warp_r2l.grad * b_mask)
+                        _reg_key_syn = (regularizer, float(alpha_sobolev), tuple(float(x) for x in curr_spacing_fixed), float(curr_fluid_sig), id(f_mask))
+                        if getattr(self, '_syn_reg_cache_key', None) != _reg_key_syn:
+                            extra_kwargs = {k: v for k, v in kwargs.items() if k not in ('fixed_mask', 'mask', 'regularizer', 'alpha', 'sobolev_alpha', 'spacing', 'fluid_sigma')}
+                            self._syn_reg_fn = get_regularizer(
+                                regularizer,
+                                alpha=alpha_sobolev,
+                                sobolev_alpha=alpha_sobolev,
+                                spacing=curr_spacing_fixed,
+                                fluid_sigma=curr_fluid_sig,
+                                fixed_mask=f_mask,
+                                mask=f_mask,
+                                **extra_kwargs,
+                            )
+                            self._syn_reg_cache_key = _reg_key_syn
+                        grad_l = self._syn_reg_fn(warp_l2r.grad)
+                        warp_l2r.grad = None
+                        grad_r = self._syn_reg_fn(warp_r2l.grad)
+                        warp_r2l.grad = None
                     else:
                         if fast_smooth:
                             # Spectral Gaussian: Sobolev Green's with soft alpha (FFT-based)
-                            grad_l = self._apply_sobolev_green_operator(warp_l2r.grad * b_mask, fluid_sigma=curr_fluid_sig, alpha=curr_fluid_sig / 2.0)
-                            grad_r = self._apply_sobolev_green_operator(warp_r2l.grad * b_mask, fluid_sigma=curr_fluid_sig, alpha=curr_fluid_sig / 2.0)
+                            grad_l = self._apply_sobolev_green_operator(warp_l2r.grad, fluid_sigma=curr_fluid_sig, alpha=curr_fluid_sig / 2.0)
+                            warp_l2r.grad = None
+                            grad_r = self._apply_sobolev_green_operator(warp_r2l.grad, fluid_sigma=curr_fluid_sig, alpha=curr_fluid_sig / 2.0)
+                            warp_r2l.grad = None
                         else:
                             # Spatial Gaussian: separable convolution filter
-                            grad_l = separable_gaussian_filter(warp_l2r.grad * b_mask, curr_fluid_sig, kernel_type=kernel_type)
-                            grad_r = separable_gaussian_filter(warp_r2l.grad * b_mask, curr_fluid_sig, kernel_type=kernel_type)
-                    warp_l2r.grad = None
-                    warp_r2l.grad = None
+                            grad_l = separable_gaussian_filter(warp_l2r.grad, curr_fluid_sig, kernel_type=kernel_type)
+                            warp_l2r.grad = None
+                            grad_r = separable_gaussian_filter(warp_r2l.grad, curr_fluid_sig, kernel_type=kernel_type)
+                            warp_r2l.grad = None
 
                     # Deformed-space smoothing: warp gradient to deformed config,
                     # smooth there, warp back. This bounds ∇_y δ (gradient in deformed
@@ -1759,15 +1785,15 @@ class SyNTo(nn.Module):
 
                     restrict_mask = self._get_restrict_mask(grad_l.device, grad_l.dtype)
                     if restrict_mask is not None:
-                        grad_l = grad_l * restrict_mask
-                        grad_r = grad_r * restrict_mask
+                        grad_l = grad_l if grad_l.is_contiguous() else grad_l.contiguous()
+                        grad_r = grad_r if grad_r.is_contiguous() else grad_r.contiguous()
+                        grad_l.mul_(restrict_mask)
+                        grad_r.mul_(restrict_mask)
 
-                    grad_l_voxel = grad_l / curr_spacing_fixed_xyz  # convert to voxel units
-                    max_norm_l = torch.sqrt(torch.sum(grad_l_voxel**2, dim=-1)).max()
-                    del grad_l_voxel
-                    grad_r_voxel = grad_r / curr_spacing_fixed_xyz
-                    max_norm_r = torch.sqrt(torch.sum(grad_r_voxel**2, dim=-1)).max()
-                    del grad_r_voxel
+                    from .core.inverse import _scaled_sq_sum
+                    sp_flat = curr_spacing_fixed_xyz.reshape(-1)
+                    max_norm_l = _scaled_sq_sum(grad_l, sp_flat, divide=True).amax().sqrt()
+                    max_norm_r = _scaled_sq_sum(grad_r, sp_flat, divide=True).amax().sqrt()
                     
                     if verbose >= 2:
                         print(f"DEBUG PyTorch L{level_idx} E{epoch} max_norm_l: {float(max_norm_l)}, max_norm_r: {float(max_norm_r)}")
@@ -1799,21 +1825,20 @@ class SyNTo(nn.Module):
                         max_norm_r_safe = max_norm_r if use_analytical_gradients else torch.clamp(max_norm_r, min=1e-8)
                         # Device-side select instead of ``if tensor > x`` (a host sync): zero step
                         # for a zero gradient, ITK scaling otherwise.
-                        delta_l = torch.where(max_norm_l > 1e-12, effective_cfl / max_norm_l_safe,
-                                              torch.zeros_like(max_norm_l)) * grad_l
-                        delta_r = torch.where(max_norm_r > 1e-12, effective_cfl / max_norm_r_safe,
-                                              torch.zeros_like(max_norm_r)) * grad_r
-                        del grad_l, grad_r
+                        scale_l = torch.where(max_norm_l > 1e-12, effective_cfl / max_norm_l_safe,
+                                              torch.zeros_like(max_norm_l))
+                        scale_r = torch.where(max_norm_r > 1e-12, effective_cfl / max_norm_r_safe,
+                                              torch.zeros_like(max_norm_r))
+                        delta_l = (grad_l if grad_l.is_contiguous() else grad_l.contiguous()).mul_(scale_l)
+                        del grad_l
+                        delta_r = (grad_r if grad_r.is_contiguous() else grad_r.contiguous()).mul_(scale_r)
+                        del grad_r
 
                         # Antisymmetric velocity projection: remove common-mode drift
-                        # to anchor the geodesic midpoint at the Fréchet mean.
-                        # Decomposes (δ_l, δ_r) into antisymmetric (geodesic) and
-                        # symmetric (drift) components, then discards the drift.
+                        # delta_l_anti = 0.5 * (delta_l - delta_r), delta_r_anti = -delta_l_anti
                         if getattr(self, 'antisymmetric', True):
-                            e0 = delta_l + delta_r
-                            delta_l = delta_l - 0.5 * e0
-                            delta_r = delta_r - 0.5 * e0
-                            del e0
+                            delta_l.sub_(delta_r).mul_(0.5)
+                            delta_r.copy_(delta_l).neg_()
 
                         # syntx default is now lagrangian due to fundamental PyTorch
                         # coordinate-frame smoothing limitations in the Eulerian formulation
@@ -2235,7 +2260,7 @@ class SyNTo(nn.Module):
         with torch.no_grad():
             target_grid_shape = tuple(self.grid_shape)
             interp_mode_full = 'bilinear' if dim == 2 else 'trilinear'
-            offload_midpoints = int(np.prod(target_grid_shape)) > 16_777_216
+            offload_midpoints = int(np.prod(target_grid_shape)) >= 4_194_304
 
             def _upsample_or_take(field_t: torch.Tensor) -> torch.Tensor:
                 field_d = field_t.detach()
@@ -3599,7 +3624,7 @@ def registration(
         )
     
     # 4. Save displacement fields to temp files to match ANTs file-based transforms
-    from .transforms import _cache_disp_image_and_field, apply_transforms as _apply_transforms
+    from .transforms import _cache_disp_image_and_field, _write_ants_images_fast, apply_transforms as _apply_transforms
     _apply_dev = str(device) if backend == 'pytorch' else None
     outprefix = kwargs.get('outprefix', None)
     _has_midpoint_warps = (
@@ -3689,9 +3714,11 @@ def registration(
 
         fwd_img = disp_tensor_to_itk(total_fwd_deformable, fixed_primary)
         inv_img = disp_tensor_to_itk(total_inv_deformable, fixed_primary)
-        
-        ants.image_write(fwd_img, fwd_file)
-        ants.image_write(inv_img, inv_file)
+
+        _write_ants_images_fast(
+            [(fwd_img, fwd_file), (inv_img, inv_file)],
+            compresslevel=4 if outprefix is not None else 1,
+        )
         _cache_disp_image_and_field(fwd_file, fwd_img, _apply_dev)
         _cache_disp_image_and_field(inv_file, inv_img, _apply_dev)
         fwd_warp_image = fwd_img
@@ -3726,28 +3753,35 @@ def registration(
     inverse_identity_errors = {}
     if not midpoint_only and sum(reg_iterations) > 0 and hasattr(model, 'warp_l2r') and hasattr(model, 'warp_r2l'):
         import torch
-        if backend == 'pytorch':
-            w_l2r = model.warp_l2r.data.cpu()
-            w_r2l = model.warp_r2l.data.cpu()
-            w_l2r_inv = (
-                w_r2l
-                if model.warp_l2r_inv.data.data_ptr() == model.warp_r2l.data.data_ptr()
-                else model.warp_l2r_inv.data.cpu()
-            )
-            w_r2l_inv = (
-                w_l2r
-                if model.warp_r2l_inv.data.data_ptr() == model.warp_l2r.data.data_ptr()
-                else model.warp_r2l_inv.data.cpu()
-            )
-        else:
-            w_l2r = torch.from_numpy(np.array(model.warp_l2r))
-            w_l2r_inv = torch.from_numpy(np.array(model.warp_l2r_inv))
-            w_r2l = torch.from_numpy(np.array(model.warp_r2l))
-            w_r2l_inv = torch.from_numpy(np.array(model.warp_r2l_inv))
-            
-        inverse_identity_errors['phi_1'] = calculate_inverse_identity_error(w_l2r, w_l2r_inv, fixed_primary.spacing, fixed_primary.origin, fixed_primary.direction)
-        inverse_identity_errors['phi_2'] = calculate_inverse_identity_error(w_r2l, w_r2l_inv, fixed_primary.spacing, fixed_primary.origin, fixed_primary.direction)
-        del w_l2r, w_l2r_inv, w_r2l, w_r2l_inv
+        with torch.no_grad():
+            if backend == 'pytorch':
+                w_l2r = model.warp_l2r.data
+                w_r2l = model.warp_r2l.data
+                w_l2r_inv = (
+                    w_r2l
+                    if model.warp_l2r_inv.data.data_ptr() == model.warp_r2l.data.data_ptr()
+                    else model.warp_l2r_inv.data
+                )
+                w_r2l_inv = (
+                    w_l2r
+                    if model.warp_r2l_inv.data.data_ptr() == model.warp_l2r.data.data_ptr()
+                    else model.warp_r2l_inv.data
+                )
+            else:
+                w_l2r = torch.from_numpy(np.array(model.warp_l2r))
+                w_l2r_inv = torch.from_numpy(np.array(model.warp_l2r_inv))
+                w_r2l = torch.from_numpy(np.array(model.warp_r2l))
+                w_r2l_inv = torch.from_numpy(np.array(model.warp_r2l_inv))
+
+            err_1 = calculate_inverse_identity_error(w_l2r, w_l2r_inv, fixed_primary.spacing, fixed_primary.origin, fixed_primary.direction)
+            err_2 = calculate_inverse_identity_error(w_r2l, w_r2l_inv, fixed_primary.spacing, fixed_primary.origin, fixed_primary.direction)
+            if isinstance(err_1.get('error_map'), torch.Tensor):
+                err_1['error_map'] = err_1['error_map'].cpu()
+            if isinstance(err_2.get('error_map'), torch.Tensor):
+                err_2['error_map'] = err_2['error_map'].cpu()
+            inverse_identity_errors['phi_1'] = err_1
+            inverse_identity_errors['phi_2'] = err_2
+            del w_l2r, w_l2r_inv, w_r2l, w_r2l_inv
         
     # 6. Apply transforms to generate warped output images
     if return_warped and not _skip_full_warps:
@@ -3771,8 +3805,7 @@ def registration(
         fwd_mid_img = disp_tensor_to_itk(model.midpoint_warp_l2r, fixed_primary)
         inv_mid_img = disp_tensor_to_itk(model.midpoint_warp_r2l, fixed_primary)
 
-        ants.image_write(fwd_mid_img, fwd_mid_file)
-        ants.image_write(inv_mid_img, inv_mid_file)
+        _write_ants_images_fast([(fwd_mid_img, fwd_mid_file), (inv_mid_img, inv_mid_file)], compresslevel=1)
         _cache_disp_image_and_field(fwd_mid_file, fwd_mid_img, _apply_dev)
         _cache_disp_image_and_field(inv_mid_file, inv_mid_img, _apply_dev)
 

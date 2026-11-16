@@ -3010,8 +3010,27 @@ def pullback_digital_diffeomorphism_to_halves(
         # Build sparse FD stencils ONLY around the modified midpoint neighborhoods!
         has_l2r_mod = bool(l2r_refine_mask.any().item())
         has_r2l_mod = bool(r2l_mod_mask.any().item())
+        has_l2r_inv_mod = bool(nz_mask.any().item())
         w_l2r_flat = w_l2r.reshape(-1, dim)
         w_r2l_flat = w_r2l.reshape(-1, dim)
+        w_l2r_inv_flat = w_l2r_inv.reshape(-1, dim)
+
+        if has_l2r_inv_mod:
+            sten_l2r_inv = _build_sparse_fd_stencil(nz_mask, steps_fd, dtype)
+            det_l2r_inv_0s, _ = _eval_sparse_fd_det(
+                w_l2r_inv_flat[sten_l2r_inv["pool_flat"]], sten_l2r_inv, D_rev_inv, eye, use_physical
+            )
+            sten_dom_l2r_inv = torch.ones_like(dom_b.reshape(-1)[sten_l2r_inv["sten_flat"]])
+            floor_l2r_inv = min(
+                float(jac_floor),
+                float(det_l2r_inv_0s.amin().item())
+                if det_l2r_inv_0s.numel() > 0
+                else float(jac_floor),
+            )
+        else:
+            sten_l2r_inv = None
+            sten_dom_l2r_inv = None
+            floor_l2r_inv = float(jac_floor)
 
         if has_l2r_mod:
             sten_l2r = _build_sparse_fd_stencil(l2r_refine_mask, steps_fd, dtype)
@@ -3098,7 +3117,18 @@ def pullback_digital_diffeomorphism_to_halves(
                 )
                 ok_r2l = float(det_r2l_c[sten_dom_r2l].amin().item()) >= floor_r2l - 1e-4
 
-            if ok_l2r and ok_r2l:
+            ok_l2r_inv = True
+            if has_l2r_inv_mod and bool(sten_dom_l2r_inv.any().item()):
+                det_l2r_inv_c, _ = _eval_sparse_fd_det(
+                    cand_l2r_inv.reshape(-1, dim)[sten_l2r_inv["pool_flat"]],
+                    sten_l2r_inv,
+                    D_rev_inv,
+                    eye,
+                    use_physical,
+                )
+                ok_l2r_inv = float(det_l2r_inv_c[sten_dom_l2r_inv].amin().item()) >= floor_l2r_inv - 1e-4
+
+            if ok_l2r and ok_r2l and ok_l2r_inv:
                 best_l2r = cand_l2r
                 best_r2l = cand_r2l
                 best_l2r_inv = cand_l2r_inv
