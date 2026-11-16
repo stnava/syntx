@@ -134,7 +134,8 @@ def auto_select_intensity_percentiles(
     """
     import numpy as np
     arr = image.numpy() if hasattr(image, "numpy") else np.asarray(image)
-    pos = arr[arr > 0]
+    is_hu = bool(arr.size > 0 and float(arr.min()) <= -500.0 and float(arr.max()) >= 100.0)
+    pos = arr[arr > -900.0] if is_hu else arr[arr > 0]
     if len(pos) < 100:
         return (2.0, 98.0)
 
@@ -230,14 +231,18 @@ def normalize_image(
         norm_arr = np.clip(arr, 0.0, 1.0).astype(np.float32)
         return image.new_image_like(norm_arr) if is_ants else norm_arr
 
+    is_hu = bool(arr_min <= -500.0 and arr_max >= 100.0)
+
     if method in ('auto', 'entropy'):
         p_min, p_max = auto_select_intensity_percentiles(arr)
-        pos = arr[arr > 0] if foreground_only else arr
+        pos = (arr[arr > -900.0] if is_hu else arr[arr > 0]) if foreground_only else arr
         if len(pos) > 0:
-            q_min = float(np.percentile(pos, p_min))
-            q_max = float(np.percentile(pos, p_max))
+            q_min = -1000.0 if (is_hu and foreground_only) else float(np.percentile(pos, p_min))
+            q_max = float(np.percentile(pos, max(p_max, 99.0) if is_hu else p_max))
+            if is_hu and foreground_only:
+                q_max = max(q_max, 300.0)
             if q_max <= q_min + 1e-4:
-                q_min = 0.0
+                q_min = -1000.0 if is_hu else 0.0
                 q_max = float(pos.max())
         else:
             q_min = float(arr.min())
@@ -245,12 +250,12 @@ def normalize_image(
         norm_arr = np.clip((arr - q_min) / (q_max - q_min + eps), 0.0, 1.0).astype(np.float32)
 
     elif method in ('robust', 'percentile'):
-        pos = arr[arr > 0] if foreground_only else arr
+        pos = (arr[arr > -900.0] if is_hu else arr[arr > 0]) if foreground_only else arr
         if len(pos) > 0:
-            q_min = float(np.percentile(pos, p_min))
+            q_min = -1000.0 if (is_hu and foreground_only) else float(np.percentile(pos, p_min))
             q_max = float(np.percentile(pos, p_max))
             if q_max <= q_min + 1e-4:
-                q_min = 0.0
+                q_min = -1000.0 if is_hu else 0.0
                 q_max = float(pos.max())
         else:
             q_min = float(arr.min())
@@ -263,7 +268,7 @@ def normalize_image(
         norm_arr = np.clip((arr - q_min) / (q_max - q_min + eps), 0.0, 1.0).astype(np.float32)
 
     elif method in ('zscore', 'standard'):
-        pos = arr[arr > 0] if foreground_only else arr
+        pos = (arr[arr > -900.0] if is_hu else arr[arr > 0]) if foreground_only else arr
         mean = float(pos.mean()) if len(pos) > 0 else float(arr.mean())
         std = float(pos.std()) if len(pos) > 0 else float(arr.std())
         norm_arr = ((arr - mean) / (std + eps)).astype(np.float32)

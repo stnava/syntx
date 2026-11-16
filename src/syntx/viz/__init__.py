@@ -20,6 +20,8 @@ from .core import (
     AnatomicalVisualizer,
 )
 from .figures import (
+    _same_physical_grid,
+    _align_to_reference_grid,
     extract_2d_slice,
     extract_oriented_slice,
     plot_deformation_grid,
@@ -29,6 +31,7 @@ from .figures import (
     compute_deformation_tensor_rgb,
     plot_deformation_tensor_rgb,
     render_input_pair_figure,
+    render_warped_comparison_figure,
     render_standard_4panel,
     render_label_alignment_figure,
     render_label_overlay_figure,
@@ -101,6 +104,7 @@ __all__ = [
     "get_dkt_colormap",
     "dkt_colormap",
     "render_input_pair_figure",
+    "render_warped_comparison_figure",
     "render_standard_4panel",
     "render_label_alignment_figure",
     "render_label_overlay_figure",

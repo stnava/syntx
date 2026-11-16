@@ -17,6 +17,8 @@ import matplotlib.pyplot as plt
 
 from .figures import (
     render_input_pair_figure,
+    render_warped_comparison_figure,
+    render_checkerboard_figure,
     render_standard_4panel,
     render_label_alignment_figure,
     plot_deformation_grid,
@@ -103,6 +105,27 @@ def create_visualization_gallery(
 
     fig1_light = render_input_pair_figure(fixed, moving, theme="light", title="Figure 1: Pre-Registration Input Images (Light Theme)")
     uri_fig1_light = fig_to_base64_png(fig1_light)
+
+    # Generate Warped Comparison & Checkerboard whenever warped is supplied
+    uri_warped_cmp = None
+    uri_checkerboard = None
+    if warped is not None:
+        fig_warped = render_warped_comparison_figure(
+            fixed,
+            warped,
+            theme="light",
+            title="Post-Registration Fixed vs. Warped Moving-to-Fixed Alignment",
+        )
+        uri_warped_cmp = fig_to_base64_png(fig_warped)
+
+        fig_checker = render_checkerboard_figure(
+            fixed,
+            warped,
+            title="Post-Registration Fixed / Warped Checkerboard",
+            theme="light",
+            resample_to_target=True,
+        )
+        uri_checkerboard = fig_to_base64_png(fig_checker)
 
     # Generate Figure 2 (Standard 4-Panel) if warped/warp/detJ available
     uri_fig2 = None
@@ -291,6 +314,8 @@ def create_visualization_gallery(
                 </div>
             </div>
         </div>
+
+        {"<div class='section-card'><h2>Post-Registration Warped Alignment &amp; Checkerboard Verification</h2><p style='color: var(--text-secondary);'>Direct physical-space comparison of Fixed Target and Warped Moving-to-Fixed anatomy alongside multi-planar checkerboard continuity.</p><div class='grid-2col'><div><h3 style='color: var(--accent);'>Fixed vs. Warped Moving-to-Fixed</h3><img class='fig-img' src='" + uri_warped_cmp + "' alt='Warped Moving-to-Fixed Comparison'></div><div><h3 style='color: var(--accent-green);'>Fixed / Warped Checkerboard</h3><img class='fig-img' src='" + uri_checkerboard + "' alt='Fixed Warped Checkerboard'></div></div></div>" if uri_warped_cmp and uri_checkerboard else ""}
 
         {"<div class='section-card'><h2>Figure 2: Standard 4-Panel Registration Quality Report</h2><p style='color: var(--text-secondary);'>Panel A: Deformed Mesh Grid | Panel B: Jacobian det(J) Map | Panel C: Inverse Error Map (mm) | Panel D: Canny Edge Alignment Overlap</p><img class='fig-img' src='" + uri_fig2 + "' alt='Figure 2 Report'></div>" if uri_fig2 else ""}
 

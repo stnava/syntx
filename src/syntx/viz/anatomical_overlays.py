@@ -868,11 +868,14 @@ def render_flow_on_anatomy_report_figure(
       - Panel B: Deformed Coordinate Mesh Grid on Target Anatomy
     """
     plt.rcParams.update(LIGHT_THEME_RC)
+    is_dark = str(theme).lower() == "dark"
+    bg_col = "#090d16" if is_dark else "#FFFFFF"
+    txt_col = "#F8FAFC" if is_dark else "#1E293B"
     ref_img = fixed if isinstance(fixed, ants.ANTsImage) else ants.image_read(fixed) if isinstance(fixed, str) else None
     dim = 2 if (ref_img is not None and ref_img.dimension == 2) or (isinstance(fixed, np.ndarray) and fixed.ndim == 2) else 3
 
     if dim == 2:
-        fig, axes = plt.subplots(1, 2, figsize=(12, 5.5), facecolor='#FFFFFF')
+        fig, axes = plt.subplots(1, 2, figsize=(12, 5.5), facecolor=bg_col)
         visualize_flow_on_anatomy(
             anatomy=fixed, flow=warp, slice_axis=2, slice_idx=0,
             mode='quiver_magnitude', target_contour=target_label, target_labels=target_labels,
@@ -884,7 +887,7 @@ def render_flow_on_anatomy_report_figure(
             title="B: Deformed Coordinate Mesh Grid", ax=axes[1], reorient=reorient
         )
     else:
-        fig, axes = plt.subplots(1, 4, figsize=(21, 5.2), facecolor='#FFFFFF')
+        fig, axes = plt.subplots(1, 4, figsize=(21, 5.2), facecolor=bg_col)
         # Axial
         visualize_flow_on_anatomy(
             anatomy=fixed, flow=warp, slice_axis=2, slice_idx=slice_idx if slice_axis == 2 else None,
@@ -912,13 +915,21 @@ def render_flow_on_anatomy_report_figure(
             title=f"D: Deformed Coordinate Mesh ({primary_name})", ax=axes[3], reorient=reorient
         )
 
+    if is_dark:
+        for ax_f in fig.axes:
+            ax_f.set_facecolor(bg_col)
+            if ax_f.get_title():
+                ax_f.title.set_color(txt_col)
+            ax_f.tick_params(colors="#CBD5E1")
+            ax_f.yaxis.label.set_color("#CBD5E1")
+
     main_title = title or "Displacement Flow Field Dynamics & Coordinate Regularity on Target Anatomy"
-    fig.suptitle(main_title, fontsize=13, fontweight='bold', y=0.98, color='#1E293B')
+    fig.suptitle(main_title, fontsize=13, fontweight='bold', y=0.98, color=txt_col)
     plt.tight_layout()
 
     if output_path:
         os.makedirs(os.path.dirname(os.path.abspath(output_path)), exist_ok=True)
-        fig.savefig(output_path, dpi=dpi, bbox_inches='tight', facecolor='#FFFFFF')
+        fig.savefig(output_path, dpi=dpi, bbox_inches='tight', facecolor=bg_col)
         plt.close(fig)
 
     return fig
@@ -946,7 +957,10 @@ def render_segmentation_overlap_report_figure(
       - Panel C: Spatial Overlap Confusion Map (Emerald = True Positive, Amber = Under-reach, Red = Spillover)
     """
     plt.rcParams.update(LIGHT_THEME_RC)
-    fig, axes = plt.subplots(1, 3, figsize=(16.5, 5.5), facecolor='#FFFFFF')
+    is_dark = str(theme).lower() == "dark"
+    bg_col = "#090d16" if is_dark else "#FFFFFF"
+    txt_col = "#F8FAFC" if is_dark else "#1E293B"
+    fig, axes = plt.subplots(1, 3, figsize=(16.5, 5.5), facecolor=bg_col)
 
     # Panel A: Target Reference
     visualize_segmentation_on_anatomy(
@@ -999,13 +1013,19 @@ def render_segmentation_overlap_report_figure(
         reorient=reorient
     )
 
+    if is_dark:
+        for ax_s in fig.axes:
+            ax_s.set_facecolor(bg_col)
+            if ax_s.get_title():
+                ax_s.title.set_color(txt_col)
+
     main_title = title or "Anatomical Segmentation Alignment & Spatial Overlap on Target Anatomy"
-    fig.suptitle(main_title, fontsize=13, fontweight='bold', y=0.98, color='#1E293B')
+    fig.suptitle(main_title, fontsize=13, fontweight='bold', y=0.98, color=txt_col)
     plt.tight_layout()
 
     if output_path:
         os.makedirs(os.path.dirname(os.path.abspath(output_path)), exist_ok=True)
-        fig.savefig(output_path, dpi=dpi, bbox_inches='tight', facecolor='#FFFFFF')
+        fig.savefig(output_path, dpi=dpi, bbox_inches='tight', facecolor=bg_col)
         plt.close(fig)
 
     return fig

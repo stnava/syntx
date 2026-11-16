@@ -2163,11 +2163,13 @@ def tvf_registration(
 
     t_start = _time.time()
     require_finite_images(fixed=fixed, moving=moving)
-    dim = fixed.dimension
-    grid_shape = fixed.shape
-    spacing = fixed.spacing
-    origin = fixed.origin
-    direction = fixed.direction
+    fixed_primary = fixed[0] if isinstance(fixed, (list, tuple)) else fixed
+    moving_primary = moving[0] if isinstance(moving, (list, tuple)) else moving
+    dim = fixed_primary.dimension
+    grid_shape = fixed_primary.shape
+    spacing = fixed_primary.spacing
+    origin = fixed_primary.origin
+    direction = fixed_primary.direction
 
     if reg_iterations is None:
         reg_iterations = iterations
@@ -2286,17 +2288,17 @@ def tvf_registration(
         init_M_phys, init_t_phys = parse_ants_affine(init_tx_list, dim)
     else:
         from .robust_affine import robust_affine
-        reg_aff = robust_affine(fixed, moving, dof=affine_dof, mode=affine_mode, seed=affine_seed, verbose=verbose)
+        reg_aff = robust_affine(fixed_primary, moving_primary, dof=affine_dof, mode=affine_mode, seed=affine_seed, verbose=verbose)
         init_tx_list = reg_aff['fwdtransforms']
         init_M_phys, init_t_phys = parse_ants_affine(init_tx_list, dim)
 
     from .core.pipeline import normalize_and_tensorize, auto_detect_device, cleanup_gpu
 
     grid_shape_zyx = itk_shape_to_tensor_shape(grid_shape)
-    moving_shape_zyx = itk_shape_to_tensor_shape(moving.shape)
-    moving_spacing = list(moving.spacing)
-    moving_origin = list(moving.origin)
-    moving_direction = moving.direction.tolist() if hasattr(moving.direction, 'tolist') else moving.direction
+    moving_shape_zyx = itk_shape_to_tensor_shape(moving_primary.shape)
+    moving_spacing = list(moving_primary.spacing)
+    moving_origin = list(moving_primary.origin)
+    moving_direction = moving_primary.direction.tolist() if hasattr(moving_primary.direction, 'tolist') else moving_primary.direction
 
     # everything TVFModel.fit reads, explicitly
     fit_kwargs = dict(advanced)
@@ -2369,8 +2371,8 @@ def tvf_registration(
             with torch.no_grad():
                 from .transform import compute_grid_to_physical_reference_matrix
                 dtype_dev = torch.float32
-                H_x = compute_grid_to_physical_reference_matrix(fixed.shape, fixed.spacing, fixed.origin, fixed.direction, device=device, dtype=dtype_dev)
-                H_y = compute_grid_to_physical_reference_matrix(moving.shape, moving.spacing, moving.origin, moving.direction, device=device, dtype=dtype_dev)
+                H_x = compute_grid_to_physical_reference_matrix(fixed_primary.shape, fixed_primary.spacing, fixed_primary.origin, fixed_primary.direction, device=device, dtype=dtype_dev)
+                H_y = compute_grid_to_physical_reference_matrix(moving_primary.shape, moving_primary.spacing, moving_primary.origin, moving_primary.direction, device=device, dtype=dtype_dev)
                 T_phys = torch.eye(dim + 1, device=device, dtype=dtype_dev)
                 T_phys[:dim, :dim] = init_M_phys.to(device=device, dtype=dtype_dev)
                 T_phys[:dim, dim] = init_t_phys.to(device=device, dtype=dtype_dev)
@@ -2508,8 +2510,8 @@ def tvf_registration(
 
         if init_M_phys is not None:
             from .transform import compute_grid_to_physical_reference_matrix
-            H_x = compute_grid_to_physical_reference_matrix(fixed.shape, fixed.spacing, fixed.origin, fixed.direction, device='cpu', dtype=torch.float32).numpy()
-            H_y = compute_grid_to_physical_reference_matrix(moving.shape, moving.spacing, moving.origin, moving.direction, device='cpu', dtype=torch.float32).numpy()
+            H_x = compute_grid_to_physical_reference_matrix(fixed_primary.shape, fixed_primary.spacing, fixed_primary.origin, fixed_primary.direction, device='cpu', dtype=torch.float32).numpy()
+            H_y = compute_grid_to_physical_reference_matrix(moving_primary.shape, moving_primary.spacing, moving_primary.origin, moving_primary.direction, device='cpu', dtype=torch.float32).numpy()
             T_phys = np.eye(dim + 1, dtype=np.float32)
             T_phys[:dim, :dim] = init_M_phys.numpy() if hasattr(init_M_phys, 'numpy') else np.asarray(init_M_phys)
             T_phys[:dim, dim] = init_t_phys.numpy() if hasattr(init_t_phys, 'numpy') else np.asarray(init_t_phys)
@@ -2603,8 +2605,8 @@ def tvf_registration(
         raise ValueError(f"Unknown backend: {backend}")
     from .transforms import _cache_disp_image_and_field, apply_transforms as _apply_transforms
     _apply_dev = str(device) if backend.lower() == 'pytorch' else None
-    fwd_img = disp_tensor_to_itk(fwd_disp, fixed)
-    inv_img = disp_tensor_to_itk(inv_disp, fixed)
+    fwd_img = disp_tensor_to_itk(fwd_disp, fixed_primary)
+    inv_img = disp_tensor_to_itk(inv_disp, fixed_primary)
 
     fwd_file = tempfile.NamedTemporaryFile(suffix='_tvf_fwd_Warp.nii.gz', delete=False).name
     inv_file = tempfile.NamedTemporaryFile(suffix='_tvf_inv_Warp.nii.gz', delete=False).name
@@ -2614,7 +2616,7 @@ def tvf_registration(
     _cache_disp_image_and_field(inv_file, inv_img, _apply_dev)
 
     # Export physical affine transform using standardized ITK layout
-    M_phys, t_phys = grid_to_physical_affine(T_grid, fixed, moving)
+    M_phys, t_phys = grid_to_physical_affine(T_grid, fixed_primary, moving_primary)
     affine_file = tempfile.NamedTemporaryFile(suffix='.mat', delete=False).name
 
     tx_fwd, tx_inv = export_ants_affine_transform(M_phys, t_phys, dim=dim, filename=affine_file)
@@ -2631,8 +2633,8 @@ def tvf_registration(
         whichtoinvert_inv = [True]
 
     # Generate warped output images (same as registration())
-    warpedmovout = _apply_transforms(fixed=fixed, moving=moving, transformlist=fwd_transforms)
-    warpedfixout = _apply_transforms(fixed=moving, moving=fixed, transformlist=inv_transforms,
+    warpedmovout = _apply_transforms(fixed=fixed_primary, moving=moving_primary, transformlist=fwd_transforms)
+    warpedfixout = _apply_transforms(fixed=moving_primary, moving=fixed_primary, transformlist=inv_transforms,
                                      whichtoinvert=whichtoinvert_inv)
 
     fit_time = _time.time() - t_start
@@ -2682,12 +2684,12 @@ def tvf_registration(
             temporal_weight=temporal_weight,
             fast_smooth=fast_smooth,
             advanced=dict(advanced),
-            fixed_shape=tuple(fixed.shape),
-            fixed_spacing=tuple(fixed.spacing),
-            fixed_orientation=str(fixed.orientation) if hasattr(fixed, 'orientation') else None,
-            moving_shape=tuple(moving.shape),
-            moving_spacing=tuple(moving.spacing),
-            moving_orientation=str(moving.orientation) if hasattr(moving, 'orientation') else None,
+            fixed_shape=tuple(fixed_primary.shape),
+            fixed_spacing=tuple(fixed_primary.spacing),
+            fixed_orientation=str(fixed_primary.orientation) if hasattr(fixed_primary, 'orientation') else None,
+            moving_shape=tuple(moving_primary.shape),
+            moving_spacing=tuple(moving_primary.spacing),
+            moving_orientation=str(moving_primary.orientation) if hasattr(moving_primary, 'orientation') else None,
         )
         ret_dict['provenance'] = provenance
     except Exception:

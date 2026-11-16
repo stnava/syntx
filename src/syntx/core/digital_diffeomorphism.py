@@ -3018,11 +3018,12 @@ def pullback_digital_diffeomorphism_to_halves(
             det_l2r_0s, _ = _eval_sparse_fd_det(
                 w_l2r_flat[sten_l2r["pool_flat"]], sten_l2r, D_rev_inv, eye, use_physical
             )
-            sten_dom_l2r = dom_b.reshape(-1)[sten_l2r["sten_flat"]]
+            # Include boundary stencil voxels so one-sided boundary Jacobians cannot flip sign
+            sten_dom_l2r = torch.ones_like(dom_b.reshape(-1)[sten_l2r["sten_flat"]])
             floor_l2r = min(
                 float(jac_floor),
-                float(det_l2r_0s[sten_dom_l2r].amin().item())
-                if bool(sten_dom_l2r.any().item())
+                float(det_l2r_0s.amin().item())
+                if det_l2r_0s.numel() > 0
                 else float(jac_floor),
             )
         else:
@@ -3035,11 +3036,11 @@ def pullback_digital_diffeomorphism_to_halves(
             det_r2l_0s, _ = _eval_sparse_fd_det(
                 w_r2l_flat[sten_r2l["pool_flat"]], sten_r2l, D_rev_inv, eye, use_physical
             )
-            sten_dom_r2l = dom_b.reshape(-1)[sten_r2l["sten_flat"]]
+            sten_dom_r2l = torch.ones_like(dom_b.reshape(-1)[sten_r2l["sten_flat"]])
             floor_r2l = min(
                 float(jac_floor),
-                float(det_r2l_0s[sten_dom_r2l].amin().item())
-                if bool(sten_dom_r2l.any().item())
+                float(det_r2l_0s.amin().item())
+                if det_r2l_0s.numel() > 0
                 else float(jac_floor),
             )
         else:

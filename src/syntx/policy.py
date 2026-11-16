@@ -128,8 +128,10 @@ def synthesize_policy(pair_diag: PairDiagnosis) -> RegistrationPolicy:
 
     if fix.is_pelvis() or mov.is_pelvis():
         return RegistrationPolicy(
-            transform_type="SyN", similarity_metric="cc2", denoise=denoise_3d_mri,
-            explanation="Pelvis: SyN, cc2.")
+            transform_type="SyN", similarity_metric="cc2",
+            guided="mind" if denoise_3d_mri else None,
+            denoise=denoise_3d_mri,
+            explanation="Pelvis: SyN, cc2" + (", Rician denoising, MIND self-similarity guidance." if denoise_3d_mri else "."))
 
     if pair_diag.relationship == "CROSS_MODAL":
         return RegistrationPolicy(

@@ -2275,7 +2275,7 @@ class SyNTo(nn.Module):
             _run_deformable_polish = (self.inverse_steps > 0 and sum(epochs_per_level) > 0)
             _dd_on = bool(kwargs.get('digital_diffeomorphism', True))
             _dd_floor = float(kwargs.get('digital_diffeomorphism_floor', 0.05))
-            _dd_steps = int(kwargs.get('digital_diffeomorphism_steps', compose_polish_steps))
+            _dd_steps = int(kwargs.get('digital_diffeomorphism_steps', max(compose_polish_steps, 50)))
 
             X_phys = get_physical_grid_torch(
                 target_grid_shape, fixed_spacing, fixed_origin, fixed_direction, device=device, dtype=dtype
@@ -3166,39 +3166,39 @@ def registration(
                 syn_metric_weights = [0.30, 0.70]
     elif guided == 'mind':
         from .landmarks.mind import compute_mind
-        mind_offsets = kwargs.pop('mind_offsets', 4)
-        if not isinstance(fixed, (list, tuple)):
+        mind_offsets = kwargs.pop('mind_offsets', 6)
+        fixed_base = list(fixed) if isinstance(fixed, (list, tuple)) else [fixed]
+        moving_base = list(moving) if isinstance(moving, (list, tuple)) else [moving]
+        n_base = len(fixed_base)
+        f0_m, m0_m = fixed_base[0], moving_base[0]
+        if f0_m.dimension == 3 and m0_m.dimension == 3:
             if verbose:
-                print("Extracting physical LPS MIND descriptors for fixed image...")
-            fixed_mind_t = compute_mind(fixed, n_offsets=mind_offsets)
-            fixed_channels = [fixed]
-            for c in range(fixed_mind_t.shape[1]):
-                arr_c = fixed_mind_t[0, c].cpu().numpy()
-                img_c = ants.from_numpy(arr_c, origin=fixed.origin, spacing=fixed.spacing, direction=fixed.direction)
-                fixed_channels.append(img_c)
-            fixed = fixed_channels
+                print("Extracting physical LPS MIND descriptors for fixed and moving images...")
+            sp_max = max(float(s) for s in f0_m.spacing)
+            off_mm = max(1.5, min(3.0, 0.8 * sp_max))
+            p_sz = 3 if min(int(n) for n in f0_m.shape) < 32 else 5
+            fixed_mind_t = compute_mind(f0_m, n_offsets=mind_offsets, patch_size=p_sz, offset_distance=off_mm, device=kwargs.get('device'))
+            moving_mind_t = compute_mind(m0_m, n_offsets=mind_offsets, patch_size=p_sz, offset_distance=off_mm, device=kwargs.get('device'))
+            fixed = fixed_base + [
+                ants.from_numpy(fixed_mind_t[0, c].detach().cpu().numpy(), origin=f0_m.origin, spacing=f0_m.spacing, direction=f0_m.direction)
+                for c in range(fixed_mind_t.shape[1])
+            ]
+            moving = moving_base + [
+                ants.from_numpy(moving_mind_t[0, c].detach().cpu().numpy(), origin=m0_m.origin, spacing=m0_m.spacing, direction=m0_m.direction)
+                for c in range(moving_mind_t.shape[1])
+            ]
+            n_extra = len(fixed) - n_base
+            if syn_metric is None or syn_metric in ('cc2', 'lncc'):
+                syn_metric = ['cc2'] * n_base + ['cc2'] * n_extra
+            elif isinstance(syn_metric, str):
+                syn_metric = [syn_metric] * n_base + ['cc2'] * n_extra
+            elif isinstance(syn_metric, (list, tuple)) and len(syn_metric) == n_base:
+                syn_metric = list(syn_metric) + ['cc2'] * n_extra
 
-        if not isinstance(moving, (list, tuple)):
-            if verbose:
-                print("Extracting physical LPS MIND descriptors for moving image...")
-            moving_mind_t = compute_mind(moving, n_offsets=mind_offsets)
-            moving_channels = [moving]
-            for c in range(moving_mind_t.shape[1]):
-                arr_c = moving_mind_t[0, c].cpu().numpy()
-                img_c = ants.from_numpy(arr_c, origin=moving.origin, spacing=moving.spacing, direction=moving.direction)
-                moving_channels.append(img_c)
-            moving = moving_channels
-
-        n_extra = len(fixed) - 1
-        if syn_metric is None or syn_metric in ('cc2', 'lncc'):
-            syn_metric = ['cc2'] + ['cc2'] * n_extra
-        elif isinstance(syn_metric, str):
-            syn_metric = [syn_metric] + ['cc2'] * n_extra
-
-        if syn_metric_weights is None:
-            w_mind = float(guided_weight) if guided_weight is not None else 0.20
-            w_primary = 1.0 - w_mind
-            syn_metric_weights = [w_primary] + [w_mind / max(n_extra, 1)] * n_extra
+            if syn_metric_weights is None:
+                w_mind = float(guided_weight) if guided_weight is not None else 0.25
+                w_primary = 1.0 - w_mind
+                syn_metric_weights = [w_primary / max(n_base, 1)] * n_base + [w_mind / max(n_extra, 1)] * n_extra
 
     # 1. Extract physical properties
     fixed_primary = fixed[0] if isinstance(fixed, (list, tuple)) else fixed
@@ -3990,16 +3990,30 @@ def auto_reg(
         from .device import resolve_device
         target_device = resolve_device(None, task='syn')
 
-    dim = fixed.dimension if hasattr(fixed, 'dimension') else (fixed.ndim if hasattr(fixed, 'ndim') else 3)
-    fixed_proc = fixed
-    moving_proc = moving
+    is_multi_in = isinstance(fixed, (list, tuple)) and isinstance(moving, (list, tuple))
+    if is_multi_in:
+        if len(fixed) == 0 or len(fixed) != len(moving):
+            raise ValueError("auto_reg: multi-channel fixed and moving lists must be non-empty and equal length")
+        fixed_list = list(fixed)
+        moving_list = list(moving)
+        fixed_ref = fixed_list[0]
+        moving_ref = moving_list[0]
+    else:
+        fixed_list = None
+        moving_list = None
+        fixed_ref = fixed
+        moving_ref = moving
+
+    dim = fixed_ref.dimension if hasattr(fixed_ref, 'dimension') else (fixed_ref.ndim if hasattr(fixed_ref, 'ndim') else 3)
+    fixed_proc = fixed_list if is_multi_in else fixed
+    moving_proc = moving_list if is_multi_in else moving
 
     # Slice 4D ANTsImage inputs to 3D for processing while preserving diagnosis capability
-    if hasattr(fixed_proc, 'dimension') and fixed_proc.dimension > 3:
+    if not is_multi_in and hasattr(fixed_proc, 'dimension') and fixed_proc.dimension > 3:
         import warnings
         warnings.warn(f"auto_reg: 4D fixed image (dimension={fixed_proc.dimension}) detected; slicing axis=3, idx=0 to 3D.")
         fixed_proc = ants.slice_image(fixed_proc, axis=3, idx=0)
-    if hasattr(moving_proc, 'dimension') and moving_proc.dimension > 3:
+    if not is_multi_in and hasattr(moving_proc, 'dimension') and moving_proc.dimension > 3:
         import warnings
         warnings.warn(f"auto_reg: 4D moving image (dimension={moving_proc.dimension}) detected; slicing axis=3, idx=0 to 3D.")
         moving_proc = ants.slice_image(moving_proc, axis=3, idx=0)
@@ -4011,7 +4025,9 @@ def auto_reg(
         import warnings
         warnings.warn(f"auto_reg: 4D moving_label (dimension={moving_label.dimension}) detected; slicing axis=3, idx=0 to 3D.")
         moving_label = ants.slice_image(moving_label, axis=3, idx=0)
-    dim = fixed_proc.dimension if hasattr(fixed_proc, 'dimension') else (fixed_proc.ndim if hasattr(fixed_proc, 'ndim') else 3)
+    fixed_primary = fixed_proc[0] if isinstance(fixed_proc, (list, tuple)) else fixed_proc
+    moving_primary = moving_proc[0] if isinstance(moving_proc, (list, tuple)) else moving_proc
+    dim = fixed_primary.dimension if hasattr(fixed_primary, 'dimension') else (fixed_primary.ndim if hasattr(fixed_primary, 'ndim') else 3)
 
     # 2. Autonomous Diagnosis & Policy Synthesis
     pair_diag = None
@@ -4021,7 +4037,7 @@ def auto_reg(
         try:
             from .diagnose import diagnose_pair
             from .policy import synthesize_policy
-            pair_diag = diagnose_pair(fixed, moving, fast=False)
+            pair_diag = diagnose_pair(fixed_ref, moving_ref, fast=False)
             policy = synthesize_policy(pair_diag)
             if verbose:
                 print(f"[auto_reg] Autonomous Diagnosis: {pair_diag.relationship} | Fixed: {pair_diag.fixed.body_part} ({pair_diag.fixed.modality}) | Moving: {pair_diag.moving.body_part} ({pair_diag.moving.modality})")
@@ -4031,11 +4047,14 @@ def auto_reg(
                 print(f"[auto_reg] Autonomous diagnosis fallback: {e}")
 
     # Parameter resolution: Explicit user arguments take strict precedence over synthesized policy
+    apply_ct_window = False
     if policy is not None:
         if type_of_transform is None:
             type_of_transform = policy.transform_type
             if guided is None:
                 guided = policy.guided
+        elif guided is None:
+            guided = policy.guided
         if denoise is False:
             denoise = policy.denoise
         if cohort_type == 'auto' and policy.cohort_type != 'auto':
@@ -4044,25 +4063,24 @@ def auto_reg(
             robust_affine = policy.robust_affine
         policy_metric = (policy.similarity_metric
                          if 'similarity_metric' not in kwargs and 'syn_metric' not in kwargs else None)
-        # CT Windowing if diagnosed CT
         if policy.ct_window is not None and pair_diag is not None and pair_diag.fixed.is_ct():
-            if policy.ct_window == (-1000.0, 400.0) and not pair_diag.fixed.is_thorax():
-                pass
-            else:
-                w_min, w_max = policy.ct_window
-                arr_f = np.clip((fixed_proc.numpy() - w_min) / max(w_max - w_min, 1e-4), 0.0, 1.0).astype(np.float32)
-                arr_m = np.clip((moving_proc.numpy() - w_min) / max(w_max - w_min, 1e-4), 0.0, 1.0).astype(np.float32)
-                fixed_proc = fixed_proc.new_image_like(arr_f)
-                moving_proc = moving_proc.new_image_like(arr_m)
+            if not (policy.ct_window == (-1000.0, 400.0) and not pair_diag.fixed.is_thorax()):
+                apply_ct_window = True
 
     # 3. Adaptive Preprocessing: Non-local means Rician denoising
-    if denoise in (True, 'auto') and dim == 3 and hasattr(fixed, 'dimension'):
+    if denoise in (True, 'auto') and dim == 3 and hasattr(fixed_primary, 'dimension'):
         try:
             import antstorch
             if verbose:
                 print("Applying adaptive non-local means denoising...")
-            fixed_proc = antstorch.denoise_image(fixed_proc, shrink_factor=2, p=1, r=1, noise_model="Rician")
-            moving_proc = antstorch.denoise_image(moving_proc, shrink_factor=2, p=1, r=1, noise_model="Rician")
+            if isinstance(fixed_proc, (list, tuple)):
+                fixed_proc = [antstorch.denoise_image(ch, shrink_factor=2, p=1, r=1, noise_model="Rician") for ch in fixed_proc]
+                moving_proc = [antstorch.denoise_image(ch, shrink_factor=2, p=1, r=1, noise_model="Rician") for ch in moving_proc]
+                fixed_primary, moving_primary = fixed_proc[0], moving_proc[0]
+            else:
+                fixed_proc = antstorch.denoise_image(fixed_proc, shrink_factor=2, p=1, r=1, noise_model="Rician")
+                moving_proc = antstorch.denoise_image(moving_proc, shrink_factor=2, p=1, r=1, noise_model="Rician")
+                fixed_primary, moving_primary = fixed_proc, moving_proc
         except Exception as e:
             if verbose:
                 print(f"[auto_reg] Denoising fallback: {e}")
@@ -4080,33 +4098,82 @@ def auto_reg(
     is_tvf = transform_type_upper in ('TVF', 'DIRICHLET_TVF', 'DSTI_TVF', 'TIME_VARYING')
     is_syngs = transform_type_upper in ('SYNGS', 'GEODESIC', 'SYN_GS', 'EPDIFF')
     is_affine_only = transform_type_upper in ('AFFINE', 'RIGID', 'TRANSLATION', 'AFFINE_ONLY', 'ROBUST_AFFINE')
-    # `registration()` (plain SyN/SyNTo), `syngs_registration()`, and `tvf_registration()`
-    # all now resolve their own initial affine/rigid alignment via `robust_affine`
-    # internally whenever `initial_transform` isn't supplied (see each function's
-    # `initial_transform`/`affine_dof`/`affine_mode`/`affine_seed` handling). Precomputing
-    # it here too would just be a redundant, wasted second `robust_affine` call for all
-    # three, so it's skipped below for all of them -- only `is_affine_only` (which calls
-    # `robust_affine` directly itself, not through one of these wrappers) still needs
-    # `auto_reg`'s own precomputation.
     is_self_resolving_backend = not is_affine_only
     if policy_metric is not None and not is_affine_only:
         kwargs['syn_metric'] = policy_metric          # the metric keyword all three backends take
 
-    # 4. Deterministic Robust Affine Initialization
+    # 5. Deterministic Robust Affine Initialization (run BEFORE narrow CT windowing so global affine sees full HU attenuation)
     initial_transform = kwargs.pop('initial_transform', None)
     aff_mode = robust_affine if isinstance(robust_affine, str) and robust_affine in ('translation_only', 'com_only', 'pytorch', 'ants_fast') else 'auto'
+    need_pre_window_affine = bool(
+        apply_ct_window and dim == 3 and hasattr(fixed_primary, 'dimension')
+        and float(fixed_primary.numpy().min()) <= -200.0
+    )
     should_run_affine = (
         (robust_affine is True) or
         (isinstance(robust_affine, str) and robust_affine in ('auto', 'translation_only', 'com_only', 'pytorch', 'ants_fast')) or
-        (robust_affine == 'auto' and dim == 3 and hasattr(fixed, 'dimension'))
-    ) and initial_transform is None and not is_affine_only and not is_self_resolving_backend
+        (robust_affine == 'auto' and dim == 3 and hasattr(fixed_primary, 'dimension'))
+    ) and initial_transform is None and not is_affine_only and (not is_self_resolving_backend or need_pre_window_affine)
 
     if should_run_affine:
         from .robust_affine import robust_affine as run_robust_affine
         if verbose:
             print(f"Computing deterministic multi-start robust affine initialization (mode='{aff_mode}')...")
-        aff_res = run_robust_affine(fixed_proc, moving_proc, mode=aff_mode, seed=seed, verbose=verbose)
+        aff_res = run_robust_affine(fixed_primary, moving_primary, mode=aff_mode, device=target_device, seed=seed, verbose=verbose)
         initial_transform = aff_res['fwdtransforms']
+
+    # Apply physical CT attenuation windowing / multi-band decomposition for deformable stage
+    if apply_ct_window and not isinstance(fixed_proc, (list, tuple)):
+        w_min, w_max = policy.ct_window
+        arr_f_raw = fixed_proc.numpy()
+        arr_m_raw = moving_proc.numpy()
+        is_true_3d_hu = bool(
+            dim == 3 and not is_affine_only and not is_syngs
+            and float(arr_f_raw.min()) <= -200.0 and float(arr_m_raw.min()) <= -200.0
+        )
+        def _win_img(img_like, arr_in, lo, hi):
+            return img_like.new_image_like(np.clip((arr_in - lo) / max(hi - lo, 1e-4), 0.0, 1.0).astype(np.float32))
+
+        if is_true_3d_hu and (w_min, w_max) == (-150.0, 250.0):
+            # Multi-band physical X-ray attenuation: soft-tissue parenchyma + vascular/dense + full pleural/skeletal context
+            fixed_proc = [
+                _win_img(fixed_primary, arr_f_raw, -150.0, 250.0),
+                _win_img(fixed_primary, arr_f_raw, 20.0, 480.0),
+                _win_img(fixed_primary, arr_f_raw, -1000.0, 800.0),
+            ]
+            moving_proc = [
+                _win_img(moving_primary, arr_m_raw, -150.0, 250.0),
+                _win_img(moving_primary, arr_m_raw, 20.0, 480.0),
+                _win_img(moving_primary, arr_m_raw, -1000.0, 800.0),
+            ]
+            fixed_primary, moving_primary = fixed_proc[0], moving_proc[0]
+            if not is_tvf and 'syn_metric_weights' not in kwargs and 'metric_weights' not in kwargs:
+                m_base = kwargs.get('syn_metric', 'cc')
+                if isinstance(m_base, str):
+                    kwargs['syn_metric'] = [m_base, m_base, m_base]
+                kwargs['syn_metric_weights'] = [0.55, 0.30, 0.15]
+        elif is_true_3d_hu and (w_min, w_max) == (-1000.0, 400.0):
+            fixed_proc = [
+                _win_img(fixed_primary, arr_f_raw, -1000.0, 400.0),
+                _win_img(fixed_primary, arr_f_raw, -150.0, 600.0),
+            ]
+            moving_proc = [
+                _win_img(moving_primary, arr_m_raw, -1000.0, 400.0),
+                _win_img(moving_primary, arr_m_raw, -150.0, 600.0),
+            ]
+            fixed_primary, moving_primary = fixed_proc[0], moving_proc[0]
+        else:
+            fixed_proc = _win_img(fixed_primary, arr_f_raw, w_min, w_max)
+            moving_proc = _win_img(moving_primary, arr_m_raw, w_min, w_max)
+            fixed_primary, moving_primary = fixed_proc, moving_proc
+    elif isinstance(fixed_proc, (list, tuple)) and not is_affine_only and not is_tvf and not is_syngs:
+        n_ch = len(fixed_proc)
+        if n_ch > 1 and guided not in (True, 'sulcal', 'mind'):
+            m_base = kwargs.get('syn_metric', 'cc2')
+            if isinstance(m_base, str):
+                kwargs['syn_metric'] = [m_base] * n_ch
+            if 'syn_metric_weights' not in kwargs and 'metric_weights' not in kwargs:
+                kwargs['syn_metric_weights'] = [1.0 / n_ch] * n_ch
 
     # 6. Execute Registration with Proven Best Parameters
     eff_levels = levels
@@ -4114,10 +4181,10 @@ def auto_reg(
     if not is_affine_only:
         from .pyramid import plan_scale_space_levels, scale_space_iterations
         if eff_levels is None and eff_iters is None:
-            if hasattr(fixed_proc, 'spacing') and hasattr(fixed_proc, 'shape') and dim in (2, 3):
-                sp_xyz = tuple(float(s) for s in fixed_proc.spacing[:dim])
-                sh_zyx = tuple(int(n) for n in fixed_proc.shape[:dim])[::-1]
-                ext_sorted = sorted(float(n) * float(s) for n, s in zip(fixed_proc.shape[:dim], sp_xyz))
+            if hasattr(fixed_primary, 'spacing') and hasattr(fixed_primary, 'shape') and dim in (2, 3):
+                sp_xyz = tuple(float(s) for s in fixed_primary.spacing[:dim])
+                sh_zyx = tuple(int(n) for n in fixed_primary.shape[:dim])[::-1]
+                ext_sorted = sorted(float(n) * float(s) for n, s in zip(fixed_primary.shape[:dim], sp_xyz))
                 transverse_ext = ext_sorted[-2] if dim == 3 else ext_sorted[-1]
                 pol_coarse_mm = float(policy.coarse_spacing_mm) if policy is not None else 4.0
                 eff_coarse_mm = max(pol_coarse_mm, transverse_ext / 64.0)
@@ -4149,7 +4216,7 @@ def auto_reg(
         if reg_iterations is not None:
             aff_params['iterations'] = reg_iterations
         aff_params.update(kwargs)
-        res = run_robust_affine(fixed=fixed_proc, moving=moving_proc, **aff_params)
+        res = run_robust_affine(fixed=fixed_primary, moving=moving_primary, **aff_params)
         transform_label = f"Robust Affine ({transform_type})"
     elif is_tvf:
         from .tvf import tvf_registration
@@ -4177,7 +4244,7 @@ def auto_reg(
             'verbose': verbose
         }
         syngs_params.update(kwargs)
-        res = syngs_registration(fixed=fixed_proc, moving=moving_proc, **syngs_params)
+        res = syngs_registration(fixed=fixed_primary, moving=moving_primary, **syngs_params)
         transform_label = "SyNGS (Riemannian Geodesic)"
     else:
         syn_params = {
@@ -4205,6 +4272,8 @@ def auto_reg(
         reg_used = str(syn_params.get('regularizer', 'sobolev')).lower()
         if guided in (True, 'sulcal'):
             transform_label = "SyN (Eulerian Sobolev Guided)" if reg_used == 'sobolev' else f"SyN ({reg_used.capitalize()} Guided)"
+        elif guided == 'mind':
+            transform_label = f"SyN ({reg_used.capitalize()} MIND-Guided)"
         else:
             transform_label = "SyN (Eulerian Sobolev)" if reg_used == 'sobolev' else f"SyN ({reg_used.capitalize()})"
 
@@ -4212,7 +4281,7 @@ def auto_reg(
 
     # 5. Compute Comprehensive Metrics
     if 'warpedfixout' not in res:
-        res['warpedfixout'] = fixed_proc
+        res['warpedfixout'] = fixed_primary
     warpedmovout = res['warpedmovout']
     fwd_tx = res['fwdtransforms']
 
@@ -4242,10 +4311,10 @@ def auto_reg(
             # Folding: the per-method determinant (syntx.liouville_determinant) when the result
             # supports it, else the finite-difference Jacobian; the FD values are kept as fd_*
             from .deformation_metrics import compute_jacobian_metrics, flow_jacobian_metrics
-            fd = compute_jacobian_metrics(fixed_proc, warp_file)
+            fd = compute_jacobian_metrics(fixed_primary, warp_file)
             metrics['fd_jac_min'] = fd['min']
             metrics['fd_folding_pct'] = fd['folding_pct']
-            flow = flow_jacobian_metrics(fixed_proc, res)
+            flow = flow_jacobian_metrics(fixed_primary, res)
             src = flow if flow is not None else dict(fd, measure="finite difference of the exported field")
             metrics['jac_mean'] = float(src['mean'])
             metrics['jac_min'] = float(src['min'])
@@ -4288,9 +4357,9 @@ def auto_reg(
     # Image similarity scores via image_compare
     try:
         from .image_compare import image_compare
-        metrics['lncc_score'] = float(image_compare(fixed_proc, warpedmovout, metricname='lncc'))
-        metrics['mse_score'] = float(image_compare(fixed_proc, warpedmovout, metricname='mse'))
-        metrics['mattes_mi_score'] = float(image_compare(fixed_proc, warpedmovout, metricname='mattes_mi'))
+        metrics['lncc_score'] = float(image_compare(fixed_primary, warpedmovout, metricname='lncc'))
+        metrics['mse_score'] = float(image_compare(fixed_primary, warpedmovout, metricname='mse'))
+        metrics['mattes_mi_score'] = float(image_compare(fixed_primary, warpedmovout, metricname='mattes_mi'))
     except Exception as e:
         if verbose:
             print(f"[auto_reg] Image similarity calculation skipped: {e}")
@@ -4316,7 +4385,7 @@ def auto_reg(
         which_inv = res.get('whichtoinvert_inv', [True] if n_inv == 1 else ([True, False] if n_inv == 2 else [True] + [False] * (n_inv - 1)))
         try:
             d_fix, d_mov, d_sym = compute_bidirectional_dice(
-                fixed_label, moving_label, fixed_proc, moving_proc,
+                fixed_label, moving_label, fixed_primary, moving_primary,
                 fwd_tx, res.get('invtransforms', []), which_inv
             )
             metrics['dice_fixed'] = float(d_fix)

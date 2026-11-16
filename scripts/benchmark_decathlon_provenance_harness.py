@@ -47,7 +47,7 @@ os.environ["PYTORCH_MPS_HIGH_WATERMARK_RATIO"] = "0.0"
 
 import syntx
 from syntx.core.utils import normalize_image
-from syntx.core.losses import mattes_mi_loss_nd
+from syntx.core.losses import mattes_mi_loss_nd, box_lncc_loss_nd
 from syntx.landmarks import (
     preprocess_for_landmarks,
     is_ct_image,
@@ -58,7 +58,8 @@ from syntx.landmarks import (
 from syntx.landmarks.matcher import compute_tre
 from syntx.landmarks.optimal_transport import sampled_optimal_transport_affine
 from syntx.landmarks import spatial as S
-from syntx.robust_affine import robust_affine
+from syntx.landmarks.mind import compute_mind
+from syntx.robust_affine import robust_affine, _analyze_volume_support_3d, _ct_axial_tomography_anchor_3d
 from syntx.deformation_metrics import compute_bidirectional_dice
 from syntx.pyramid import cap_ants_image
 from syntx.registration_metrics import evaluate_registration_qc
@@ -256,20 +257,103 @@ def score_affine_candidate_mattes(
     moving_ones: ants.ANTsImage,
     expected_ov: float,
     tx_list: List[str],
+    fixed_mind: Optional[torch.Tensor] = None,
+    moving_mind_imgs: Optional[List[ants.ANTsImage]] = None,
+    is_internal_fov_pair: bool = False,
+    has_slab_asymmetry: bool = False,
+    ct_tomo: Optional[Dict[str, Any]] = None,
+    mov_trunc_img_ax: Optional[int] = None,
 ) -> float:
-    """Scores an affine candidate via whole-domain Mattes MI (GEMINI.md §2 & §3) + slab-overlap guard."""
+    """Scores an affine candidate via physical-support Mattes MI + precomputed 3-D MIND consistency."""
     flags = [False] * len(tx_list)
     w_img = ants.apply_transforms(eval_fixed_norm, moving_norm, transformlist=tx_list, whichtoinvert=flags)
     w_in = ants.apply_transforms(eval_fixed_norm, moving_ones, transformlist=tx_list, whichtoinvert=flags)
-    in_frac = float((w_in.numpy() > 0.5).mean())
+    in_mask_np = w_in.numpy() > 0.95
+    in_frac = float(in_mask_np.mean())
     t0 = S.image_to_tensor(eval_fixed_norm).reshape(-1)
     tw = S.image_to_tensor(w_img).reshape(-1)
+    in_t = S.image_to_tensor(eval_fixed_norm.new_image_like(in_mask_np.astype(np.float32))).reshape(-1) > 0.5
+    mi_mask = None
+    if is_internal_fov_pair and int(in_t.sum().item()) >= 64:
+        mi_mask = in_t
+    elif mov_trunc_img_ax is not None and len(tx_list) == 1:
+        tx_m = ants.read_transform(tx_list[0])
+        pars_m = np.asarray(tx_m.parameters, dtype=np.float64)
+        A_m = pars_m[:9].reshape(3, 3)
+        t_m = pars_m[9:12]
+        c_m = np.asarray(tx_m.fixed_parameters[:3], dtype=np.float64)
+        sh_f = eval_fixed_norm.shape
+        gx, gy, gz = np.meshgrid(
+            np.arange(sh_f[0], dtype=np.float64),
+            np.arange(sh_f[1], dtype=np.float64),
+            np.arange(sh_f[2], dtype=np.float64),
+            indexing="ij",
+        )
+        vox_f = np.stack([gx, gy, gz], axis=-1).reshape(-1, 3)
+        dir_f = np.asarray(eval_fixed_norm.direction, dtype=np.float64).reshape(3, 3)
+        sp_f = np.asarray(eval_fixed_norm.spacing, dtype=np.float64)
+        org_f = np.asarray(eval_fixed_norm.origin, dtype=np.float64)
+        phys_f = org_f + (vox_f * sp_f) @ dir_f.T
+        phys_y = (phys_f - c_m) @ A_m.T + c_m + t_m
+        dir_m_inv_T = np.linalg.inv(np.asarray(moving_norm.direction, dtype=np.float64).reshape(3, 3)).T
+        sp_m = np.asarray(moving_norm.spacing, dtype=np.float64)
+        org_m = np.asarray(moving_norm.origin, dtype=np.float64)
+        vox_y_ax = ((phys_y - org_m) @ dir_m_inv_T)[:, mov_trunc_img_ax] / sp_m[mov_trunc_img_ax]
+        n_ax = float(moving_norm.shape[mov_trunc_img_ax] - 1)
+        ax_in_np = ((vox_y_ax >= 0.005 * n_ax) & (vox_y_ax <= 0.995 * n_ax)).reshape(sh_f)
+        ax_in_t = S.image_to_tensor(eval_fixed_norm.new_image_like(ax_in_np.astype(np.float32))).reshape(-1) > 0.5
+        if int(ax_in_t.sum().item()) >= 64:
+            mi_mask = ax_in_t
     with torch.no_grad():
         mi_loss = float(
-            mattes_mi_loss_nd(tw, t0, mask=None, num_bins=32, auto_mask=False, fixed_range=(0.0, 1.0)).item()
+            mattes_mi_loss_nd(tw, t0, mask=mi_mask, num_bins=32, auto_mask=False, fixed_range=(0.0, 1.0)).item()
         )
-    ov_deficit = max(0.0, 0.55 * expected_ov - in_frac)
-    return -mi_loss - 2.0 * ov_deficit
+        loss = mi_loss
+        if ct_tomo is not None and len(tx_list) == 1:
+            tx_obj = ants.read_transform(tx_list[0])
+            pars = np.asarray(tx_obj.parameters, dtype=np.float64)
+            A_tx = pars[:9].reshape(3, 3)
+            t_tx = pars[9:12]
+            c_tx = np.asarray(tx_obj.fixed_parameters[:3], dtype=np.float64)
+            mapped_cf = A_tx @ (ct_tomo["c_anchor_f"] - c_tx) + c_tx + t_tx
+            dz_dev = abs(float(mapped_cf[ct_tomo["axis_lps"]] - ct_tomo["c_anchor_m"][ct_tomo["axis_lps"]]))
+            z_pen = 0.14 * (max(0.0, dz_dev - 30.0) / 25.0) ** 2
+            loss = mi_loss + z_pen
+        elif (is_internal_fov_pair or has_slab_asymmetry) and fixed_mind is not None and moving_mind_imgs is not None and int(in_mask_np.sum()) >= 64:
+            w_m = torch.stack(
+                [torch.from_numpy(ants.apply_transforms(eval_fixed_norm, mc, transformlist=tx_list, whichtoinvert=flags).numpy())
+                 for mc in moving_mind_imgs],
+                dim=0,
+            )  # [6, nx, ny, nz]
+            f_m = fixed_mind[0].detach().cpu()
+            fg_np = in_mask_np if is_internal_fov_pair else (in_mask_np & ((eval_fixed_norm.numpy() > 0.02) | (w_img.numpy() > 0.02)))
+            if int(fg_np.sum()) >= 64:
+                fg_t = torch.from_numpy(fg_np)
+                fm_sel = f_m[:, fg_t]
+                wm_sel = w_m[:, fg_t]
+                mind_l1 = float((wm_sel - fm_sel).abs().mean().item())
+                fm_c = fm_sel - fm_sel.mean(dim=-1, keepdim=True)
+                wm_c = wm_sel - wm_sel.mean(dim=-1, keepdim=True)
+                denom_m = float(torch.sqrt(fm_c.pow(2).mean().clamp_min(1e-6) * wm_c.pow(2).mean().clamp_min(1e-6)).item())
+                mind_corr_loss = -float((fm_c * wm_c).mean().item()) / denom_m
+                if has_slab_asymmetry:
+                    ov_zyx = torch.from_numpy(in_mask_np.transpose(2, 1, 0).astype(np.float32))[None, None]
+                    sp_eval_min = min(float(s) for s in eval_fixed_norm.spacing)
+                    w_sz = min(min(eval_fixed_norm.shape), max(5, int(round(60.0 / max(sp_eval_min, 1.0))) | 1))
+                    if w_sz % 2 == 0:
+                        w_sz = max(3, w_sz - 1)
+                    f_zyx = torch.from_numpy(eval_fixed_norm.numpy().transpose(2, 1, 0))[None, None]
+                    w_zyx = torch.from_numpy(w_img.numpy().transpose(2, 1, 0))[None, None]
+                    fm_zyx = f_m.permute(2, 1, 0).unsqueeze(0).permute(0, 4, 1, 2, 3) if f_m.dim() == 3 else f_m.permute(0, 3, 2, 1).unsqueeze(0)
+                    wm_zyx = w_m.permute(0, 3, 2, 1).unsqueeze(0)
+                    lncc_img = float(box_lncc_loss_nd(w_zyx, f_zyx, window_size=w_sz, mask=ov_zyx).item())
+                    lncc_mind = float(box_lncc_loss_nd(wm_zyx, fm_zyx, window_size=w_sz, mask=ov_zyx).item())
+                    loss = 0.25 * mi_loss + 0.50 * lncc_img + 1.00 * lncc_mind
+                else:
+                    loss = mi_loss + 0.50 * mind_corr_loss + 0.65 * mind_l1
+    ov_req = 0.84 * expected_ov if (is_internal_fov_pair or has_slab_asymmetry) else 0.78 * expected_ov
+    ov_deficit = max(0.0, ov_req - in_frac)
+    return -loss - (3.5 if (is_internal_fov_pair or has_slab_asymmetry) else 2.5) * ov_deficit
 
 
 def evaluate_decathlon_task(
@@ -317,29 +401,34 @@ def evaluate_decathlon_task(
     l0_p = os.path.join(t_dir, c0["label"]) if isinstance(c0, dict) and "label" in c0 else None
     l1_p = os.path.join(t_dir, c1["label"]) if isinstance(c1, dict) and "label" in c1 else None
 
-    # 1. Load Images & Squeeze 4D if multi-channel using dataset.json modality metadata (zero task-name hardcoding)
-    img0_raw = ants.image_read(p0)
-    img1_raw = ants.image_read(p1)
+    # 1. Load Images & Extract Co-Registered Anatomical Channels via dataset.json modality metadata (zero task-name hardcoding)
+    img0_loaded = ants.image_read(p0)
+    img1_loaded = ants.image_read(p1)
 
     mod_map = meta.get("modality", {}) if isinstance(meta.get("modality"), dict) else {}
     ch_sel = next((int(k) for k, v in mod_map.items() if str(v).strip().upper() in ("T1W", "T1")), 0)
+    lesion_tags = {"FLAIR", "T1GD", "T1CE", "T1C", "GD"}
 
-    if img0_raw.dimension == 4:
-        ch0 = min(ch_sel, img0_raw.shape[-1] - 1)
-        img0_raw = ants.from_numpy(
-            img0_raw.numpy()[..., ch0],
-            origin=img0_raw.origin[:3],
-            spacing=img0_raw.spacing[:3],
-            direction=img0_raw.direction[:3, :3],
-        )
-    if img1_raw.dimension == 4:
-        ch1 = min(ch_sel, img1_raw.shape[-1] - 1)
-        img1_raw = ants.from_numpy(
-            img1_raw.numpy()[..., ch1],
-            origin=img1_raw.origin[:3],
-            spacing=img1_raw.spacing[:3],
-            direction=img1_raw.direction[:3, :3],
-        )
+    def _extract_anatomical_channels(im4d: ants.ANTsImage) -> Tuple[ants.ANTsImage, List[ants.ANTsImage]]:
+        if im4d.dimension != 4:
+            return im4d, [im4d]
+        n_c = int(im4d.shape[-1])
+        arr4 = im4d.numpy()
+        org3, sp3, dir3 = im4d.origin[:3], im4d.spacing[:3], im4d.direction[:3, :3]
+        c_prim = min(ch_sel, n_c - 1)
+        prim = ants.from_numpy(arr4[..., c_prim], origin=org3, spacing=sp3, direction=dir3)
+        anat_indices = [c_prim]
+        for k_idx in range(n_c):
+            if k_idx == c_prim:
+                continue
+            tag = str(mod_map.get(str(k_idx), "")).strip().upper()
+            if tag and tag not in lesion_tags:
+                anat_indices.append(k_idx)
+        ch_list = [ants.from_numpy(arr4[..., ci], origin=org3, spacing=sp3, direction=dir3) for ci in anat_indices]
+        return prim, ch_list
+
+    img0_raw, img0_raw_channels = _extract_anatomical_channels(img0_loaded)
+    img1_raw, img1_raw_channels = _extract_anatomical_channels(img1_loaded)
 
     raw_l0 = ants.image_read(l0_p) if (l0_p and os.path.exists(l0_p)) else None
     raw_l1 = ants.image_read(l1_p) if (l1_p and os.path.exists(l1_p)) else None
@@ -358,18 +447,22 @@ def evaluate_decathlon_task(
             direction=raw_l1.direction[:3, :3],
         )
 
-    # Bug H5: Generate verified parenchymal masks on native full-resolution images
-    mask0_native = extract_surrogate_mask(img0_raw, task_spec, raw_l0)
-    mask1_native = extract_surrogate_mask(img1_raw, task_spec, raw_l1)
+    # Bug H5: Generate verified parenchymal masks on native full-resolution images (img0_loaded preserves 4D channel indexing when needed)
+    mask0_native = extract_surrogate_mask(img0_loaded if img0_loaded.dimension == 4 else img0_raw, task_spec, raw_l0)
+    mask1_native = extract_surrogate_mask(img1_loaded if img1_loaded.dimension == 4 else img1_raw, task_spec, raw_l1)
 
     # Bug H2: Working image downsampling using cap_ants_image with deformable policy preserving native z-spacing
     # Ground-truth labels are NEVER downsampled.
-    img0 = img0_raw
-    img1 = img1_raw
-    if np.prod(img0.shape) > 5_000_000:
-        img0 = cap_ants_image(img0, max_resolution_mm=1.5, policy="deformable")
-    if np.prod(img1.shape) > 5_000_000:
-        img1 = cap_ants_image(img1, max_resolution_mm=1.5, policy="deformable")
+    img0_channels = [
+        cap_ants_image(ch, max_resolution_mm=1.5, policy="deformable") if np.prod(ch.shape) > 5_000_000 else ch
+        for ch in img0_raw_channels
+    ]
+    img1_channels = [
+        cap_ants_image(ch, max_resolution_mm=1.5, policy="deformable") if np.prod(ch.shape) > 5_000_000 else ch
+        for ch in img1_raw_channels
+    ]
+    img0 = img0_channels[0]
+    img1 = img1_channels[0]
 
     # Autonomous image-driven modality & anatomy diagnosis via syntx.diagnose_pair + synthesize_policy (zero task-name hints)
     pair_diag = syntx.diagnose_pair(img0, img1, fast=False)
@@ -432,7 +525,7 @@ def evaluate_decathlon_task(
                 tre_vals = np.linalg.norm(pts_pred - pts_true, axis=1)
                 tre_median = float(np.median(tre_vals))
 
-    # 4. Multi-Start Tournament Portfolio (Bug H3: zero test-label leakage, whole-domain Mattes MI per GEMINI.md §2 & §3)
+    # 4. Multi-Start Tournament Portfolio (Bug H3: zero test-label leakage; unclipped physical img0/img1 passed to robust_affine)
     tx_id = ants.create_ants_transform(transform_type="AffineTransform", dimension=3)
     tx_id.set_parameters(np.concatenate([np.eye(3).ravel(), np.zeros(3)]))
     tx_id.set_fixed_parameters(np.array(ants.get_center_of_mass(pre0)))
@@ -441,7 +534,7 @@ def evaluate_decathlon_task(
     ants.write_transform(tx_id, id_mat)
 
     t0_aff = time.time()
-    res_aff_default = robust_affine(pre0, pre1, mode="auto", device=device, verbose=False)
+    res_aff_default = robust_affine(img0, img1, mode="auto", device=device, verbose=False)
     t_aff_default = time.time() - t0_aff
 
     # Candidate C: SIFT3D + RANSAC keypoint candidate (consistent scale range on both volumes)
@@ -460,7 +553,7 @@ def evaluate_decathlon_task(
                 with tempfile.NamedTemporaryFile(suffix=".mat", delete=False) as tmp_s:
                     sift_mat = tmp_s.name
                 ants.write_transform(tx_sift, sift_mat)
-                res_aff_sift = robust_affine(pre0, pre1, mode="auto", initial_transform=sift_mat, device=device, verbose=False)
+                res_aff_sift = robust_affine(img0, img1, mode="auto", initial_transform=sift_mat, device=device, verbose=False)
         except Exception:
             pass
 
@@ -470,29 +563,80 @@ def evaluate_decathlon_task(
     if not smoke:
         try:
             ot_mat = sampled_optimal_transport_affine(pre0, pre1, sampling_percentage=0.08, device=device)
-            res_aff_ot = robust_affine(pre0, pre1, mode="auto", initial_transform=ot_mat, device=device, verbose=False)
+            res_aff_ot = robust_affine(img0, img1, mode="auto", initial_transform=ot_mat, device=device, verbose=False)
         except Exception:
             pass
 
-    n0 = normalize_image(pre0, method="auto", force=True)
-    n1 = normalize_image(pre1, method="auto", force=True)
-    eval_fixed = n0
+    n0 = normalize_image(img0, method="auto", force=True)
+    n1 = normalize_image(img1, method="auto", force=True)
+    eval_fixed = cap_ants_image(n0, max_resolution_mm=3.0, policy="mm_iso") if np.prod(n0.shape) > 250_000 else n0
+    eval_mov = cap_ants_image(n1, max_resolution_mm=3.0, policy="mm_iso") if np.prod(n1.shape) > 250_000 else n1
+    sup_f = _analyze_volume_support_3d(img0, n0)
+    sup_m = _analyze_volume_support_3d(img1, n1)
+    is_internal_pair = bool(sup_f["is_internal_fov"] and sup_m["is_internal_fov"])
+    ex_f, ex_m = sup_f["ext_world"], sup_m["ext_world"]
+    et_f, et_m = sup_f["end_touch_lps"], sup_m["end_touch_lps"]
+    ext_ratios = np.maximum(ex_f, ex_m) / np.maximum(np.minimum(ex_f, ex_m), 10.0)
+    ext_diffs = np.abs(ex_m - ex_f)
+    asym_axes = [
+        i for i in range(3)
+        if (
+            (ext_ratios[i] >= 1.30 and ext_diffs[i] >= 60.0)
+            or (ext_ratios[i] >= 1.18 and ext_diffs[i] >= 90.0)
+        )
+        and (et_f[i] >= 0.10 or et_m[i] >= 0.10)
+    ]
+    sp_f_lps, sp_m_lps = sup_f["span_lps"], sup_m["span_lps"]
+    trans_ok = sum(
+        1 for i in range(3)
+        if i not in asym_axes and 0.50 <= (sp_m_lps[i] / max(sp_f_lps[i], 10.0)) <= 1.90 and max(sp_f_lps[i], sp_m_lps[i]) >= 100.0
+    )
+    has_slab_asym = bool(not sup_f["is_internal_fov"] and not sup_m["is_internal_fov"] and len(asym_axes) == 1 and trans_ok >= 2)
+    mov_trunc_ax = None
+    if has_slab_asym and et_m[asym_axes[0]] >= 0.03 and ex_f[asym_axes[0]] > 1.12 * ex_m[asym_axes[0]]:
+        mov_trunc_ax = int(np.argmax(np.abs(np.asarray(eval_mov.direction, dtype=np.float64).reshape(3, 3)[asym_axes[0], :])))
+    ct_tomo_info = None
+    if has_slab_asym and sup_f["is_hu"] and sup_m["is_hu"]:
+        try:
+            ct_tomo_info = _ct_axial_tomography_anchor_3d(img0, img1, asym_axis_lps=asym_axes[0])
+        except Exception:
+            ct_tomo_info = None
+    f_mind_eval = None
+    m_mind_imgs = None
+    if is_internal_pair or (has_slab_asym and ct_tomo_info is None):
+        p_mind = 3 if min(eval_fixed.shape) < 32 else 5
+        off_mind = max(2.0, 1.5 * min(float(s) for s in eval_fixed.spacing))
+        f_mind_eval = compute_mind(eval_fixed, n_offsets=6, patch_size=p_mind, offset_distance=off_mind, device=device)
+        m_mind_t = compute_mind(eval_mov, n_offsets=6, patch_size=p_mind, offset_distance=off_mind, device=device).detach().cpu()
+        m_mind_imgs = [
+            ants.from_numpy(m_mind_t[0, c].numpy(), origin=eval_mov.origin, spacing=eval_mov.spacing, direction=eval_mov.direction)
+            for c in range(6)
+        ]
+
     ones1 = ants.from_numpy(
-        np.ones(pre1.shape, dtype=np.float32),
-        origin=pre1.origin,
-        spacing=pre1.spacing,
-        direction=pre1.direction,
+        np.ones(eval_mov.shape, dtype=np.float32),
+        origin=eval_mov.origin,
+        spacing=eval_mov.spacing,
+        direction=eval_mov.direction,
     )
-    ext0 = np.abs(np.asarray(eval_fixed.direction).reshape(3, 3)) @ (
-        np.asarray(eval_fixed.shape, dtype=np.float64) * np.asarray(eval_fixed.spacing, dtype=np.float64)
-    )
-    ext1 = np.abs(np.asarray(pre1.direction).reshape(3, 3)) @ (
-        np.asarray(pre1.shape, dtype=np.float64) * np.asarray(pre1.spacing, dtype=np.float64)
-    )
+    ext0 = sup_f["ext_world"]
+    ext1 = sup_m["ext_world"]
     expected_ov = float(np.clip(np.prod(np.minimum(1.0, ext1 / np.maximum(ext0, 1e-3))), 0.05, 1.0))
 
     def _score_candidate(res_dict: Dict[str, Any]) -> float:
-        return score_affine_candidate_mattes(eval_fixed, n1, ones1, expected_ov, res_dict["fwdtransforms"])
+        return score_affine_candidate_mattes(
+            eval_fixed,
+            eval_mov,
+            ones1,
+            expected_ov,
+            res_dict["fwdtransforms"],
+            fixed_mind=f_mind_eval,
+            moving_mind_imgs=m_mind_imgs,
+            is_internal_fov_pair=is_internal_pair,
+            has_slab_asymmetry=has_slab_asym,
+            ct_tomo=ct_tomo_info,
+            mov_trunc_img_ax=mov_trunc_ax,
+        )
 
     candidates = [
         ("Identity", {"fwdtransforms": [id_mat], "invtransforms": [id_mat]}, _score_candidate({"fwdtransforms": [id_mat]})),
@@ -518,21 +662,27 @@ def evaluate_decathlon_task(
     warped_aff_img = ants.apply_transforms(pre0, pre1, winning_aff["fwdtransforms"], whichtoinvert=[False])
     lncc_aff = compute_structural_lncc(pre0, warped_aff_img, mask=None)
 
-    # 5a. Autonomous syntx.auto_reg deformable registration (diagnose_pair -> synthesize_policy -> scale-space Beltrami SyN)
+    # 5a. Autonomous syntx.auto_reg deformable registration (diagnose_pair -> synthesize_policy -> scale-space Beltrami TVF/SyN)
     reg_iters = [10, 5] if smoke else None
+    reg_fixed_in = img0_channels if len(img0_channels) > 1 else img0
+    reg_moving_in = img1_channels if len(img1_channels) > 1 else img1
+    deform_kwargs: Dict[str, Any] = {
+        "regularizer": "beltrami",
+        "dilatation_weight": 0.1,
+    }
+    if auto_policy.transform_type.upper() != "TVF":
+        deform_kwargs["grad_step"] = 0.7
     t0_syn_belt = time.time()
     res_syn_beltrami = syntx.auto_reg(
-        fixed=img0,
-        moving=img1,
-        type_of_transform="SyN",
-        guided=False,
+        fixed=reg_fixed_in,
+        moving=reg_moving_in,
+        type_of_transform=None,
+        guided=None,
         initial_transform=winning_aff["fwdtransforms"][0],
-        regularizer="beltrami",
-        grad_step=0.7,
-        dilatation_weight=0.1,
         reg_iterations=reg_iters,
         device=device,
         verbose=False,
+        **deform_kwargs,
     )
     t_syn_belt = time.time() - t0_syn_belt
     _, _, dice_syntx_syn = compute_bidirectional_dice(

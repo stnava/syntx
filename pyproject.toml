@@ -1,15 +1,15 @@
 [build-system]
-requires = ["setuptools>=61.0"]
+requires = ["setuptools>=77.0.0"]
 build-backend = "setuptools.build_meta"
 
 [project]
 name = "syntx"
-version = "6.37.2"
+version = "6.38.0"
 description = "Symmetric diffeomorphic and affine image registration methods in PyTorch and JAX"
 
 readme = "README.md"
 requires-python = ">=3.10"
-license = {text = "Apache-2.0"}
+license = "Apache-2.0"
 authors = [
     {name = "syntx developers"}
 ]

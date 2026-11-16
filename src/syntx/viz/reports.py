@@ -190,6 +190,7 @@ def create_registration_report(
     show_report=False,
     reg=None,
     dice_overlap=None,
+    theme: str = "light",
     **kwargs
 ):
     """Write an HTML report (plus PNG figures) for one registration.
@@ -271,7 +272,15 @@ def create_registration_report(
     import warnings
     import matplotlib.pyplot as plt
     from ..image_compare import image_compare
-    from .figures import render_input_pair_figure, render_standard_4panel, plot_time_varying_velocity_grid
+    from .core import AnatomicalVisualizer
+    from .figures import (
+        _align_to_reference_grid,
+        render_input_pair_figure,
+        render_warped_comparison_figure,
+        render_checkerboard_figure,
+        render_standard_4panel,
+        plot_time_varying_velocity_grid,
+    )
     from .stats import plot_label_overlap_stats, plot_loss_convergence
     from .anatomical_overlays import (
         render_flow_on_anatomy_report_figure,
@@ -280,22 +289,25 @@ def create_registration_report(
     if kwargs:
         raise TypeError(f"create_registration_report() got unexpected keyword(s) {sorted(kwargs)}")
     provenance_given = provenance is not None
-    
+
     if reg is not None and isinstance(reg, dict):
         if warped is None:
-            warped = reg.get("warpedmovout", fixed)
+            warped = reg.get("warpedmovout")
         if warp is None and "fwdtransforms" in reg:
             warp = reg["fwdtransforms"][0]
         if provenance is None and "provenance" in reg:
             provenance = reg["provenance"]
     elif isinstance(warped, dict):
         reg_dict = warped
-        warped = reg_dict.get("warpedmovout", fixed)
+        if reg is None:
+            reg = reg_dict
+        warped = reg_dict.get("warpedmovout")
         if warp is None and "fwdtransforms" in reg_dict:
             warp = reg_dict["fwdtransforms"][0]
         if provenance is None and "provenance" in reg_dict:
             provenance = reg_dict["provenance"]
 
+    has_warped = warped is not None
     if warped is None:
         warped = fixed
 
@@ -317,6 +329,21 @@ def create_registration_report(
         prov.update(provenance)
     elif isinstance(provenance, str):
         prov["info"] = provenance
+
+    if isinstance(fixed, ants.ANTsImage):
+        if isinstance(warped, str) and not warped.endswith(".mat"):
+            warped = ants.image_read(warped)
+        if isinstance(warped, ants.ANTsImage):
+            warped = _align_to_reference_grid(warped, fixed, interp_type="linear")
+        elif hasattr(warped, "shape"):
+            if hasattr(warped, "detach"):
+                warped = AnatomicalVisualizer._array_to_image(warped, fixed)
+            elif isinstance(warped, np.ndarray):
+                w_np = np.squeeze(warped).astype(np.float32)
+                if w_np.shape == fixed.shape:
+                    warped = fixed.new_image_like(w_np)
+                elif w_np.shape == fixed.shape[::-1]:
+                    warped = AnatomicalVisualizer._array_to_image(w_np, fixed)
 
     fi_arr = fixed.numpy() if isinstance(fixed, ants.ANTsImage) else np.squeeze(np.asarray(fixed))
     mi_arr = warped.numpy() if isinstance(warped, ants.ANTsImage) else np.squeeze(np.asarray(warped))
@@ -458,14 +485,37 @@ def create_registration_report(
         except Exception:
             pass
     elif not isinstance(warp, str) and warp is not None:
-        warp_img = warp
+        if (
+            isinstance(warp, np.ndarray)
+            and isinstance(fixed, ants.ANTsImage)
+            and warp.shape == (*fixed.shape, fixed.dimension)
+            and fixed.shape != fixed.shape[::-1]
+        ):
+            warp_img = ants.from_numpy(
+                np.ascontiguousarray(warp, dtype=np.float32),
+                origin=fixed.origin,
+                spacing=fixed.spacing,
+                direction=fixed.direction,
+                has_components=True,
+            )
+        else:
+            warp_img = warp
 
     if detJ is None and warp_img is not None and not isinstance(warp_img, str):
         detJ_arr, jac_stats = _compute_jacobian_stats(warp_img, fixed)
-        detJ = detJ_arr
+        detJ_plot = (
+            np.asarray(detJ_arr, dtype=np.float32)
+            if np.isfinite(detJ_arr).any()
+            else np.ones(fi_arr.shape, dtype=np.float32)
+        )
+        detJ = fixed.new_image_like(detJ_plot) if isinstance(fixed, ants.ANTsImage) else detJ_plot
     elif isinstance(detJ, ants.ANTsImage):
+        if isinstance(fixed, ants.ANTsImage):
+            detJ = _align_to_reference_grid(detJ, fixed, interp_type="linear")
         detJ_arr = detJ.numpy()
         mask_eval = ants.get_mask(fixed).numpy() > 0 if meta_fixed["is_ants"] else (detJ_arr != 0)
+        if not np.any(mask_eval):
+            mask_eval = np.ones_like(detJ_arr, dtype=bool)
         jac_stats = {
             "min": float(np.min(detJ_arr)),
             "max": float(np.max(detJ_arr)),
@@ -473,19 +523,40 @@ def create_registration_report(
             "std": float(np.std(detJ_arr)),
             "folding_pct": float(np.mean(detJ_arr[mask_eval] <= 0.0) * 100.0),
         }
-    elif isinstance(detJ, np.ndarray) and detJ.ndim >= 2:
-        detJ_arr = detJ
-        jac_stats = {
-            "min": float(np.min(detJ_arr)),
-            "max": float(np.max(detJ_arr)),
-            "mean": float(np.mean(detJ_arr)),
-            "std": float(np.std(detJ_arr)),
-            "folding_pct": float(np.mean(detJ_arr <= 0.0) * 100.0),
-        }
+    elif detJ is not None and hasattr(detJ, "shape"):
+        was_det_tensor = hasattr(detJ, "detach")
+        detJ_arr = np.squeeze(detJ.detach().cpu().numpy() if was_det_tensor else np.asarray(detJ)).astype(np.float32)
+        if detJ_arr.ndim >= 2:
+            if isinstance(fixed, ants.ANTsImage):
+                if detJ_arr.shape != fixed.shape and detJ_arr.shape == fixed.shape[::-1]:
+                    detJ_arr = np.ascontiguousarray(np.transpose(detJ_arr, tuple(range(detJ_arr.ndim)[::-1])))
+                elif was_det_tensor and fixed.shape == fixed.shape[::-1]:
+                    detJ_arr = np.ascontiguousarray(np.transpose(detJ_arr, tuple(range(detJ_arr.ndim)[::-1])))
+                if detJ_arr.shape == fixed.shape:
+                    detJ = fixed.new_image_like(detJ_arr)
+                else:
+                    detJ = detJ_arr
+            else:
+                detJ = detJ_arr
+            jac_stats = {
+                "min": float(np.min(detJ_arr)),
+                "max": float(np.max(detJ_arr)),
+                "mean": float(np.mean(detJ_arr)),
+                "std": float(np.std(detJ_arr)),
+                "folding_pct": float(np.mean(detJ_arr <= 0.0) * 100.0),
+            }
+        else:
+            nan = float("nan")
+            jac_stats = {"min": nan, "max": nan, "mean": nan, "std": nan, "folding_pct": nan}
+            detJ = (
+                fixed.new_image_like(np.ones(fixed.shape, dtype=np.float32))
+                if isinstance(fixed, ants.ANTsImage)
+                else np.ones_like(fi_arr, dtype=np.float32)
+            )
     else:
         # no warp / Jacobian: nothing to report (not "no folding")
-        detJ_arr = np.ones_like(fi_arr)
-        detJ = detJ_arr
+        detJ_arr = np.ones_like(fi_arr, dtype=np.float32)
+        detJ = fixed.new_image_like(detJ_arr) if isinstance(fixed, ants.ANTsImage) else detJ_arr
         nan = float('nan')
         jac_stats = {"min": nan, "max": nan, "mean": nan, "std": nan, "folding_pct": nan}
 
@@ -499,21 +570,46 @@ def create_registration_report(
             pass
 
     if have_inv_map:
-        if hasattr(inv_err_map, 'cpu'):
-            inv_err_map = inv_err_map.cpu().numpy()
-        inv_np = inv_err_map.numpy() if isinstance(inv_err_map, ants.ANTsImage) else np.asarray(inv_err_map)
-        
-        # PyTorch tensors are ZYX, ANTsImages are XYZ
-        if inv_np.shape != fi_arr.shape:
-            if inv_np.shape == fi_arr.shape[::-1]:
-                inv_np = np.transpose(inv_np, tuple(range(inv_np.ndim)[::-1]))
-                
+        if isinstance(inv_err_map, ants.ANTsImage):
+            if getattr(inv_err_map, "components", 1) > 1:
+                inv_err_map = ants.from_numpy(
+                    np.linalg.norm(inv_err_map.numpy(), axis=-1).astype(np.float32),
+                    origin=inv_err_map.origin,
+                    spacing=inv_err_map.spacing,
+                    direction=inv_err_map.direction,
+                )
+            if isinstance(fixed, ants.ANTsImage):
+                inv_err_map = _align_to_reference_grid(inv_err_map, fixed, interp_type="linear")
+            inv_np = inv_err_map.numpy()
+        else:
+            was_inv_tensor = hasattr(inv_err_map, "detach") or hasattr(inv_err_map, "cpu")
+            if hasattr(inv_err_map, "detach"):
+                inv_np = inv_err_map.detach().cpu().numpy()
+            elif hasattr(inv_err_map, "cpu"):
+                inv_np = inv_err_map.cpu().numpy()
+            else:
+                inv_np = np.asarray(inv_err_map)
+            inv_np = np.squeeze(inv_np).astype(np.float32)
+            if inv_np.ndim == fi_arr.ndim + 1 and inv_np.shape[-1] == fi_arr.ndim:
+                inv_np = np.linalg.norm(inv_np, axis=-1).astype(np.float32)
+
+            # PyTorch tensors are ZYX, ANTsImages are XYZ
+            if inv_np.shape != fi_arr.shape and inv_np.shape == fi_arr.shape[::-1]:
+                inv_np = np.ascontiguousarray(np.transpose(inv_np, tuple(range(inv_np.ndim)[::-1])))
+            elif was_inv_tensor and isinstance(fixed, ants.ANTsImage) and fi_arr.shape == fi_arr.shape[::-1]:
+                inv_np = np.ascontiguousarray(np.transpose(inv_np, tuple(range(inv_np.ndim)[::-1])))
+
+            if isinstance(fixed, ants.ANTsImage) and inv_np.shape == fixed.shape:
+                inv_err_map = fixed.new_image_like(inv_np)
+            else:
+                inv_err_map = inv_np
+
         inv_stats = {
             "max": float(np.max(inv_np)),
             "mean": float(np.mean(inv_np)),
             "p95": float(np.percentile(inv_np, 95)),
         }
-        
+
         # Interior error calculation (eroded mask by 5 voxels to avoid border truncation artifacts)
         if isinstance(fixed, ants.ANTsImage):
             base_mask = ants.get_mask(fixed)
@@ -534,68 +630,111 @@ def create_registration_report(
         # no inverse map: n/a (an all-zeros map was reported as 0 mm)
         nan = float('nan')
         inv_stats = {"max": nan, "mean": nan, "p95": nan, "interior_max": nan, "interior_mean": nan, "interior_p95": nan}
-        inv_err_map = np.zeros(fi_arr.shape, dtype=np.float32)       # blank panel in the figure
+        zero_inv = np.zeros(fi_arr.shape, dtype=np.float32)
+        inv_err_map = fixed.new_image_like(zero_inv) if isinstance(fixed, ants.ANTsImage) else zero_inv
 
-    # --- Render Figures ---
+    # --- Render Figures (Light & Dark native pairs for interactive theme toggle) ---
     ts = int(time.time())
     fig_num = 1
-    
-    fig1_name = f"fig1_inputs_{ts}.png"
-    fig1_abs = os.path.join(assets_dir, fig1_name)
-    plt.close(render_input_pair_figure(fixed, moving, output_path=fig1_abs, title=f"Figure {fig_num}: Original Input Pair"))
-    fig_num += 1
-    
-    fig2_name = f"fig2_4panel_{ts}.png"
-    fig2_abs = os.path.join(assets_dir, fig2_name)
-    fig2 = render_standard_4panel(
-        fixed=fixed, warped=warped,
-        warp=warp_img if warp_img is not None else np.zeros((*fi_arr.shape, fi_arr.ndim)),
-        detJ=detJ,
-        inv_err_map=inv_err_map,
-        slice_axis=slice_axis, slice_idx=slice_idx,
-        lncc_val=metrics.get('LNCC (w=9)', 0.0),
-        inv_err_max=inv_stats.get("interior_max", inv_stats["max"]), 
-        inv_err_mean=inv_stats.get("interior_mean", inv_stats["mean"]), 
-        inv_err_p95=inv_stats.get("interior_p95", inv_stats["p95"]),
-        min_detJ=jac_stats["min"],
-        title_prefix=f"{prov['algorithm']} ({prov['backend']})",
-        jac_measure=jac_measure,
-        filename=fig2_abs
+    eff_theme = "dark" if str(theme).lower() == "dark" else "light"
+
+    def _render_dual_theme(stem: str, render_fn) -> dict:
+        paths = {}
+        for _th in ("light", "dark"):
+            p = os.path.join(assets_dir, f"{stem}_{_th}.png")
+            fig_obj = render_fn(_th, p)
+            if fig_obj is not None and hasattr(fig_obj, "savefig"):
+                plt.close(fig_obj)
+            paths[_th] = p
+        return paths
+
+    def _theme_img_html(paths: dict, alt_text: str) -> str:
+        rel_default = os.path.relpath(paths[eff_theme], html_dir)
+        rel_light = os.path.relpath(paths["light"], html_dir)
+        rel_dark = os.path.relpath(paths["dark"], html_dir)
+        return (
+            f'<img class="theme-img" src="{rel_default}" '
+            f'data-src-light="{rel_light}" data-src-dark="{rel_dark}" '
+            f'alt="{alt_text}" style="max-width: 100%; border-radius: 8px;">'
+        )
+
+    _fig1_num = fig_num
+    fig1_paths = _render_dual_theme(
+        f"fig1_inputs_{ts}",
+        lambda _th, _p: render_input_pair_figure(
+            fixed, moving, theme=_th, output_path=_p, title=f"Figure {_fig1_num}: Original Input Pair"
+        ),
     )
-    if fig2 is not None:
-        plt.close(fig2)
     fig_num += 1
-    
+
+    if warp_img is not None:
+        warp_for_4panel = warp_img
+    elif isinstance(fixed, ants.ANTsImage):
+        warp_for_4panel = ants.from_numpy(
+            np.zeros((*fixed.shape, fixed.dimension), dtype=np.float32),
+            origin=fixed.origin,
+            spacing=fixed.spacing,
+            direction=fixed.direction,
+            has_components=True,
+        )
+    else:
+        warp_for_4panel = np.zeros((*fi_arr.shape, fi_arr.ndim), dtype=np.float32)
+
+    fig2_paths = _render_dual_theme(
+        f"fig2_4panel_{ts}",
+        lambda _th, _p: render_standard_4panel(
+            fixed=fixed,
+            warped=warped,
+            warp=warp_for_4panel,
+            detJ=detJ,
+            inv_err_map=inv_err_map,
+            slice_axis=slice_axis,
+            slice_idx=slice_idx,
+            theme=_th,
+            lncc_val=metrics.get('LNCC (w=9)', 0.0),
+            inv_err_max=inv_stats.get("interior_max", inv_stats["max"]),
+            inv_err_mean=inv_stats.get("interior_mean", inv_stats["mean"]),
+            inv_err_p95=inv_stats.get("interior_p95", inv_stats["p95"]),
+            min_detJ=jac_stats["min"],
+            title_prefix=f"{prov['algorithm']} ({prov['backend']})",
+            jac_measure=jac_measure,
+            filename=_p,
+        ),
+    )
+    fig2_abs = fig2_paths[eff_theme]
+    fig_num += 1
+
     html_figs = f'''
         <section class="card" style="margin-bottom: 2rem;">
             <h2>Figure 1: Input Image Pair (Fixed & Moving)</h2>
-            <div style="text-align: center;"><img src="{os.path.relpath(fig1_abs, html_dir)}" alt="Figure 1" style="max-width: 100%; border-radius: 8px;"></div>
+            <div style="text-align: center;">{_theme_img_html(fig1_paths, "Figure 1")}</div>
         </section>
         <section class="card" style="margin-bottom: 2rem;">
             <h2>Figure 2: Standard 4-Panel Diagnostic Report</h2>
-            <div style="text-align: center;"><img src="{os.path.relpath(fig2_abs, html_dir)}" alt="Figure 2" style="max-width: 100%; border-radius: 8px;"></div>
+            <div style="text-align: center;">{_theme_img_html(fig2_paths, "Figure 2")}</div>
         </section>
     '''
 
     fig_flow_abs = None
     if warp_img is not None:
         try:
-            fig_flow_name = f"fig{fig_num}_flow_anatomy_{ts}.png"
-            fig_flow_abs = os.path.join(assets_dir, fig_flow_name)
-            _f_flow = render_flow_on_anatomy_report_figure(
-                fixed=fixed,
-                warp=warp_img,
-                slice_axis=slice_axis,
-                slice_idx=slice_idx,
-                target_label=fixed_label,
-                output_path=fig_flow_abs,
+            flow_paths = _render_dual_theme(
+                f"fig{fig_num}_flow_anatomy_{ts}",
+                lambda _th, _p: render_flow_on_anatomy_report_figure(
+                    fixed=fixed,
+                    warp=warp_img,
+                    slice_axis=slice_axis,
+                    slice_idx=slice_idx,
+                    target_label=fixed_label,
+                    theme=_th,
+                    output_path=_p,
+                ),
             )
-            if _f_flow is not None:
-                plt.close(_f_flow)
+            fig_flow_abs = flow_paths[eff_theme]
             html_figs += f'''
         <section class="card" style="margin-bottom: 2rem;">
             <h2>Figure {fig_num}: Displacement Flow Dynamics & Regularity on Target Anatomy</h2>
-            <div style="text-align: center;"><img src="{os.path.relpath(fig_flow_abs, html_dir)}" alt="Figure {fig_num}" style="max-width: 100%; border-radius: 8px;"></div>
+            <div style="text-align: center;">{_theme_img_html(flow_paths, f"Figure {fig_num}")}</div>
         </section>
             '''
             fig_num += 1
@@ -613,24 +752,25 @@ def create_registration_report(
                     warped_label = _apply_transforms(fixed, moving_label, warp, interpolator='nearestNeighbor')
 
             if warped_label is not None:
-                fig_seg_name = f"fig{fig_num}_seg_overlap_{ts}.png"
-                fig_seg_abs = os.path.join(assets_dir, fig_seg_name)
                 d_score = dice_sym if isinstance(dice_sym, (int, float)) and np.isfinite(dice_sym) else (dice_overlap if isinstance(dice_overlap, (int, float)) else None)
-                _f_seg = render_segmentation_overlap_report_figure(
-                    fixed=fixed,
-                    target_label=fixed_label,
-                    warped_label=warped_label,
-                    slice_axis=slice_axis,
-                    slice_idx=slice_idx,
-                    dice_score=d_score,
-                    output_path=fig_seg_abs,
+                seg_paths = _render_dual_theme(
+                    f"fig{fig_num}_seg_overlap_{ts}",
+                    lambda _th, _p: render_segmentation_overlap_report_figure(
+                        fixed=fixed,
+                        target_label=fixed_label,
+                        warped_label=warped_label,
+                        slice_axis=slice_axis,
+                        slice_idx=slice_idx,
+                        dice_score=d_score,
+                        theme=_th,
+                        output_path=_p,
+                    ),
                 )
-                if _f_seg is not None:
-                    plt.close(_f_seg)
+                fig_seg_abs = seg_paths[eff_theme]
                 html_figs += f'''
         <section class="card" style="margin-bottom: 2rem;">
             <h2>Figure {fig_num}: Anatomical Segmentation Alignment & Spatial Overlap</h2>
-            <div style="text-align: center;"><img src="{os.path.relpath(fig_seg_abs, html_dir)}" alt="Figure {fig_num}" style="max-width: 100%; border-radius: 8px;"></div>
+            <div style="text-align: center;">{_theme_img_html(seg_paths, f"Figure {fig_num}")}</div>
         </section>
                 '''
                 fig_num += 1
@@ -638,18 +778,62 @@ def create_registration_report(
             warnings.warn(f"create_registration_report: segmentation overlap figure generation failed ({e})")
             fig_seg_abs = None
 
+    fig_warped_abs = None
+    fig_checkerboard_abs = None
+    if has_warped:
+        _warped_num = fig_num
+        warped_paths = _render_dual_theme(
+            f"fig{_warped_num}_warped_comparison_{ts}",
+            lambda _th, _p: render_warped_comparison_figure(
+                fixed,
+                warped,
+                moving=moving,
+                theme=_th,
+                output_path=_p,
+                title=f"Figure {_warped_num}: Fixed Target vs. Pre-Registration Moving vs. Warped Moving-to-Fixed",
+            ),
+        )
+        fig_warped_abs = warped_paths[eff_theme]
+        html_figs += f'''
+        <section class="card" style="margin-bottom: 2rem;">
+            <h2>Figure {fig_num}: Fixed Target vs. Pre-Registration Moving vs. Warped Moving-to-Fixed</h2>
+            <div style="text-align: center;">{_theme_img_html(warped_paths, f"Figure {fig_num}")}</div>
+        </section>
+        '''
+        fig_num += 1
+
+        _chk_num = fig_num
+        chk_paths = _render_dual_theme(
+            f"fig{_chk_num}_checkerboard_{ts}",
+            lambda _th, _p: render_checkerboard_figure(
+                fixed,
+                warped,
+                title=f"Figure {_chk_num}: Fixed / Warped Checkerboard Alignment",
+                save_path=_p,
+                theme=_th,
+                resample_to_target=True,
+            ),
+        )
+        fig_checkerboard_abs = chk_paths[eff_theme]
+        html_figs += f'''
+        <section class="card" style="margin-bottom: 2rem;">
+            <h2>Figure {fig_num}: Fixed / Warped Checkerboard Alignment</h2>
+            <div style="text-align: center;">{_theme_img_html(chk_paths, f"Figure {fig_num}")}</div>
+        </section>
+        '''
+        fig_num += 1
+
     if reg is not None and isinstance(reg, dict) and 'model' in reg:
         model = reg['model']
         if type(model).__name__ == 'TVFModel':
-            fig_tvf_name = f"fig{fig_num}_velocity_{ts}.png"
-            fig_tvf_abs = os.path.join(assets_dir, fig_tvf_name)
-            _f = plot_time_varying_velocity_grid(model, fixed_image=fixed, output_path=fig_tvf_abs)
-            if _f is not None:
-                plt.close(_f)
+            tvf_paths = _render_dual_theme(
+                f"fig{fig_num}_velocity_{ts}",
+                lambda _th, _p: plot_time_varying_velocity_grid(model, fixed_image=fixed, theme=_th, output_path=_p),
+            )
             html_figs += f'''
             <section class="card" style="margin-bottom: 2rem;">
                 <h2>Figure {fig_num}: Time-Varying Velocity Field Flow Keyframes</h2>
-                <div style="text-align: center;"><img src="{os.path.relpath(fig_tvf_abs, html_dir)}" alt="Figure {fig_num}" style="max-width: 100%; border-radius: 8px;"></div>
+                <div style="text-align: center;">{_theme_img_html(tvf_paths, f"Figure {fig_num}")}</div>
             </section>
             '''
             fig_num += 1
@@ -662,37 +846,39 @@ def create_registration_report(
             losses = reg['model'].syn_losses
     elif reg is not None and isinstance(reg, dict) and 'loss_history' in reg:
         losses = reg['loss_history']
-        
+
     if losses:
-        fig_loss_name = f"fig{fig_num}_loss_{ts}.png"
-        fig_loss_abs = os.path.join(assets_dir, fig_loss_name)
-        _f = plot_loss_convergence(losses, output_path=fig_loss_abs, title=f"Similarity Loss Convergence ({prov['algorithm']})")
-        if _f is not None:
-            plt.close(_f)
+        loss_paths = _render_dual_theme(
+            f"fig{fig_num}_loss_{ts}",
+            lambda _th, _p: plot_loss_convergence(
+                losses, theme=_th, output_path=_p, title=f"Similarity Loss Convergence ({prov['algorithm']})"
+            ),
+        )
         html_figs += f'''
         <section class="card" style="margin-bottom: 2rem;">
             <h2>Figure {fig_num}: Multi-Resolution Similarity Loss Convergence</h2>
-            <div style="text-align: center;"><img src="{os.path.relpath(fig_loss_abs, html_dir)}" alt="Figure {fig_num}" style="max-width: 100%; border-radius: 8px;"></div>
+            <div style="text-align: center;">{_theme_img_html(loss_paths, f"Figure {fig_num}")}</div>
         </section>
         '''
         fig_num += 1
 
     if regional_overlap_sym and fixed_label is not None:
-        fig_dkt_name = f"fig{fig_num}_dkt_overlap_{ts}.png"
-        fig_dkt_abs = os.path.join(assets_dir, fig_dkt_name)
         dice_dict = {
-            'fixed_dice': list(regional_overlap_fwd.values()), 
-            'moving_dice': list(regional_overlap_inv.values()), 
-            'sym_dice': list(regional_overlap_sym.values()), 
-            'per_region': regional_overlap_sym
+            'fixed_dice': list(regional_overlap_fwd.values()),
+            'moving_dice': list(regional_overlap_inv.values()),
+            'sym_dice': list(regional_overlap_sym.values()),
+            'per_region': regional_overlap_sym,
         }
-        _f = plot_label_overlap_stats(dice_scores=dice_dict, output_path=fig_dkt_abs, title="Label Overlap (per label)")
-        if _f is not None:
-            plt.close(_f)
+        dkt_paths = _render_dual_theme(
+            f"fig{fig_num}_dkt_overlap_{ts}",
+            lambda _th, _p: plot_label_overlap_stats(
+                dice_scores=dice_dict, theme=_th, output_path=_p, title="Label Overlap (per label)"
+            ),
+        )
         html_figs += f'''
         <section class="card" style="margin-bottom: 2rem;">
             <h2>Figure {fig_num}: Anatomical Label Overlap Stats</h2>
-            <div style="text-align: center;"><img src="{os.path.relpath(fig_dkt_abs, html_dir)}" alt="Figure {fig_num}" style="max-width: 100%; border-radius: 8px;"></div>
+            <div style="text-align: center;">{_theme_img_html(dkt_paths, f"Figure {fig_num}")}</div>
         </section>
         '''
         fig_num += 1
@@ -701,8 +887,8 @@ def create_registration_report(
     prov_str = json.dumps(prov, indent=2)
     html_figs += f'''
         <section class="card" style="margin-bottom: 2rem;">
-            <h2>📋 Registration Provenance & Hyperparameters</h2>
-            <pre style="background: #1e293b; color: #38bdf8; padding: 1rem; border-radius: 6px; overflow-x: auto;"><code>{prov_str}</code></pre>
+            <h2>Registration Provenance &amp; Hyperparameters</h2>
+            <pre class="prov-pre"><code>{prov_str}</code></pre>
         </section>
     '''
 
@@ -714,33 +900,75 @@ def create_registration_report(
     metrics_html = "".join([f"<tr><td>{k}:</td><td class='metric-val'>{_fmt(v, '.4f')}</td></tr>" for k, v in metrics.items()])
     prov_badge = ('<div class="badge badge-success">Provenance attached</div>' if provenance_given
                   else '<div class="badge">No run provenance supplied</div>')
+    init_btn_label = "&#9728; Light Theme" if eff_theme == "dark" else "&#9790; Dark Theme"
 
     html_content = f"""<!DOCTYPE html>
-<html lang="en">
+<html lang="en" data-theme="{eff_theme}">
 <head>
     <meta charset="utf-8">
     <title>{title}</title>
     <style>
-        body {{ font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif; background: #090d16; color: #f8fafc; margin: 0; padding: 2rem; }}
+        :root, html[data-theme="light"] {{
+            --page-bg: #ffffff;
+            --page-ink: #0f172a;
+            --card-bg: #f8fafc;
+            --card-bd: #cbd5e1;
+            --hdr-col: #0284c7;
+            --sub-hdr-col: #1e293b;
+            --badge-bg: #f1f5f9;
+            --badge-fg: #334155;
+            --badge-ok-bg: #ecfdf5;
+            --badge-ok-fg: #047857;
+            --pre-bg: #f1f5f9;
+            --pre-fg: #0f172a;
+            --toggle-bg: #f1f5f9;
+            --toggle-fg: #0f172a;
+            --toggle-hover: #e2e8f0;
+        }}
+        html[data-theme="dark"] {{
+            --page-bg: #090d16;
+            --page-ink: #f8fafc;
+            --card-bg: #0f172a;
+            --card-bd: #1e293b;
+            --hdr-col: #38bdf8;
+            --sub-hdr-col: #cbd5e1;
+            --badge-bg: #1e293b;
+            --badge-fg: #94a3b8;
+            --badge-ok-bg: #064e3b;
+            --badge-ok-fg: #34d399;
+            --pre-bg: #1e293b;
+            --pre-fg: #38bdf8;
+            --toggle-bg: #1e293b;
+            --toggle-fg: #f8fafc;
+            --toggle-hover: #334155;
+        }}
+        body {{ font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif; background: var(--page-bg); color: var(--page-ink); margin: 0; padding: 2rem; transition: background-color 0.18s ease, color 0.18s ease; }}
         .container {{ max-width: 1200px; margin: 0 auto; }}
-        header {{ border-bottom: 1px solid #1e293b; padding-bottom: 1rem; margin-bottom: 2rem; }}
-        h1 {{ font-size: 1.8rem; font-weight: 700; color: #38bdf8; margin: 0; }}
-        .badge {{ display: inline-block; background: #1e293b; color: #94a3b8; padding: 0.25rem 0.6rem; border-radius: 4px; font-size: 0.85rem; font-weight: 600; margin-top: 0.5rem; }}
-        .badge-success {{ background: #064e3b; color: #34d399; }}
+        header {{ border-bottom: 1px solid var(--card-bd); padding-bottom: 1rem; margin-bottom: 2rem; }}
+        .header-top {{ display: flex; justify-content: space-between; align-items: center; gap: 1rem; flex-wrap: wrap; }}
+        h1 {{ font-size: 1.8rem; font-weight: 700; color: var(--hdr-col); margin: 0; }}
+        .theme-toggle {{ cursor: pointer; background: var(--toggle-bg); color: var(--toggle-fg); border: 1px solid var(--card-bd); padding: 0.4rem 0.85rem; border-radius: 6px; font-size: 0.85rem; font-weight: 600; transition: background-color 0.15s ease; }}
+        .theme-toggle:hover {{ background: var(--toggle-hover); }}
+        .badge {{ display: inline-block; background: var(--badge-bg); color: var(--badge-fg); border: 1px solid var(--card-bd); padding: 0.25rem 0.6rem; border-radius: 4px; font-size: 0.85rem; font-weight: 600; margin-top: 0.5rem; }}
+        .badge-success {{ background: var(--badge-ok-bg); color: var(--badge-ok-fg); }}
         .grid-2 {{ display: grid; grid-template-columns: 1fr 1fr; gap: 1.5rem; margin-bottom: 2rem; }}
-        .card {{ background: #0f172a; border: 1px solid #1e293b; border-radius: 8px; padding: 1.25rem; }}
-        .card h2 {{ font-size: 1.1rem; color: #cbd5e1; margin-top: 0; margin-bottom: 1rem; border-bottom: 1px solid #334155; padding-bottom: 0.5rem; }}
+        .card {{ background: var(--card-bg); border: 1px solid var(--card-bd); border-radius: 8px; padding: 1.25rem; }}
+        .card h2 {{ font-size: 1.1rem; color: var(--sub-hdr-col); margin-top: 0; margin-bottom: 1rem; border-bottom: 1px solid var(--card-bd); padding-bottom: 0.5rem; }}
+        .prov-pre {{ background: var(--pre-bg); color: var(--pre-fg); border: 1px solid var(--card-bd); padding: 1rem; border-radius: 6px; overflow-x: auto; }}
         table {{ width: 100%; border-collapse: collapse; font-size: 0.9rem; }}
         td, th {{ padding: 0.5rem 0.25rem; text-align: left; }}
-        tr:not(:last-child) {{ border-bottom: 1px solid #1e293b; }}
-        .metric-val {{ font-family: monospace; font-weight: 600; color: #38bdf8; }}
-        footer {{ margin-top: 3rem; text-align: center; color: #64748b; font-size: 0.85rem; border-top: 1px solid #1e293b; padding-top: 1.5rem; }}
+        tr:not(:last-child) {{ border-bottom: 1px solid var(--card-bd); }}
+        .metric-val {{ font-family: monospace; font-weight: 600; color: var(--hdr-col); }}
+        footer {{ margin-top: 3rem; text-align: center; color: #64748b; font-size: 0.85rem; border-top: 1px solid var(--card-bd); padding-top: 1.5rem; }}
     </style>
 </head>
 <body>
     <div class="container">
         <header>
-            <h1>{title}</h1>
+            <div class="header-top">
+                <h1>{title}</h1>
+                <button id="theme-toggle" class="theme-toggle" type="button" aria-label="Toggle light or dark theme">{init_btn_label}</button>
+            </div>
             <div class="badge">{html.escape(str(meta_fixed.get("name", fixed_name)))} &larr; {html.escape(str(meta_moving.get("name", moving_name)))}</div>
             {prov_badge}
             <div class="badge">Engine: {prov['algorithm']} ({prov['backend']})</div>
@@ -777,6 +1005,37 @@ def create_registration_report(
             <p>Generated by <strong>syntx.viz</strong></p>
         </footer>
     </div>
+    <script>
+    (function() {{
+        var STORAGE_KEY = "syntx-report-theme";
+        var root = document.documentElement;
+        var btn = document.getElementById("theme-toggle");
+        function applyTheme(mode) {{
+            var m = (mode === "dark") ? "dark" : "light";
+            root.setAttribute("data-theme", m);
+            var imgs = document.querySelectorAll("img.theme-img");
+            for (var i = 0; i < imgs.length; i++) {{
+                var nextSrc = imgs[i].getAttribute(m === "dark" ? "data-src-dark" : "data-src-light");
+                if (nextSrc) imgs[i].setAttribute("src", nextSrc);
+            }}
+            if (btn) {{
+                btn.textContent = (m === "dark") ? "\u2600 Light Theme" : "\u263E Dark Theme";
+            }}
+        }}
+        var saved = null;
+        try {{ saved = localStorage.getItem(STORAGE_KEY); }} catch (e) {{}}
+        var initial = (saved === "dark" || saved === "light") ? saved : (root.getAttribute("data-theme") || "light");
+        applyTheme(initial);
+        if (btn) {{
+            btn.addEventListener("click", function() {{
+                var cur = root.getAttribute("data-theme") === "dark" ? "dark" : "light";
+                var next = (cur === "dark") ? "light" : "dark";
+                applyTheme(next);
+                try {{ localStorage.setItem(STORAGE_KEY, next); }} catch (e) {{}}
+            }});
+        }}
+    }})();
+    </script>
 </body>
 </html>
 """
@@ -791,6 +1050,8 @@ def create_registration_report(
         "html_path": output_html,
         "fig_path": fig2_abs,
         "fig2_path": fig2_abs,
+        "fig_warped_path": fig_warped_abs,
+        "fig_checkerboard_path": fig_checkerboard_abs,
         "fig_flow_path": fig_flow_abs,
         "fig_seg_path": fig_seg_abs,
         "metrics": metrics,

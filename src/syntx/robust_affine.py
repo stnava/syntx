@@ -1067,6 +1067,268 @@ def _spacing_ratio(spacing) -> float:
     return max(sp) / max(min(sp), 1e-12)
 
 
+def _analyze_volume_support_3d(img: ants.ANTsImage, img_norm: ants.ANTsImage) -> dict:
+    """Inspect 3-D physical support in LPS (mm): enclosed trunk bbox vs. truncated internal window."""
+    arr = img.numpy()
+    amin, amax = float(arr.min()), float(arr.max())
+    is_hu = bool(amin <= -500.0 and amax >= 100.0)
+    if is_hu:
+        fg = arr > -200.0
+        border_fg_frac = 0.0
+    else:
+        n_arr = img_norm.numpy()
+        pos = n_arr[n_arr > 0.01]
+        thr = max(0.05, float(np.percentile(pos, 20.0))) if pos.size >= 64 else 0.05
+        fg = n_arr > thr
+        nx, ny, _ = fg.shape
+        if nx >= 8 and ny >= 8:
+            bmask = np.zeros_like(fg, dtype=bool)
+            bmask[0, :, :] = bmask[-1, :, :] = bmask[:, 0, :] = bmask[:, -1, :] = True
+            border_fg_frac = float(fg[bmask].mean())
+        else:
+            border_fg_frac = 0.0
+
+    sp = np.asarray(img.spacing[:3], dtype=np.float64)
+    org = np.asarray(img.origin[:3], dtype=np.float64)
+    dr = np.asarray(img.direction, dtype=np.float64).reshape(3, 3)
+    ext_world = np.abs(dr) @ (np.asarray(img.shape[:3], dtype=np.float64) * sp)
+    end_touch_img = np.array([
+        0.5 * (float(fg[0, :, :].mean()) + float(fg[-1, :, :].mean())),
+        0.5 * (float(fg[:, 0, :].mean()) + float(fg[:, -1, :].mean())),
+        0.5 * (float(fg[:, :, 0].mean()) + float(fg[:, :, -1].mean())),
+    ], dtype=np.float64)
+    end_touch_lps = np.abs(dr) @ end_touch_img
+    is_internal_fov = bool(
+        not is_hu
+        and border_fg_frac >= 0.25
+        and float(ext_world.min()) >= 25.0
+        and float(np.sort(ext_world)[-2]) < 320.0
+    )
+
+    # Downsampled largest-component trunk bounding box in physical LPS (mm)
+    stride = tuple(max(1, int(round(4.0 / max(float(s), 1e-3)))) for s in sp)
+    fg_sub = fg[::stride[0], ::stride[1], ::stride[2]]
+    if not is_internal_fov and int(fg_sub.sum()) >= 32:
+        try:
+            sub_sp = tuple(float(s * st) for s, st in zip(sp, stride))
+            fg_img = ants.from_numpy(fg_sub.astype(np.float32), origin=tuple(org), spacing=sub_sp, direction=dr)
+            fg_lcc = ants.iMath(fg_img, "GetLargestComponent").numpy() > 0.5
+            if int(fg_lcc.sum()) >= 16:
+                fg_sub = fg_lcc
+        except Exception:
+            pass
+    idx_sub = np.argwhere(fg_sub)
+    if len(idx_sub) >= 16:
+        idx_full = idx_sub.astype(np.float64) * np.asarray(stride, dtype=np.float64)
+        pts_lps = (dr @ (idx_full * sp).T).T + org
+        lo = np.percentile(pts_lps, 5.0, axis=0)
+        hi = np.percentile(pts_lps, 95.0, axis=0)
+        center_lps = 0.5 * (lo + hi)
+        span_lps = np.maximum(hi - lo, 10.0)
+    else:
+        center_lps = org + dr @ (0.5 * (np.asarray(img.shape[:3], dtype=np.float64) - 1.0) * sp)
+        span_lps = np.maximum(ext_world, 10.0)
+
+    return {
+        "is_hu": is_hu,
+        "is_internal_fov": is_internal_fov,
+        "border_fg_frac": border_fg_frac,
+        "end_touch_lps": end_touch_lps,
+        "center_lps": center_lps,
+        "span_lps": span_lps,
+        "ext_world": ext_world,
+    }
+
+
+def _ct_axial_tomography_anchor_3d(
+    fixed: ants.ANTsImage,
+    moving: ants.ANTsImage,
+    asym_axis_lps: int = 2,
+    step_mm: float = 4.0,
+):
+    """1-D calibrated Hounsfield cross-sectional area tomography along ``asym_axis_lps``.
+
+    Computes couch-free body-hull cross-sectional tissue-fraction curves
+    ``[enclosed_lung, adipose, parenchyma, cortical_bone]`` at 4 mm spacing and solves
+    for the cranio-caudal physical translation ``tz_lps`` and transverse hull scale.
+    """
+    import scipy.ndimage as ndi
+
+    def _profile_one(img: ants.ANTsImage):
+        im_iso = cap_ants_image(img, max_resolution_mm=step_mm, policy='mm_iso')
+        arr = im_iso.numpy()
+        sp = np.asarray(im_iso.spacing[:3], dtype=np.float64)
+        org = np.asarray(im_iso.origin[:3], dtype=np.float64)
+        dr = np.asarray(im_iso.direction, dtype=np.float64).reshape(3, 3)
+        img_ax = int(np.argmax(np.abs(dr[asym_axis_lps, :])))
+        arr_ax = np.moveaxis(arr, img_ax, 2) if img_ax != 2 else arr
+        in_axes_img = [i for i in range(3) if i != img_ax]
+        px_cm2 = float(sp[in_axes_img[0]] * sp[in_axes_img[1]]) / 100.0
+        nz = int(arr_ax.shape[2])
+        if nz < 6:
+            return None
+        ijk = np.zeros((nz, 3), dtype=np.float64)
+        ijk[:, img_ax] = np.arange(nz, dtype=np.float64)
+        s_mm = ((dr @ (ijk * sp).T).T + org)[:, asym_axis_lps]
+        if s_mm[-1] < s_mm[0]:
+            s_mm = s_mm[::-1]
+            arr_ax = arr_ax[:, :, ::-1]
+            flipped = True
+        else:
+            flipped = False
+
+        prof = np.zeros((nz, 4), dtype=np.float64)
+        c_slice = np.zeros((nz, 3), dtype=np.float64)
+        w_slice = np.zeros((nz, 3), dtype=np.float64)
+        valid_slice = np.zeros(nz, dtype=bool)
+        st3 = np.ones((3, 3), dtype=bool)
+        for k in range(nz):
+            sl = arr_ax[:, :, k]
+            solid = ndi.binary_opening(sl > -200.0, structure=st3)
+            lbl, n_cc = ndi.label(solid)
+            if n_cc > 0:
+                cnts = np.bincount(lbl.ravel())
+                cnts[0] = 0
+                hull = ndi.binary_fill_holes(lbl == int(np.argmax(cnts)))
+            else:
+                hull = sl > -200.0
+            n_hull = int(hull.sum())
+            if n_hull >= 25:
+                lung = hull & (sl > -920.0) & (sl < -400.0)
+                fat = hull & (sl >= -150.0) & (sl < -30.0)
+                paren = hull & (sl >= 10.0) & (sl < 220.0)
+                bone = hull & (sl >= 250.0)
+                # Per-slice fractional tissue composition in [0, 1] (invariant to shoulders/arms/girth)
+                prof[k] = [
+                    float(lung.sum()) / n_hull,
+                    float(fat.sum()) / n_hull,
+                    float(paren.sum()) / n_hull,
+                    float(bone.sum()) / n_hull,
+                ]
+                pts = np.argwhere(hull)
+                lo_ij, hi_ij = pts.min(axis=0), pts.max(axis=0)
+                k_orig = (nz - 1 - k) if flipped else k
+                p_lo, p_hi = np.zeros(3), np.zeros(3)
+                p_lo[in_axes_img[0]], p_lo[in_axes_img[1]], p_lo[img_ax] = lo_ij[0], lo_ij[1], k_orig
+                p_hi[in_axes_img[0]], p_hi[in_axes_img[1]], p_hi[img_ax] = hi_ij[0], hi_ij[1], k_orig
+                lps_a = dr @ (p_lo * sp) + org
+                lps_b = dr @ (p_hi * sp) + org
+                c_slice[k] = 0.5 * (lps_a + lps_b)
+                w_slice[k] = np.abs(lps_b - lps_a)
+                valid_slice[k] = True
+
+        if int(valid_slice.sum()) < 6:
+            return None
+        return s_mm, prof, c_slice, w_slice, valid_slice
+
+    p_fix = _profile_one(fixed)
+    p_mov = _profile_one(moving)
+    if p_fix is None or p_mov is None:
+        return None
+    z0, f0, cs0, ws0, vs0 = p_fix
+    z1, f1, cs1, ws1, vs1 = p_mov
+    len0, len1 = float(z0[-1] - z0[0]), float(z1[-1] - z1[0])
+    min_ov = 0.80 * min(len0, len1)
+    tz_min = float(z1[0] - z0[-1]) + min_ov
+    tz_max = float(z1[-1] - z0[0]) - min_ov
+    if tz_max < tz_min:
+        mid = 0.5 * ((z1[0] + z1[-1]) - (z0[0] + z0[-1]))
+        tz_min, tz_max = mid - 20.0, mid + 20.0
+
+    weights = np.array([2.5, 0.6, 1.4, 2.2], dtype=np.float64)
+    best_err, best_tz = float('inf'), 0.5 * (tz_min + tz_max)
+    for tz in np.arange(tz_min, tz_max + 0.5, step_mm):
+        zq = z0 + tz
+        valid = vs0 & (zq >= z1[0]) & (zq <= z1[-1])
+        if int(valid.sum()) < 6:
+            continue
+        f1_i = np.stack([np.interp(zq[valid], z1[vs1], f1[vs1, c]) for c in range(4)], axis=1)
+        diff = np.abs(f0[valid] - f1_i) * weights
+        if int(valid.sum()) >= 10:
+            df0 = np.gradient(f0[valid], axis=0)
+            df1 = np.gradient(f1_i, axis=0)
+            err = float(diff.mean() + 2.0 * (np.abs(df0 - df1) * weights).mean())
+        else:
+            err = float(diff.mean())
+        if err < best_err:
+            best_err, best_tz = err, float(tz)
+
+    # Measure transverse center & trunk width strictly over the matched overlap slab (excludes shoulders/legs outside overlap)
+    ov0 = vs0 & ((z0 + best_tz) >= z1[0]) & ((z0 + best_tz) <= z1[-1])
+    ov1 = vs1 & (z1 >= (z0[0] + best_tz)) & (z1 <= (z0[-1] + best_tz))
+    c0 = np.median(cs0[ov0 if int(ov0.sum()) >= 4 else vs0], axis=0)
+    w0 = np.maximum(np.median(ws0[ov0 if int(ov0.sum()) >= 4 else vs0], axis=0), 50.0)
+    c1 = np.median(cs1[ov1 if int(ov1.sum()) >= 4 else vs1], axis=0)
+    w1 = np.maximum(np.median(ws1[ov1 if int(ov1.sum()) >= 4 else vs1], axis=0), 50.0)
+
+    s_diag = [
+        1.0 if i == asym_axis_lps else float(np.clip(w1[i] / max(w0[i], 10.0), 0.72, 1.55))
+        for i in range(3)
+    ]
+    z_ov_mid_f = float(np.median(z0[ov0])) if int(ov0.sum()) >= 4 else 0.5 * float(z0[0] + z0[-1])
+    c_anchor_f = c0.copy(); c_anchor_f[asym_axis_lps] = z_ov_mid_f
+    c_anchor_m = c1.copy(); c_anchor_m[asym_axis_lps] = z_ov_mid_f + best_tz
+    return {
+        "axis_lps": int(asym_axis_lps),
+        "tz_lps": float(best_tz),
+        "A_tomo": np.diag(s_diag),
+        "c_anchor_f": c_anchor_f,
+        "c_anchor_m": c_anchor_m,
+        "profile_err": float(best_err),
+    }
+
+
+def _compute_level_mind_zyx_3d(
+    vol_zyx: torch.Tensor,
+    sp_lvl_xyz: list,
+    dir_xyz_np: np.ndarray,
+    min_offset_mm: float = 0.0,
+) -> torch.Tensor:
+    """6-axis physical-LPS MIND descriptor on a [1, 1, nz, ny, nx] tensor (MPS-safe, zero F.pad)."""
+    nz, ny, nx = (int(x) for x in vol_zyx.shape[2:])
+    p_sz = 3 if min(nz, ny, nx) < 32 else 5
+    d_mm = max(float(min_offset_mm), 1.5 * min(float(s) for s in sp_lvl_xyz))
+    offs_lps = np.array([
+        [-d_mm, 0.0, 0.0], [d_mm, 0.0, 0.0],
+        [0.0, -d_mm, 0.0], [0.0, d_mm, 0.0],
+        [0.0, 0.0, -d_mm], [0.0, 0.0, d_mm],
+    ], dtype=np.float64)
+    vox_xyz = (dir_xyz_np.T @ offs_lps.T).T / np.maximum(np.asarray(sp_lvl_xyz, dtype=np.float64), 1e-4)
+
+    from .core.smoothing import separable_1d_filter
+
+    k_box = torch.full((p_sz,), 1.0 / float(p_sz), device=vol_zyx.device, dtype=vol_zyx.dtype)
+    box_kernels = (k_box, k_box, k_box)
+    avg_i = separable_1d_filter(vol_zyx, box_kernels)
+    avg_i2 = separable_1d_filter(vol_zyx * vol_zyx, box_kernels)
+    var = (avg_i2 - avg_i * avg_i).clamp_min(1e-6)
+
+    def _slice_pair(size: int, shift: int):
+        if shift == 0:
+            return slice(None), slice(None)
+        if shift > 0:
+            return slice(shift, size), slice(0, size - shift)
+        return slice(0, size + shift), slice(-shift, size)
+
+    chans = []
+    for row in vox_xyz:
+        r = np.rint(row).astype(int)
+        if np.all(r == 0):
+            a = int(np.argmax(np.abs(row)))
+            r[a] = 1 if row[a] >= 0 else -1
+        dx = int(np.clip(r[0], -(nx - 1), nx - 1))
+        dy = int(np.clip(r[1], -(ny - 1), ny - 1))
+        dz = int(np.clip(r[2], -(nz - 1), nz - 1))
+        shifted = torch.zeros_like(vol_zyx)
+        sz_s, sz_d = _slice_pair(nz, dz)
+        sy_s, sy_d = _slice_pair(ny, dy)
+        sx_s, sx_d = _slice_pair(nx, dx)
+        shifted[:, :, sz_d, sy_d, sx_d] = vol_zyx[:, :, sz_s, sy_s, sx_s]
+        ssd = separable_1d_filter((vol_zyx - shifted).pow(2), box_kernels)
+        chans.append(torch.exp(-ssd / var))
+    return torch.cat(chans, dim=1).contiguous()
+
+
 def _run_pytorch_affine_solver(fixed: ants.ANTsImage, moving: ants.ANTsImage, initial_tx_path: str = None,
                                device: str = 'auto', verbose: bool = False, multi_start: bool = True,
                                n_starts: int = 3, cone_angles_deg: list = None, seed: int = 42,
@@ -1269,6 +1531,55 @@ def _run_pytorch_affine_solver(fixed: ants.ANTsImage, moving: ants.ANTsImage, in
     ext_f_world = np.abs(np.asarray(fixed.direction, dtype=np.float64).reshape(dim, dim)) @ (np.asarray(fixed.shape[:dim], dtype=np.float64) * np.asarray(fixed.spacing[:dim], dtype=np.float64))
     ext_m_world = np.abs(np.asarray(moving.direction, dtype=np.float64).reshape(dim, dim)) @ (np.asarray(moving.shape[:dim], dtype=np.float64) * np.asarray(moving.spacing[:dim], dtype=np.float64))
     expected_ov = float(np.clip(np.prod(np.minimum(1.0, ext_m_world / np.maximum(ext_f_world, 1e-3))), 0.05, 1.0))
+
+    support_f = support_m = None
+    is_internal_fov_pair = False
+    has_slab_asymmetry = False
+    asym_axes = []
+    t_trunk = t_init
+    if dim == 3 and hasattr(fixed, 'direction') and hasattr(moving, 'direction'):
+        support_f = _analyze_volume_support_3d(fixed, fixed_norm)
+        support_m = _analyze_volume_support_3d(moving, moving_norm)
+        t_trunk = support_m['center_lps'] - support_f['center_lps']
+        is_internal_fov_pair = bool(support_f['is_internal_fov'] and support_m['is_internal_fov'])
+        if not support_f['is_internal_fov'] and not support_m['is_internal_fov']:
+            sp_f_lps, sp_m_lps = support_f['span_lps'], support_m['span_lps']
+            ex_f, ex_m = support_f['ext_world'], support_m['ext_world']
+            et_f, et_m = support_f['end_touch_lps'], support_m['end_touch_lps']
+            ext_ratios = np.maximum(ex_f, ex_m) / np.maximum(np.minimum(ex_f, ex_m), 10.0)
+            ext_diffs = np.abs(ex_m - ex_f)
+            asym_axes = [
+                i for i in range(3)
+                if (
+                    (ext_ratios[i] >= 1.30 and ext_diffs[i] >= 60.0)
+                    or (ext_ratios[i] >= 1.18 and ext_diffs[i] >= 90.0)
+                )
+                and (et_f[i] >= 0.10 or et_m[i] >= 0.10)
+            ]
+            trans_ok = sum(
+                1 for i in range(3)
+                if i not in asym_axes and 0.50 <= (sp_m_lps[i] / max(sp_f_lps[i], 10.0)) <= 1.90 and max(sp_f_lps[i], sp_m_lps[i]) >= 100.0
+            )
+            has_slab_asymmetry = bool(len(asym_axes) == 1 and trans_ok >= 2)
+    mov_trunc_img_ax = None
+    if (
+        has_slab_asymmetry
+        and support_f is not None
+        and support_m is not None
+        and support_m['end_touch_lps'][asym_axes[0]] >= 0.03
+        and support_f['ext_world'][asym_axes[0]] > 1.12 * support_m['ext_world'][asym_axes[0]]
+    ):
+        mov_trunc_img_ax = int(
+            np.argmax(np.abs(np.asarray(moving.direction, dtype=np.float64).reshape(3, 3)[asym_axes[0], :]))
+        )
+    ct_tomo = None
+    if has_slab_asymmetry and support_f is not None and support_f['is_hu'] and support_m['is_hu']:
+        try:
+            ct_tomo = _ct_axial_tomography_anchor_3d(fixed, moving, asym_axis_lps=asym_axes[0])
+        except Exception:
+            ct_tomo = None
+    use_mind_guidance = bool((is_internal_fov_pair or (has_slab_asymmetry and ct_tomo is None)) and dim == 3 and _level_builder is None)
+
     fi_arr = image_to_tensor(fixed_norm, device=device_obj, to_zyx=True)
     mi_arr = image_to_tensor(moving_norm, device=device_obj, to_zyx=True)
 
@@ -1333,7 +1644,22 @@ def _run_pytorch_affine_solver(fixed: ants.ANTsImage, moving: ants.ANTsImage, in
             valid_lev = valid_lev.to(device=device_obj, dtype=torch.bool).reshape(fmask.shape)
         # prebuilt once per level (the constants are not rebuilt in the objective's thousands of calls)
         warp_mov = prebuild_warp(moving.origin, moving.direction, moving.spacing, f_mov, o_mov, mi_lev.shape[2:], device_obj)
-        entry = dict(fi=fi_lev, mi=mi_lev, mi_mask=(mi_lev > fg_level).to(mi_lev.dtype), shape=shape_zyx, phys=phys_xyz,
+        fi_mind_lev = mi_mind_lev = None
+        if use_mind_guidance:
+            with torch.no_grad():
+                lvl_sp_f = [float(f_fix[i]) * float(fixed.spacing[i]) for i in range(dim)]
+                lvl_sp_m = [float(f_mov[i]) * float(moving.spacing[i]) for i in range(dim)]
+                min_off = 14.0 if has_slab_asymmetry else 0.0
+                fi_mind_lev = _compute_level_mind_zyx_3d(
+                    fi_lev, lvl_sp_f, np.asarray(fixed.direction, dtype=np.float64).reshape(3, 3), min_offset_mm=min_off
+                )
+                mi_mind_lev = _compute_level_mind_zyx_3d(
+                    mi_lev, lvl_sp_m, np.asarray(moving.direction, dtype=np.float64).reshape(3, 3), min_offset_mm=min_off
+                )
+        entry = dict(fi=fi_lev, mi=mi_lev, mi_mask=(mi_lev > fg_level).to(mi_lev.dtype),
+                     fi_mind=fi_mind_lev, mi_mind=mi_mind_lev,
+                     lvl_sp_min=min(float(f_fix[i]) * float(fixed.spacing[i]) for i in range(dim)),
+                     shape=shape_zyx, phys=phys_xyz,
                      mask=fmask, valid=valid_lev, points=None, level=level, warp=warp_mov)
         # Determine sampling percentage for this level:
         stage_samplings = [s.get('sampling') for s in schedule if int(s['level']) == level and s.get('sampling') is not None]
@@ -1372,7 +1698,11 @@ def _run_pytorch_affine_solver(fixed: ants.ANTsImage, moving: ants.ANTsImage, in
         sel_all = idx_fg.to(device_obj)
         # Candidate scoring, path selection, full_grid stages and the self-check COMPARE poses with the same bias on both sides, on every domain voxel:
         # they stay on the voxel centres (jittering them mis-ranked starts on sharp synthetic images: scattered-SyN 2-D, 2026-10-21).
-        entry['points_full'] = dict(phys=phys_xyz[sel_all], fvals=fi_lev.reshape(-1)[sel_all])
+        entry['points_full'] = dict(
+            phys=phys_xyz[sel_all],
+            fvals=fi_lev.reshape(-1)[sel_all],
+            fmind=fi_mind_lev.reshape(6, -1)[:, sel_all].contiguous() if fi_mind_lev is not None else None,
+        )
         entry['points_jit'] = None
 
         if needs_point_sample:
@@ -1384,7 +1714,15 @@ def _run_pytorch_affine_solver(fixed: ants.ANTsImage, moving: ants.ANTsImage, in
             work_xyz = torch.minimum(work_xyz.clamp(min=0.0), shape_xyz_t - 1.0)
             norm = (2.0 * work_xyz / (shape_xyz_t - 1.0) - 1.0).reshape(1, *([1] * (dim - 1)), -1, dim)
             fvals_all = F.grid_sample(fi_lev, norm, mode='bilinear', padding_mode='border', align_corners=True).reshape(-1)
-            entry['points_jit'] = dict(phys=orig_xyz + ((work_xyz * f_t + o_t) * sp_xyz) @ dir_xyz.t(), fvals=fvals_all)
+            fmind_all = (
+                F.grid_sample(fi_mind_lev, norm, mode='bilinear', padding_mode='border', align_corners=True).reshape(6, -1)
+                if fi_mind_lev is not None else None
+            )
+            entry['points_jit'] = dict(
+                phys=orig_xyz + ((work_xyz * f_t + o_t) * sp_xyz) @ dir_xyz.t(),
+                fvals=fvals_all,
+                fmind=fmind_all,
+            )
 
             k = None
             if n_sample_points is not None:
@@ -1401,7 +1739,11 @@ def _run_pytorch_affine_solver(fixed: ants.ANTsImage, moving: ants.ANTsImage, in
 
                 w_dom = None if lvl_w is None else lvl_w[idx_fg]
                 pos = draw_indices(w_dom, int(idx_fg.numel()), k, gen).to(device_obj)
-                entry['points'] = dict(phys=entry['points_jit']['phys'][pos], fvals=entry['points_jit']['fvals'][pos])
+                entry['points'] = dict(
+                    phys=entry['points_jit']['phys'][pos],
+                    fvals=entry['points_jit']['fvals'][pos],
+                    fmind=entry['points_jit']['fmind'][:, pos].contiguous() if fmind_all is not None else None,
+                )
         pyr[level] = entry
 
     # Gate default Tikhonov scale/shear shrinkage to genuinely thin anisotropic slabs (<90 mm or <24 slices)
@@ -1414,6 +1756,17 @@ def _run_pytorch_affine_solver(fixed: ants.ANTsImage, moving: ants.ANTsImage, in
     )
     eff_lambda_shear = float(lambda_shear) if (((aniso_f or aniso_m) and is_thin_slab) or lambda_shear != 0.02) else 0.0
     eff_lambda_scale = float(lambda_scale) if (((aniso_f or aniso_m) and is_thin_slab) or lambda_scale != 0.01) else 0.0
+    if is_internal_fov_pair:
+        eff_lambda_shear = max(eff_lambda_shear, 0.05)
+        eff_lambda_scale = max(eff_lambda_scale, 0.05)
+    elif has_slab_asymmetry:
+        eff_lambda_shear = max(eff_lambda_shear, 0.02)
+        eff_lambda_scale = max(eff_lambda_scale, 0.01)
+
+    def _make_path(B_mat, t_vec, p_name):
+        return _AffinePath(B_mat, t_vec, dim, device_obj, p_name, spacing=sp_fix)
+
+    from .core.losses import box_lncc_loss_nd
 
     def objective(path: '_AffinePath', dof: str, level: int, full: bool = False, sampling: float = None):
         e = pyr[level]
@@ -1421,34 +1774,89 @@ def _run_pytorch_affine_solver(fixed: ants.ANTsImage, moving: ants.ANTsImage, in
         A = path.matrix(dof)
         teff = path.t + C_phys - A @ C_phys
         if e['points'] is not None and not full:
-            phys_p, fv = e['points']['phys'], e['points']['fvals']
+            phys_p, fv, fv_mind = e['points']['phys'], e['points']['fvals'], e['points'].get('fmind')
         else:
-            phys_p, fv = e['points_full']['phys'], e['points_full']['fvals']
+            phys_p, fv, fv_mind = e['points_full']['phys'], e['points_full']['fvals'], e['points_full'].get('fmind')
             if samp is not None and float(samp) < 1.0:
                 eff_samp = min(1.0, max(float(samp), 1000.0 / max(fv.numel(), 1)))
                 if eff_samp < 1.0:
                     idx = mattes_sample_indices(fv.numel(), eff_samp, fv.device)   # the regular subsample of the dense evaluation
                     phys_p, fv = phys_p[idx], fv[idx]
+                    if fv_mind is not None:
+                        fv_mind = fv_mind[:, idx]
         y = e['warp'](phys_p @ A.t() + teff)
         grid = y.reshape(1, 1, *([1] * (dim - 2)), -1, dim) if dim == 3 else y.reshape(1, 1, -1, dim)
         w = F.grid_sample(e['mi'], grid, mode='bilinear', padding_mode='zeros', align_corners=True).reshape(-1)
+        max_abs_y = y.abs().amax(dim=-1)
+        in_b = max_abs_y <= 0.99
         m = None
         if mask_mode == 'union':
             m = (fv > fg_level) | (w > fg_level)
+        elif is_internal_fov_pair and int(in_b.sum().item()) >= 64:
+            # Truncated internal-window FOV: out-of-FOV zeros are unacquired tissue, not background air
+            m = in_b
+        elif mov_trunc_img_ax is not None:
+            # Moving scan is axially truncated relative to Fixed: out-of-slab zeros along the truncated moving axis
+            # are unacquired anatomy, whereas transverse X/Y air inside the overlapping slab remains unmasked
+            ax_in_b = y[:, mov_trunc_img_ax].abs() <= 0.99
+            if int(ax_in_b.sum().item()) >= 64:
+                m = ax_in_b
         # 'fixed_fg' and the valid margin are already in the point domain; 'none' is every voxel
         loss = mattes_mi_loss_nd(w, fv, mask=m, num_bins=num_bins, auto_mask=False, fixed_range=fixed_range)
+        if use_mind_guidance and fv_mind is not None and e.get('mi_mind') is not None:
+            if has_slab_asymmetry and full and (samp is None or float(samp) >= 1.0) and min(e['shape']) >= 5:
+                # Physical ~60 mm spatial window LNCC on precomputed MIND + physical attenuation strictly inside valid interior
+                sh3 = e['shape']
+                w_sz = min(min(int(x) for x in sh3), max(5, int(round(60.0 / max(e['lvl_sp_min'], 1.0))) | 1))
+                if w_sz % 2 == 0:
+                    w_sz = max(3, w_sz - 1)
+                yg3 = e['warp'](e['phys'] @ A.t() + teff)
+                in3 = (yg3.abs().amax(dim=-1) <= 0.95).reshape(1, 1, *sh3).to(w.dtype)
+                if e['valid'] is not None:
+                    in3 = in3 * e['valid'].reshape(1, 1, *sh3).to(w.dtype)
+                if int((in3 > 0.5).sum().item()) >= 64:
+                    g3 = yg3.reshape(1, *sh3, 3)
+                    w3 = F.grid_sample(e['mi'], g3, mode='bilinear', padding_mode='border', align_corners=True)
+                    wm3 = F.grid_sample(e['mi_mind'], g3, mode='bilinear', padding_mode='border', align_corners=True)
+                    lncc_img = box_lncc_loss_nd(w3, e['fi'], window_size=w_sz, mask=in3)
+                    lncc_mind = box_lncc_loss_nd(wm3, e['fi_mind'], window_size=w_sz, mask=in3)
+                    loss = 0.25 * loss + 0.50 * lncc_img + 1.00 * lncc_mind
+            else:
+                w_mind = F.grid_sample(e['mi_mind'], grid, mode='bilinear', padding_mode='border', align_corners=True).reshape(6, -1)
+                fg_m = in_b if is_internal_fov_pair else (in_b & ((fv > 0.02) | (w > 0.02)))
+                if int(fg_m.sum().item()) >= 64:
+                    fm_sel = fv_mind[:, fg_m]
+                    wm_sel = w_mind[:, fg_m]
+                    mind_l1 = (wm_sel - fm_sel).abs().mean()
+                    fm_c = fm_sel - fm_sel.mean(dim=-1, keepdim=True)
+                    wm_c = wm_sel - wm_sel.mean(dim=-1, keepdim=True)
+                    denom_m = torch.sqrt(fm_c.pow(2).mean().clamp_min(1e-6) * wm_c.pow(2).mean().clamp_min(1e-6))
+                    mind_corr_loss = -(fm_c * wm_c).mean() / denom_m
+                    if has_slab_asymmetry:
+                        loss = loss + 0.40 * mind_corr_loss + 0.60 * mind_l1
+                    else:
+                        loss = loss + 0.50 * mind_corr_loss + 0.65 * mind_l1
         if fg_dice_weight > 0:
             wm = F.grid_sample(e['mi_mask'], grid, mode='bilinear', padding_mode='zeros', align_corners=True).reshape(-1)
             fm = (fv > fg_level).to(wm.dtype)
             loss = loss + fg_dice_weight * soft_dice_loss_nd(fm, wm)
         if eff_lambda_shear > 0 or eff_lambda_scale > 0:
             loss = loss + path.regularization_loss(dof, lambda_shear=eff_lambda_shear, lambda_scale=eff_lambda_scale)
-        # Guard against slab-amputation poses where >45% of expected fixed-in-moving overlap falls outside the acquired volume
-        max_abs_y = y.abs().amax(dim=-1)
+        if ct_tomo is not None:
+            # Dead-zone cranio-caudal tomography anchor: 0 penalty within +-30 mm respiratory range, smooth quadratic beyond
+            ax_a = ct_tomo['axis_lps']
+            cf_t = torch.tensor(ct_tomo['c_anchor_f'], dtype=torch.float32, device=device_obj)
+            cm_t = torch.tensor(ct_tomo['c_anchor_m'], dtype=torch.float32, device=device_obj)
+            mapped_cf = cf_t @ A.t() + teff
+            dz_dev = (mapped_cf[ax_a] - cm_t[ax_a]).abs()
+            loss = loss + 0.14 * (F.relu(dz_dev - 30.0) / 25.0).pow(2)
+        # Guard against slab-amputation poses where expected fixed-in-moving overlap falls outside the acquired volume
         smooth_in = torch.sigmoid(20.0 * (1.02 - max_abs_y)).mean()
-        ov_deficit = F.relu(0.55 * expected_ov - smooth_in)
+        ov_req = 0.84 * expected_ov if (is_internal_fov_pair or has_slab_asymmetry) else 0.65 * expected_ov
+        ov_deficit = F.relu(ov_req - smooth_in)
         if float(ov_deficit.detach().item()) > 0.0:
-            loss = loss + 1.5 * ov_deficit + 0.05 * F.relu(max_abs_y - 1.0).mean()
+            ov_w = 3.5 if (is_internal_fov_pair or has_slab_asymmetry) else 1.8
+            loss = loss + ov_w * ov_deficit + 0.05 * F.relu(max_abs_y - 1.0).mean()
         return loss
 
     # 3. candidate starts, scored at the coarsest level -------------------------------------
@@ -1489,18 +1897,67 @@ def _run_pytorch_affine_solver(fixed: ants.ANTsImage, moving: ants.ANTsImage, in
                 break
 
     if not cands or multi_start:
-        cands.append(('Identity_CoM', np.eye(dim), t_init))
-        if np.linalg.norm(t_fov - t_init) >= 1.0:
+        if is_internal_fov_pair:
+            # Truncated internal windows: FOV geometric center and Identity are primary anchors
             cands.append(('Identity_FOV', np.eye(dim), t_fov))
-        # The self-check below uses plain Identity as a baseline, so it must also be a start: a pair that is already
-        # aligned in physical space (shared origin, e.g. synthetic or same-scanner data) has its optimum AT identity
-        # and a CoM offset is then a worse start than doing nothing. Skipped when CoM coincides with identity.
-        if np.linalg.norm(t_init) > 1e-6:
             cands.append(('Identity', np.eye(dim), np.zeros(dim)))
+            if np.linalg.norm(t_init - t_fov) >= 1.0:
+                cands.append(('Identity_CoM', np.eye(dim), t_init))
+            # 1-D in-plane pelvic/ROI offsets around FOV center (±15 mm) to bridge bladder/fat center offsets
+            if multi_start and dim == 3:
+                for ax_i, ax_nm in ((0, 'X'), (1, 'Y')):
+                    for off_mm in (-15.0, 15.0):
+                        dv = np.zeros(3, dtype=np.float64)
+                        dv[ax_i] = off_mm
+                        cands.append((f'FOV_{ax_nm}{off_mm:+.0f}mm', np.eye(3), t_fov + dv))
+        else:
+            cands.append(('Identity_CoM', np.eye(dim), t_init))
+            if np.linalg.norm(t_fov - t_init) >= 1.0:
+                cands.append(('Identity_FOV', np.eye(dim), t_fov))
+            if dim == 3 and np.linalg.norm(t_trunk - t_init) >= 4.0:
+                cands.append(('Identity_TrunkBox', np.eye(dim), t_trunk))
+            # The self-check below uses plain Identity as a baseline, so it must also be a start: a pair that is already
+            # aligned in physical space (shared origin, e.g. synthetic or same-scanner data) has its optimum AT identity
+            # and a CoM offset is then a worse start than doing nothing. Skipped when CoM coincides with identity.
+            if np.linalg.norm(t_init) > 1e-6:
+                cands.append(('Identity', np.eye(dim), np.zeros(dim)))
         for k, t_pc in enumerate(t_phase_corr):
             cands.append((f'Identity_PhaseCorr{k}', np.eye(dim), t_pc))
         for k, t_sc in enumerate(scan_bases):
             cands.append((f'Identity_Scan{k}', np.eye(dim), t_sc))
+
+        # Axial coverage-asymmetry candidate generation: 1-D CT cross-sectional tomography anchor (or non-CT slab sweep)
+        t_tomo_base = None
+        A_tomo_base = None
+        if ct_tomo is not None and multi_start and dim == 3:
+            A_tomo_base = ct_tomo['A_tomo']
+            cf_a, cm_a = ct_tomo['c_anchor_f'], ct_tomo['c_anchor_m']
+            t_tomo_base = A_tomo_base @ (com_f - cf_a) + cm_a - com_f
+            t_tomo_rig = (cm_a - cf_a)
+            cands.append(('CT_Tomo_Scaled', A_tomo_base, t_tomo_base))
+            cands.append(('CT_Tomo_Rigid', np.eye(3), t_tomo_rig))
+            for off_mm in (-18.0, 18.0):
+                dv = np.zeros(3, dtype=np.float64); dv[ct_tomo['axis_lps']] = off_mm
+                cands.append((f'CT_Tomo_Scaled_{off_mm:+.0f}mm', A_tomo_base, t_tomo_base + dv))
+                cands.append((f'CT_Tomo_Rigid_{off_mm:+.0f}mm', np.eye(3), t_tomo_rig + dv))
+        elif has_slab_asymmetry and multi_start and dim == 3 and dof == 'affine':
+            sp_f_lps, sp_m_lps = support_f['span_lps'], support_m['span_lps']
+            ex_f, ex_m = support_f['ext_world'], support_m['ext_world']
+            c_f_lps, c_m_lps = support_f['center_lps'], support_m['center_lps']
+            s_diag = [
+                1.0 if i in asym_axes else float(np.clip(sp_m_lps[i] / max(sp_f_lps[i], 10.0), 0.65, 1.65))
+                for i in range(3)
+            ]
+            A_slab = np.diag(s_diag)
+            ax_a = asym_axes[0]
+            max_dz = 0.55 * abs(float(ex_m[ax_a] - ex_f[ax_a])) + 25.0
+            for si, dz_mm in enumerate(np.linspace(-max_dz, max_dz, 17)):
+                d_vec = np.zeros(3, dtype=np.float64)
+                d_vec[ax_a] = float(dz_mm)
+                t_slab = A_slab @ (com_f - c_f_lps) + c_m_lps + d_vec - com_f
+                cands.append((f'SlabSweep{si:02d}_{dz_mm:+.0f}mm', A_slab, t_slab))
+                t_slab_rig = (c_m_lps - c_f_lps) + d_vec
+                cands.append((f'SlabRigid{si:02d}_{dz_mm:+.0f}mm', np.eye(3), t_slab_rig))
 
         # 0b. Negative Half CoM and Dipole Candidate (when both images contain negative data, e.g. CT air/lungs)
         if com_f_neg is not None and com_m_neg is not None and multi_start:
@@ -1536,8 +1993,10 @@ def _run_pytorch_affine_solver(fixed: ants.ANTsImage, moving: ants.ANTsImage, in
                     cone_angles_deg = [-180.0, -90.0, -45.0, -24.0, -18.0, -12.0, -6.0, 6.0, 12.0, 18.0, 24.0, 45.0, 90.0, 180.0]
                 else:
                     cone_angles_deg = [-24.0, -18.0, -12.0, -6.0, 6.0, 12.0, 18.0, 24.0]
-            fov_sweep = [('FOV', t_fov)] if np.linalg.norm(t_fov - t_init) >= 1.5 * coarse_mm else []
-            rot_sweep_bases = ([('CoM', t_init)] + fov_sweep
+            fov_sweep = [('FOV', t_fov)] if (is_internal_fov_pair or np.linalg.norm(t_fov - t_init) >= 1.5 * coarse_mm) else []
+            tomo_sweep = [('Tomo', ct_tomo['c_anchor_m'] - ct_tomo['c_anchor_f'])] if ct_tomo is not None else []
+            primary_base = [('FOV', t_fov)] if is_internal_fov_pair else (tomo_sweep + [('CoM', t_init)] + fov_sweep)
+            rot_sweep_bases = (primary_base
                                + [(f'PhaseCorr{k}', t_pc) for k, t_pc in enumerate(t_phase_corr)]
                                + [(f'Scan{k}', t_sc) for k, t_sc in enumerate(scan_bases)])
             for base_name, t_base in rot_sweep_bases:
@@ -1551,7 +2010,10 @@ def _run_pytorch_affine_solver(fixed: ants.ANTsImage, moving: ants.ANTsImage, in
                             Rx = np.array([[1, 0, 0], [0, np.cos(rx), -np.sin(rx)], [0, np.sin(rx), np.cos(rx)]])
                             Ry = np.array([[np.cos(ry), 0, np.sin(ry)], [0, 1, 0], [-np.sin(ry), 0, np.cos(ry)]])
                             Rz = np.array([[np.cos(rz), -np.sin(rz), 0], [np.sin(rz), np.cos(rz), 0], [0, 0, 1]])
-                            cands.append((f'{base_name}_{axis}_{deg:+.0f}deg', Rz @ Ry @ Rx, t_base))
+                            R_cone = Rz @ Ry @ Rx
+                            if base_name == 'Tomo' and A_tomo_base is not None:
+                                cands.append((f'TomoScaled_{axis}_{deg:+.0f}deg', R_cone @ A_tomo_base, t_tomo_base))
+                            cands.append((f'{base_name}_{axis}_{deg:+.0f}deg', R_cone, t_base))
                     else:
                         cands.append((f'{base_name}_rot_{deg:+.0f}deg', np.array([[np.cos(rad), -np.sin(rad)], [np.sin(rad), np.cos(rad)]]), t_base))
 
@@ -1559,7 +2021,7 @@ def _run_pytorch_affine_solver(fixed: ants.ANTsImage, moving: ants.ANTsImage, in
     scored = []
     with torch.no_grad():
         for name, B, tt in cands:
-            p = _AffinePath(B, tt, dim, device_obj, name, spacing=sp_fix)
+            p = _make_path(B, tt, name)
             scored.append((float(objective(p, 'rigid', coarse, full=True, sampling=1.0).item()), name, B, tt))
     scored.sort(key=lambda x: x[0])
 
@@ -1577,18 +2039,32 @@ def _run_pytorch_affine_solver(fixed: ants.ANTsImage, moving: ants.ANTsImage, in
                                                    domain_diam=trans_basin_diam)
         keep = (prov + clustered_others)[:n_starts]
     else:
-        keep = _cluster_candidates_se3(scored, n_starts,
+        eff_n_starts = max(n_starts, 5) if has_slab_asymmetry else (max(n_starts, 4) if is_internal_fov_pair else n_starts)
+        keep = _cluster_candidates_se3(scored, eff_n_starts,
                                        cluster_threshold=cluster_threshold,
                                        domain_diam=trans_basin_diam)
-        if n_starts >= 2 and not any(s[1] in ('Identity', 'Identity_CoM') or s[1].startswith('CoM_') for s in keep):
-            com_pool = [s for s in scored if s[1] in ('Identity', 'Identity_CoM') or s[1].startswith('CoM_')]
+        if has_slab_asymmetry:
+            slab_prefixes = ('CT_Tomo', 'Tomo', 'SlabSweep', 'SlabRigid')
+            slab_pool = _cluster_candidates_se3(
+                [s for s in scored if s[1].startswith(slab_prefixes)],
+                2,
+                cluster_threshold=0.50,
+                domain_diam=100.0,
+            )
+            existing_names = {s[1] for s in keep}
+            for sc_item in reversed(slab_pool):
+                if sc_item[1] not in existing_names:
+                    keep = [sc_item] + list(keep[:-1])
+                    existing_names.add(sc_item[1])
+        if eff_n_starts >= 2 and not any(s[1] in ('Identity', 'Identity_CoM', 'Identity_FOV') or s[1].startswith('CoM_') for s in keep):
+            com_pool = [s for s in scored if s[1] in ('Identity', 'Identity_CoM', 'Identity_FOV') or s[1].startswith('CoM_')]
             if com_pool:
                 keep = list(keep[:-1]) + [com_pool[0]]
 
     if verbose:
         print(f"[robust_affine mode='pytorch'] {len(cands)} start candidates scored at level {coarse}; "
               f"keeping {[f'{n} ({s:.4f})' for s, n, _, _ in keep]}", flush=True)
-    paths = [_AffinePath(B, tt, dim, device_obj, name, spacing=sp_fix) for _, name, B, tt in keep]
+    paths = [_make_path(B, tt, name) for _, name, B, tt in keep]
 
     # 4. schedule -------------------------------------------------------------------------
     # Every stage ends when the path has CONVERGED (the sampled points move < convergence_tol_vox working voxels between
@@ -1717,6 +2193,8 @@ def _run_pytorch_affine_solver(fixed: ants.ANTsImage, moving: ants.ANTsImage, in
             last_check = 0
             pts_ = _path_points(p, dof, level)[0]
             pt_radius = float((pts_ - C_phys).pow(2).sum(-1).mean().sqrt())
+            best_stage_loss = float('inf')
+            best_stage_state = None
             for cycle in range(max_ext):
                 blocks = cycle + 1
                 lr_c = tuple(v * scale for v in lr)
@@ -1730,6 +2208,10 @@ def _run_pytorch_affine_solver(fixed: ants.ANTsImage, moving: ants.ANTsImage, in
                 for it in range(iters):
                     opt.zero_grad(set_to_none=True)
                     loss = closure_loss()
+                    lv_now = float(loss.detach().item())
+                    if math.isfinite(lv_now) and lv_now < best_stage_loss:
+                        best_stage_loss = lv_now
+                        best_stage_state = {n: getattr(p, n).detach().clone() for n in ('t', 'omega', 'scale', 'shear')}
                     loss.backward()
                     opt.step()
                     if sched is not None:
@@ -1747,6 +2229,13 @@ def _run_pytorch_affine_solver(fixed: ants.ANTsImage, moving: ants.ANTsImage, in
                 if tracker.all_converged:
                     break
                 scale *= 0.5
+            if best_stage_state is not None:
+                with torch.no_grad():
+                    end_lv = float(closure_loss().detach().item())
+                    if not math.isfinite(end_lv) or best_stage_loss < end_lv:
+                        for n, v in best_stage_state.items():
+                            getattr(p, n).copy_(v)
+                        last_loss[p.name] = torch.tensor(best_stage_loss, device=device_obj, dtype=torch.float32)
         return {'stage': f"{optimizer}@L{level}", 'level': int(level), 'path': p.name, 'iterations': int(done), 'blocks': int(blocks),
                 'tol_mm': tracker.tol, 'probe_rejections': int(rejected), 'converged': bool(tracker.all_converged), 'fixed_block': (not judged), 'final_step_mm': float(tracker.last_step[0]),
                 'seconds': round(time.time() - t_stage, 2)}
@@ -1786,9 +2275,13 @@ def _run_pytorch_affine_solver(fixed: ants.ANTsImage, moving: ants.ANTsImage, in
     with torch.no_grad():
         coarse_dof = schedule[-1]['dof']
         final_coarse = float(objective(winner, coarse_dof, coarse, full=True, sampling=1.0).item())
+        base_starts = [('Identity', np.zeros(dim)), ('Identity_FOV', t_fov)] if is_internal_fov_pair else [('Identity', np.zeros(dim)), ('Identity_CoM', t_init)]
+        if ct_tomo is not None and t_tomo_base is not None and A_tomo_base is not None:
+            base_starts = [('CT_Tomo_Scaled', t_tomo_base), ('CT_Tomo_Rigid', ct_tomo['c_anchor_m'] - ct_tomo['c_anchor_f'])] + base_starts
         baselines = {}
-        for b_name, b_t in (('Identity', np.zeros(dim)), ('Identity_CoM', t_init)):
-            baselines[b_name] = float(objective(_AffinePath(np.eye(dim), b_t, dim, device_obj, b_name, spacing=sp_fix),
+        for b_name, b_t in base_starts:
+            B_b = A_tomo_base if b_name == 'CT_Tomo_Scaled' else np.eye(dim)
+            baselines[b_name] = float(objective(_make_path(B_b, b_t, b_name),
                                                 coarse_dof, coarse, full=True, sampling=1.0).item())
     best_baseline = min(baselines.values())
     def _fails(loss):
@@ -1797,8 +2290,9 @@ def _run_pytorch_affine_solver(fixed: ants.ANTsImage, moving: ants.ANTsImage, in
     if _fails(final_coarse):
         # A multi-start can commit to a rotated start that never returns (a featureless pair: the identity is the best answer and the
         # data cannot pull a candidate back to it). Before declaring failure, run the whole schedule once from each trivial start.
-        for b_name, b_t in sorted((('Identity', np.zeros(dim)), ('Identity_CoM', t_init)), key=lambda kv: baselines[kv[0]]):
-            retry, retry_pre = _run_schedule([_AffinePath(np.eye(dim), b_t, dim, device_obj, b_name, spacing=sp_fix)])
+        for b_name, b_t in sorted(base_starts, key=lambda kv: baselines[kv[0]]):
+            B_b = A_tomo_base if b_name == 'CT_Tomo_Scaled' else np.eye(dim)
+            retry, retry_pre = _run_schedule([_make_path(B_b, b_t, b_name)])
             with torch.no_grad():
                 retry_loss = float(objective(retry, coarse_dof, coarse, full=True, sampling=1.0).item())
             if np.isfinite(retry_loss) and retry_loss < final_coarse:
@@ -1808,7 +2302,7 @@ def _run_pytorch_affine_solver(fixed: ants.ANTsImage, moving: ants.ANTsImage, in
     if _fails(final_coarse) and pre_final is not None:
         # the finest stage converged to its own optimum, which on a weak-signal pair can score worse on the coarse grid than the pose that
         # entered it; accept the pose entering the finest stage if THAT beats doing nothing
-        q = _AffinePath(winner.B.detach().cpu().numpy(), np.zeros(dim), dim, device_obj, winner.name + '_pre_finest', spacing=sp_fix)
+        q = _make_path(winner.B.detach().cpu().numpy(), np.zeros(dim), winner.name + '_pre_finest')
         with torch.no_grad():
             for n, v in pre_final.items():
                 getattr(q, n).copy_(v)
@@ -1819,8 +2313,7 @@ def _run_pytorch_affine_solver(fixed: ants.ANTsImage, moving: ants.ANTsImage, in
     if _fails(final_coarse):
         raise RobustAffineSolverError(
             f"robust_affine: the optimised pose (loss {final_coarse:.4f} at pyramid level {coarse}) is not better "
-            f"than doing nothing (identity {baselines['Identity']:.4f}, centre-of-mass start "
-            f"{baselines['Identity_CoM']:.4f}); the solver did not find a usable alignment for this pair.")
+            f"than doing nothing ({baselines}); the solver did not find a usable alignment for this pair.")
 
     # 5. export --------------------------------------------------------------------------
     A_fin, t_fin = winner.numpy_affine()

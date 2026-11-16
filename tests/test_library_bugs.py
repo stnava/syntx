@@ -262,3 +262,75 @@ class TestBugL4AnisotropyWorkingImageCapping:
         assert res['warpedfixout'].shape == fixed.shape
         assert np.allclose(res['warpedfixout'].spacing, fixed.spacing)
 
+
+# ==============================================================================
+# Physical Hounsfield Attenuation, Acquisition Support & Multi-Channel TVF/auto_reg
+# ==============================================================================
+
+class TestPhysicalAttenuationAndAcquisitionSupport:
+    """Tests for calibrated HU normalization, physical support classification, and multi-channel TVF/auto_reg."""
+
+    def test_calibrated_hu_normalization_preserves_lung_fat_parenchyma_and_bone(self):
+        from syntx.core.utils import normalize_image
+        from syntx.core.pipeline import normalize_and_tensorize
+
+        arr = np.full((32, 32, 16), -1000.0, dtype=np.float32)
+        arr[4:28, 4:28, :] = -90.0     # Subcutaneous fat
+        arr[8:14, 8:24, :] = -750.0    # Lung parenchyma
+        arr[15:24, 8:24, :] = 60.0     # Soft-tissue organ
+        arr[24:27, 14:18, :] = 600.0   # Vertebral cortical bone
+        ct = ants.from_numpy(arr, spacing=(1.5, 1.5, 2.5))
+
+        norm_arr = normalize_image(ct, method="auto", force=True).numpy()
+        v_air = float(norm_arr[0, 0, 0])
+        v_lung = float(norm_arr[10, 16, 8])
+        v_fat = float(norm_arr[5, 5, 8])
+        v_soft = float(norm_arr[18, 16, 8])
+        v_bone = float(norm_arr[25, 15, 8])
+        assert v_air < v_lung < v_fat < v_soft < v_bone, (v_air, v_lung, v_fat, v_soft, v_bone)
+
+        I_t, _ = normalize_and_tensorize(ct, ct, backend="pytorch", device="cpu")
+        assert I_t.shape == (1, 1, 16, 32, 32)
+        assert float(I_t[0, 0, 8, 16, 10]) > float(I_t[0, 0, 0, 0, 0])  # lung > air
+        assert float(I_t[0, 0, 8, 15, 25]) > float(I_t[0, 0, 8, 16, 18])  # bone > soft tissue
+
+    def test_analyze_volume_support_distinguishes_enclosed_vs_internal_window(self):
+        from syntx.core.utils import normalize_image
+        from syntx.robust_affine import _analyze_volume_support_3d
+
+        # Enclosed brain-like volume surrounded by zero air
+        arr_enc = np.zeros((48, 48, 40), dtype=np.float32)
+        arr_enc[10:38, 10:38, 6:34] = 200.0
+        im_enc = ants.from_numpy(arr_enc, spacing=(3.0, 3.0, 3.5))
+        sup_enc = _analyze_volume_support_3d(im_enc, normalize_image(im_enc, method="auto", force=True))
+        assert sup_enc["is_internal_fov"] is False
+        assert sup_enc["border_fg_frac"] < 0.05
+
+        # Truncated internal pelvic/subcortical window (tissue crosses lateral boundaries)
+        rng = np.random.default_rng(7)
+        arr_int = rng.uniform(150.0, 800.0, size=(48, 48, 16)).astype(np.float32)
+        im_int = ants.from_numpy(arr_int, spacing=(2.0, 2.0, 3.6))
+        sup_int = _analyze_volume_support_3d(im_int, normalize_image(im_int, method="auto", force=True))
+        assert sup_int["is_internal_fov"] is True
+        assert sup_int["border_fg_frac"] >= 0.25
+
+    def test_multichannel_tvf_and_auto_reg_preserve_physical_geometry(self):
+        rng = np.random.default_rng(11)
+        a0 = rng.uniform(10.0, 200.0, size=(24, 24, 16)).astype(np.float32)
+        a1 = rng.uniform(5.0, 120.0, size=(24, 24, 16)).astype(np.float32)
+        sp, org = (2.0, 2.0, 3.0), (12.0, -8.0, 5.0)
+        f_list = [ants.from_numpy(a0, spacing=sp, origin=org), ants.from_numpy(a1, spacing=sp, origin=org)]
+        m_list = [ants.from_numpy(np.roll(a0, 1, axis=0), spacing=sp, origin=org),
+                  ants.from_numpy(np.roll(a1, 1, axis=0), spacing=sp, origin=org)]
+
+        res_tvf = syntx.tvf(f_list, m_list, initial_transform="identity", levels=[2, 1], reg_iterations=[2, 1], device="cpu")
+        assert res_tvf["warpedmovout"].shape == (24, 24, 16)
+        assert np.allclose(res_tvf["warpedmovout"].origin, org)
+        assert np.allclose(res_tvf["warpedmovout"].spacing, sp)
+
+        res_auto = auto_reg(f_list, m_list, type_of_transform="SyN", initial_transform="identity",
+                            reg_iterations=[2, 1], diagnose=False, device="cpu")
+        assert res_auto["warpedmovout"].shape == (24, 24, 16)
+        assert np.allclose(res_auto["warpedmovout"].origin, org)
+
+

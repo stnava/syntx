@@ -35,6 +35,51 @@ from .core import AnatomicalSlice, AnatomicalVisualizer
 from .colormaps import dkt_colormap, get_dkt_colormap, get_dkt_label_color_dict
 
 
+def _same_physical_grid(a: ants.ANTsImage, b: ants.ANTsImage, tol: float = 1e-4) -> bool:
+    """Return True if two ANTsImages share shape, spacing, origin, and direction within ``tol``."""
+    if not (isinstance(a, ants.ANTsImage) and isinstance(b, ants.ANTsImage)):
+        return False
+    if a.dimension != b.dimension or tuple(a.shape) != tuple(b.shape):
+        return False
+    return bool(
+        np.allclose(a.spacing, b.spacing, atol=tol, rtol=tol)
+        and np.allclose(a.origin, b.origin, atol=tol, rtol=tol)
+        and np.allclose(a.direction, b.direction, atol=tol, rtol=tol)
+    )
+
+
+def _align_to_reference_grid(img, ref, interp_type: str = "linear"):
+    """Resample ``img`` onto ``ref``'s physical grid when both are ANTsImages and their grids differ."""
+    if isinstance(img, ants.ANTsImage) and isinstance(ref, ants.ANTsImage):
+        if img.dimension != ref.dimension:
+            raise ValueError(
+                f"Dimension mismatch between image ({img.dimension}D) and reference ({ref.dimension}D)."
+            )
+        if not _same_physical_grid(ref, img):
+            from ..transforms import apply_transforms as _apply_transforms
+
+            n_comp = getattr(img, "components", 1)
+            if n_comp > 1:
+                return ants.merge_channels(
+                    [
+                        _apply_transforms(
+                            fixed=ref,
+                            moving=c,
+                            transformlist=["identity"],
+                            interpolator=interp_type,
+                        )
+                        for c in ants.split_channels(img)
+                    ]
+                )
+            return _apply_transforms(
+                fixed=ref,
+                moving=img,
+                transformlist=["identity"],
+                interpolator=interp_type,
+            )
+    return img
+
+
 def extract_oriented_slice(img, slice_axis: int = 2, slice_idx=None, reorient: bool = True, ref_image=None):
     """Return ``(slice_array, aspect_ratio)`` from ``AnatomicalVisualizer.extract_slice``.
 
@@ -265,8 +310,30 @@ def plot_edge_overlay(
     matplotlib.figure.Figure
         Not closed.
     """
-    fi_arr, aspect_ratio = extract_oriented_slice(fixed, slice_axis=slice_axis, slice_idx=slice_idx, reorient=reorient)
-    mi_arr, _ = extract_oriented_slice(warped, slice_axis=slice_axis, slice_idx=slice_idx, reorient=reorient)
+    if isinstance(fixed, ants.ANTsImage):
+        if isinstance(warped, str) and not warped.endswith('.mat'):
+            warped = ants.image_read(warped)
+        if isinstance(warped, ants.ANTsImage):
+            warped = _align_to_reference_grid(warped, fixed, interp_type="linear")
+        elif warped is not None and hasattr(warped, 'shape'):
+            warped = AnatomicalVisualizer._array_to_image(warped, fixed)
+        fi_slice = AnatomicalVisualizer.extract_slice(
+            fixed, plane=slice_axis, slice_idx=slice_idx, reorient=reorient
+        )
+        resolved_slice_idx = fi_slice.slice_idx
+        fi_arr, aspect_ratio = fi_slice.data, fi_slice.aspect_ratio
+        mi_arr, _ = extract_oriented_slice(
+            warped, slice_axis=slice_axis, slice_idx=resolved_slice_idx, reorient=reorient, ref_image=fixed
+        )
+    else:
+        fi_slice = AnatomicalVisualizer.extract_slice(
+            fixed, plane=slice_axis, slice_idx=slice_idx, reorient=reorient
+        )
+        resolved_slice_idx = fi_slice.slice_idx
+        fi_arr, aspect_ratio = fi_slice.data, fi_slice.aspect_ratio
+        mi_arr, _ = extract_oriented_slice(
+            warped, slice_axis=slice_axis, slice_idx=resolved_slice_idx, reorient=reorient
+        )
 
     def _norm(a):
         amin, amax = np.min(a), np.max(a)
@@ -1150,14 +1217,44 @@ def render_standard_4panel(
             "Without it panel C (inverse consistency) would be meaningless; pass the error map or registration_result."
         )
 
-    # arrays / tensors (syntx tensor layout) get the fixed image's geometry
+    # arrays / tensors (syntx tensor layout) get the fixed image's geometry;
+    # ANTsImages for warped/detJ/inv_err_map are resampled onto fixed's physical grid.
     if isinstance(fixed, ants.ANTsImage):
         def _on_fixed(x):
-            if x is None or isinstance(x, ants.ANTsImage) or not hasattr(x, 'shape'):
+            if x is None:
+                return None
+            if isinstance(x, str) and not x.endswith('.mat'):
+                x = ants.image_read(x)
+            if isinstance(x, ants.ANTsImage):
+                return _align_to_reference_grid(x, fixed, interp_type="linear")
+            if not hasattr(x, 'shape'):
                 return x
             return AnatomicalVisualizer._array_to_image(x, fixed)
-        warped, moving, detJ = _on_fixed(warped), _on_fixed(moving), _on_fixed(detJ)
-        if not isinstance(inv_err_map, ants.ANTsImage) and hasattr(inv_err_map, 'shape'):
+
+        warped, detJ = _on_fixed(warped), _on_fixed(detJ)
+        if moving is not None and not isinstance(moving, ants.ANTsImage):
+            if isinstance(moving, str) and not moving.endswith('.mat'):
+                moving = ants.image_read(moving)
+            elif hasattr(moving, 'shape'):
+                arr_m = moving.detach().cpu().numpy() if hasattr(moving, 'detach') else np.asarray(moving)
+                arr_m_sq = np.squeeze(arr_m)
+                if tuple(arr_m_sq.shape) == tuple(reversed(fixed.shape)):
+                    moving = AnatomicalVisualizer._array_to_image(moving, fixed)
+                else:
+                    moving = AnatomicalVisualizer._array_to_image(moving, None)
+        if isinstance(inv_err_map, str) and not inv_err_map.endswith('.mat'):
+            inv_err_map = ants.image_read(inv_err_map)
+        if isinstance(inv_err_map, ants.ANTsImage):
+            if getattr(inv_err_map, 'components', 1) > 1:
+                inv_norm_arr = np.linalg.norm(inv_err_map.numpy(), axis=-1).astype(np.float32)
+                inv_err_map = ants.from_numpy(
+                    inv_norm_arr,
+                    origin=inv_err_map.origin,
+                    spacing=inv_err_map.spacing,
+                    direction=inv_err_map.direction,
+                )
+            inv_err_map = _align_to_reference_grid(inv_err_map, fixed, interp_type="linear")
+        elif hasattr(inv_err_map, 'shape'):
             e = inv_err_map.detach().cpu().numpy() if hasattr(inv_err_map, 'detach') else np.asarray(inv_err_map)
             e = np.squeeze(e)
             if e.ndim == fixed.dimension + 1 and e.shape[-1] == fixed.dimension:
@@ -1166,27 +1263,48 @@ def render_standard_4panel(
         if warp is not None and not isinstance(warp, ants.ANTsImage) and hasattr(warp, 'shape'):
             warp = _as_displacement_image(warp, fixed)
 
-    fi_arr, aspect_ratio = extract_oriented_slice(fixed, slice_axis=slice_axis, slice_idx=slice_idx, reorient=reorient, ref_image=fixed)
-    warped_arr, _ = extract_oriented_slice(warped, slice_axis=slice_axis, slice_idx=slice_idx, reorient=reorient, ref_image=fixed)
-    detJ_arr, _ = extract_oriented_slice(detJ, slice_axis=slice_axis, slice_idx=slice_idx, reorient=reorient, ref_image=fixed)
-    
+    fi_slice = AnatomicalVisualizer.extract_slice(
+        fixed, plane=slice_axis, slice_idx=slice_idx, reorient=reorient, ref_image=fixed
+    )
+    resolved_slice_idx = fi_slice.slice_idx
+    fi_arr, aspect_ratio = fi_slice.data, fi_slice.aspect_ratio
+    warped_arr, _ = extract_oriented_slice(
+        warped, slice_axis=slice_axis, slice_idx=resolved_slice_idx, reorient=reorient, ref_image=fixed
+    )
+    detJ_arr, _ = extract_oriented_slice(
+        detJ, slice_axis=slice_axis, slice_idx=resolved_slice_idx, reorient=reorient, ref_image=fixed
+    )
+
     import warnings
     panel_a_note = ""
     try:
         # in-plane displacement in display pixels (mm converted with the slice geometry)
-        dcol, drow, _, _, _ = _display_displacement(warp, fixed, slice_axis, slice_idx, reorient)
+        dcol, drow, _, _, _ = _display_displacement(warp, fixed, slice_axis, resolved_slice_idx, reorient)
     except Exception as e:
         warnings.warn(f"render_standard_4panel: no displacement for panel A ({e})")
         dcol = drow = np.zeros_like(fi_arr, dtype=float)
         panel_a_note = " (displacement unavailable)"
 
     if moving is not None:
-        mov_arr, _ = extract_oriented_slice(moving, slice_axis=slice_axis, slice_idx=slice_idx, reorient=reorient, ref_image=fixed)
+        mov_slice_idx = (
+            slice_idx
+            if (
+                not isinstance(moving, ants.ANTsImage)
+                or not isinstance(fixed, ants.ANTsImage)
+                or _same_physical_grid(fixed, moving)
+            )
+            else None
+        )
+        mov_arr, mov_aspect = extract_oriented_slice(
+            moving, slice_axis=slice_axis, slice_idx=mov_slice_idx, reorient=reorient
+        )
     else:
-        mov_arr = warped_arr
+        mov_arr, mov_aspect = warped_arr, aspect_ratio
 
     try:
-        inv_err_arr, _ = extract_oriented_slice(inv_err_map, slice_axis=slice_axis, slice_idx=slice_idx, reorient=reorient, ref_image=fixed)
+        inv_err_arr, _ = extract_oriented_slice(
+            inv_err_map, slice_axis=slice_axis, slice_idx=resolved_slice_idx, reorient=reorient, ref_image=fixed
+        )
         if inv_err_arr.ndim == 3:
             inv_err_arr = np.linalg.norm(inv_err_arr, axis=-1)
         inv_err_arr = np.asarray(inv_err_arr, dtype=np.float32)
@@ -1204,23 +1322,40 @@ def render_standard_4panel(
     cbar_tick_color = "#c9d1d9" if is_dark else "#334155"
 
     if show_header:
-        fig, axes = plt.subplots(3, 2, figsize=(14, 16), facecolor=bg_color)
-        for ax_row in axes:
-            for ax in ax_row:
-                ax.set_facecolor(bg_color)
-                ax.axis('off')
+        fig = plt.figure(figsize=(15, 16) if moving is not None else (14, 16), facecolor=bg_color)
+        gs = fig.add_gridspec(3, 6)
+        if moving is not None:
+            ax_hdr_fixed = fig.add_subplot(gs[0, 0:2])
+            ax_hdr_moving = fig.add_subplot(gs[0, 2:4])
+            ax_hdr_warped = fig.add_subplot(gs[0, 4:6])
+            header_axes = [ax_hdr_fixed, ax_hdr_moving, ax_hdr_warped]
 
-        # Row 0: Far Top Inputs (Fixed Left | Moving Right)
-        axes[0, 0].imshow(fi_arr, cmap='gray', aspect=aspect_ratio)
-        axes[0, 0].set_title('Fixed Target Image Input', color='#38bdf8', fontsize=11, fontweight='bold')
+            ax_hdr_fixed.imshow(fi_arr, cmap='gray', aspect=aspect_ratio)
+            ax_hdr_fixed.set_title('Fixed Target Image', color='#38bdf8', fontsize=11, fontweight='bold')
 
-        axes[0, 1].imshow(mov_arr, cmap='gray', aspect=aspect_ratio)
-        axes[0, 1].set_title('Moving / Warped Image Input', color='#fb923c', fontsize=11, fontweight='bold')
+            ax_hdr_moving.imshow(mov_arr, cmap='gray', aspect=mov_aspect)
+            ax_hdr_moving.set_title('Moving Image (Before)', color='#fb923c', fontsize=11, fontweight='bold')
 
-        ax_panel_a = axes[1, 0]
-        ax_panel_b = axes[1, 1]
-        ax_panel_c = axes[2, 0]
-        ax_panel_d = axes[2, 1]
+            ax_hdr_warped.imshow(warped_arr, cmap='gray', aspect=aspect_ratio)
+            ax_hdr_warped.set_title('Warped Moving Image (After)', color='#3fb950', fontsize=11, fontweight='bold')
+        else:
+            ax_hdr_fixed = fig.add_subplot(gs[0, 0:3])
+            ax_hdr_warped = fig.add_subplot(gs[0, 3:6])
+            header_axes = [ax_hdr_fixed, ax_hdr_warped]
+
+            ax_hdr_fixed.imshow(fi_arr, cmap='gray', aspect=aspect_ratio)
+            ax_hdr_fixed.set_title('Fixed Target Image', color='#38bdf8', fontsize=11, fontweight='bold')
+
+            ax_hdr_warped.imshow(warped_arr, cmap='gray', aspect=aspect_ratio)
+            ax_hdr_warped.set_title('Warped Moving Image (Aligned to Fixed)', color='#3fb950', fontsize=11, fontweight='bold')
+
+        ax_panel_a = fig.add_subplot(gs[1, 0:3])
+        ax_panel_b = fig.add_subplot(gs[1, 3:6])
+        ax_panel_c = fig.add_subplot(gs[2, 0:3])
+        ax_panel_d = fig.add_subplot(gs[2, 3:6])
+        for ax in [*header_axes, ax_panel_a, ax_panel_b, ax_panel_c, ax_panel_d]:
+            ax.set_facecolor(bg_color)
+            ax.axis('off')
     else:
         fig, axes = plt.subplots(2, 2, figsize=(14, 12), facecolor=bg_color)
         for ax_row in axes:
@@ -1277,7 +1412,8 @@ def render_standard_4panel(
     p95_err_val = inv_err_p95 if inv_err_p95 is not None else float(np.percentile(inv_err_arr, 95))
 
     ax_panel_c.imshow(fi_arr, cmap='gray', alpha=0.3, aspect=aspect_ratio)
-    im_err = ax_panel_c.imshow(inv_err_arr, cmap='inferno', alpha=0.85, vmin=0.0, vmax=max(3.0, max_err_val), aspect=aspect_ratio)
+    vmax_err = max(3.0, float(max_err_val)) if np.isfinite(max_err_val) else 3.0
+    im_err = ax_panel_c.imshow(inv_err_arr, cmap='inferno', alpha=0.85, vmin=0.0, vmax=vmax_err, aspect=aspect_ratio)
     ax_panel_c.set_title(f'Panel C: Inverse Identity Error (mm)\nMax: {max_err_val:.4f}mm | Mean: {mean_err_val:.4f}mm | p95: {p95_err_val:.4f}mm', color='#d29922', fontsize=11, fontweight='bold')
 
     cbar_e = fig.colorbar(im_err, ax=ax_panel_c, fraction=0.046, pad=0.04)
@@ -1285,7 +1421,7 @@ def render_standard_4panel(
     cbar_e.ax.tick_params(colors=cbar_tick_color)
 
     # Panel D: Standardized High-Contrast Canny Edge Overlap
-    plot_edge_overlay(fixed, warped, slice_axis=slice_axis, slice_idx=slice_idx, edge_color='#f85149', fixed_edge_color=None, theme=theme, reorient=reorient, ax=ax_panel_d, title="")
+    plot_edge_overlay(fixed, warped, slice_axis=slice_axis, slice_idx=resolved_slice_idx, edge_color='#f85149', fixed_edge_color=None, theme=theme, reorient=reorient, ax=ax_panel_d, title="")
     lncc_str = f"Target LNCC: {lncc_val:.4f}" if lncc_val is not None else ""
     mi_str = f"Mattes MI: {mi_val:.4f}" if mi_val is not None else ""
     metrics_sub = " | ".join(filter(None, [lncc_str, mi_str]))
@@ -1866,8 +2002,9 @@ def render_checkerboard_figure(
     views: Tuple[str, ...] = ("axial", "coronal", "sagittal"),
     theme: str = "dark",
     dpi: int = 110,
+    resample_to_target: bool = False,
 ):
-    """Checkerboard of two images on the same grid, one panel per view.
+    """Checkerboard of two images on the same physical grid, one panel per view.
 
     Tile (row // pattern_size + col // pattern_size) even shows ``image_a``, odd shows
     ``image_b``; anatomy that is aligned continues across tile edges. Each slice is scaled
@@ -1876,8 +2013,8 @@ def render_checkerboard_figure(
 
     Parameters
     ----------
-    image_a, image_b : ants.ANTsImage
-        Same shape.
+    image_a, image_b : ants.ANTsImage or np.ndarray
+        Images on the same physical grid (or resampled when ``resample_to_target=True``).
     title : str, default ""
     save_path : str, optional
         If given, save there (parent directories are created), close the figure and return
@@ -1885,9 +2022,14 @@ def render_checkerboard_figure(
     pattern_size : int, default 8
         Tile edge length in pixels.
     views : tuple of str, default ("axial", "coronal", "sagittal")
+        Automatically restricted to ``("axial",)`` when ``image_a`` is 2-D and default
+        3-plane views were passed.
     theme : str, default "dark"
     dpi : int, default 110
         Resolution of the saved file.
+    resample_to_target : bool, default False
+        When True and both inputs are ANTsImages of matching dimension on different physical
+        grids, resample ``image_b`` onto ``image_a`` via ``ants.resample_image_to_target``.
 
     Returns
     -------
@@ -1897,10 +2039,37 @@ def render_checkerboard_figure(
     Raises
     ------
     ValueError
-        If the shapes differ.
+        If dimensions differ, or if physical grids differ while ``resample_to_target=False``.
     """
-    if image_a.shape != image_b.shape:
+    if isinstance(image_a, ants.ANTsImage) and isinstance(image_b, ants.ANTsImage):
+        if image_a.dimension != image_b.dimension:
+            raise ValueError(
+                f"image_a dimension {image_a.dimension} != image_b dimension {image_b.dimension}."
+            )
+        if not _same_physical_grid(image_a, image_b):
+            if resample_to_target:
+                image_b = _align_to_reference_grid(image_b, image_a, interp_type="linear")
+            else:
+                mismatches = []
+                if tuple(image_a.shape) != tuple(image_b.shape):
+                    mismatches.append(f"shape {image_a.shape} != {image_b.shape}")
+                if not np.allclose(image_a.spacing, image_b.spacing, atol=1e-4, rtol=1e-4):
+                    mismatches.append(f"spacing {image_a.spacing} != {image_b.spacing}")
+                if not np.allclose(image_a.origin, image_b.origin, atol=1e-4, rtol=1e-4):
+                    mismatches.append(f"origin {image_a.origin} != {image_b.origin}")
+                if not np.allclose(image_a.direction, image_b.direction, atol=1e-4, rtol=1e-4):
+                    mismatches.append("direction cosine matrices differ")
+                detail = "; ".join(mismatches) or "physical grid mismatch"
+                raise ValueError(
+                    f"image_a and image_b are not on the same physical grid ({detail}) -- "
+                    f"pass resample_to_target=True to resample image_b onto image_a."
+                )
+    elif tuple(image_a.shape) != tuple(image_b.shape):
         raise ValueError(f"image_a shape {image_a.shape} != image_b shape {image_b.shape} -- must be on the same grid.")
+
+    dim_a = image_a.dimension if isinstance(image_a, ants.ANTsImage) else np.squeeze(np.asarray(image_a)).ndim
+    if dim_a == 2 and tuple(views) == ("axial", "coronal", "sagittal"):
+        views = ("axial",)
 
     is_dark = theme.lower() == "dark"
     bg_color = "#0f172a" if is_dark else "#ffffff"
@@ -1930,10 +2099,13 @@ def render_checkerboard_figure(
         axes = [axes]
 
     plane_axis = {"sagittal": 0, "coronal": 1, "axial": 2}
+    ref_for_b = image_a if isinstance(image_a, ants.ANTsImage) else None
     for ax, view in zip(axes, views):
         axis = plane_axis[view]
         slice_a_obj = AnatomicalVisualizer.extract_slice(image_a, plane=axis, slice_idx=None)
-        slice_b_obj = AnatomicalVisualizer.extract_slice(image_b, plane=axis, slice_idx=slice_a_obj.slice_idx, ref_image=image_a)
+        slice_b_obj = AnatomicalVisualizer.extract_slice(
+            image_b, plane=axis, slice_idx=slice_a_obj.slice_idx, ref_image=ref_for_b
+        )
         panel = _checker(_normalize(slice_a_obj.data), _normalize(slice_b_obj.data))
         ax.imshow(panel, cmap="gray", aspect=slice_a_obj.aspect_ratio, vmin=0, vmax=1, origin="upper")
         ax.set_title(view, color=text_color, fontsize=10)
@@ -1948,6 +2120,258 @@ def render_checkerboard_figure(
         fig.savefig(save_path, facecolor=bg_color, dpi=dpi)
         plt.close(fig)
         return save_path
+    return fig
+
+
+def render_warped_comparison_figure(
+    fixed,
+    warped,
+    moving=None,
+    output_path=None,
+    title=None,
+    slice_indices=None,
+    theme: str = "light",
+    crop_background: bool = True,
+    reorient: bool = True,
+    show_colorbar: bool = True,
+    dpi=150,
+    show_figure: bool = False,
+    filename=None,
+):
+    """Render direct grayscale Fixed Target vs. Warped Moving-to-Fixed comparison on Fixed's physical grid.
+
+    When both ``fixed`` and ``warped`` are ``ANTsImage``s on different physical grids, ``warped``
+    is resampled onto ``fixed`` via ``_align_to_reference_grid(..., interp_type="linear")``.
+    Both ``fixed`` and ``warped`` are sliced at ``fixed``'s exact LPI slice indices and cropped
+    using ``fixed``'s exact 2-D foreground bounding box per plane so every displayed pixel
+    corresponds in physical LPS coordinates. When ``moving`` is supplied, an optional middle
+    row/panel shows ``Moving (Pre-Registration)`` in its own native physical aspect ratio.
+    """
+    if output_path is None and filename is not None:
+        output_path = filename
+
+    if isinstance(fixed, str) and not fixed.endswith(".mat"):
+        fixed = ants.image_read(fixed)
+    if isinstance(warped, str) and not warped.endswith(".mat"):
+        warped = ants.image_read(warped)
+    if moving is not None and isinstance(moving, str) and not moving.endswith(".mat"):
+        moving = ants.image_read(moving)
+
+    if isinstance(fixed, ants.ANTsImage):
+        if isinstance(warped, ants.ANTsImage):
+            warped = _align_to_reference_grid(warped, fixed, interp_type="linear")
+        elif warped is not None and hasattr(warped, "shape"):
+            warped = AnatomicalVisualizer._array_to_image(warped, fixed)
+        if moving is not None and not isinstance(moving, ants.ANTsImage) and hasattr(moving, "shape"):
+            arr_m = moving.detach().cpu().numpy() if hasattr(moving, "detach") else np.asarray(moving)
+            if tuple(np.squeeze(arr_m).shape) == tuple(reversed(fixed.shape)):
+                moving = AnatomicalVisualizer._array_to_image(moving, fixed)
+            else:
+                moving = AnatomicalVisualizer._array_to_image(moving, None)
+    else:
+        arr_f = np.squeeze(fixed.detach().cpu().numpy() if hasattr(fixed, "detach") else np.asarray(fixed))
+        arr_w = np.squeeze(warped.detach().cpu().numpy() if hasattr(warped, "detach") else np.asarray(warped))
+        if arr_f.ndim != arr_w.ndim:
+            raise ValueError(f"Dimension mismatch between fixed ({arr_f.ndim}D) and warped ({arr_w.ndim}D).")
+        if arr_f.shape != arr_w.shape:
+            fixed = AnatomicalVisualizer._array_to_image(arr_f, None)
+            warped = _align_to_reference_grid(
+                AnatomicalVisualizer._array_to_image(arr_w, None), fixed, interp_type="linear"
+            )
+
+    dim = fixed.dimension if isinstance(fixed, ants.ANTsImage) else np.squeeze(np.asarray(fixed)).ndim
+    if dim not in (2, 3):
+        raise ValueError(f"render_warped_comparison_figure expects 2D or 3D images, got {dim}D.")
+
+    is_dark = theme.lower() == "dark"
+    bg_color = "#090d16" if is_dark else "#ffffff"
+    text_color = "#f8fafc" if is_dark else "#1e293b"
+    sub_color = "#94a3b8" if is_dark else "#475569"
+    fixed_label_color = "#38bdf8" if is_dark else "#0284c7"
+    moving_label_color = "#fb923c" if is_dark else "#d97706"
+    warped_label_color = "#3fb950" if is_dark else "#059669"
+    cbar_tick_color = "#c9d1d9" if is_dark else "#334155"
+
+    def _fixed_crop_slices(sl_arr: np.ndarray):
+        if not crop_background:
+            return (slice(None), slice(None))
+        smin, smax = float(np.min(sl_arr)), float(np.max(sl_arr))
+        fg = (sl_arr > -900.0) if (smin <= -500.0 and smax >= 100.0) else (sl_arr > 0)
+        if not np.any(fg):
+            return (slice(None), slice(None))
+        rows = np.where(np.any(fg, axis=1))[0]
+        cols = np.where(np.any(fg, axis=0))[0]
+        pad = 4
+        return (
+            slice(max(0, int(rows[0]) - pad), min(sl_arr.shape[0], int(rows[-1]) + pad + 1)),
+            slice(max(0, int(cols[0]) - pad), min(sl_arr.shape[1], int(cols[-1]) + pad + 1)),
+        )
+
+    def _intensity_bounds(arrays):
+        vmin = min(float(np.min(a)) for a in arrays)
+        vmax = max(float(np.max(a)) for a in arrays)
+        if vmax <= vmin:
+            vmax = vmin + 1.0
+        return vmin, vmax
+
+    ref_img = fixed if isinstance(fixed, ants.ANTsImage) else None
+
+    if dim == 2:
+        fi_sl_obj = AnatomicalVisualizer.extract_slice(fixed, plane="axial", reorient=reorient)
+        wa_sl_obj = AnatomicalVisualizer.extract_slice(warped, plane="axial", reorient=reorient, ref_image=ref_img)
+        crop = _fixed_crop_slices(fi_sl_obj.data)
+        fi_render = fi_sl_obj.data[crop]
+        wa_render = wa_sl_obj.data[crop]
+
+        n_cols = 3 if moving is not None else 2
+        fig, axes = plt.subplots(1, n_cols, figsize=(4.8 * n_cols, 5.0), dpi=dpi, facecolor=bg_color)
+        fig.subplots_adjust(wspace=0.18, left=0.06, right=0.92, top=0.86, bottom=0.05)
+        for ax in axes:
+            ax.set_facecolor(bg_color)
+            ax.axis("off")
+
+        vmin_f, vmax_f = _intensity_bounds([fi_render])
+        im0 = axes[0].imshow(fi_render, cmap="gray", aspect=fi_sl_obj.aspect_ratio, vmin=vmin_f, vmax=vmax_f)
+        axes[0].set_title("Fixed Target", fontsize=12, fontweight="bold", color=fixed_label_color, pad=8)
+        if show_colorbar:
+            cb0 = fig.colorbar(im0, ax=axes[0], fraction=0.046, pad=0.04)
+            cb0.ax.tick_params(colors=cbar_tick_color, labelsize=9)
+
+        warped_col = 1
+        if moving is not None:
+            mi_sl_obj = AnatomicalVisualizer.extract_slice(moving, plane="axial", reorient=reorient)
+            mi_crop = _fixed_crop_slices(mi_sl_obj.data)
+            mi_render = mi_sl_obj.data[mi_crop]
+            vmin_m, vmax_m = _intensity_bounds([mi_render])
+            im_m = axes[1].imshow(mi_render, cmap="gray", aspect=mi_sl_obj.aspect_ratio, vmin=vmin_m, vmax=vmax_m)
+            axes[1].set_title(
+                "Moving (Pre-Registration)", fontsize=12, fontweight="bold", color=moving_label_color, pad=8
+            )
+            if show_colorbar:
+                cb_m = fig.colorbar(im_m, ax=axes[1], fraction=0.046, pad=0.04)
+                cb_m.ax.tick_params(colors=cbar_tick_color, labelsize=9)
+            warped_col = 2
+
+        vmin_w, vmax_w = _intensity_bounds([wa_render])
+        im_w = axes[warped_col].imshow(
+            wa_render, cmap="gray", aspect=fi_sl_obj.aspect_ratio, vmin=vmin_w, vmax=vmax_w
+        )
+        axes[warped_col].set_title(
+            "Warped Moving-to-Fixed", fontsize=12, fontweight="bold", color=warped_label_color, pad=8
+        )
+        if show_colorbar:
+            cb_w = fig.colorbar(im_w, ax=axes[warped_col], fraction=0.046, pad=0.04)
+            cb_w.ax.tick_params(colors=cbar_tick_color, labelsize=9)
+
+        if title is None:
+            title = "Fixed Target vs. Warped Moving-to-Fixed Comparison"
+        fig.suptitle(title, fontsize=14, fontweight="bold", color=text_color, y=0.97)
+    else:
+        n_rows = 3 if moving is not None else 2
+        fig, axes = plt.subplots(
+            n_rows, 3, figsize=(14, 4.1 * n_rows + 0.4), dpi=dpi, facecolor=bg_color
+        )
+        fig.subplots_adjust(wspace=0.18, hspace=0.25, left=0.10, right=0.90, top=0.89, bottom=0.05)
+        for ax_row in axes:
+            for ax in ax_row:
+                ax.set_facecolor(bg_color)
+                ax.axis("off")
+
+        plane_specs = [("Axial", "Z", 2), ("Coronal", "Y", 1), ("Sagittal", "X", 0)]
+        fixed_panels = []
+        warped_panels = []
+        moving_panels = []
+
+        for plane_name, axis_letter, plane_axis in plane_specs:
+            req_idx = slice_indices[plane_axis] if slice_indices is not None else None
+            fi_sl_obj = AnatomicalVisualizer.extract_slice(
+                fixed, plane=plane_axis, slice_idx=req_idx, reorient=reorient
+            )
+            s_idx = fi_sl_obj.slice_idx
+            wa_sl_obj = AnatomicalVisualizer.extract_slice(
+                warped, plane=plane_axis, slice_idx=s_idx, reorient=reorient, ref_image=ref_img
+            )
+            crop = _fixed_crop_slices(fi_sl_obj.data)
+            lbl = f"{plane_name} ({axis_letter}={s_idx})"
+            fixed_panels.append((fi_sl_obj.data[crop], lbl, fi_sl_obj.aspect_ratio))
+            warped_panels.append((wa_sl_obj.data[crop], lbl, fi_sl_obj.aspect_ratio))
+
+            if moving is not None:
+                mov_same = (
+                    isinstance(fixed, ants.ANTsImage)
+                    and isinstance(moving, ants.ANTsImage)
+                    and _same_physical_grid(fixed, moving)
+                )
+                mov_req_idx = req_idx if mov_same else None
+                mi_sl_obj = AnatomicalVisualizer.extract_slice(
+                    moving, plane=plane_axis, slice_idx=mov_req_idx, reorient=reorient
+                )
+                m_crop = _fixed_crop_slices(mi_sl_obj.data)
+                m_lbl = f"{plane_name} ({axis_letter}={mi_sl_obj.slice_idx})"
+                moving_panels.append((mi_sl_obj.data[m_crop], m_lbl, mi_sl_obj.aspect_ratio))
+
+        vmin_f, vmax_f = _intensity_bounds([p[0] for p in fixed_panels])
+        im_fixed = None
+        for col_idx, (sl_arr, lbl, asp) in enumerate(fixed_panels):
+            im = axes[0, col_idx].imshow(sl_arr, cmap="gray", aspect=asp, vmin=vmin_f, vmax=vmax_f)
+            if col_idx == 0:
+                im_fixed = im
+            axes[0, col_idx].set_title(f"Fixed Target: {lbl}", fontsize=11, fontweight="bold", color=sub_color)
+        if show_colorbar and im_fixed is not None:
+            cb_f = fig.colorbar(im_fixed, ax=axes[0, :].ravel().tolist(), fraction=0.015, pad=0.03)
+            cb_f.ax.tick_params(colors=cbar_tick_color, labelsize=9)
+        axes[0, 0].text(
+            -0.22, 0.5, "FIXED\nTARGET", transform=axes[0, 0].transAxes,
+            fontsize=12, fontweight="bold", va="center", ha="center", color=fixed_label_color, rotation=90,
+        )
+
+        warped_row = 1
+        if moving is not None:
+            vmin_m, vmax_m = _intensity_bounds([p[0] for p in moving_panels])
+            im_moving = None
+            for col_idx, (sl_arr, lbl, asp) in enumerate(moving_panels):
+                im = axes[1, col_idx].imshow(sl_arr, cmap="gray", aspect=asp, vmin=vmin_m, vmax=vmax_m)
+                if col_idx == 0:
+                    im_moving = im
+                axes[1, col_idx].set_title(
+                    f"Moving (Pre-Reg): {lbl}", fontsize=11, fontweight="bold", color=sub_color
+                )
+            if show_colorbar and im_moving is not None:
+                cb_m = fig.colorbar(im_moving, ax=axes[1, :].ravel().tolist(), fraction=0.015, pad=0.03)
+                cb_m.ax.tick_params(colors=cbar_tick_color, labelsize=9)
+            axes[1, 0].text(
+                -0.22, 0.5, "MOVING\n(PRE-REG)", transform=axes[1, 0].transAxes,
+                fontsize=12, fontweight="bold", va="center", ha="center", color=moving_label_color, rotation=90,
+            )
+            warped_row = 2
+
+        vmin_w, vmax_w = _intensity_bounds([p[0] for p in warped_panels])
+        im_warped = None
+        for col_idx, (sl_arr, lbl, asp) in enumerate(warped_panels):
+            im = axes[warped_row, col_idx].imshow(sl_arr, cmap="gray", aspect=asp, vmin=vmin_w, vmax=vmax_w)
+            if col_idx == 0:
+                im_warped = im
+            axes[warped_row, col_idx].set_title(
+                f"Warped Moving-to-Fixed: {lbl}", fontsize=11, fontweight="bold", color=sub_color
+            )
+        if show_colorbar and im_warped is not None:
+            cb_w = fig.colorbar(im_warped, ax=axes[warped_row, :].ravel().tolist(), fraction=0.015, pad=0.03)
+            cb_w.ax.tick_params(colors=cbar_tick_color, labelsize=9)
+        axes[warped_row, 0].text(
+            -0.22, 0.5, "WARPED\n(ALIGNED)", transform=axes[warped_row, 0].transAxes,
+            fontsize=12, fontweight="bold", va="center", ha="center", color=warped_label_color, rotation=90,
+        )
+
+        if title is None:
+            title = "Fixed Target vs. Warped Moving-to-Fixed Comparison (Tri-Planar Views)"
+        fig.suptitle(title, fontsize=14, fontweight="bold", color=text_color, y=0.97)
+
+    if output_path is not None:
+        os.makedirs(os.path.dirname(os.path.abspath(output_path)) or ".", exist_ok=True)
+        fig.savefig(output_path, dpi=dpi, bbox_inches="tight", facecolor=bg_color)
+
+    if show_figure:
+        plt.show()
     return fig
 
 

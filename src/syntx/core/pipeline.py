@@ -91,15 +91,20 @@ def normalize_and_tensorize(fixed, moving, winsorize_quantiles=None, backend='py
         if arr_min >= -1e-4 and arr_max <= 1.0 + 1e-4 and arr_max >= 0.5:
             return np.clip(arr, 0.0, 1.0).astype(np.float32)
 
+        is_hu = bool(arr_min <= -500.0 and arr_max >= 100.0)
         has_negative = bool((arr < -1e-4).any())
-        if has_negative:
+        if is_hu:
+            fg = arr[arr > -900.0]
+        elif has_negative:
             fg = arr[np.abs(arr) > 1e-4]
         else:
             fg = arr[arr > 0]
-            
+
         if len(fg) > 0:
-            p02 = float(np.percentile(fg, 100.0 * q_lo))
+            p02 = -1000.0 if is_hu else float(np.percentile(fg, 100.0 * q_lo))
             p98 = float(np.percentile(fg, 100.0 * q_hi))
+            if is_hu:
+                p98 = max(p98, 300.0)
             if p98 <= p02 + 1e-4:
                 p02 = float(min(0.0, fg.min()))
                 p98 = float(fg.max())
