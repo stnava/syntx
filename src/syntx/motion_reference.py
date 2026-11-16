@@ -131,7 +131,7 @@ def _register_group_backward(img4d_g, mean_img, kw, backend, verbose, ref_intens
 
 def build_low_motion_reference(
     images: List[ants.ANTsImage],
-    n_low_motion: int = 10,
+    n_low_motion: Optional[int] = 10,
     coarse_resolution_cap_mm: Optional[float] = 8.0,
     fd_radius: float = 50.0,
     device: str = "auto",
@@ -178,6 +178,8 @@ def build_low_motion_reference(
 
     t0 = _time.time()
     crude_ref = _mean_image(images)
+    if n_low_motion is None or int(n_low_motion) <= 0:
+        return crude_ref
 
     if n <= n_low_motion:
         selected = images

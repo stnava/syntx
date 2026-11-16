@@ -573,3 +573,17 @@ def test_f2_blocked_level_chain_isolation():
     assert info[2]["root"] == 0
     assert info[1]["root"] == 1
     assert components == [[0, 2], [1]]
+
+
+def test_build_low_motion_reference_none_returns_exact_unweighted_mean():
+    """n_low_motion=None returns the unweighted voxelwise mean directly while keeping default n_low_motion=10."""
+    import inspect
+    from syntx.motion_reference import _mean_image, build_low_motion_reference
+
+    assert inspect.signature(build_low_motion_reference).parameters["n_low_motion"].default == 10
+    rng = np.random.default_rng(7)
+    imgs = [ants.from_numpy(rng.uniform(1.0, 10.0, size=(8, 9, 10)).astype(np.float32), spacing=(2.0, 2.0, 2.0)) for _ in range(4)]
+    expected = _mean_image(imgs).numpy()
+    actual = build_low_motion_reference(imgs, n_low_motion=None).numpy()
+    np.testing.assert_array_equal(actual, expected)
+

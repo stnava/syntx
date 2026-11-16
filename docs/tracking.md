@@ -1,12 +1,26 @@
 # Tracking Summary
-current phase: v6.38.1 (boundary-consistent & model-geometry-aware `liouville_determinant` with JAX parity, compact `16.73 MB` WebP MSD HTML report, 7-repo topological ANTsX ecosystem verification, and compute speed & `-49.8%` MPS memory optimization pass)
-next WP: per-run synthetic calibration of slice-set clock thresholds; fix opt-in `engine='projected'` motion regression
+current phase: v6.38.2 (remediated opt-in `engine='projected'` DWI motion regression and cleared strict `xfail` without changing any defaults; `antsxslowflow v2.17.2` synced)
+next WP: per-run synthetic calibration of slice-set clock thresholds
 blockers: none
-active work: none (`v6.38.1` released; verified across `2,561` `syntx` tests + 7-repo topological ANTsX downstream suite)
+active work: none (`v6.38.2` released; verified across `174` `--runslow` motion & guard tests + `738` `antsxslowflow` tests, `0` `xfail`s)
 device: Apple Silicon MPS / CPU (macOS arm64)
 last updated: 2026-11-16
 
 ---
+
+## R42 (Opt-In `engine='projected'` DWI Motion Regression Fix & Strict `xfail` Removal; v6.38.2, 2026-11-16)
+- **Root-Cause Diagnosis (`src/syntx/{motion_design,motion_reference}.py`, `tests/{test_motion_design,test_motion_reference}.py`)**:
+  - **2x2 Factorial & Commit Bisection (`de675df` $\rightarrow$ `59513a9` $\rightarrow$ `e066990`)**: Isolated the `engine='projected'` DWI regression (`FD error = 0.322–0.343 mm` vs. `joint = 0.102 mm`) to two mechanisms in `projected` mode on short multi-level DWI series (`4` `b0` + `16` `DW` frames):
+    1. In `H0` (`motion_correct_grouped`), `build_low_motion_reference(..., n_low_motion=10)` selected a 10-frame subset of the 16 diffusion directions and ran an un-demeaned `schedule_mode='fast'` (`num_bins=18`, no `pe_affine` or `bias_covariates`) pass, breaking both spherical gradient isotropy ($\frac{1}{10}\sum \mathbf{g}_t\mathbf{g}_t^T \neq \frac{1}{3} I$) and inter-level orientation alignment (`+0.29–0.51°` `DW`-vs-`b0` offset left permanently in the exact 6-DOF `P_D` intercept nullspace when `n_b0 = 4 < GAUGE_MIN_FRAMES = 8`).
+    2. In `H1` (`projected`), shells shorter than `METRIC_FRAMES_PER_COLUMN * 5 = 40` drop their 5 $\ell = 2$ spherical-harmonic columns from `D_metric` (`rank = 2` intercepts only), yet `kw1` omitted `bias_covariates`, allowing `H1` to re-introduce the direction-locked $\ell = 2$ pose bias that `H0` had removed.
+  - **Fix (Scoped Strictly to Opt-In `engine='projected'`; Zero Default Changes)**:
+    - Added `n_low_motion=None` fast-path to `build_low_motion_reference` (returning the unweighted `_mean_image(images)` while preserving default `n_low_motion=10`), set `kw0.setdefault("n_low_motion", None)` for `projected` `"shells"` in `H0`, stripped `"n_low_motion"` from `kw1`, and forwarded `bias_covariates` into `kw1` for any `projected` shell whose $\ell = 2$ block was dropped from `D_metric`.
+    - Kept `engine="joint"` default and all `joint` / `unified` / `dispatch` / `DWI_MOTION_PRESET` defaults 100% untouched; removed `@pytest.mark.xfail(strict=True)` from `test_projected_dwi_beats_joint_and_unified_on_the_phantom` without relaxing any threshold.
+  - **Measured Accuracy Across 4 DWI Phantoms (CPU, `surround_weight=0.0`)**:
+    - `seed=42, eddy=0.4` (`dwi_16_seed42_bundle`): `projected` **`0.322 -> 0.1168 mm`** vs. `joint = 0.1023 mm` (**`1.141x < 1.30x`**, `<= 0.22 mm`).
+    - `seed=42, eddy=0.0`: `projected` **`0.3431 -> 0.1079 mm`** vs. `joint = 0.1360 mm` (**`0.793x`**).
+    - `seed=7, eddy=0.4`: `projected = 0.1330 mm` vs. `joint = 0.1090 mm` (**`1.220x < 1.30x`**).
+    - `seed=0, eddy=0.4`: `projected = 0.0945 mm` vs. `joint = 0.1087 mm` (**`0.869x`**).
 
 ## R41 (Boundary-Consistent `liouville_determinant`, Compact WebP MSD Report, 7-Repo Topological ANTsX Verification & MPS Compute/Memory Optimization Pass; v6.38.1, 2026-11-16)
 - **Boundary-Consistent & Model-Geometry-Aware `liouville_determinant` (`src/syntx/liouville.py`, `src/syntx/core/digital_diffeomorphism.py`, `tests/test_liouville.py`)**:

@@ -596,19 +596,15 @@ def test_projected_design_matrix_intercepts_and_l2_blocks():
 
 
 @pytest.mark.slow
-@pytest.mark.xfail(
-    strict=True,
-    reason="Known regression in the opt-in engine='projected' (no caller in syntx or the antsx repos; default is 'joint'). "
-    "Bisected 2026-10-30: passes at de675df (v6.30.6); 59513a9 (L-BFGS mm preconditioning) -> projected FD 0.188 vs "
-    "joint 0.104; e066990 (v6.31.0) -> projected 0.322 vs joint 0.102. The 1.3x claim no longer holds; fix the engine, "
-    "do not relax the threshold.",
-)
 def test_projected_dwi_beats_joint_and_unified_on_the_phantom(dwi_16_seed42_bundle):
     """G1 of docs/MOTION_JOINT_V2_AND_CENSORING_PLAN.md: single-shell DWI phantom with a planted eddy shift, the design in the
     metric (``projected``) stays within 1.3x of the joint engine's head FD error (0.199 vs 0.160 vs unified 0.242 after the Newton
     unit fix; it was 0.176 vs 0.210 before), keeps the eddy
     term applied, and fixes no level gauge for the 4-frame b0 level (below GAUGE_MIN_FRAMES: its link is the measurement)."""
+    import inspect
     from syntx.motion_simulation import evaluate_motion_estimate
+
+    assert inspect.signature(motion_correct_design).parameters["engine"].default == "joint"
 
     sim, d, _ = dwi_16_seed42_bundle
     bv = sim.extra["bvals"]

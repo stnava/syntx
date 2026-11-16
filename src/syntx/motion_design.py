@@ -636,6 +636,11 @@ def _joint(image, design: Design, *, init: str = "levels", surround_weight: Opti
         kw0.pop("debias_pe_pseudomotion", None)
     if design.name == "shells":
         kw0 = {"preset": "dwi", **_DWI_DEFAULTS, **kw0}
+        if projected:
+            # In projected mode, inter-level offsets below GAUGE_MIN_FRAMES stay in the P_D nullspace at H0's pose;
+            # using the unweighted full-group mean preserves both spherical gradient isotropy and temporal mean-pose
+            # alignment across interleaved levels without un-demeaned fast-pass orientation drift.
+            kw0.setdefault("n_low_motion", None)
         if design.pe_affine_covariates is not None and design.pe_axis is not None:
             kw0.setdefault("pe_affine_covariates", design.pe_affine_covariates)
             kw0.setdefault("pe_axis", design.pe_axis)
@@ -690,7 +695,7 @@ def _joint(image, design: Design, *, init: str = "levels", surround_weight: Opti
     kw1 = dict(kwargs)
     kw1.update(backend=backend, **{k: v for k, v in knobs.items() if k != "schedule_mode"})
     if design.name == "shells":
-        kw1 = {k: v for k, v in kw1.items() if k not in ("registration_direction", "metric_smoothing_mm", "cross_num_bins")}
+        kw1 = {k: v for k, v in kw1.items() if k not in ("registration_direction", "metric_smoothing_mm", "cross_num_bins", "n_low_motion")}
     if kw1.get("outprefix") is not None:
         kw1["outprefix"] = f"{kw1['outprefix']}h1_"
     if enc is not None:
@@ -722,6 +727,19 @@ def _joint(image, design: Design, *, init: str = "levels", surround_weight: Opti
                 if shell is not None and layout[int(shell)]["n"] >= GAUGE_FRAMES_PER_COLUMN * n_block:
                     cols.append(i)
             kw1["design_gauge"] = D_metric[:, cols] if cols else None
+        if design.name == "shells" and design.bias_covariates is not None:
+            # Shells with fewer than METRIC_FRAMES_PER_COLUMN * 5 frames drop l=2 from D_metric (intercept-only in
+            # the metric); carry their l=2 columns into post-hoc surround-Tukey bias_covariates so H1 does not
+            # re-introduce the direction-locked pose bias that H0 removed.
+            l2_all = np.asarray(design.bias_covariates, dtype=np.float64)
+            l2_rem = np.zeros_like(l2_all)
+            for k in ks[1:]:
+                m = levels == k
+                live = int(np.sum(np.ptp(l2_all[m], axis=0) > 0)) if np.any(m) else 0
+                if live > 0 and layout[k]["n"] < METRIC_FRAMES_PER_COLUMN * live:
+                    l2_rem[m] = l2_all[m]
+            if np.any(l2_rem != 0):
+                kw1.setdefault("bias_covariates", l2_rem)
         kw1.setdefault("surround_scale", "curvature")    # prior weights relative to the measured image curvature (metric-independent)
     if pe_cov is not None:
         kw1.update(pe_affine_covariates=pe_cov, pe_axis=design.pe_axis, pe_b0_split=True)
