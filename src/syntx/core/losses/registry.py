@@ -82,6 +82,9 @@ def parse_similarity_metric(
         for k, v in kwargs.items():
             if k in current_dict and v is not None:
                 current_dict[k] = v
+        mc = current_dict["metric_chunks"]
+        if isinstance(mc, bool) or not isinstance(mc, int) or mc < 1:
+            raise ValueError(f"metric_chunks must be a positive integer, got {mc!r}")
         return SimilarityLossConfig(**current_dict)
 
     if not isinstance(metric_spec, str):
@@ -116,9 +119,12 @@ def parse_similarity_metric(
     auto_mask = kwargs.get("auto_mask", None)
     feature_layers = kwargs.get("feature_layers", None)
     num_bins = kwargs.get("num_bins", kwargs.get("mattes_bins", 32))
-    metric_chunks = int(kwargs.get("metric_chunks", 1) or 1)
-    if metric_chunks < 1:
-        raise ValueError(f"metric_chunks must be >= 1, got {metric_chunks}")
+    raw_chunks = kwargs.get("metric_chunks", 1)
+    if raw_chunks is None:
+        raw_chunks = 1
+    if isinstance(raw_chunks, bool) or not isinstance(raw_chunks, int) or raw_chunks < 1:
+        raise ValueError(f"metric_chunks must be a positive integer, got {raw_chunks!r}")
+    metric_chunks = raw_chunks
     single_pass = bool(kwargs.get("single_pass", kwargs.get("lncc_single_pass", False)))
 
     canonical_metric = m_lower

@@ -273,6 +273,9 @@ _ENTRY_POINTS = [
     ("syntx", "tvf_registration"), ("syntx", "syngs"), ("syntx", "syngs_registration"),
     ("syntx", "greedy"), ("syntx", "greedy_registration"), ("syntx", "robust_affine"),
     ("syntx", "auto_reg"), ("ants", "registration"),
+    ("syntx.benchmark.external", "run_voxelmorph_pretrained"),
+    ("syntx.benchmark.external", "run_voxelmorph_multiscale"),
+    ("syntx.benchmark.external", "run_fireants_greedy"),
 ]
 # (module, class) whose fit() receives the fully resolved parameters.
 _MODELS = [
@@ -314,6 +317,20 @@ def _wrap_entry(qualname: str, fn):
         stack.append(rec)
         try:
             out = fn(*args, **kwargs)
+            if (
+                qualname.startswith("syntx.benchmark.external.")
+                and isinstance(out, dict)
+                and isinstance(out.get("provenance"), dict)
+                and not rec["resolved"]
+            ):
+                rec["resolved"].append(
+                    {
+                        "model": qualname,
+                        "fit_args": {},
+                        "fit_kwargs": {k: jsonable(v) for k, v in kwargs.items()},
+                        "model_attributes": jsonable(out["provenance"]),
+                    }
+                )
             rec["status"] = "success"
             return out
         except BaseException as e:

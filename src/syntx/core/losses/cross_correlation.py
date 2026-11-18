@@ -359,6 +359,13 @@ class ANTsPseudoLNCC(torch.autograd.Function):
         return g_I, g_J, None, None
 
 
+def _longest_slab_axis(shape: tuple[int, ...]) -> int:
+    """Return the tensor axis ``>= 2`` with the largest spatial extent."""
+    dim = len(shape) - 2
+    best_d = max(range(dim), key=lambda d: int(shape[2 + d]))
+    return 2 + best_d
+
+
 def _slab_bounds(depth: int, n_chunks: int, radius: int) -> list[tuple[int, int, int, int, int, int]]:
     """Partition ``[0, depth)`` into ``n_chunks`` core slabs ``[z0, z1)`` padded by a ``2 * radius``
     halo ``[s0, s1)`` with local core slice ``[c0, c1)``."""
@@ -384,22 +391,29 @@ def _lncc_chunked_no_grad(
     floor_val: float,
     n_chunks: int,
     work_dtype: torch.dtype,
+    slab_axis: int = 2,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Memory-bounded no-grad evaluation of LNCC numerator and denominator across depth slabs."""
-    slabs = _slab_bounds(I.shape[2], n_chunks, window_size // 2)
+    """Memory-bounded no-grad evaluation of LNCC numerator and denominator across longest-axis slabs."""
+    slabs = _slab_bounds(int(I.shape[slab_axis]), n_chunks, window_size // 2)
     total_num = torch.zeros((), device=I.device, dtype=work_dtype)
     total_active = torch.zeros((), device=I.device, dtype=work_dtype) if mask is not None else None
+    need_contig = slab_axis > 2
 
     for z0, z1, s0, s1, c0, c1 in slabs:
-        I_s = I[:, :, s0:s1].to(work_dtype)
-        J_s = J[:, :, s0:s1].to(work_dtype)
+        s_len = s1 - s0
+        c_len = c1 - c0
+        I_s = I.narrow(slab_axis, s0, s_len).to(work_dtype)
+        J_s = J.narrow(slab_axis, s0, s_len).to(work_dtype)
+        if need_contig:
+            I_s = I_s.contiguous()
+            J_s = J_s.contiguous()
         F_c, M_c, I_var_f, J_var_f, IJ_cov_f = _centered_moments_nd(
             I_s, J_s, window_size, differentiable=False
         )
         del I_s, J_s, F_c, M_c
-        I_var_c = I_var_f[:, :, c0:c1]
-        J_var_c = J_var_f[:, :, c0:c1]
-        IJ_cov_c = IJ_cov_f[:, :, c0:c1]
+        I_var_c = I_var_f.narrow(slab_axis, c0, c_len)
+        J_var_c = J_var_f.narrow(slab_axis, c0, c_len)
+        IJ_cov_c = IJ_cov_f.narrow(slab_axis, c0, c_len)
         del I_var_f, J_var_f, IJ_cov_f
 
         safe_I = torch.clamp(I_var_c, min=floor_val)
@@ -411,7 +425,7 @@ def _lncc_chunked_no_grad(
         del IJ_cov_c, safe_I, safe_J
 
         if mask is not None:
-            m_c = (mask[:, :, z0:z1] if mask.shape[2] > 1 else mask).to(work_dtype)
+            m_c = (mask.narrow(slab_axis, z0, z1 - z0) if mask.shape[slab_axis] > 1 else mask).to(work_dtype)
             active_c = ((I_var_c > floor_val) & (J_var_c > floor_val) & (m_c > 0.5)).to(work_dtype)
             total_num = total_num - torch.sum(cc_c * active_c)
             total_active = total_active + torch.sum(active_c)
@@ -428,7 +442,7 @@ def _lncc_chunked_no_grad(
 
 
 class _ChunkedLocalNCC(torch.autograd.Function):
-    """Exact slab-halo-chunked LNCC / CC^2 (autograd or ANTs pseudo-gradient) along spatial axis 0.
+    """Exact slab-halo-chunked LNCC / CC^2 (autograd or ANTs pseudo-gradient) along the longest spatial axis.
 
     Each core slab ``[z0, z1)`` is evaluated with a ``2 * (window_size // 2)`` halo ``[s0, s1)``
     so both nested ``box_mean_nd`` passes and their backward passes see exact interior window
@@ -446,6 +460,7 @@ class _ChunkedLocalNCC(torch.autograd.Function):
         floor_val: float,
         n_chunks: int,
         use_pseudo: bool,
+        slab_axis: int = 2,
     ) -> torch.Tensor:
         needs_upcast = I.dtype in (torch.float16, torch.bfloat16)
         work_dtype = torch.float32 if needs_upcast else I.dtype
@@ -456,7 +471,7 @@ class _ChunkedLocalNCC(torch.autograd.Function):
 
         with torch.no_grad(), torch.amp.autocast(device_type=dev_type, enabled=False):
             total_num, total_den = _lncc_chunked_no_grad(
-                I, J, mask, window_size, squared, floor_val, n_chunks, work_dtype
+                I, J, mask, window_size, squared, floor_val, n_chunks, work_dtype, slab_axis=slab_axis
             )
             loss = total_num / total_den
 
@@ -474,6 +489,7 @@ class _ChunkedLocalNCC(torch.autograd.Function):
         ctx.work_dtype = work_dtype
         ctx.orig_dtype = I.dtype
         ctx.dev_type = dev_type
+        ctx.slab_axis = int(slab_axis)
         return loss if needs_upcast else loss.to(I.dtype)
 
     @staticmethod
@@ -481,7 +497,7 @@ class _ChunkedLocalNCC(torch.autograd.Function):
         need_I = ctx.needs_input_grad[0]
         need_J = ctx.needs_input_grad[1]
         if not need_I and not need_J:
-            return None, None, None, None, None, None, None, None
+            return None, None, None, None, None, None, None, None, None
 
         if ctx.has_mask:
             I, J, mask, total_den = ctx.saved_tensors
@@ -493,7 +509,9 @@ class _ChunkedLocalNCC(torch.autograd.Function):
         window_size = ctx.window_size
         squared = ctx.squared
         floor_val = ctx.floor_val
-        slabs = _slab_bounds(I.shape[2], ctx.n_chunks, window_size // 2)
+        slab_axis = ctx.slab_axis
+        need_contig = slab_axis > 2
+        slabs = _slab_bounds(int(I.shape[slab_axis]), ctx.n_chunks, window_size // 2)
 
         grad_I = torch.zeros(I.shape, device=I.device, dtype=work_dtype) if need_I else None
         grad_J = torch.zeros(J.shape, device=J.device, dtype=work_dtype) if need_J else None
@@ -501,19 +519,25 @@ class _ChunkedLocalNCC(torch.autograd.Function):
         if ctx.use_pseudo:
             with torch.no_grad(), torch.amp.autocast(device_type=ctx.dev_type, enabled=False):
                 for z0, z1, s0, s1, c0, c1 in slabs:
-                    I_s = I[:, :, s0:s1].to(work_dtype)
-                    J_s = J[:, :, s0:s1].to(work_dtype)
+                    s_len = s1 - s0
+                    c_len = c1 - c0
+                    z_len = z1 - z0
+                    I_s = I.narrow(slab_axis, s0, s_len).to(work_dtype)
+                    J_s = J.narrow(slab_axis, s0, s_len).to(work_dtype)
+                    if need_contig:
+                        I_s = I_s.contiguous()
+                        J_s = J_s.contiguous()
                     F_full, M_full, I_var_f, J_var_f, IJ_cov_f = _centered_moments_nd(
                         I_s, J_s, window_size, differentiable=False
                     )
                     del I_s, J_s
-                    I_var_c = I_var_f[:, :, c0:c1]
-                    J_var_c = J_var_f[:, :, c0:c1]
-                    IJ_cov_c = IJ_cov_f[:, :, c0:c1]
+                    I_var_c = I_var_f.narrow(slab_axis, c0, c_len)
+                    J_var_c = J_var_f.narrow(slab_axis, c0, c_len)
+                    IJ_cov_c = IJ_cov_f.narrow(slab_axis, c0, c_len)
                     del I_var_f, J_var_f, IJ_cov_f
-                    n_win_c = _window_counts(F_full, window_size)[:, :, c0:c1]
-                    F_c = F_full[:, :, c0:c1]
-                    M_c = M_full[:, :, c0:c1]
+                    n_win_c = _window_counts(F_full, window_size).narrow(slab_axis, c0, c_len)
+                    F_c = F_full.narrow(slab_axis, c0, c_len)
+                    M_c = M_full.narrow(slab_axis, c0, c_len)
                     del F_full, M_full
 
                     safe_I = torch.clamp(I_var_c, min=floor_val)
@@ -530,30 +554,38 @@ class _ChunkedLocalNCC(torch.autograd.Function):
                         gI_c = scale * (M_c - cc_c * F_c)
 
                     if mask is not None:
-                        m_c = (mask[:, :, z0:z1] if mask.shape[2] > 1 else mask).to(work_dtype)
+                        m_c = (mask.narrow(slab_axis, z0, z_len) if mask.shape[slab_axis] > 1 else mask).to(work_dtype)
                         active_c = ((I_var_c > floor_val) & (J_var_c > floor_val) & (m_c > 0.5)).to(work_dtype)
                         gI_c = gI_c * active_c
                         gJ_c = gJ_c * active_c
 
                     if grad_I is not None:
-                        grad_I[:, :, z0:z1].copy_(gI_c)
+                        grad_I.narrow(slab_axis, z0, z_len).copy_(gI_c)
                     if grad_J is not None:
-                        grad_J[:, :, z0:z1].copy_(gJ_c)
+                        grad_J.narrow(slab_axis, z0, z_len).copy_(gJ_c)
 
             pseudo_den = total_den if mask is not None else (float(I.numel()) / float(I.shape[0]))
             scale_out = grad_output.to(work_dtype) / pseudo_den
         else:
             with torch.enable_grad(), torch.amp.autocast(device_type=ctx.dev_type, enabled=False):
                 for z0, z1, s0, s1, c0, c1 in slabs:
-                    I_s = I[:, :, s0:s1].detach().to(work_dtype).requires_grad_(need_I)
-                    J_s = J[:, :, s0:s1].detach().to(work_dtype).requires_grad_(need_J)
+                    s_len = s1 - s0
+                    c_len = c1 - c0
+                    z_len = z1 - z0
+                    I_s_raw = I.narrow(slab_axis, s0, s_len).detach().to(work_dtype)
+                    J_s_raw = J.narrow(slab_axis, s0, s_len).detach().to(work_dtype)
+                    if need_contig:
+                        I_s_raw = I_s_raw.contiguous()
+                        J_s_raw = J_s_raw.contiguous()
+                    I_s = I_s_raw.requires_grad_(need_I)
+                    J_s = J_s_raw.requires_grad_(need_J)
 
                     F_s, M_s, I_var_f, J_var_f, IJ_cov_f = _centered_moments_nd(
                         I_s, J_s, window_size, differentiable=True
                     )
-                    I_var_c = I_var_f[:, :, c0:c1]
-                    J_var_c = J_var_f[:, :, c0:c1]
-                    IJ_cov_c = IJ_cov_f[:, :, c0:c1]
+                    I_var_c = I_var_f.narrow(slab_axis, c0, c_len)
+                    J_var_c = J_var_f.narrow(slab_axis, c0, c_len)
+                    IJ_cov_c = IJ_cov_f.narrow(slab_axis, c0, c_len)
                     del I_var_f, J_var_f, IJ_cov_f
 
                     safe_I = torch.clamp(I_var_c, min=floor_val)
@@ -564,7 +596,7 @@ class _ChunkedLocalNCC(torch.autograd.Function):
                         cc_c = torch.clamp(IJ_cov_c / (torch.sqrt(safe_I * safe_J) + 1e-6), min=-1.0, max=1.0)
 
                     if mask is not None:
-                        m_c = (mask[:, :, z0:z1] if mask.shape[2] > 1 else mask).detach().to(work_dtype)
+                        m_c = (mask.narrow(slab_axis, z0, z_len) if mask.shape[slab_axis] > 1 else mask).detach().to(work_dtype)
                         active_c = (
                             (I_var_c.detach() > floor_val) & (J_var_c.detach() > floor_val) & (m_c > 0.5)
                         ).to(work_dtype)
@@ -582,11 +614,11 @@ class _ChunkedLocalNCC(torch.autograd.Function):
                         g_idx = 0
                         if need_I:
                             if grads[g_idx] is not None:
-                                grad_I[:, :, s0:s1].add_(grads[g_idx])
+                                grad_I.narrow(slab_axis, s0, s_len).add_(grads[g_idx])
                             g_idx += 1
                         if need_J:
                             if grads[g_idx] is not None:
-                                grad_J[:, :, s0:s1].add_(grads[g_idx])
+                                grad_J.narrow(slab_axis, s0, s_len).add_(grads[g_idx])
 
                     del I_s, J_s, F_s, M_s, I_var_c, J_var_c, IJ_cov_c, safe_I, safe_J, cc_c, slab_num
 
@@ -596,7 +628,7 @@ class _ChunkedLocalNCC(torch.autograd.Function):
             grad_I = (grad_I * scale_out).to(ctx.orig_dtype)
         if grad_J is not None:
             grad_J = (grad_J * scale_out).to(ctx.orig_dtype)
-        return grad_I, grad_J, None, None, None, None, None, None
+        return grad_I, grad_J, None, None, None, None, None, None, None
 
 
 def local_ncc_loss_nd(
@@ -649,8 +681,8 @@ def local_ncc_loss_nd(
         raise ValueError(f"Only 2D and 3D images are supported, got {dim}D.")
     if window_size < 1 or window_size % 2 == 0:
         raise ValueError(f"local_ncc_loss_nd: window_size must be a positive odd integer, got {window_size}")
-    if int(metric_chunks) < 1:
-        raise ValueError(f"local_ncc_loss_nd: metric_chunks must be >= 1, got {metric_chunks}")
+    if isinstance(metric_chunks, bool) or not isinstance(metric_chunks, int) or metric_chunks < 1:
+        raise ValueError(f"local_ncc_loss_nd: metric_chunks must be a positive integer, got {metric_chunks!r}")
 
     use_pseudo = use_ants_pseudo_gradient or use_analytical_gradients
 
@@ -661,7 +693,8 @@ def local_ncc_loss_nd(
         if window_size % 2 == 0:
             window_size = max(1, window_size - 1)
 
-    n_chunks = min(int(metric_chunks), I.shape[2])
+    slab_axis = _longest_slab_axis(tuple(I.shape))
+    n_chunks = min(int(metric_chunks), int(I.shape[slab_axis]))
     if n_chunks > 1:
         floor_c = 1e-6 if use_pseudo else max(float(var_floor), 1e-6)
         if not torch.is_grad_enabled() or (not I.requires_grad and not J.requires_grad):
@@ -671,11 +704,11 @@ def local_ncc_loss_nd(
             mask_exp = mask.expand_as(I[:, :1]) if (mask is not None and mask.dim() < I.dim()) else mask
             with torch.no_grad(), torch.amp.autocast(device_type=dev_type, enabled=False):
                 total_num, total_den = _lncc_chunked_no_grad(
-                    I, J, mask_exp, window_size, squared, floor_c, n_chunks, work_dtype
+                    I, J, mask_exp, window_size, squared, floor_c, n_chunks, work_dtype, slab_axis=slab_axis
                 )
                 loss = total_num / total_den
             return loss if needs_upcast else loss.to(I.dtype)
-        return _ChunkedLocalNCC.apply(I, J, mask, window_size, squared, floor_c, n_chunks, use_pseudo)
+        return _ChunkedLocalNCC.apply(I, J, mask, window_size, squared, floor_c, n_chunks, use_pseudo, slab_axis)
 
     if use_pseudo and squared:
         return ANTsPseudoLNCC.apply(I, J, mask, window_size)

@@ -25,7 +25,7 @@ ALLOWED_DATA_EXCEPTIONS: dict[str, str] = {
 }
 
 ALLOWED_REGISTRATION_EXCEPTIONS: dict[str, str] = {
-    "benchmark/evaluate.py:589": (
+    "benchmark/evaluate.py:583": (
         "Affine benchmark baseline runner measuring external ANTs C++ affine against syntx"
     ),
     "benchmark/high_level.py:373": (
@@ -43,7 +43,7 @@ ALLOWED_REGISTRATION_EXCEPTIONS: dict[str, str] = {
     "robust_affine.py:3154": (
         "mode='ants_fast' explicit C++ affine backend inside syntx (the registration engine itself)"
     ),
-    "robust_affine.py:3246": (
+    "robust_affine.py:3260": (
         "mode='ants_fast' explicit C++ affine backend inside syntx (the registration engine itself)"
     ),
     "template.py:394": (

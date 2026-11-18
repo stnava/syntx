@@ -199,6 +199,38 @@ def fast_separable_gaussian_filter(
     return torch.movedim(v_filtered, 1, -1).contiguous()
 
 
+def _shifted_slice_blur_1d_inplace(
+    x: torch.Tensor,
+    sa: int,
+    weights: Sequence[float],
+    eff_mode: str,
+) -> torch.Tensor:
+    """1-D symmetric shifted-slice Gaussian filter along axis ``sa`` using in-place ``.add_``.
+
+    Callers must ensure ``not (torch.is_grad_enabled() and x.requires_grad)`` and
+    ``eff_mode in ('replicate', 'constant')``. Allocates zero padded buffers and avoids 5-D
+    ``F.pad`` and ``im2col`` workspaces.
+    """
+    pad = len(weights) // 2
+    length = x.shape[sa]
+    replicate = (eff_mode == 'replicate')
+    acc = x * float(weights[pad])
+    first = x.narrow(sa, 0, 1) if replicate else None
+    last = x.narrow(sa, length - 1, 1) if replicate else None
+    for d in range(1, pad + 1):
+        w = float(weights[pad + d])
+        if d < length:
+            acc.narrow(sa, d, length - d).add_(x.narrow(sa, 0, length - d), alpha=w)
+            acc.narrow(sa, 0, length - d).add_(x.narrow(sa, d, length - d), alpha=w)
+            if replicate:
+                acc.narrow(sa, 0, d).add_(first, alpha=w)
+                acc.narrow(sa, length - d, d).add_(last, alpha=w)
+        elif replicate:
+            acc.add_(first, alpha=w)
+            acc.add_(last, alpha=w)
+    return acc
+
+
 def separable_gaussian_filter(
     grid: torch.Tensor,
     sigma,
@@ -206,13 +238,14 @@ def separable_gaussian_filter(
     sigma_mode='voxel',
     mode: str = 'replicate',
     kernel_type: str = 'bessel',
+    channels_last: bool = True,
 ) -> torch.Tensor:
     """
-    Separable Gaussian smoothing of a channel-last field along each spatial axis.
+    Separable Gaussian smoothing of a field along each spatial axis.
 
     Parameters
     ----------
-    grid : Tensor (B, *spatial, C)
+    grid : Tensor (B, *spatial, C) when ``channels_last=True``, or (B, C, *spatial) when False
         Any C (vector components or image channels); spatial axes in tensor order (z, y, x).
     sigma : float or sequence
         Standard deviation in voxels. A sequence gives one value per spatial axis (tensor
@@ -223,51 +256,73 @@ def separable_gaussian_filter(
         combinations raise ValueError.)
     sigma_mode : {'voxel', 'physical'}, default 'voxel'
     mode : str, default 'replicate'
-        ``F.pad`` mode: 'replicate', 'constant' (zeros) or 'reflect'.
+        ``F.pad`` mode: 'replicate', 'constant' / 'zeros', or 'reflect'.
         Ignored for the compact kernel (always zero padding).
     kernel_type : str, default 'bessel'
         'bessel': ITK-style discrete Gaussian (``get_cached_gaussian_kernel_1d``).
         'compact' / 'compact_gaussian' / 'erf': ``fast_separable_gaussian_filter``.
         'gaussian' and 'sobolev' are accepted aliases of 'bessel'; other values raise ValueError.
+    channels_last : bool, default True
+        Whether the channel axis is last ``(B, *spatial, C)`` or second ``(B, C, *spatial)``.
 
     Returns
     -------
     Tensor of the input shape (contiguous); ``grid`` itself if every sigma <= 0. Axes with
-    sigma <= 0 are not filtered. 3-D input off MPS uses depthwise ``conv3d``; MPS and 2-D use
-    reshaped ``conv1d`` (same result).
+    sigma <= 0 are not filtered.
     """
     if kernel_type in ('compact', 'compact_gaussian', 'erf'):
-        return fast_separable_gaussian_filter(grid, sigma, spacing=spacing, sigma_mode=sigma_mode)
+        if channels_last:
+            return fast_separable_gaussian_filter(grid, sigma, spacing=spacing, sigma_mode=sigma_mode)
+        v_cl = torch.movedim(grid, 1, -1)
+        out_cl = fast_separable_gaussian_filter(v_cl, sigma, spacing=spacing, sigma_mode=sigma_mode)
+        return torch.movedim(out_cl, -1, 1).contiguous()
     if kernel_type not in ('bessel', 'gaussian', 'sobolev'):
         raise ValueError(f"unknown kernel_type {kernel_type!r}: use 'bessel' (aliases 'gaussian', "
                          "'sobolev') or 'compact' / 'compact_gaussian' / 'erf'")
     device = grid.device
     dtype = grid.dtype
     shape = grid.shape
-    spatial_shape = shape[1:-1]
+    spatial_shape = shape[1:-1] if channels_last else shape[2:]
     num_spatial = len(spatial_shape)
-    
+
     sigma_list = _resolve_sigmas(sigma, spacing, sigma_mode, num_spatial)
-        
+
     if all(s <= 0.0 for s in sigma_list):
         return grid
-        
-    v = torch.movedim(grid, -1, 1)
-    
-    pad_kwargs = {'mode': mode}
-    if mode == 'constant':
+
+    eff_mode = 'constant' if mode == 'zeros' else mode
+    need_grad = bool(torch.is_grad_enabled() and grid.requires_grad)
+    _is_mps = hasattr(device, 'type') and device.type == 'mps'
+
+    w_dtype = torch.float64 if dtype == torch.float64 else torch.float32
+
+    # Fast CPU 3-D path (when autograd is not active and mode is replicate/constant):
+    # operate directly on the input layout via symmetric shifted-slice .add_ without movedim/conv3d.
+    if num_spatial == 3 and not _is_mps and not need_grad and eff_mode in ('replicate', 'constant'):
+        out = grid
+        sa_offset = 1 if channels_last else 2
+        for i, sig in enumerate(sigma_list):
+            if sig <= 0.0:
+                continue
+            weights = get_cached_gaussian_kernel_1d(sig, 'cpu', w_dtype).view(-1).tolist()
+            out = _shifted_slice_blur_1d_inplace(out, i + sa_offset, weights, eff_mode)
+        return out if out.is_contiguous() else out.contiguous()
+
+    v = torch.movedim(grid, -1, 1) if channels_last else grid
+
+    pad_kwargs = {'mode': eff_mode}
+    if eff_mode == 'constant':
         pad_kwargs['value'] = 0.0
 
-    _is_mps = hasattr(device, 'type') and device.type == 'mps'
     if num_spatial == 3 and not _is_mps:
-        # Fast path: F.conv3d with degenerate 1D kernels (broken on MPS for large volumes)
+        # Autograd-safe / reflect-mode 3-D path off MPS: F.conv3d with degenerate 1D kernels
         C = v.shape[1]
         for i, sig in enumerate(sigma_list):
             if sig <= 0.0:
                 continue
             kernel_1d = get_cached_gaussian_kernel_1d(sig, device, dtype).squeeze(0)
             pad = kernel_1d.shape[-1] // 2
-            
+
             if i == 0:
                 kz = kernel_1d.view(1, 1, -1, 1, 1).repeat(C, 1, 1, 1, 1)
                 v = F.conv3d(F.pad(v, (0, 0, 0, 0, pad, pad), **pad_kwargs), kz, groups=C)
@@ -277,8 +332,8 @@ def separable_gaussian_filter(
             elif i == 2:
                 kx = kernel_1d.view(1, 1, 1, 1, -1).repeat(C, 1, 1, 1, 1)
                 v = F.conv3d(F.pad(v, (pad, pad, 0, 0, 0, 0), **pad_kwargs), kx, groups=C)
-        return torch.movedim(v, 1, -1).contiguous()
-        
+        return (torch.movedim(v, 1, -1) if channels_last else v).contiguous()
+
     for i in range(num_spatial):
         sig = sigma_list[i]
         if sig <= 0.0:
@@ -287,8 +342,14 @@ def separable_gaussian_filter(
         kernel = get_cached_gaussian_kernel_1d(sig, device, dtype)
         kernel_size = kernel.shape[-1]
         pad_size = kernel_size // 2
-
         target_dim = i + 2
+
+        # MPS large-kernel path (kernel_size >= 33): avoid multi-GB Metal conv1d im2col workspace
+        if _is_mps and kernel_size >= 33 and not need_grad and eff_mode in ('replicate', 'constant'):
+            weights = get_cached_gaussian_kernel_1d(sig, 'cpu', w_dtype).view(-1).tolist()
+            v = _shifted_slice_blur_1d_inplace(v, target_dim, weights, eff_mode)
+            continue
+
         if target_dim == v.ndim - 1:
             v_contig = v if v.is_contiguous() else v.contiguous()
             last_dim_size = v_contig.shape[-1]
@@ -313,7 +374,7 @@ def separable_gaussian_filter(
             v = v_conv_reshaped.permute(*dims).contiguous()
             del v_conv_reshaped
 
-    return torch.movedim(v, 1, -1).contiguous()
+    return (torch.movedim(v, 1, -1) if channels_last else v).contiguous()
 
 _SOBOLEV_FILTER_CACHE = {}
 

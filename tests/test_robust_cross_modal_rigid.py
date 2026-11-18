@@ -53,6 +53,15 @@ def test_robust_cross_modal_rigid_recovers_known_offset():
     corr = np.corrcoef(warped_arr.ravel(), fixed_arr.ravel())[0, 1]
     assert corr > 0.8, f"expected strong correlation after registration, got {corr:.3f}"
 
+    # Verify Stage 2 seed scoping is deterministic across distinct seeds on small ROIs
+    for s in (9, 12, 45):
+        res_s = robust_cross_modal_rigid(
+            fixed=fixed, moving=moving, moving_mask=mask, seed=s, device="cpu",
+            aff_sampling=32, aff_random_sampling_rate=0.2, aff_iterations=(50, 20), verbose=False,
+        )
+        corr_s = np.corrcoef(res_s["warpedmovout"].numpy().ravel(), fixed_arr.ravel())[0, 1]
+        assert corr_s > 0.95, f"seed={s} under-converged on 16^3 sphere: corr={corr_s:.4f}"
+
 
 @pytest.mark.slow
 def test_robust_cross_modal_rigid_without_mask_falls_back_to_otsu():

@@ -865,22 +865,25 @@ class GeodesicShootingModel(nn.Module):
                     _prealigned_moving=curr_moving_aff,
                     _level_ctx=level_ctx,
                 )
-                if total_loss < best_level_loss_t:
-                    best_level_loss_t = total_loss.detach()
+                total_loss.backward()
+                loss_t = total_loss.detach()
+                del total_loss
+                if loss_t < best_level_loss_t:
+                    best_level_loss_t = loss_t
                     best_v0_fwd = self.velocity_0_fwd.detach().clone()
                     if self.velocity_0_inv is not None:
                         best_v0_inv = self.velocity_0_inv.detach().clone()
 
-                total_loss.backward()
                 optimizer.step()
                 if (ep + 1) % 5 == 0 or ep == epochs - 1:   # one device sync per 5 epochs + level end
-                    ep_loss = float(total_loss.detach().item())
+                    ep_loss = float(loss_t.item())
                     check_loss_collapse(
                         ep_loss, float(best_level_loss_t.item()), f"syntx.syngs level {level}"
                     )
                     if stop.update(ep, ep_loss):
                         break
-            stop.end_level(ep + 1)
+            if epochs > 0:
+                stop.end_level(ep + 1)
 
             best_level_loss = float(best_level_loss_t.item())
 

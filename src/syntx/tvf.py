@@ -1597,6 +1597,8 @@ class TVFModel(nn.Module):
                     kinetic = self._path_energy(energy_weight, temporal_weight, energy_alpha, vel_spacing, device, dtype)
                     total_loss = sim_loss + kinetic
                     total_loss.backward()
+                    loss_t = total_loss.detach()
+                    del total_loss, sim_loss, kinetic
                     
                     # Step 3: Compute analytical velocity gradient via chain rule
                     with torch.no_grad():
@@ -1624,6 +1626,8 @@ class TVFModel(nn.Module):
                         # Distribute gradient across all time steps
                         for t in range(self.n_time_steps):
                             self.velocity.grad[t, 0] = combined_grad[0]
+                    del I_mid_det, J_mid_det, I_mid, J_mid, grad_I_mid, grad_J_mid, g_im, g_jm
+                    del grad_wrt_phi_fixed, grad_wrt_phi_moving, combined_grad
                 else:
                     # === Standard autograd mode with AMP Mixed Precision ===
                     with torch.amp.autocast(device_type=dev_type, dtype=amp_dtype, enabled=use_amp):
@@ -1641,9 +1645,10 @@ class TVFModel(nn.Module):
                     kinetic = self._path_energy(energy_weight, temporal_weight, energy_alpha, vel_spacing, device, dtype)
                     total_loss = sim_loss.to(dtype) + kinetic
                     total_loss.backward()
+                    loss_t = total_loss.detach()
+                    del total_loss, sim_loss, kinetic
 
                 # Record epoch loss in self.losses history and checkpoint best velocity BEFORE parameter updates
-                loss_t = total_loss.detach()
                 self.losses.append(loss_t)
                 if loss_t < best_level_loss_t:
                     best_level_loss_t = loss_t

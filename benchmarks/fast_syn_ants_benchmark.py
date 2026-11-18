@@ -140,9 +140,22 @@ ARM_LABELS: Dict[str, str] = {
     "syngs_best": "syntx.syngs (sobolev α=0.448 — canonical)",
     "syngs_beltrami": "syntx.syngs (beltrami α=0.27, dil=0.075, step=0.825 — tuned)",
     "tvf_best": "syntx.tvf (beltrami α=2.5 — canonical)",
+    "syntx_greedy": "syntx.greedy (unidirectional, return_inverse=False)",
+    "fireants_greedy": "FireANTs 1.5.1 GreedyRegistration (repaired, unidirectional)",
+    "voxelmorph_pretrained": "VoxelMorph 0.3.3 pretrained (zero-shot, PIR canonical)",
+    "voxelmorph_polished": "VoxelMorph 0.3.3 pretrained + 30-step SVF polish",
+    "voxelmorph_svf": "VoxelMorph 0.3.3 [4, 2, 1] multi-scale SVF (5^3 LNCC)",
     "syntx_e2e_syn": "syntx.syn ('SyN' end-to-end: robust_affine + sobolev)",
     "ants_e2e_syn": "ants.registration ('SyN' end-to-end: Affine + SyN)",
 }
+
+EXTERNAL_ARM_CHOICES: Tuple[str, ...] = (
+    "syntx_greedy",
+    "fireants_greedy",
+    "voxelmorph_pretrained",
+    "voxelmorph_polished",
+    "voxelmorph_svf",
+)
 
 DKT31_NAMES: Dict[int, str] = {
     1002: "L Caudal Ant Cingulate",
@@ -291,6 +304,14 @@ def _ensure_ice_dict(
 
     fwd_warp = next((t for t in fwd_tx if isinstance(t, str) and t.endswith(".nii.gz")), None)
     inv_warp = next((t for t in inv_tx if isinstance(t, str) and t.endswith(".nii.gz")), None)
+    if fwd_warp is not None and inv_warp is None:
+        # Unidirectional deformable transform (no inverse warp generated)
+        return {
+            "max_error": float("nan"),
+            "mean_error": float("nan"),
+            "p95": float("nan"),
+            "error_map": None,
+        }
     if fwd_warp is None or inv_warp is None:
         # Exact invertible linear matrix (.mat only)
         return {
@@ -544,6 +565,74 @@ def _execute_single_registration(
                 verbose=False,
             )
             return res, device
+        if arm == "syntx_greedy":
+            res = syntx.greedy(
+                fixed=fi,
+                moving=mi,
+                initial_transform=shared_affine_path,
+                return_inverse=False,
+                reg_iterations=reg_iters_list,
+                device=device,
+                seed=pairs_seed,
+                verbose=False,
+            )
+            return res, device
+        if arm == "fireants_greedy":
+            from syntx.benchmark.external import run_fireants_greedy
+
+            scales = [2**i for i in range(len(reg_iters_list) - 1, -1, -1)]
+            res = run_fireants_greedy(
+                fixed=fi,
+                moving=mi,
+                initial_transform=shared_affine_path,
+                scales=scales,
+                reg_iterations=reg_iters_list,
+                return_inverse=False,
+                device=device,
+                seed=pairs_seed,
+            )
+            return res, device
+        if arm == "voxelmorph_pretrained":
+            from syntx.benchmark.external import run_voxelmorph_pretrained
+
+            res = run_voxelmorph_pretrained(
+                fixed=fi,
+                moving=mi,
+                initial_transform=shared_affine_path,
+                polish_steps=0,
+                return_inverse=False,
+                device=device,
+                seed=pairs_seed,
+            )
+            return res, device
+        if arm == "voxelmorph_polished":
+            from syntx.benchmark.external import run_voxelmorph_pretrained
+
+            res = run_voxelmorph_pretrained(
+                fixed=fi,
+                moving=mi,
+                initial_transform=shared_affine_path,
+                polish_steps=30,
+                return_inverse=False,
+                device=device,
+                seed=pairs_seed,
+            )
+            return res, device
+        if arm == "voxelmorph_svf":
+            from syntx.benchmark.external import run_voxelmorph_multiscale
+
+            scales = [2**i for i in range(len(reg_iters_list) - 1, -1, -1)]
+            res = run_voxelmorph_multiscale(
+                fixed=fi,
+                moving=mi,
+                initial_transform=shared_affine_path,
+                scales=scales,
+                reg_iterations=reg_iters_list,
+                return_inverse=False,
+                device=device,
+                seed=pairs_seed,
+            )
+            return res, device
         if arm.startswith("syn_"):
             reg_key = arm[len("syn_") :]
             if reg_key == "divcurl":
@@ -729,12 +818,16 @@ def run_worker_single(args: argparse.Namespace) -> None:
         art_dir = out_dir / "artifacts" / f"pair_{pair_idx:03d}" / f"{track}_{arm}_rep{rep}"
         persisted_tx = _persist_transforms(fwd_tx, inv_tx, art_dir)
 
+    is_unidirectional = len(inv_tx) == 0 and track == "deformable"
     dice_fixed, dice_moving, dice_sym = compute_bidirectional_dice(
         fl, ml, fi, mi, fwd_tx, inv_tx, which_inv
     )
+    if is_unidirectional:
+        dice_moving = float("nan")
+        dice_sym = float(dice_fixed)
     regional_dice = (
         _compute_per_region_symmetric_dice(fl, ml, fi, mi, fwd_tx, inv_tx, which_inv)
-        if args.save_regional_dice
+        if (args.save_regional_dice and not is_unidirectional)
         else {}
     )
 
@@ -805,6 +898,7 @@ def run_worker_single(args: argparse.Namespace) -> None:
         "dice_fixed": float(dice_fixed),
         "dice_moving": float(dice_moving),
         "dice_sym": float(dice_sym),
+        "unidirectional": bool(is_unidirectional),
         "lncc_similarity": lncc_sim,
         "mattes_mi_similarity": mi_sim,
         "folding_pct": float(jac_primary["folding_pct"]),
@@ -1049,9 +1143,12 @@ def _run_subprocess_job(
         raise FileNotFoundError(f"Worker exited 0 but did not write {out_json}")
     rec = json.loads(out_json.read_text())
     if "dice_sym" in rec:
+        ice_p95_s = (
+            f"{rec['inv_p95_mm']:.4f}mm" if math.isfinite(float(rec["inv_p95_mm"])) else "N/A"
+        )
         print(
             f"  [DONE  ] {label} | Dice={rec['dice_sym']:.4f} | Fold={rec['folding_pct']:.4f}% "
-            f"| ICE_p95={rec['inv_p95_mm']:.4f}mm | QC={rec['qc']['status']} "
+            f"| ICE_p95={ice_p95_s} | QC={rec['qc']['status']} "
             f"| Solver={rec['runtime_seconds']:.1f}s (wall {dt:.1f}s)",
             flush=True,
         )
@@ -1574,7 +1671,7 @@ def _aggregate_arm_rows(
         recs = [pmap[p] for p in sorted(pmap)]
         d_syms = [r["dice_sym"] for r in recs]
         d_fix = [r["dice_fixed"] for r in recs]
-        d_mov = [r["dice_moving"] for r in recs]
+        d_mov = [r["dice_moving"] for r in recs if math.isfinite(float(r["dice_moving"]))]
         d_intra = [r["dice_sym"] for r in recs if r.get("pair_type") == "intra"]
         d_inter = [r["dice_sym"] for r in recs if r.get("pair_type") != "intra"]
         folds = [r["folding_pct"] for r in recs]
@@ -1584,9 +1681,9 @@ def _aggregate_arm_rows(
         fd_min_j = [float(r.get("fd_min_jacobian", r["min_jacobian"])) for r in recs]
         harm = [r["harmonic_energy"] for r in recs]
         bend = [r["bending_energy"] for r in recs]
-        ice_m = [r["inv_mean_mm"] for r in recs]
-        ice_p95 = [r["inv_p95_mm"] for r in recs]
-        ice_imax = [r["inv_interior_max_mm"] for r in recs if math.isfinite(r["inv_interior_max_mm"])]
+        ice_m = [r["inv_mean_mm"] for r in recs if math.isfinite(float(r["inv_mean_mm"]))]
+        ice_p95 = [r["inv_p95_mm"] for r in recs if math.isfinite(float(r["inv_p95_mm"]))]
+        ice_imax = [r["inv_interior_max_mm"] for r in recs if math.isfinite(float(r["inv_interior_max_mm"]))]
         times = [r["runtime_seconds"] for r in recs]
         qc_fails = sum(1 for r in recs if r["qc"]["status"] == "fail")
         qc_warns = sum(1 for r in recs if r["qc"]["status"] == "warn")
@@ -1645,7 +1742,7 @@ def _aggregate_arm_rows(
                 "mean_dice_inter": float(statistics.mean(d_inter)) if d_inter else float("nan"),
                 "std_dice_inter": float(statistics.stdev(d_inter)) if len(d_inter) > 1 else 0.0,
                 "mean_dice_fixed": float(statistics.mean(d_fix)),
-                "mean_dice_moving": float(statistics.mean(d_mov)),
+                "mean_dice_moving": float(statistics.mean(d_mov)) if d_mov else float("nan"),
                 "mean_delta_vs_ants_pp": float(statistics.mean(deltas_pp)) if deltas_pp else 0.0,
                 "wins_vs_ants": f"{wins}/{n_cmp}" if n_cmp else "—",
                 "wilcoxon_p_vs_ants": wilcoxon_p,
@@ -1658,9 +1755,9 @@ def _aggregate_arm_rows(
                 "jac_measure": recs[0]["jacobian_measure"],
                 "mean_harmonic_energy": float(statistics.mean(harm)),
                 "mean_bending_energy": float(statistics.mean(bend)),
-                "mean_inv_mm": float(statistics.mean(ice_m)),
-                "mean_inv_p95_mm": float(statistics.mean(ice_p95)),
-                "max_inv_interior_mm": float(max(ice_imax)) if ice_imax else 0.0,
+                "mean_inv_mm": float(statistics.mean(ice_m)) if ice_m else float("nan"),
+                "mean_inv_p95_mm": float(statistics.mean(ice_p95)) if ice_p95 else float("nan"),
+                "max_inv_interior_mm": float(max(ice_imax)) if ice_imax else float("nan"),
                 "mean_time_s": float(statistics.mean(times)),
                 "mean_speedup_vs_ants": float(statistics.mean(speedups)) if speedups else 1.0,
                 "qc_pass_count": qc_summary,
@@ -1964,6 +2061,11 @@ def _write_reports(
             d_style = ' style="color:#059669;font-weight:700"' if is_best else ""
             delta = r["mean_delta_vs_ants_pp"]
             delta_color = "#059669" if delta > 0.01 else ("#dc2626" if delta < -0.01 else "#475569")
+            mov_dice_s = (
+                f"{r['mean_dice_moving']:.4f}"
+                if math.isfinite(float(r["mean_dice_moving"]))
+                else "N/A (unidir)"
+            )
             row_html = (
                 f"<tr>"
                 f"<td><strong>{_html.escape(r['arm'])}</strong>"
@@ -1971,7 +2073,7 @@ def _write_reports(
                 f"<td><code>{_html.escape(str(r['device']))}</code></td>"
                 f"<td{d_style}>{r['mean_dice_sym']:.4f} ± {r['std_dice_sym']:.4f}</td>"
                 f"<td>{r['median_dice_sym']:.4f} ({r['iqr_dice_sym']:.4f})</td>"
-                f"<td>{r['mean_dice_fixed']:.4f} / {r['mean_dice_moving']:.4f}</td>"
+                f"<td>{r['mean_dice_fixed']:.4f} / {mov_dice_s}</td>"
                 f"<td style='color:{delta_color};font-weight:600'>{delta:+.2f}%</td>"
                 f"<td><strong>{_html.escape(r['wins_vs_ants'])}</strong></td>"
             )
@@ -1981,13 +2083,18 @@ def _write_reports(
                 row_html += f"<td{pv_cls}><code>{_html.escape(_fmt_pval(pv))}</code></td>"
             if include_deform:
                 max_j_s = f"{r['mean_max_jac']:.1f}" if math.isfinite(r["mean_max_jac"]) else "—"
+                ice_s = (
+                    f"{r['mean_inv_mm']:.4f} / {r['mean_inv_p95_mm']:.4f}"
+                    if math.isfinite(float(r["mean_inv_mm"]))
+                    else "N/A (unidir)"
+                )
                 row_html += (
                     f"<td>{r['mean_folding_pct']:.5f}%</td>"
                     f"<td>{r['worst_min_jac']:+.4f}</td>"
                     f"<td>{r['mean_fd_folding_pct']:.5f}% ({r['worst_fd_min_jac']:+.3f})</td>"
                     f"<td>{max_j_s}</td>"
                     f"<td>{r['mean_harmonic_energy']:.4f} / {r['mean_bending_energy']:.4f}</td>"
-                    f"<td>{r['mean_inv_mm']:.4f} / {r['mean_inv_p95_mm']:.4f}</td>"
+                    f"<td>{ice_s}</td>"
                 )
             row_html += (
                 f"<td><strong>{r['mean_time_s']:.1f}s</strong></td>"
@@ -2048,16 +2155,26 @@ def _write_reports(
         [x for x in all_records if x["rep"] == 0],
         key=lambda z: ({"affine": 0, "deformable": 1, "e2e": 2}.get(z["track"], 9), z["pair_idx"], z["arm"]),
     ):
+        mov_s = (
+            f"{r['dice_moving']:.4f}"
+            if math.isfinite(float(r["dice_moving"]))
+            else "N/A"
+        )
+        ice_p_s = (
+            f"{r['inv_mean_mm']:.4f} / {r['inv_p95_mm']:.4f}"
+            if math.isfinite(float(r["inv_mean_mm"]))
+            else "N/A"
+        )
         pair_rows_html.append(
             f"<tr>"
             f"<td><code>{_html.escape(r['track'])}</code></td>"
             f"<td><strong>#{r['pair_idx']:02d}</strong> ({_html.escape(r['pair_type'])})"
             f"<div class='sub'>{_html.escape(r['fixed_id'])} ← {_html.escape(r['moving_id'])}</div></td>"
             f"<td><code>{_html.escape(r['arm'])}</code></td>"
-            f"<td><strong>{r['dice_sym']:.4f}</strong> ({r['dice_fixed']:.4f} / {r['dice_moving']:.4f})</td>"
+            f"<td><strong>{r['dice_sym']:.4f}</strong> ({r['dice_fixed']:.4f} / {mov_s})</td>"
             f"<td>{r['folding_pct']:.5f}%</td>"
             f"<td>{r['min_jacobian']:+.4f}</td>"
-            f"<td>{r['inv_mean_mm']:.4f} / {r['inv_p95_mm']:.4f}</td>"
+            f"<td>{ice_p_s}</td>"
             f"<td>{r['runtime_seconds']:.1f}s</td>"
             f"<td>{_qc_badge_html(r['qc']['status'])}</td>"
             f"</tr>"
@@ -2404,7 +2521,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p.add_argument("--pairs", type=int, nargs="+", default=list(DEFAULT_PAIRS))
     p.add_argument("--reg-iterations", type=int, nargs="+", default=list(DEFAULT_REG_ITERATIONS))
-    p.add_argument("--regularizers", type=str, nargs="+", default=list(DEFAULT_REGULARIZERS))
+    p.add_argument("--regularizers", type=str, nargs="*", default=list(DEFAULT_REGULARIZERS))
     p.add_argument(
         "--repro-pair",
         type=int,
@@ -2442,6 +2559,19 @@ def build_parser() -> argparse.ArgumentParser:
         "--include-syngs-beltrami",
         action="store_true",
         help="Opt-in: include tuned syntx.syngs (beltrami) deformable arm.",
+    )
+    p.add_argument(
+        "--include-external",
+        action="store_true",
+        help="Opt-in: include unidirectional comparison & external baseline arms (syntx_greedy, fireants_greedy, voxelmorph_pretrained, voxelmorph_polished, voxelmorph_svf).",
+    )
+    p.add_argument(
+        "--external-arms",
+        type=str,
+        nargs="+",
+        choices=list(EXTERNAL_ARM_CHOICES),
+        default=[],
+        help="Opt-in: specific external/unidirectional deformable arms to include.",
     )
     p.add_argument(
         "--all-pairs",
@@ -2620,6 +2750,13 @@ def main(argv: Optional[Sequence[str]] = None) -> Dict[str, Any]:
             for extra_arm in ("syngs_best", "tvf_best"):
                 if extra_arm not in syn_arms:
                     syn_arms.append(extra_arm)
+        ext_arms: List[str] = list(EXTERNAL_ARM_CHOICES) if args.include_external else []
+        for ext_a in args.external_arms:
+            if ext_a not in ext_arms:
+                ext_arms.append(ext_a)
+        for ext_a in ext_arms:
+            if ext_a not in syn_arms:
+                syn_arms.append(ext_a)
         if args.affine_only:
             syn_arms = []
             ants_deform_arms = ()

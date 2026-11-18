@@ -469,6 +469,23 @@ class SwinUNETRExtractor(FeatureExtractor):
         """Identity: the input is used unscaled."""
         return x
 
+    @staticmethod
+    def _pad_to_multiple_3d(x: torch.Tensor, multiple: int = 32) -> torch.Tensor:
+        """Zero-pad the far end of each spatial axis of a 5-D tensor ``(B, C, D, H, W)`` to a
+        multiple of ``multiple`` using per-axis ``torch.cat`` (avoiding 5-D ``F.pad`` which
+        silently corrupts MPS tensors when trailing ``H * W >= 65536`` and ``pad_h == pad_w == 0``).
+        """
+        import math
+        x_input = x
+        for ax_offset, s in enumerate(x.shape[2:]):
+            pad_len = int(math.ceil(s / float(multiple)) * multiple) - int(s)
+            if pad_len > 0:
+                axis = 2 + ax_offset
+                z_shape = list(x_input.shape)
+                z_shape[axis] = pad_len
+                x_input = torch.cat([x_input, x_input.new_zeros(z_shape)], dim=axis)
+        return x_input
+
     def extract(self, x: torch.Tensor) -> list:
         """
         Return the requested Swin-ViT encoder outputs for ``x`` (B, 1, D, H, W).
@@ -482,15 +499,8 @@ class SwinUNETRExtractor(FeatureExtractor):
         if len(x.shape) != 5:
             raise ValueError("Input must be a 5D tensor (B, C, D, H, W)")
 
-        import math
         spatial_shape = x.shape[2:]
-        pad_size = [int(math.ceil(s / 32.0) * 32) for s in spatial_shape]
-
-        pad_d = pad_size[0] - spatial_shape[0]
-        pad_h = pad_size[1] - spatial_shape[1]
-        pad_w = pad_size[2] - spatial_shape[2]
-
-        x_input = F.pad(x, (0, pad_w, 0, pad_h, 0, pad_d), mode='constant', value=0.0)
+        x_input = self._pad_to_multiple_3d(x, multiple=32)
 
         hidden_states = self.model.swinViT(x_input)
         features = []

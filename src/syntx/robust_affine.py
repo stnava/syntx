@@ -3243,19 +3243,35 @@ def robust_cross_modal_rigid(
 
     if verbose:
         print("[robust_cross_modal_rigid] Stage 2: fine multi-resolution Mattes MI refinement...")
-    reg_fine = ants.registration(
-        fixed=fixed,
-        moving=moving,
-        type_of_transform="Rigid",
-        initial_transform=initial_tx,
-        aff_metric="mattes",
-        aff_sampling=aff_sampling,
-        aff_random_sampling_rate=aff_random_sampling_rate,
-        aff_iterations=aff_iterations,
-        aff_shrink_factors=aff_shrink_factors,
-        aff_smoothing_sigmas=aff_smoothing_sigmas,
-        verbose=verbose,
+    # Preserve >= 8 voxels per axis and >= 256 Mattes MI samples at the coarsest shrink level
+    # (no-op on clinical >= 64^3 volumes; prevents 12-sample histogram starvation on small ROIs),
+    # and scope Stage 2's C++ --random-seed deterministically without leaking into caller state.
+    max_shrink = max(1, min(int(d) for d in fixed.shape) // 8)
+    eff_shrinks = tuple(min(max(1, int(sf)), max_shrink) for sf in aff_shrink_factors)
+    eff_sigmas = tuple(
+        float(sg) * (sh / max(1, int(orig)))
+        for sg, sh, orig in zip(aff_smoothing_sigmas, eff_shrinks, aff_shrink_factors)
     )
+    coarsest_vox = float(np.prod([max(1, int(d) // max(eff_shrinks)) for d in fixed.shape]))
+    eff_sampling_rate = max(float(aff_random_sampling_rate), min(1.0, 256.0 / coarsest_vox))
+    prev_seed = ants.config._random_seed
+    ants.config._random_seed = 42 if seed is None else int(seed)
+    try:
+        reg_fine = ants.registration(
+            fixed=fixed,
+            moving=moving,
+            type_of_transform="Rigid",
+            initial_transform=initial_tx,
+            aff_metric="mattes",
+            aff_sampling=aff_sampling,
+            aff_random_sampling_rate=eff_sampling_rate,
+            aff_iterations=aff_iterations,
+            aff_shrink_factors=eff_shrinks,
+            aff_smoothing_sigmas=eff_sigmas,
+            verbose=verbose,
+        )
+    finally:
+        ants.config._random_seed = prev_seed
     fwd = reg_fine['fwdtransforms']
     inv = reg_fine.get('invtransforms', [])
 

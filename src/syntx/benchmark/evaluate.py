@@ -534,57 +534,51 @@ def _evaluate_mindboggle_pair_impl(
             **greedy_kwargs, **kwargs
         )
     elif model_lower in ("fireants", "fireants_greedy"):
-        import tempfile
-        from fireants.io import Image as FAImage, BatchedImages as FABatchedImages
-        from fireants.registration.greedy import GreedyRegistration as FireANTsGreedy
-
-        # Convert canonical affine to physical 4x4 matrix
-        tx_obj = ants.read_transform(aff_0)
-        A = np.array(tx_obj.parameters[:9]).reshape(3, 3)
-        t = np.array(tx_obj.parameters[9:12])
-        c = np.array(tx_obj.fixed_parameters[:3])
-        offset = t + c - A @ c
-        M = np.eye(4)
-        M[:3, :3] = A
-        M[:3, 3] = offset
-        M_t = torch.from_numpy(M).float().unsqueeze(0).to(device)
-
-        fa_tmpdir = tempfile.mkdtemp(prefix="fireants_bench_")
-        f_path = os.path.join(fa_tmpdir, "f.nii.gz")
-        m_path = os.path.join(fa_tmpdir, "m.nii.gz")
-        ants.image_write(fi, f_path)
-        ants.image_write(mi, m_path)
-        b_f = FABatchedImages([FAImage.load_file(f_path, device=device)])
-        b_m = FABatchedImages([FAImage.load_file(m_path, device=device)])
+        from .external import run_fireants_greedy
 
         fa_lr = kwargs.pop("optimizer_lr", user_grad_step if user_grad_step is not None else 0.50)
         fa_flow = user_flow_sigma if user_flow_sigma is not None else 1.0
         fa_total = user_total_sigma if user_total_sigma is not None else 0.25
         fa_iters = user_reg_iters if user_reg_iters is not None else [100, 100, 50]
-
-        fa_reg = FireANTsGreedy(
-            scales=[4, 2, 1],
-            iterations=fa_iters,
-            fixed_images=b_f,
-            moving_images=b_m,
-            loss_type='cc',
-            cc_kernel_size=5,
-            deformation_type='compositive',
-            optimizer='Adam',
-            optimizer_lr=fa_lr,
-            smooth_grad_sigma=fa_flow,
-            smooth_warp_sigma=fa_total,
-            init_affine=M_t
+        res_reg = run_fireants_greedy(
+            fixed=fi,
+            moving=mi,
+            initial_transform=aff_0,
+            reg_iterations=fa_iters,
+            optimizer_lr=float(fa_lr),
+            smooth_grad_sigma=float(fa_flow),
+            smooth_warp_sigma=float(fa_total),
+            device=device,
+            seed=seed + pair_idx,
+            **kwargs,
         )
-        fa_reg.optimize()
-        w_file = os.path.join(fa_tmpdir, "fireants_fwd_warp.nii.gz")
-        fa_reg.save_as_ants_transforms(w_file, save_inverse=False)
-        res_reg = {
-            'fwdtransforms': [w_file],
-            'invtransforms': [],
-            'whichtoinvert_inv': [],
-            'warpedmovout': ants.apply_transforms(fi, mi, [w_file]),
-        }
+    elif model_lower in ("voxelmorph_pretrained", "voxelmorph_polished", "voxelmorph_pretrained_polished"):
+        from .external import run_voxelmorph_pretrained
+
+        default_polish = 0 if model_lower == "voxelmorph_pretrained" else 30
+        polish_steps = int(kwargs.pop("polish_steps", default_polish))
+        res_reg = run_voxelmorph_pretrained(
+            fixed=fi,
+            moving=mi,
+            initial_transform=aff_0,
+            polish_steps=polish_steps,
+            device=device,
+            seed=seed + pair_idx,
+            **kwargs,
+        )
+    elif model_lower in ("voxelmorph_svf", "voxelmorph_multiscale"):
+        from .external import run_voxelmorph_multiscale
+
+        vxm_iters = user_reg_iters if user_reg_iters is not None else [100, 100, 50]
+        res_reg = run_voxelmorph_multiscale(
+            fixed=fi,
+            moving=mi,
+            initial_transform=aff_0,
+            reg_iterations=vxm_iters,
+            device=device,
+            seed=seed + pair_idx,
+            **kwargs,
+        )
     elif model_lower in ("ants", "ants_syn"):
         res_reg = ants.registration(
             fixed=fi, moving=mi, type_of_transform="SyNOnly",
@@ -596,7 +590,7 @@ def _evaluate_mindboggle_pair_impl(
             verbose=verbose
         )
     else:
-        raise ValueError(f"Unknown registration model: '{model}'. Supported: 'affine', 'affine_fast', 'affine_accurate', 'ants', 'sobolev', 'gaussian', 'syn', 'syn_navier', 'syn_solenoidal', 'syn_divcurl', 'syn_hyperelastic', 'syn_regadam', 'tvf', 'tvf_navier', 'syngs', 'greedy', 'greedy_regadam', 'fireants'")
+        raise ValueError(f"Unknown registration model: '{model}'. Supported: 'affine', 'affine_fast', 'affine_accurate', 'ants', 'sobolev', 'gaussian', 'syn', 'syn_navier', 'syn_solenoidal', 'syn_divcurl', 'syn_hyperelastic', 'syn_regadam', 'tvf', 'tvf_navier', 'syngs', 'greedy', 'greedy_regadam', 'fireants', 'voxelmorph_pretrained', 'voxelmorph_polished', 'voxelmorph_svf'")
 
     t_reg = (t_aff if model_lower in ("affine", "affine_default") else (res_reg.get("runtime_seconds", time.time() - t0_reg) if "affine" in model_lower else (time.time() - t0_reg + t_aff)))
 
@@ -605,12 +599,16 @@ def _evaluate_mindboggle_pair_impl(
     inv_tx = res_reg["invtransforms"]
     which_inv = res_reg.get("whichtoinvert_inv", [True, False])
 
-    df_fixed, df_moving, dice_sym = compute_bidirectional_dice(
-        fl, ml, fi, mi, fwd_tx, inv_tx, which_inv
-    )
-    if (inv_tx is None or len(inv_tx) == 0) or ("greedy" in model_lower or "fireants" in model_lower):
+    if (inv_tx is None or len(inv_tx) == 0) or ("greedy" in model_lower or "fireants" in model_lower or "voxelmorph" in model_lower):
+        df_fixed, _, _ = compute_bidirectional_dice(
+            fl, ml, fi, mi, fwd_tx, [], []
+        )
         dice_sym = df_fixed
         df_moving = float("nan")
+    else:
+        df_fixed, df_moving, dice_sym = compute_bidirectional_dice(
+            fl, ml, fi, mi, fwd_tx, inv_tx, which_inv
+        )
 
     fwd_warp_file = next((x for x in fwd_tx if isinstance(x, str) and x.endswith(".nii.gz")), None)
     if fwd_warp_file is not None:

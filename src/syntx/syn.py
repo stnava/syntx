@@ -115,6 +115,77 @@ _CONTINUUM_REGS = frozenset({
     'poroelastic', 'darcy_stokes', 'biot',
 })
 
+
+def _backward_similarity_terms_per_term(
+    I_mid: torch.Tensor,
+    J_mid: torch.Tensor,
+    active_metric_names,
+    active_loss_functions,
+    curr_metric_weights,
+    in_bounds_mask=None,
+    metric_losses_dict=None,
+    scale_weight: float = 1.0,
+    propagate_to_mid: bool = True,
+    dev_type: str = 'cpu',
+    amp_dtype: torch.dtype = torch.float16,
+    use_amp: bool = False,
+):
+    """Evaluate and backpropagate multi-channel / multi-metric similarity terms one at a time
+    through detached midpoint leaves ``(I_mid_leaf, J_mid_leaf)`` so at most 1 metric autograd
+    graph is alive in memory at any moment. Filters ``grad is not None`` before forwarding
+    into ``(I_mid, J_mid)`` via ``torch.autograd.backward(*zip(*pairs))``.
+    """
+    I_mid_leaf = I_mid.detach().requires_grad_(True)
+    J_mid_leaf = J_mid.detach().requires_grad_(True)
+    loss_t = torch.zeros((), device=I_mid.device, dtype=I_mid.dtype)
+    n_fns = len(active_loss_functions)
+    for c_idx, (name, fn, weight) in enumerate(zip(active_metric_names, active_loss_functions, curr_metric_weights)):
+        if I_mid_leaf.shape[1] > 1 and n_fns == I_mid_leaf.shape[1]:
+            I_c = I_mid_leaf[:, c_idx:c_idx + 1]
+            J_c = J_mid_leaf[:, c_idx:c_idx + 1]
+        else:
+            I_c = I_mid_leaf
+            J_c = J_mid_leaf
+        w_val = float(weight)
+        with torch.amp.autocast(device_type=dev_type, dtype=amp_dtype, enabled=use_amp):
+            if w_val == 0.0:
+                with torch.no_grad():
+                    try:
+                        val_loss = fn(I_c, J_c, mask=in_bounds_mask)
+                    except TypeError:
+                        val_loss = fn(I_c, J_c)
+            else:
+                try:
+                    val_loss = fn(I_c, J_c, mask=in_bounds_mask)
+                except TypeError:
+                    val_loss = fn(I_c, J_c)
+        val_det = val_loss.detach() if torch.is_tensor(val_loss) else torch.tensor(float(val_loss), device=I_mid.device, dtype=I_mid.dtype)
+        if metric_losses_dict is not None:
+            metric_losses_dict[name] = val_det
+        if w_val != 0.0:
+            eff_w = w_val * float(scale_weight)
+            term_loss = eff_w * val_loss
+            loss_t = loss_t + eff_w * val_det.to(dtype=I_mid.dtype)
+            if torch.is_tensor(term_loss) and term_loss.requires_grad:
+                term_loss.backward()
+            del term_loss
+        del val_loss, val_det, I_c, J_c
+
+    g_im = I_mid_leaf.grad
+    g_jm = J_mid_leaf.grad
+    del I_mid_leaf, J_mid_leaf
+    if propagate_to_mid:
+        pairs = [
+            (t, g)
+            for t, g in ((I_mid, g_im), (J_mid, g_jm))
+            if g is not None and t.requires_grad
+        ]
+        if pairs:
+            torch.autograd.backward(*zip(*pairs))
+        del pairs, g_im, g_jm
+        return loss_t, None, None
+    return loss_t, g_im, g_jm
+
 class TriPlanarVGG3DLoss(nn.Module):
     """VGG19 perceptual similarity for 2-D / 3-D images (3-D: features of axial, coronal and
     sagittal slices). Used by ``syntx.syn`` for ``syn_metric='vgg19'``; see ``__init__`` for
@@ -1275,19 +1346,31 @@ class SyNTo(nn.Module):
 
                 if dual_gradient:
                     # 1. Analytical Pseudo-Gradient Branch
-                    I_mid_det = I_mid.detach().requires_grad_(True)
-                    J_mid_det = J_mid.detach().requires_grad_(True)
-                    
-                    loss_a = 0.0
                     metric_losses_dict = {}
-                    for name, fn, weight in zip(active_metric_names, active_loss_functions, curr_metric_weights):
-                        val_loss_a = fn(I_mid_det, J_mid_det, mask=in_bounds_mask)
-                        loss_a += weight * val_loss_a
-                        metric_losses_dict[name] = val_loss_a.detach()
-                        
-                    loss_a.backward()
-                    g_im = I_mid_det.grad if I_mid_det.grad is not None else torch.zeros_like(I_mid_det)
-                    g_jm = J_mid_det.grad if J_mid_det.grad is not None else torch.zeros_like(J_mid_det)
+                    if len(active_loss_functions) > 1:
+                        _, g_im, g_jm = _backward_similarity_terms_per_term(
+                            I_mid, J_mid,
+                            active_metric_names, active_loss_functions, curr_metric_weights,
+                            in_bounds_mask=in_bounds_mask,
+                            metric_losses_dict=metric_losses_dict,
+                            propagate_to_mid=False,
+                        )
+                        g_im = g_im if g_im is not None else torch.zeros_like(I_mid)
+                        g_jm = g_jm if g_jm is not None else torch.zeros_like(J_mid)
+                    else:
+                        I_mid_det = I_mid.detach().requires_grad_(True)
+                        J_mid_det = J_mid.detach().requires_grad_(True)
+                        loss_a = 0.0
+                        for name, fn, weight in zip(active_metric_names, active_loss_functions, curr_metric_weights):
+                            val_loss_a = fn(I_mid_det, J_mid_det, mask=in_bounds_mask)
+                            loss_a += weight * val_loss_a
+                            metric_losses_dict[name] = val_loss_a.detach()
+                            del val_loss_a
+                        loss_a.backward()
+                        del loss_a
+                        g_im = I_mid_det.grad if I_mid_det.grad is not None else torch.zeros_like(I_mid_det)
+                        g_jm = J_mid_det.grad if J_mid_det.grad is not None else torch.zeros_like(J_mid_det)
+                        del I_mid_det, J_mid_det
                     
                     with torch.no_grad():
                         if self.image_grad_clip is not None and self.image_grad_clip > 0:
@@ -1308,53 +1391,76 @@ class SyNTo(nn.Module):
                     if warp_r2l.grad is not None:
                         warp_r2l.grad = None
 
-                    loss_auto = 0.0
-                    for name, fn, weight in zip(active_metric_names, active_loss_functions, curr_metric_weights):
-                        val_loss_auto = fn(I_mid, J_mid, mask=in_bounds_mask)
-                        loss_auto += weight * val_loss_auto
+                    if len(active_loss_functions) > 1:
+                        loss_t, _, _ = _backward_similarity_terms_per_term(
+                            I_mid, J_mid,
+                            active_metric_names, active_loss_functions, curr_metric_weights,
+                            in_bounds_mask=in_bounds_mask,
+                            propagate_to_mid=True,
+                        )
+                    else:
+                        loss_auto = 0.0
+                        for name, fn, weight in zip(active_metric_names, active_loss_functions, curr_metric_weights):
+                            val_loss_auto = fn(I_mid, J_mid, mask=in_bounds_mask)
+                            loss_auto += weight * val_loss_auto
+                            del val_loss_auto
 
-                    loss_auto.backward()
-                    loss_t = loss_auto.detach()
+                        loss_auto.backward()
+                        loss_t = loss_auto.detach()
+                        del loss_auto
 
                     autograd_scale_fixed = compute_autograd_physical_scale(fixed_shape_t, fixed_spacing_t, device=device, dtype=dtype)
                     autograd_scale_moving = compute_autograd_physical_scale(moving_shape_t, moving_spacing_t, device=device, dtype=dtype)
-                    grad_l_autograd = warp_l2r.grad * autograd_scale_fixed
-                    grad_r_autograd = warp_r2l.grad * autograd_scale_moving
+                    grad_l_autograd = (warp_l2r.grad * autograd_scale_fixed) if warp_l2r.grad is not None else torch.zeros_like(warp_l2r)
+                    grad_r_autograd = (warp_r2l.grad * autograd_scale_moving) if warp_r2l.grad is not None else torch.zeros_like(warp_r2l)
 
                     # 3. Dual-Gradient Convex Combination (Averaging)
                     with torch.no_grad():
                         warp_l2r.grad = (1.0 - dual_w) * grad_l_analytic + dual_w * grad_l_autograd
                         warp_r2l.grad = (1.0 - dual_w) * grad_r_analytic + dual_w * grad_r_autograd
-                    del I_mid_det, J_mid_det, g_im, g_jm
+                    del g_im, g_jm
                     del grad_l_analytic, grad_r_analytic, grad_l_autograd, grad_r_autograd
 
                     self.syn_losses.append(loss_t)
                     level_syn_losses.append(loss_t)
 
                 elif use_analytical_gradients:
-                    I_mid_det = I_mid.detach().requires_grad_(True)
-                    J_mid_det = J_mid.detach().requires_grad_(True)
-                    
-                    loss = 0.0
                     metric_losses_dict = {}
                     if verbose >= 2:
-                        print(f"DEBUG PyTorch epoch {epoch} I_mid min/max: {I_mid_det.min().item()} {I_mid_det.max().item()} mean: {I_mid_det.mean().item()} var: {I_mid_det.var().item()}")
-                        print(f"DEBUG PyTorch epoch {epoch} J_mid min/max: {J_mid_det.min().item()} {J_mid_det.max().item()} mean: {J_mid_det.mean().item()} var: {J_mid_det.var().item()}")
+                        print(f"DEBUG PyTorch epoch {epoch} I_mid min/max: {I_mid.min().item()} {I_mid.max().item()} mean: {I_mid.mean().item()} var: {I_mid.var().item()}")
+                        print(f"DEBUG PyTorch epoch {epoch} J_mid min/max: {J_mid.min().item()} {J_mid.max().item()} mean: {J_mid.mean().item()} var: {J_mid.var().item()}")
                         print(f"DEBUG PyTorch epoch {epoch} mask sum: {in_bounds_mask.sum().item() if in_bounds_mask is not None else 'None'}")
                         print(f"DEBUG PyTorch weights: {curr_metric_weights}")
-                    for name, fn, weight in zip(active_metric_names, active_loss_functions, curr_metric_weights):
-                        try:
-                            val_loss = fn(I_mid_det, J_mid_det, mask=in_bounds_mask)
-                        except TypeError:
-                            val_loss = fn(I_mid_det, J_mid_det)
+                    if len(active_loss_functions) > 1:
+                        loss_t, g_im, g_jm = _backward_similarity_terms_per_term(
+                            I_mid, J_mid,
+                            active_metric_names, active_loss_functions, curr_metric_weights,
+                            in_bounds_mask=in_bounds_mask,
+                            metric_losses_dict=metric_losses_dict,
+                            propagate_to_mid=False,
+                        )
+                        g_im = g_im if g_im is not None else torch.zeros_like(I_mid)
+                        g_jm = g_jm if g_jm is not None else torch.zeros_like(J_mid)
+                    else:
+                        I_mid_det = I_mid.detach().requires_grad_(True)
+                        J_mid_det = J_mid.detach().requires_grad_(True)
+                        loss = 0.0
+                        for name, fn, weight in zip(active_metric_names, active_loss_functions, curr_metric_weights):
+                            try:
+                                val_loss = fn(I_mid_det, J_mid_det, mask=in_bounds_mask)
+                            except TypeError:
+                                val_loss = fn(I_mid_det, J_mid_det)
 
-                        loss += weight * val_loss
-                        metric_losses_dict[name] = val_loss.detach()
-                    
-                    loss.backward()
-                    loss_t = loss.detach()
-                    g_im = I_mid_det.grad if I_mid_det.grad is not None else torch.zeros_like(I_mid_det)
-                    g_jm = J_mid_det.grad if J_mid_det.grad is not None else torch.zeros_like(J_mid_det)
+                            loss += weight * val_loss
+                            metric_losses_dict[name] = val_loss.detach()
+                            del val_loss
+                        
+                        loss.backward()
+                        loss_t = loss.detach()
+                        del loss
+                        g_im = I_mid_det.grad if I_mid_det.grad is not None else torch.zeros_like(I_mid_det)
+                        g_jm = J_mid_det.grad if J_mid_det.grad is not None else torch.zeros_like(J_mid_det)
+                        del I_mid_det, J_mid_det
                     if verbose >= 2:
                         print(f"DEBUG PyTorch L{level_idx} E{epoch} g_im max: {g_im.abs().max().item()}, g_jm max: {g_jm.abs().max().item()}")
                         
@@ -1381,7 +1487,7 @@ class SyNTo(nn.Module):
 
                         grad_r_raw = (g_jm.movedim(1, -1) * grad_J_mid_sampled).contiguous()
                         warp_r2l.grad = grad_r_raw
-                    del I_mid_det, J_mid_det, g_im, g_jm, grad_l_raw, grad_r_raw
+                    del g_im, g_jm, grad_l_raw, grad_r_raw
 
                 else:
                     loss = 0.0
@@ -1389,19 +1495,38 @@ class SyNTo(nn.Module):
                     dev_type = 'cuda' if 'cuda' in str(device) else ('mps' if 'mps' in str(device) else 'cpu')
                     use_amp = bool(kwargs.get('amp', True)) and (dev_type in ('cuda', 'mps'))
                     amp_dtype = torch.float16
+                    per_term_bw = len(active_loss_functions) > 1
+                    boot_m = kwargs.get('bootstrap_mode', getattr(self, 'bootstrap_mode', None))
+                    boot_active = boot_m in ['jitter', 'antithetic', 'strided']
+                    orig_w = float(kwargs.get('bootstrap_orig_weight', getattr(self, 'bootstrap_orig_weight', 0.50))) if boot_active else 1.0
+
+                    if per_term_bw:
+                        loss_t, _, _ = _backward_similarity_terms_per_term(
+                            I_mid, J_mid,
+                            active_metric_names, active_loss_functions, curr_metric_weights,
+                            in_bounds_mask=in_bounds_mask,
+                            metric_losses_dict=metric_losses_dict,
+                            scale_weight=orig_w,
+                            propagate_to_mid=True,
+                            dev_type=dev_type,
+                            amp_dtype=amp_dtype,
+                            use_amp=use_amp,
+                        )
 
                     with torch.amp.autocast(device_type=dev_type, dtype=amp_dtype, enabled=use_amp):
-                        for c_idx, (name, fn, weight) in enumerate(zip(active_metric_names, active_loss_functions, curr_metric_weights)):
-                            if I_mid.shape[1] > 1 and len(active_loss_functions) == I_mid.shape[1]:
-                                I_c = I_mid[:, c_idx:c_idx+1]
-                                J_c = J_mid[:, c_idx:c_idx+1]
-                            else:
-                                I_c = I_mid
-                                J_c = J_mid
-                            val_loss = fn(I_c, J_c, mask=in_bounds_mask)
+                        if not per_term_bw:
+                            for c_idx, (name, fn, weight) in enumerate(zip(active_metric_names, active_loss_functions, curr_metric_weights)):
+                                if I_mid.shape[1] > 1 and len(active_loss_functions) == I_mid.shape[1]:
+                                    I_c = I_mid[:, c_idx:c_idx+1]
+                                    J_c = J_mid[:, c_idx:c_idx+1]
+                                else:
+                                    I_c = I_mid
+                                    J_c = J_mid
+                                val_loss = fn(I_c, J_c, mask=in_bounds_mask)
 
-                            loss += weight * val_loss
-                            metric_losses_dict[name] = val_loss.detach()
+                                loss += weight * val_loss
+                                metric_losses_dict[name] = val_loss.detach()
+                                del val_loss, I_c, J_c
 
                         jac_penalty_w = float(kwargs.get('jacobian_penalty_weight', getattr(self, 'jacobian_penalty_weight', 0.0)))
                         if jac_penalty_w > 0.0:
@@ -1516,9 +1641,7 @@ class SyNTo(nn.Module):
                             scale_norm_dd = float(torch.mean((fixed_shape_t - 1.0) * fixed_spacing_t / 2.0).item())
                             loss = loss + (dd_loss_w / (scale_norm_dd + 1e-6)) * l_dd_tot
 
-                        boot_m = kwargs.get('bootstrap_mode', getattr(self, 'bootstrap_mode', None))
-                        if boot_m in ['jitter', 'antithetic', 'strided']:
-                            orig_w = float(kwargs.get('bootstrap_orig_weight', getattr(self, 'bootstrap_orig_weight', 0.50)))
+                        if boot_active:
                             jitter_amp = float(kwargs.get('bootstrap_jitter_scale', getattr(self, 'bootstrap_jitter_scale', 0.30)))
                             n_boot_samples = int(kwargs.get('bootstrap_samples', getattr(self, 'bootstrap_samples', 2 if boot_m == 'antithetic' else 1)))
                             
@@ -1549,19 +1672,37 @@ class SyNTo(nn.Module):
                                         interpolator=self.interpolator,
                                         use_analytical_gradients=False
                                     )
-                                    loss_b = 0.0
-                                    for c_idx, (name, fn, weight) in enumerate(zip(active_metric_names, active_loss_functions, curr_metric_weights)):
-                                        if I_mid_b.shape[1] > 1 and len(active_loss_functions) == I_mid_b.shape[1]:
-                                            I_bc = I_mid_b[:, c_idx:c_idx+1]
-                                            J_bc = J_mid_b[:, c_idx:c_idx+1]
-                                        else:
-                                            I_bc = I_mid_b
-                                            J_bc = J_mid_b
-                                        val_loss_b = fn(I_bc, J_bc, mask=mask_b)
-                                        loss_b += weight * val_loss_b
-                                    total_boot_loss += boot_weight * loss_b
+                                    if per_term_bw:
+                                        loss_b_t, _, _ = _backward_similarity_terms_per_term(
+                                            I_mid_b, J_mid_b,
+                                            active_metric_names, active_loss_functions, curr_metric_weights,
+                                            in_bounds_mask=mask_b,
+                                            scale_weight=boot_weight,
+                                            propagate_to_mid=True,
+                                            dev_type=dev_type,
+                                            amp_dtype=amp_dtype,
+                                            use_amp=use_amp,
+                                        )
+                                        loss_t = loss_t + loss_b_t
+                                        del I_mid_b, J_mid_b, mask_b, loss_b_t
+                                    else:
+                                        loss_b = 0.0
+                                        for c_idx, (name, fn, weight) in enumerate(zip(active_metric_names, active_loss_functions, curr_metric_weights)):
+                                            if I_mid_b.shape[1] > 1 and len(active_loss_functions) == I_mid_b.shape[1]:
+                                                I_bc = I_mid_b[:, c_idx:c_idx+1]
+                                                J_bc = J_mid_b[:, c_idx:c_idx+1]
+                                            else:
+                                                I_bc = I_mid_b
+                                                J_bc = J_mid_b
+                                            val_loss_b = fn(I_bc, J_bc, mask=mask_b)
+                                            loss_b += weight * val_loss_b
+                                            del val_loss_b, I_bc, J_bc
+                                        total_boot_loss += boot_weight * loss_b
+                                        del I_mid_b, J_mid_b, mask_b, loss_b
                                 
-                                loss = orig_w * loss + total_boot_loss
+                                if not per_term_bw:
+                                    loss = orig_w * loss + total_boot_loss
+                                    del total_boot_loss
                             else:
                                 # Single complementary jitter sample
                                 if self.seed is not None and (self._rng is None or self._rng.device != device):
@@ -1581,20 +1722,48 @@ class SyNTo(nn.Module):
                                     interpolator=self.interpolator,
                                     use_analytical_gradients=False
                                 )
-                                loss_j = 0.0
-                                for c_idx, (name, fn, weight) in enumerate(zip(active_metric_names, active_loss_functions, curr_metric_weights)):
-                                    if I_mid_j.shape[1] > 1 and len(active_loss_functions) == I_mid_j.shape[1]:
-                                        I_jc = I_mid_j[:, c_idx:c_idx+1]
-                                        J_jc = J_mid_j[:, c_idx:c_idx+1]
-                                    else:
-                                        I_jc = I_mid_j
-                                        J_jc = J_mid_j
-                                    val_loss_j = fn(I_jc, J_jc, mask=mask_j)
-                                    loss_j += weight * val_loss_j
-                                loss = orig_w * loss + (1.0 - orig_w) * loss_j
+                                if per_term_bw:
+                                    loss_j_t, _, _ = _backward_similarity_terms_per_term(
+                                        I_mid_j, J_mid_j,
+                                        active_metric_names, active_loss_functions, curr_metric_weights,
+                                        in_bounds_mask=mask_j,
+                                        scale_weight=(1.0 - orig_w),
+                                        propagate_to_mid=True,
+                                        dev_type=dev_type,
+                                        amp_dtype=amp_dtype,
+                                        use_amp=use_amp,
+                                    )
+                                    loss_t = loss_t + loss_j_t
+                                    del I_mid_j, J_mid_j, mask_j, loss_j_t
+                                else:
+                                    loss_j = 0.0
+                                    for c_idx, (name, fn, weight) in enumerate(zip(active_metric_names, active_loss_functions, curr_metric_weights)):
+                                        if I_mid_j.shape[1] > 1 and len(active_loss_functions) == I_mid_j.shape[1]:
+                                            I_jc = I_mid_j[:, c_idx:c_idx+1]
+                                            J_jc = J_mid_j[:, c_idx:c_idx+1]
+                                        else:
+                                            I_jc = I_mid_j
+                                            J_jc = J_mid_j
+                                        val_loss_j = fn(I_jc, J_jc, mask=mask_j)
+                                        loss_j += weight * val_loss_j
+                                        del val_loss_j, I_jc, J_jc
+                                    loss = orig_w * loss + (1.0 - orig_w) * loss_j
+                                    del I_mid_j, J_mid_j, mask_j, loss_j
                         
-                    loss.backward()
-                    loss_t = loss.detach()
+                    if per_term_bw:
+                        if torch.is_tensor(loss):
+                            loss_t = loss_t + loss.detach().to(dtype=dtype)
+                            if loss.requires_grad:
+                                loss.backward()
+                        del loss
+                    else:
+                        if torch.is_tensor(loss):
+                            if loss.requires_grad:
+                                loss.backward()
+                            loss_t = loss.detach().to(dtype=dtype)
+                        else:
+                            loss_t = torch.tensor(float(loss), device=device, dtype=dtype)
+                        del loss
                     
                     # Rescale autograd gradients from normalized grid space [-1, 1] to physical mm
                     # coords_norm = (x_phys - origin) * 2 / (spacing * (shape - 1)) - 1
@@ -1605,8 +1774,12 @@ class SyNTo(nn.Module):
                     with torch.no_grad():
                         if warp_l2r.grad is not None:
                             warp_l2r.grad.mul_(autograd_scale_fixed)
+                        else:
+                            warp_l2r.grad = torch.zeros_like(warp_l2r)
                         if warp_r2l.grad is not None:
                             warp_r2l.grad.mul_(autograd_scale_moving)
+                        else:
+                            warp_r2l.grad = torch.zeros_like(warp_r2l)
                         
                     self.syn_losses.append(loss_t)
                     level_syn_losses.append(loss_t)
@@ -3166,6 +3339,12 @@ def registration(
         syn_metric = kwargs.pop('similarity_metric')
     syn_metric_weights = kwargs.pop('syn_metric_weights', kwargs.pop('metric_weights', None))
 
+    _raw_mc = kwargs.get('metric_chunks', 1)
+    if _raw_mc is None:
+        _raw_mc = 1
+    if isinstance(_raw_mc, bool) or not isinstance(_raw_mc, int) or _raw_mc < 1:
+        raise ValueError(f"syntx.syn: metric_chunks must be a positive integer, got {_raw_mc!r}")
+
     # Turnkey Sulcal Guidance: automatically extract probability maps and configure weights
     if guided in (True, 'sulcal'):
         from .surface import extract_sulcal_probability_map
@@ -3224,6 +3403,27 @@ def registration(
                 w_mind = float(guided_weight) if guided_weight is not None else 0.25
                 w_primary = 1.0 - w_mind
                 syn_metric_weights = [w_primary / max(n_base, 1)] * n_base + [w_mind / max(n_extra, 1)] * n_extra
+
+    if _raw_mc > 1 and not _greedy:
+        if str(type_of_transform).lower() in ('affine', 'rigid', 'translation'):
+            raise ValueError(
+                f"syntx.syn: metric_chunks={_raw_mc} is not supported with linear-only "
+                f"type_of_transform={type_of_transform!r}"
+            )
+        _metrics_check = list(syn_metric) if isinstance(syn_metric, (list, tuple)) else [syn_metric]
+        _cc_like = {
+            'cc', 'cc2', 'lncc', 'lncc2', 'ncc', 'cc_squared',
+            'analytical_lncc', 'pseudo_lncc', 'ants_lncc',
+        }
+        _has_cc = any(
+            (m.metric if isinstance(m, SimilarityLossConfig) else str(m)).strip().lower() in _cc_like
+            for m in _metrics_check
+        )
+        if not _has_cc:
+            raise ValueError(
+                f"syntx.syn: metric_chunks={_raw_mc} requires a local cross-correlation metric "
+                f"(got syn_metric={syn_metric!r})"
+            )
 
     # 1. Extract physical properties
     fixed_primary = fixed[0] if isinstance(fixed, (list, tuple)) else fixed
@@ -3890,7 +4090,8 @@ def registration(
             moving_orientation=str(moving.orientation) if isinstance(moving, ants.ANTsImage) else None,
             fast_smooth=fast_smooth,
             antisymmetric=antisymmetric,
-            use_analytical_gradients=use_analytical
+            use_analytical_gradients=use_analytical,
+            metric_chunks=int(_raw_mc),
         )
         ret_dict['provenance'] = provenance
     except Exception:

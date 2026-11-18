@@ -88,38 +88,79 @@ def _normalize_intensity(t: torch.Tensor) -> torch.Tensor:
     return out.clamp(0.0, 1.0)
 
 
-def _gaussian_kernel_1d(sigma: float, truncate: float = 3.0) -> torch.Tensor:
+def _gaussian_kernel_1d(sigma: float, truncate: float = 3.0, dtype: torch.dtype = torch.float32) -> torch.Tensor:
     """Normalised 1-D Gaussian kernel, radius ``max(1, ceil(truncate * sigma))`` samples."""
     radius = max(1, int(math.ceil(truncate * sigma)))
-    xs = torch.arange(-radius, radius + 1, dtype=torch.float32)
-    kernel = torch.exp(-0.5 * (xs / sigma) ** 2)
+    xs = torch.arange(-radius, radius + 1, dtype=torch.float64)
+    kernel = torch.exp(-0.5 * (xs / float(sigma)).square())
     kernel = kernel / kernel.sum()
-    return kernel
+    return kernel.to(dtype=dtype)
 
 
-def _separable_gaussian3d(vol: torch.Tensor, sigma) -> torch.Tensor:
-    """3D Gaussian blur via three separable 1-D convolutions.
+def _separable_gaussian3d(vol: torch.Tensor, sigma, mode: str = "replicate") -> torch.Tensor:
+    """3D Gaussian blur via three separable 1-D shifted-slice accumulations.
 
     ``sigma`` is either a scalar (voxels, same for all axes) or a 3-tuple of
     per-axis voxel sigmas ordered like the tensor dims (2, 3, 4) = (ix, iy, iz).
-    Zero padding at the borders (``conv3d`` padding), so the blur darkens near edges.
+    ``mode`` selects border handling: ``'replicate'`` (default, clamping edge slices
+    matching ``_shift_pad`` without 5-D ``F.pad`` or 5-D ``F.conv3d``) or
+    ``'zeros'`` / ``'constant'`` (zero-padded borders).
     An axis with ``sigma <= 0`` is not smoothed (a zero-width kernel was 0 / 0 = NaN).
     """
+    if mode not in ("replicate", "zeros", "constant"):
+        raise ValueError(f"_separable_gaussian3d mode must be 'replicate', 'zeros', or 'constant', got {mode!r}")
     if np.isscalar(sigma):
         sig = (float(sigma),) * 3
     else:
         sig = tuple(float(x) for x in sigma)
+    if any(math.isnan(s) or math.isinf(s) for s in sig):
+        raise ValueError(f"_separable_gaussian3d sigmas must be finite, got {sig}")
     out = vol
+    use_inplace = not (torch.is_grad_enabled() and vol.requires_grad)
+    replicate = (mode == "replicate")
     for dim, sg in zip((2, 3, 4), sig):
         if not sg > 0.0:
             continue
-        k = _gaussian_kernel_1d(sg).to(vol.device)
-        shape = [1, 1, 1, 1, 1]
-        shape[dim] = -1
-        kk = k.view(*shape)
-        pad = [0, 0, 0]
-        pad[dim - 2] = k.numel() // 2
-        out = F.conv3d(out, kk, padding=tuple(pad))
+        weights = _gaussian_kernel_1d(sg, dtype=vol.dtype).tolist()
+        radius = len(weights) // 2
+        length = out.shape[dim]
+        w0 = float(weights[radius])
+        if use_inplace:
+            acc = out * w0
+            first = out.narrow(dim, 0, 1) if replicate else None
+            last = out.narrow(dim, length - 1, 1) if replicate else None
+            for d in range(1, radius + 1):
+                wd = float(weights[radius + d])
+                if 2 * d < length:
+                    mid_len = length - 2 * d
+                    acc.narrow(dim, d, mid_len).add_(
+                        out.narrow(dim, 0, mid_len) + out.narrow(dim, 2 * d, mid_len), alpha=wd
+                    )
+                    if replicate:
+                        acc.narrow(dim, 0, d).add_(first + out.narrow(dim, d, d), alpha=wd)
+                        acc.narrow(dim, length - d, d).add_(out.narrow(dim, length - 2 * d, d) + last, alpha=wd)
+                    else:
+                        acc.narrow(dim, 0, d).add_(out.narrow(dim, d, d), alpha=wd)
+                        acc.narrow(dim, length - d, d).add_(out.narrow(dim, length - 2 * d, d), alpha=wd)
+                elif d < length:
+                    if replicate:
+                        acc.narrow(dim, d, length - d).add_(out.narrow(dim, 0, length - d) + last, alpha=wd)
+                        acc.narrow(dim, 0, length - d).add_(first + out.narrow(dim, d, length - d), alpha=wd)
+                        if 2 * d > length:
+                            acc.narrow(dim, length - d, 2 * d - length).add_(first + last, alpha=wd)
+                    else:
+                        acc.narrow(dim, d, length - d).add_(out.narrow(dim, 0, length - d), alpha=wd)
+                        acc.narrow(dim, 0, length - d).add_(out.narrow(dim, d, length - d), alpha=wd)
+                elif replicate:
+                    acc.add_(first + last, alpha=wd)
+            out = acc
+        else:
+            pad_mode = "replicate" if replicate else "zeros"
+            acc = out * w0
+            for d in range(1, radius + 1):
+                wd = float(weights[radius + d])
+                acc = acc + wd * (_shift_pad(out, dim, -d, pad_mode) + _shift_pad(out, dim, +d, pad_mode))
+            out = acc
     return out
 
 
