@@ -545,8 +545,8 @@ def evaluate_decathlon_task(
             kpts0_p, desc0_p = detect_sift3d(pre0, preprocess=False, max_keypoints=500, sigma_min=1.5, sigma_max=6.0)
             kpts1_p, desc1_p = detect_sift3d(pre1, preprocess=False, max_keypoints=500, sigma_min=1.5, sigma_max=6.0)
             m_pair = match_landmarks(kpts0_p, kpts1_p, desc0_p, desc1_p, ratio_thresh=0.90, mutual=True)
-            mf_pair, M_pair = ransac_filter(kpts0_p, kpts1_p, m_pair, model="rigid", inlier_thresh_mm=15.0)
-            if len(mf_pair) >= 4:
+            mf_pair, M_pair = ransac_filter(kpts0_p, kpts1_p, m_pair, model="rigid", inlier_thresh_mm=8.0, min_inliers=8)
+            if len(mf_pair) >= 8:
                 tx_sift = ants.create_ants_transform(transform_type="AffineTransform", dimension=3)
                 tx_sift.set_parameters(np.concatenate([M_pair[:3, :3].ravel(), M_pair[:3, 3]]))
                 tx_sift.set_fixed_parameters(np.zeros(3))
@@ -583,6 +583,7 @@ def evaluate_decathlon_task(
         if (
             (ext_ratios[i] >= 1.30 and ext_diffs[i] >= 60.0)
             or (ext_ratios[i] >= 1.18 and ext_diffs[i] >= 90.0)
+            or (not sup_f["is_hu"] and not sup_m["is_hu"] and ext_ratios[i] >= 1.28 and ext_diffs[i] >= 40.0)
         )
         and (et_f[i] >= 0.10 or et_m[i] >= 0.10)
     ]

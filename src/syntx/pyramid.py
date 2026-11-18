@@ -646,10 +646,20 @@ def plan_scale_space_levels(
         raise PyramidLevelError(f"spacing must be finite and > 0, got {sp}")
     k_min = max(0, int(min_levels) - 1)
     L = 1 << k_min
+    # Preserve at least 16 voxels along any axis whose native resolution is >= 24 voxels
+    # so a 4-voxel boundary taper (8 border voxels) + 5-voxel LNCC kernel retains >= 8 interior voxels.
+    while L > 1:
+        sh_init = plan_levels(n_zyx, sp, [L], policy='deformable')[0].shape_zyx
+        if any(n_orig >= 24 and n_c < 16 for n_orig, n_c in zip(n_zyx, sh_init)):
+            L //= 2
+        else:
+            break
     while L < int(max_level) and (L * s_min) < float(coarse_spacing_mm) - 1e-6:
         sh_curr = plan_levels(n_zyx, sp, [L], policy='deformable')[0].shape_zyx
         sh_next = plan_levels(n_zyx, sp, [2 * L], policy='deformable')[0].shape_zyx
         if sum(1 for a, b in zip(sh_curr, sh_next) if b < a) < 2:
+            break
+        if any(n_orig >= 24 and n_c < 16 for n_orig, n_c in zip(n_zyx, sh_next)):
             break
         L *= 2
     k_max = int(round(math.log2(L)))
@@ -666,6 +676,8 @@ def scale_space_iterations(
     if n == len(base):
         return base
     if n < len(base):
+        if n == 2 and len(base) >= 3:
+            return [min(base[-2], 60), base[-1]]
         return base[-n:]
-    # Extra coarse dyadic levels converge rapidly on small coarse grids; taper L2 from 100 -> 50
-    return [100] * (n - 3) + [100, 50, base[-1]]
+    # Extra coarse dyadic levels converge rapidly on small coarse grids; taper L2 by half
+    return [base[0]] * (n - 3) + [base[0], max(base[1] // 2, base[-1]), base[-1]]

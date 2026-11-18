@@ -3015,11 +3015,15 @@ def pullback_digital_diffeomorphism_to_halves(
         w_r2l_flat = w_r2l.reshape(-1, dim)
         w_l2r_inv_flat = w_l2r_inv.reshape(-1, dim)
 
-        if has_l2r_inv_mod:
-            sten_l2r_inv = _build_sparse_fd_stencil(nz_mask, steps_fd, dtype)
-            det_l2r_inv_0s, _ = _eval_sparse_fd_det(
-                w_l2r_inv_flat[sten_l2r_inv["pool_flat"]], sten_l2r_inv, D_rev_inv, eye, use_physical
+        def _eval_dual_min(u_flat_src: torch.Tensor, sten_d: dict) -> torch.Tensor:
+            d2_v, d4_v = _eval_sparse_dual_fd_det(
+                u_flat_src[sten_d["pool_flat"]], sten_d, D_rev_inv, eye, use_physical
             )
+            return torch.minimum(d2_v, d4_v) if use_physical else d2_v
+
+        if has_l2r_inv_mod:
+            sten_l2r_inv = _build_sparse_dual_fd_stencil(nz_mask, steps_fd, dtype, include_4th=use_physical)
+            det_l2r_inv_0s = _eval_dual_min(w_l2r_inv_flat, sten_l2r_inv)
             sten_dom_l2r_inv = torch.ones_like(dom_b.reshape(-1)[sten_l2r_inv["sten_flat"]])
             floor_l2r_inv = min(
                 float(jac_floor),
@@ -3033,10 +3037,8 @@ def pullback_digital_diffeomorphism_to_halves(
             floor_l2r_inv = float(jac_floor)
 
         if has_l2r_mod:
-            sten_l2r = _build_sparse_fd_stencil(l2r_refine_mask, steps_fd, dtype)
-            det_l2r_0s, _ = _eval_sparse_fd_det(
-                w_l2r_flat[sten_l2r["pool_flat"]], sten_l2r, D_rev_inv, eye, use_physical
-            )
+            sten_l2r = _build_sparse_dual_fd_stencil(l2r_refine_mask, steps_fd, dtype, include_4th=use_physical)
+            det_l2r_0s = _eval_dual_min(w_l2r_flat, sten_l2r)
             # Include boundary stencil voxels so one-sided boundary Jacobians cannot flip sign
             sten_dom_l2r = torch.ones_like(dom_b.reshape(-1)[sten_l2r["sten_flat"]])
             floor_l2r = min(
@@ -3051,10 +3053,8 @@ def pullback_digital_diffeomorphism_to_halves(
             floor_l2r = float(jac_floor)
 
         if has_r2l_mod:
-            sten_r2l = _build_sparse_fd_stencil(r2l_mod_mask, steps_fd, dtype)
-            det_r2l_0s, _ = _eval_sparse_fd_det(
-                w_r2l_flat[sten_r2l["pool_flat"]], sten_r2l, D_rev_inv, eye, use_physical
-            )
+            sten_r2l = _build_sparse_dual_fd_stencil(r2l_mod_mask, steps_fd, dtype, include_4th=use_physical)
+            det_r2l_0s = _eval_dual_min(w_r2l_flat, sten_r2l)
             sten_dom_r2l = torch.ones_like(dom_b.reshape(-1)[sten_r2l["sten_flat"]])
             floor_r2l = min(
                 float(jac_floor),
@@ -3097,35 +3097,17 @@ def pullback_digital_diffeomorphism_to_halves(
 
             ok_l2r = True
             if has_l2r_mod and bool(sten_dom_l2r.any().item()):
-                det_l2r_c, _ = _eval_sparse_fd_det(
-                    cand_l2r.reshape(-1, dim)[sten_l2r["pool_flat"]],
-                    sten_l2r,
-                    D_rev_inv,
-                    eye,
-                    use_physical,
-                )
+                det_l2r_c = _eval_dual_min(cand_l2r.reshape(-1, dim), sten_l2r)
                 ok_l2r = float(det_l2r_c[sten_dom_l2r].amin().item()) >= floor_l2r - 1e-4
 
             ok_r2l = True
             if has_r2l_mod and bool(sten_dom_r2l.any().item()):
-                det_r2l_c, _ = _eval_sparse_fd_det(
-                    cand_r2l.reshape(-1, dim)[sten_r2l["pool_flat"]],
-                    sten_r2l,
-                    D_rev_inv,
-                    eye,
-                    use_physical,
-                )
+                det_r2l_c = _eval_dual_min(cand_r2l.reshape(-1, dim), sten_r2l)
                 ok_r2l = float(det_r2l_c[sten_dom_r2l].amin().item()) >= floor_r2l - 1e-4
 
             ok_l2r_inv = True
             if has_l2r_inv_mod and bool(sten_dom_l2r_inv.any().item()):
-                det_l2r_inv_c, _ = _eval_sparse_fd_det(
-                    cand_l2r_inv.reshape(-1, dim)[sten_l2r_inv["pool_flat"]],
-                    sten_l2r_inv,
-                    D_rev_inv,
-                    eye,
-                    use_physical,
-                )
+                det_l2r_inv_c = _eval_dual_min(cand_l2r_inv.reshape(-1, dim), sten_l2r_inv)
                 ok_l2r_inv = float(det_l2r_inv_c[sten_dom_l2r_inv].amin().item()) >= floor_l2r_inv - 1e-4
 
             if ok_l2r and ok_r2l and ok_l2r_inv:

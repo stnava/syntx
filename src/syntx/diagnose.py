@@ -378,8 +378,32 @@ def diagnose_image(image: Union[ants.ANTsImage, torch.Tensor, np.ndarray], fast:
             and max(spatial_extent[:3]) >= 140.0
             and min(spatial_extent[:3]) >= 110.0
         )
-        body_part = "BRAIN" if is_brain_3d else "UNKNOWN"
-        confidence = 0.75 if is_brain_3d else 0.70
+        if is_brain_3d:
+            body_part = "BRAIN"
+            confidence = 0.75
+        elif (
+            dim == 3
+            and header_hint.get("anisotropy", 1.0) >= 2.2
+            and 140.0 <= sorted(spatial_extent[:3])[-2] <= 280.0
+            and 35.0 <= min(spatial_extent[:3]) <= 165.0
+        ):
+            # 3-D anisotropic internal pelvic MRI slab (e.g. extracted T2 TSE pelvic FOV)
+            nx, ny, _ = arr.shape[:3]
+            if nx >= 8 and ny >= 8:
+                bmask = np.zeros(arr.shape[:3], dtype=bool)
+                bmask[0, :, :] = bmask[-1, :, :] = bmask[:, 0, :] = bmask[:, -1, :] = True
+                border_fg = float(fg_mask[bmask].mean())
+            else:
+                border_fg = 0.0
+            if border_fg >= 0.15:
+                body_part = "PELVIS"
+                confidence = 0.80
+            else:
+                body_part = "UNKNOWN"
+                confidence = 0.70
+        else:
+            body_part = "UNKNOWN"
+            confidence = 0.70
 
     return ImageDiagnosis(
         modality=modality,

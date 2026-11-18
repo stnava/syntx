@@ -174,12 +174,16 @@ class AdjointODEIntegrate(torch.autograd.Function):
     Supports both Euler and 4th-order Runge-Kutta (RK4) integration with Catmull-Rom temporal keyframes.
     """
     @staticmethod
-    def _interp_v_fine(t, v_list):
-        T = len(v_list)
-        if T == 1:
-            return v_list[0]
+    def _interp_weights(t, T):
+        if T <= 1:
+            return ((0, 1.0),)
         if T == 2:
-            return (1.0 - t) * v_list[0] + t * v_list[1]
+            out = []
+            if abs(1.0 - t) > 1e-8:
+                out.append((0, float(1.0 - t)))
+            if abs(t) > 1e-8:
+                out.append((1, float(t)))
+            return tuple(out) if out else ((0, 1.0),)
         t_scaled = t * (T - 1)
         i = math.floor(t_scaled)
         s = t_scaled - i
@@ -192,11 +196,29 @@ class AdjointODEIntegrate(torch.autograd.Function):
         i3 = max(0, min(T - 1, i + 2))
         s2 = s * s
         s3 = s2 * s
-        c0 = 0.5 * (-s3 + 2.0 * s2 - s)
-        c1 = 0.5 * (3.0 * s3 - 5.0 * s2 + 2.0)
-        c2 = 0.5 * (-3.0 * s3 + 4.0 * s2 + s)
-        c3 = 0.5 * (s3 - s2)
-        return c0 * v_list[i0] + c1 * v_list[i1] + c2 * v_list[i2] + c3 * v_list[i3]
+        raw = (
+            (i0, 0.5 * (-s3 + 2.0 * s2 - s)),
+            (i1, 0.5 * (3.0 * s3 - 5.0 * s2 + 2.0)),
+            (i2, 0.5 * (-3.0 * s3 + 4.0 * s2 + s)),
+            (i3, 0.5 * (s3 - s2)),
+        )
+        acc = {}
+        for idx_k, w_k in raw:
+            acc[idx_k] = acc.get(idx_k, 0.0) + float(w_k)
+        out = tuple((k, w) for k, w in acc.items() if abs(w) > 1e-8)
+        return out if out else ((i1, 1.0),)
+
+    @staticmethod
+    def _interp_v_fine(t, v_list):
+        T = len(v_list)
+        iw = AdjointODEIntegrate._interp_weights(t, T)
+        if len(iw) == 1:
+            k0, w0 = iw[0]
+            return v_list[k0] if abs(w0 - 1.0) <= 1e-7 else (w0 * v_list[k0])
+        acc = iw[0][1] * v_list[iw[0][0]]
+        for k, w in iw[1:]:
+            acc = acc + w * v_list[k]
+        return acc
 
     @staticmethod
     def _eval_v(t, curr_phi, v_list, M_norm, b_norm):
@@ -263,9 +285,14 @@ class AdjointODEIntegrate(torch.autograd.Function):
             for step in reversed(range(n_steps)):
                 need_phi_s = (step > 0) or need_phi0_grad
                 phi_s = trajectory[step].detach().requires_grad_(need_phi_s)
-                v_local_stack = vel_stack.detach().requires_grad_(True)
-                v_list = [v_local_stack[i] for i in range(T)]
                 t_curr = t_start + step * dt
+                if solver == 'euler':
+                    t_samples = (t_curr,)
+                else:
+                    t_samples = (t_curr, t_curr + 0.5 * dt, t_curr + dt)
+                active_idx = sorted({k for ts in t_samples for k, _ in AdjointODEIntegrate._interp_weights(ts, T)})
+                v_act = {k: vel_stack[k].detach().requires_grad_(True) for k in active_idx}
+                v_list = [v_act.get(i) for i in range(T)]
 
                 if solver == 'euler':
                     if step == 0 and not need_phi_s:
@@ -284,23 +311,30 @@ class AdjointODEIntegrate(torch.autograd.Function):
                     k4 = AdjointODEIntegrate._eval_v(t_curr + dt, phi_s + dt * k3, v_list, M_norm, b_norm)
                     phi_next = phi_s + (dt / 6.0) * (k1 + 2 * k2 + 2 * k3 + k4)
 
+                act_tensors = tuple(v_act[k] for k in active_idx)
                 if need_phi_s:
                     grads = torch.autograd.grad(
                         outputs=phi_next,
-                        inputs=(phi_s, v_local_stack),
+                        inputs=(phi_s,) + act_tensors,
                         grad_outputs=adj_phi,
-                        retain_graph=False
+                        retain_graph=False,
+                        allow_unused=True,
                     )
                     adj_phi = grads[0]
-                    grad_vel = grad_vel + grads[1]
+                    for k, g_k in zip(active_idx, grads[1:]):
+                        if g_k is not None:
+                            grad_vel[k].add_(g_k)
                 else:
                     grads = torch.autograd.grad(
                         outputs=phi_next,
-                        inputs=(v_local_stack,),
+                        inputs=act_tensors,
                         grad_outputs=adj_phi,
-                        retain_graph=False
+                        retain_graph=False,
+                        allow_unused=True,
                     )
-                    grad_vel = grad_vel + grads[0]
+                    for k, g_k in zip(active_idx, grads):
+                        if g_k is not None:
+                            grad_vel[k].add_(g_k)
 
         return (adj_phi if need_phi0_grad else None), grad_vel, None, None, None, None, None, None, None
 

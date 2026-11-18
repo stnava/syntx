@@ -553,8 +553,37 @@ def sift3d_keypoints(
         idxs = np.argwhere(mask_np)                                   # [K, 3] (ix, iy, iz)
         if idxs.shape[0] == 0:
             continue
-        phys = vox_to_physical(affine, idxs)
-        resp = curr.squeeze().cpu().numpy()[tuple(idxs.T)]
+        dog_np = curr.squeeze().cpu().numpy()
+        nx_d, ny_d, nz_d = dog_np.shape
+        sub_idxs = idxs.astype(np.float64)
+        ix_a, iy_a, iz_a = idxs[:, 0], idxs[:, 1], idxs[:, 2]
+        interior = (
+            (ix_a >= 1) & (ix_a < nx_d - 1)
+            & (iy_a >= 1) & (iy_a < ny_d - 1)
+            & (iz_a >= 1) & (iz_a < nz_d - 1)
+        )
+        if np.any(interior):
+            # Per-axis 1-D parabolic sub-voxel extremum refinement (frame-equivariant and well-conditioned in float32)
+            ii = np.where(interior)[0]
+            x0, y0, z0 = ix_a[ii], iy_a[ii], iz_a[ii]
+            c000 = dog_np[x0, y0, z0].astype(np.float64)
+            curv_floor = np.maximum(1e-5, 0.05 * np.abs(c000))
+            delta = np.zeros((len(ii), 3), dtype=np.float64)
+            for ax_d, (v_m, v_p) in enumerate((
+                (dog_np[x0 - 1, y0, z0].astype(np.float64), dog_np[x0 + 1, y0, z0].astype(np.float64)),
+                (dog_np[x0, y0 - 1, z0].astype(np.float64), dog_np[x0, y0 + 1, z0].astype(np.float64)),
+                (dog_np[x0, y0, z0 - 1].astype(np.float64), dog_np[x0, y0, z0 + 1].astype(np.float64)),
+            )):
+                curv = v_m - 2.0 * c000 + v_p
+                ok_c = np.abs(curv) >= curv_floor
+                if np.any(ok_c):
+                    d_ax = (v_m[ok_c] - v_p[ok_c]) / (2.0 * curv[ok_c])
+                    valid_ax = np.abs(d_ax) <= 0.5
+                    ok_rows = np.where(ok_c)[0]
+                    delta[ok_rows[valid_ax], ax_d] = d_ax[valid_ax]
+            sub_idxs[ii] += delta
+        phys = vox_to_physical(affine, sub_idxs)
+        resp = dog_np[tuple(idxs.T)]
         all_pts.append(np.column_stack([
             phys,
             np.full(len(idxs), dog_sigmas[s], dtype=np.float32),

@@ -246,5 +246,70 @@ def test_tvf_amp_stays_finite_and_deforms():
     assert float(np.abs(warp).max()) > 1e-2, "AMP run silently collapsed to identity displacement"
 
 
+def test_adjoint_ode_integrate_sparse_keyframe_backward_parity():
+    """Sparse active-keyframe AdjointODEIntegrate.backward must match full unrolled autograd
+    for both Euler and RK4 with T=5 Catmull-Rom keyframes."""
+    from syntx.tvf import AdjointODEIntegrate, _compute_norm_affine_cpu
+    from syntx.spatial import get_physical_grid_torch, reverse_metadata
+
+    torch.manual_seed(23)
+    shape = (8, 9, 10)
+    spacing = (1.5, 1.2, 1.0)
+    origin = (-4.0, 2.0, 1.0)
+    direction = np.eye(3)
+    sp_rev, or_rev, dir_rev = reverse_metadata(spacing, origin, direction)
+    M_norm, b_norm = _compute_norm_affine_cpu(
+        torch.tensor(shape, dtype=torch.float64),
+        torch.tensor(sp_rev, dtype=torch.float64),
+        torch.tensor(or_rev, dtype=torch.float64),
+        torch.tensor(dir_rev, dtype=torch.float64),
+    )
+    phi_base = get_physical_grid_torch(shape, spacing, origin, direction, device=torch.device("cpu"), dtype=torch.float64)
+    vel_init = 0.25 * torch.randn((5, 1, 3, *shape), dtype=torch.float64)
+    w_loss = torch.randn_like(phi_base)
+
+    def _unrolled(phi_0, vel_stack, n_steps, dt, solver):
+        curr = phi_0
+        v_list = [vel_stack[i] for i in range(vel_stack.shape[0])]
+        for step in range(n_steps):
+            tc = step * dt
+            if solver == "euler":
+                vs = (
+                    torch.movedim(AdjointODEIntegrate._interp_v_fine(tc, v_list), 1, -1)
+                    if step == 0 and not phi_0.requires_grad
+                    else AdjointODEIntegrate._eval_v(tc, curr, v_list, M_norm, b_norm)
+                )
+                curr = curr + dt * vs
+            else:
+                k1 = (
+                    torch.movedim(AdjointODEIntegrate._interp_v_fine(tc, v_list), 1, -1)
+                    if step == 0 and not phi_0.requires_grad
+                    else AdjointODEIntegrate._eval_v(tc, curr, v_list, M_norm, b_norm)
+                )
+                k2 = AdjointODEIntegrate._eval_v(tc + 0.5 * dt, curr + 0.5 * dt * k1, v_list, M_norm, b_norm)
+                k3 = AdjointODEIntegrate._eval_v(tc + 0.5 * dt, curr + 0.5 * dt * k2, v_list, M_norm, b_norm)
+                k4 = AdjointODEIntegrate._eval_v(tc + dt, curr + dt * k3, v_list, M_norm, b_norm)
+                curr = curr + (dt / 6.0) * (k1 + 2.0 * k2 + 2.0 * k3 + k4)
+        return curr
+
+    n_steps = 7
+    dt = 1.0 / n_steps
+    for solver in ("euler", "rk4"):
+        p_adj = phi_base.clone().requires_grad_(True)
+        v_adj = vel_init.clone().requires_grad_(True)
+        out_adj = AdjointODEIntegrate.apply(p_adj, v_adj, n_steps, 0.0, 1.0, dt, M_norm, b_norm, solver)
+        (out_adj * w_loss).sum().backward()
+
+        p_ref = phi_base.clone().requires_grad_(True)
+        v_ref = vel_init.clone().requires_grad_(True)
+        out_ref = _unrolled(p_ref, v_ref, n_steps, dt, solver)
+        (out_ref * w_loss).sum().backward()
+
+        assert torch.allclose(out_adj.detach(), out_ref.detach(), atol=1e-10, rtol=1e-9)
+        assert torch.allclose(p_adj.grad, p_ref.grad, atol=1e-9, rtol=1e-8)
+        assert torch.allclose(v_adj.grad, v_ref.grad, atol=1e-9, rtol=1e-8)
+
+
+
 
 

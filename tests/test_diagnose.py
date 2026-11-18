@@ -121,3 +121,21 @@ def test_msd_task_registry():
     assert lung_task.target_anatomy == "THORAX"
     assert lung_task.primary_modality == "CT"
     assert lung_task.intensity_domain == "HOUNSFIELD"
+
+
+def test_diagnose_pelvic_mri_anisotropic_internal_window():
+    """3-D anisotropic internal-window pelvic MRI slabs (e.g. prostate T2w) must classify as PELVIS
+    and activate MIND self-similarity guidance."""
+    rng = np.random.default_rng(7)
+    arr = rng.uniform(40.0, 220.0, size=(128, 128, 20)).astype(np.float32)
+    img = ants.from_numpy(arr, spacing=(1.5, 1.5, 4.0), origin=(-96.0, -96.0, -40.0))
+
+    diag = diagnose_image(img)
+    assert diag.is_mri()
+    assert diag.body_part == "PELVIS"
+
+    pair = diagnose_pair(img, img)
+    policy = synthesize_policy(pair)
+    assert policy.guided == "mind"
+    assert policy.transform_type == "SyN"
+

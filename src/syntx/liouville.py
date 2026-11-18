@@ -346,7 +346,7 @@ def liouville_determinant(result: Dict[str, Any], fixed, method: Optional[str] =
         )
         l2r_t = torch.from_numpy(np.ascontiguousarray(np.transpose(l2r, rev_axes))).to(eval_dev)
         r2l_t = torch.from_numpy(np.ascontiguousarray(np.transpose(r2l, rev_axes))).to(eval_dev)
-        both_pos_grid = ((l2r_t > 0.0) & (r2l_t > 0.0)).float().unsqueeze(0).unsqueeze(0)
+        half_min_grid = torch.minimum(l2r_t, r2l_t).unsqueeze(0).unsqueeze(0)
         pair_t = torch.stack([r2l_t, l2r_t], dim=0).unsqueeze(0)
         del l2r_t, r2l_t
 
@@ -370,18 +370,20 @@ def liouville_determinant(result: Dict[str, Any], fixed, method: Optional[str] =
         del pair_t
         r2l_y = sampled_pair[0, 0]
         l2r_y = sampled_pair[0, 1]
-        both_pos_y = F.grid_sample(both_pos_grid, coords_norm, mode="nearest", padding_mode="border", align_corners=True)[0, 0]
-        del coords_norm, both_pos_grid
+        half_min_y = F.grid_sample(half_min_grid, coords_norm, mode="nearest", padding_mode="border", align_corners=True)[0, 0]
+        del coords_norm, half_min_grid
 
-        valid_pos = (both_pos_y > 0.5) & (l2r_y > 1e-4)
+        valid_pos = (half_min_y > 0.0) & (l2r_y > 1e-4)
         if bool((~valid_pos).any().item()):
             # Where a half folds or l2r -> 0, the inverse-function ratio r2l / l2r diverges;
-            # evaluate the finite chain-rule magnitude |det D phi_r2l(y) * det D phi_l2r^-1(x)|
-            # negated so every half-fold remains strictly <= 0 without -inf / division spikes.
+            # evaluate the signed chain-rule product det D phi_r2l(y) * det D phi_l2r^-1(x)
+            # bounded above by the folded half determinant (<= 0) without negating positive expansions.
             det_l2r_inv = _fd_det(model_ref, w_l2r_inv_cpu)
             l2r_inv_t = torch.from_numpy(np.ascontiguousarray(np.transpose(det_l2r_inv.numpy(), rev_axes))).to(eval_dev)
-            folded_val = -torch.abs(r2l_y * l2r_inv_t)
-            folded_val = torch.minimum(folded_val, torch.minimum(l2r_y, r2l_y))
+            chain_det = r2l_y * l2r_inv_t
+            folded_val = torch.minimum(
+                chain_det, torch.minimum(half_min_y, torch.minimum(l2r_y, r2l_y))
+            ).clamp(max=0.0)
             det_t = torch.where(valid_pos, r2l_y / l2r_y.clamp(min=1e-4), folded_val)
         else:
             det_t = r2l_y / l2r_y

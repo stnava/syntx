@@ -4213,6 +4213,7 @@ def auto_reg(
     eff_iters = reg_iterations
     if not is_affine_only:
         from .pyramid import plan_scale_space_levels, scale_space_iterations
+        base_ss_iters = (100, 100, 20)
         if eff_levels is None and eff_iters is None:
             if hasattr(fixed_primary, 'spacing') and hasattr(fixed_primary, 'shape') and dim in (2, 3):
                 sp_xyz = tuple(float(s) for s in fixed_primary.spacing[:dim])
@@ -4222,10 +4223,10 @@ def auto_reg(
                 pol_coarse_mm = float(policy.coarse_spacing_mm) if policy is not None else 4.0
                 eff_coarse_mm = max(pol_coarse_mm, transverse_ext / 64.0)
                 eff_levels = plan_scale_space_levels(sh_zyx, sp_xyz, coarse_spacing_mm=eff_coarse_mm)
-                eff_iters = scale_space_iterations(eff_levels)
+                eff_iters = scale_space_iterations(eff_levels, base_iterations=base_ss_iters)
             else:
                 eff_levels = [4, 2, 1]
-                eff_iters = [100, 100, 20]
+                eff_iters = list(base_ss_iters)
         elif eff_levels is None and eff_iters is not None:
             if isinstance(eff_iters, (list, tuple)):
                 eff_levels = [1 << i for i in range(len(eff_iters) - 1, -1, -1)]
@@ -4233,9 +4234,9 @@ def auto_reg(
                 eff_levels = [4, 2, 1]
         elif eff_levels is not None and eff_iters is None:
             if isinstance(eff_levels, (list, tuple)):
-                eff_iters = scale_space_iterations(eff_levels)
+                eff_iters = scale_space_iterations(eff_levels, base_iterations=base_ss_iters)
             else:
-                eff_iters = [100, 100, 20]
+                eff_iters = list(base_ss_iters)
 
     if is_affine_only:
         from .robust_affine import robust_affine as run_robust_affine
@@ -4301,6 +4302,14 @@ def auto_reg(
             'verbose': verbose
         }
         syn_params.update(kwargs)
+        if (
+            isinstance(eff_levels, (list, tuple))
+            and len(eff_levels) <= 2
+            and hasattr(fixed_primary, 'shape')
+            and max(int(n) for n in fixed_primary.shape[:dim]) < 64
+            and float(syn_params.get('grad_step', 0.4)) > 0.5
+        ):
+            syn_params['grad_step'] = 0.5
         res = registration(fixed=fixed_proc, moving=moving_proc, **syn_params)
         reg_used = str(syn_params.get('regularizer', 'sobolev')).lower()
         if guided in (True, 'sulcal'):

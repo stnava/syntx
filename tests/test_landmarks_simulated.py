@@ -216,6 +216,34 @@ def test_border_ops_match_cpu_on_mps_large_slices():
     assert float((_gradient_axes(v) - _gradient_axes(v.to("mps")).cpu()).abs().max()) < 1e-5
 
 
+def test_sift3d_subvoxel_parabolic_refinement_offgrid_blob():
+    """Parabolic DoG sub-voxel refinement must localize an off-lattice isotropic 3-D Gaussian
+    significantly closer than integer voxel quantization while preserving physical coordinates."""
+    import ants
+    from syntx.landmarks import detect_sift3d
+
+    xx, yy, zz = np.meshgrid(
+        np.arange(48, dtype=np.float32),
+        np.arange(48, dtype=np.float32),
+        np.arange(48, dtype=np.float32),
+        indexing="ij",
+    )
+    true_xyz = np.array([24.38, 25.64, 23.42], dtype=np.float32)
+    r2_blob = (xx - true_xyz[0]) ** 2 + (yy - true_xyz[1]) ** 2 + (zz - true_xyz[2]) ** 2
+    # Smooth linear background [0.15, 0.50] with peak 0.328 + 0.12 = 0.448 < p98 (0.493) so peak is unclipped
+    arr_xyz = (0.15 + 0.35 * (xx / 48.0) + 0.12 * np.exp(-0.5 * r2_blob / (1.8 ** 2))).astype(np.float32)
+    img = ants.from_numpy(arr_xyz, origin=(10.0, -20.0, 5.0), spacing=(1.0, 1.0, 1.0))
+    target_mm = np.array([10.0, -20.0, 5.0]) + true_xyz
+
+    kpts, _ = detect_sift3d(
+        img, preprocess=False, max_keypoints=20, n_scales=8, sigma_min=1.0, sigma_max=5.0, device="cpu"
+    )
+    assert len(kpts) >= 1
+    dists = np.linalg.norm(kpts[:, :3] - target_mm[None, :], axis=1)
+    assert float(dists.min()) < 0.25
+
+
+
 @pytest.mark.slow
 def test_rotation_search_recovers_60_degrees(rot60_bundle):
     from syntx.landmarks import match_sift3d_with_rotation_search

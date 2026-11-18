@@ -146,3 +146,23 @@ def test_the_scan_detects_each_kind_of_copy(tmp_path, snippet, pattern):
 def test_prose_and_comments_do_not_trip_the_scan(tmp_path):
     (tmp_path / "doc.py").write_text('"""Uses avg_pool3d and F.interpolate( in prose."""\n# resample_image( in a comment\nx = 1\n')
     assert not scan(tmp_path)
+
+
+def test_scale_space_levels_preserve_small_roi_interior_support():
+    """Verify plan_scale_space_levels respects coarse_spacing_mm and deformable 16-voxel floor,
+    and scale_space_iterations caps 2-level coarse schedules at 60 iterations."""
+    from syntx.pyramid import plan_scale_space_levels, scale_space_iterations
+
+    lvls_small = plan_scale_space_levels((28, 30, 28), (1.0, 1.0, 1.0), coarse_spacing_mm=4.0, min_levels=2)
+    assert lvls_small == [2, 1]
+    assert scale_space_iterations(lvls_small) == [60, 20]
+
+    lvls_thin = plan_scale_space_levels((14, 48, 48), (1.0, 1.0, 1.0), coarse_spacing_mm=2.0, min_levels=3)
+    assert lvls_thin == [4, 2, 1]
+
+    lvls_brain = plan_scale_space_levels((192, 224, 192), (1.0, 1.0, 1.0), coarse_spacing_mm=4.0)
+    assert lvls_brain == [4, 2, 1]
+    assert scale_space_iterations(lvls_brain) == [100, 100, 20]
+
+    assert scale_space_iterations([8, 4, 2, 1], base_iterations=(80, 60, 15)) == [80, 80, 30, 15]
+

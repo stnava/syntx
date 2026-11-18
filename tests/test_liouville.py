@@ -313,4 +313,48 @@ def test_step_log_det_at_norm_matches_velocity_gradient_2d_and_3d_oblique():
     assert torch.allclose(act_ld_2d[nonsingular_2d], ref_ld_2d[nonsingular_2d], atol=5e-5, rtol=5e-5)
 
 
+def test_syn_liouville_subvoxel_half_graze_does_not_amplify_expansion_to_spike():
+    """When a half-field grazes slightly below zero (e.g. det_l2r ~ -0.02) inside a strongly
+    expanding region (det_r2l * det_l2r_inv ~ +8.0), liouville_determinant must preserve the
+    non-positive fold flag (<= 0) without replacing it by -abs(+8.0) == -8.0."""
+    import torch
+
+    shape_ants = (24, 24, 24)
+    fi = ants.from_numpy(np.ones(shape_ants, dtype=np.float32), origin=(0.0, 0.0, 0.0), spacing=(1.0, 1.0, 1.0))
+    z, y, x = torch.meshgrid(
+        torch.arange(24, dtype=torch.float32),
+        torch.arange(24, dtype=torch.float32),
+        torch.arange(24, dtype=torch.float32),
+        indexing="ij",
+    )
+    # Mild sub-voxel graze on w_l2r around x=12: central diff at x=12 is -1.15 * exp(-1/16) = -1.08 -> det_l2r ~ -0.08
+    r2 = ((x - 12.0) ** 2 + (y - 12.0) ** 2 + (z - 12.0) ** 2) / 16.0
+    w_l2r = torch.zeros((1, 24, 24, 24, 3), dtype=torch.float32)
+    w_l2r[0, ..., 2] = -1.15 * (x - 12.0) * torch.exp(-r2)
+
+    # Strong isotropic expansion on r2l and l2r_inv so r2l_y * l2r_inv_t >> +4.0 near center
+    w_r2l = torch.zeros_like(w_l2r)
+    w_r2l[0, ..., 0] = 0.8 * (z - 12.0) * torch.exp(-r2 / 2.0)
+    w_r2l[0, ..., 1] = 0.8 * (y - 12.0) * torch.exp(-r2 / 2.0)
+    w_r2l[0, ..., 2] = 0.8 * (x - 12.0) * torch.exp(-r2 / 2.0)
+    w_l2r_inv = w_r2l.clone()
+
+    class _MockSyN:
+        pass
+
+    m = _MockSyN()
+    m.spacing = (1.0, 1.0, 1.0)
+    m.origin = (0.0, 0.0, 0.0)
+    m.direction = np.eye(3)
+    m.midpoint_warp_l2r = w_l2r
+    m.midpoint_warp_r2l = w_r2l
+    m.midpoint_warp_l2r_inv = w_l2r_inv
+
+    det_img = syntx.liouville_determinant({"model": m, "provenance": {"algorithm": "syntx.syn"}}, fi)
+    summary = syntx.determinant_summary(det_img, fi)
+    assert summary["folding_pct"] > 0.0
+    assert -0.5 < summary["min"] <= 0.0
+
+
+
 

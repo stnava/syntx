@@ -142,6 +142,10 @@ def _fig_to_png_bytes(fig: Figure, dpi: int = 150) -> bytes:
 def _encode_pil_data_uri(im: Image.Image, fmt: Optional[str] = None) -> str:
     mode = (fmt or _HTML_IMAGE_FORMAT).lower()
     rgb = im.convert("RGB")
+    if mode.startswith("webp") and max(rgb.size) > 16000:
+        scale = 16000.0 / float(max(rgb.size))
+        new_size = (max(1, int(round(rgb.width * scale))), max(1, int(round(rgb.height * scale))))
+        rgb = rgb.resize(new_size, Image.Resampling.LANCZOS)
     out = io.BytesIO()
     if mode == "webp":
         rgb.save(out, format="WEBP", quality=92, method=4)
@@ -810,10 +814,13 @@ def _describe_task_optimization_spec(
             else "Foreground [2%, 98%] robust percentile intensity normalization → [0, 1]"
         )
         if is_internal:
-            aff_obj = "32-bin Mattes MI on 3-D in-bounds overlap + 6-axis physical-LPS MIND descriptor consistency + 0.84·ov guard"
+            aff_obj = "32-bin Mattes MI on 3-D in-bounds overlap + 6-axis physical-LPS MIND descriptor consistency + 0.78·ov guard"
         elif has_slab_asym and sup_f["is_hu"]:
-            mask_desc = "1-D moving-axis mask (|y_axial| ≤ 0.99, transverse X/Y air kept)" if mov_trunc else "Full fixed domain Ω_F"
-            aff_obj = f"4 mm Hull-Fraction CT Tomography Anchor (±30 mm dead-zone) + 32-bin Mattes MI on {mask_desc}"
+            mask_desc = "truncated-axis in-bounds slab" if mov_trunc is not None else "full fixed domain Ω_F"
+            aff_obj = f"4 mm Hull-Fraction CT Tomography Basin (±30 mm dead-zone) + 32-bin Mattes MI on {mask_desc} + 0.84·ov guard"
+        elif has_slab_asym:
+            mask_desc = "truncated-axis in-bounds slab" if mov_trunc is not None else "full fixed domain Ω_F"
+            aff_obj = f"Thoracic/Slab Coverage-Asymmetry Sweep + 6-axis physical-LPS MIND consistency + 32-bin Mattes MI on {mask_desc}"
         else:
             aff_obj = "Union-FOV Hann-tapered SCOT (α = 0.5) multi-start + 32-bin Parzen Mattes MI over full fixed domain Ω_F"
 
@@ -824,8 +831,10 @@ def _describe_task_optimization_spec(
         )
 
         # Stage 2 Deformable
-        lvls = plan_scale_space_levels(img0.shape[::-1], img0.spacing, coarse_spacing_mm=pol.coarse_spacing_mm)
-        iters = scale_space_iterations(lvls)
+        ext_sorted = sorted(float(n) * float(s) for n, s in zip(img0.shape[:3], img0.spacing[:3]))
+        eff_coarse_mm = max(float(pol.coarse_spacing_mm), ext_sorted[-2] / 64.0)
+        lvls = plan_scale_space_levels(img0.shape[::-1], img0.spacing, coarse_spacing_mm=eff_coarse_mm)
+        iters = scale_space_iterations(lvls, base_iterations=(100, 100, 20))
         if sup_f["is_hu"] and pol.ct_window == (-150.0, 250.0):
             ch_desc = "3 simultaneous HU attenuation bands: Parenchymal [-150, 250] (w=0.55) + Vascular/Bone [20, 480] (w=0.30) + Body-Wall [-1000, 800] (w=0.15)"
         elif sup_f["is_hu"] and pol.ct_window == (-1000.0, 400.0):
@@ -844,10 +853,11 @@ def _describe_task_optimization_spec(
             if pol.similarity_metric == "cc"
             else "Squared LNCC (r², 5³ window; contrast-polarity invariant)"
         )
+        eff_gs = 0.5 if (len(lvls) <= 2 and max(int(n) for n in img0.shape[:3]) < 64) else 0.7
         solver_desc = (
-            "Time-Varying Velocity Field (TVF, 5 Euler steps) + Beltrami quasiconformal smoothing"
+            "Time-Varying Velocity Field (TVF, 5 Euler steps, sparse adjoint) + Beltrami quasiconformal smoothing"
             if pol.transform_type.upper() == "TVF"
-            else "Symmetric Midpoint SyN (grad_step = 0.7) + Beltrami quasiconformal smoothing (dilatation = 0.1)"
+            else f"Symmetric Midpoint SyN (grad_step = {eff_gs:.1f}) + Beltrami quasiconformal smoothing (dilatation = 0.1)"
         )
         col3 = (
             f"<div><strong>Auto-Diagnosis:</strong> <code>{html.escape(diag.fixed.body_part)} / {html.escape(diag.fixed.modality)}</code> &rarr; {html.escape(solver_desc)}</div>"
@@ -895,7 +905,7 @@ def _render_single_task_visual_suite(
     m_case = loaded["m_case"]
     win_arm = loaded["win_arm"]
 
-    cache_key = f"{tname}__{f_case}__{m_case}__{win_arm}_v3".replace("/", "_")
+    cache_key = f"{tname}__{f_case}__{m_case}__{win_arm}_v4".replace("/", "_")
     if cache_dir is not None:
         cache_dir.mkdir(parents=True, exist_ok=True)
         p_before = cache_dir / f"{cache_key}_before.png"
@@ -947,9 +957,9 @@ def _render_single_task_visual_suite(
         try:
             kp0, dc0 = detect_sift3d(pre0, preprocess=False, max_keypoints=500, sigma_min=1.5, sigma_max=6.0)
             kp1, dc1 = detect_sift3d(pre1, preprocess=False, max_keypoints=500, sigma_min=1.5, sigma_max=6.0)
-            mm = match_landmarks(kp0, kp1, dc0, dc1, ratio_thresh=0.85, mutual=True)
-            mf, M_sift = ransac_filter(kp0, kp1, mm, model="affine", inlier_thresh_mm=5.0)
-            if len(mf) >= 6 and M_sift is not None:
+            mm = match_landmarks(kp0, kp1, dc0, dc1, ratio_thresh=0.90, mutual=True)
+            mf, M_sift = ransac_filter(kp0, kp1, mm, model="rigid", inlier_thresh_mm=8.0, min_inliers=8)
+            if len(mf) >= 8 and M_sift is not None:
                 tx_s = ants.create_ants_transform(transform_type="AffineTransform", dimension=3)
                 tx_s.set_parameters(np.concatenate([M_sift[:3, :3].ravel(), M_sift[:3, 3]]))
                 tx_s.set_fixed_parameters(np.zeros(3))
@@ -1571,6 +1581,29 @@ def build_html_report(
     prostate_syntx = float(prostate_rec["dice_syntx_syn"]) if prostate_rec else float("nan")
     prostate_ants = float(prostate_rec["dice_ants_syn"]) if prostate_rec else float("nan")
     prostate_delta_pp = (prostate_syntx - prostate_ants) * 100.0
+
+    pancreas_rec = next((r for r in ordered if r.get("task_name") == "Task07_Pancreas"), None)
+    pancreas_syntx = float(pancreas_rec["dice_syntx_syn"]) if pancreas_rec else float("nan")
+    pancreas_ants = float(pancreas_rec["dice_ants_syn"]) if pancreas_rec else float("nan")
+    pancreas_delta_pp = (pancreas_syntx - pancreas_ants) * 100.0
+
+    n_zero_fold_tasks = sum(1 for r in ordered if float(r.get("folding_pct", 0.0)) < 5e-5)
+    nonzero_fold_recs = [r for r in ordered if float(r.get("folding_pct", 0.0)) >= 5e-5]
+    if nonzero_fold_recs:
+        nz_names = ", ".join(f"<code>{html.escape(r['anatomy'])}</code>" for r in nonzero_fold_recs)
+        nz_max = max(float(r["folding_pct"]) for r in nonzero_fold_recs)
+        fold_lim_html = (
+            f"<code>{n_zero_fold_tasks}/{len(ordered)}</code> MSD tasks achieve exact <code>0.0000%</code> Liouville folding across all pairs "
+            f"under the dual <code>2h + 4h</code> sparse stencil pullback; extreme inter-subject boundary strain on {nz_names} "
+            f"leaves at most <code>{nz_max:.4f}%</code> boundary Jacobian non-positivity after fixed-budget sparse polish, which "
+            f"<code>antsxqc</code> transparently grades rather than masking."
+        )
+    else:
+        fold_lim_html = (
+            f"All <code>{len(ordered)}/{len(ordered)}</code> MSD tasks achieve <code>0.0000%</code> Liouville folding across all pairs "
+            f"under the dual <code>2h + 4h</code> sparse stencil pullback; single-voxel sub-resolution grazing near steep organ boundaries "
+            f"is transparently reported via minimum Liouville Jacobian and <code>antsxqc</code> grades."
+        )
 
     mosaic_section_html = ""
     if fig_mosaic_b64:
@@ -2245,7 +2278,7 @@ def build_html_report(
       <h2>7. First-Principles Root-Cause Dissection — <code>Task09_Spleen</code> (<code>{spleen_delta_pp:+.2f} pp</code>), <code>Task03_Liver</code> (<code>{liver_delta_pp:+.2f} pp</code>) &amp; <code>Task05_Prostate</code> (<code>{prostate_delta_pp:+.2f} pp</code>)</h2>
       <p>Eliminating every per-task conditional and ROI crop exposed three general physical laws that govern thoraco-abdominal CT and internal-window MRI registration across the entire cohort:</p>
       <ul>
-        <li><strong>Law 1 — Calibrated Hounsfield Attenuation &amp; Signed <code>cc</code> Polarity:</strong> Standard <code>arr &gt; 0</code> percentile normalization clipped pulmonary parenchyma (<code>&minus;800 HU</code>), adipose fat (<code>&minus;90 HU</code>), and water (<code>0 HU</code>) to zero, while squared <code>cc2</code> (<em>r</em>&sup2;) rewarded anti-correlated (<em>r</em> = &minus;1) organ/bowel-gas interfaces. Anchoring calibrated HU volumes at physical air (<code>&minus;1000 HU</code>) and pairing simultaneous multi-band HU channels with signed <code>cc</code> (<em>r</em>) and <code>10 mm</code> physical coarse scale-space lifted 5-pair <code>Task09_Spleen</code> to <strong><code>{spleen_syntx:.4f}</code> vs. <code>ANTs {spleen_ants:.4f}</code> (<code>{spleen_delta_pp:+.2f} pp</code>, <code>{spleen_wins}/{spleen_n}</code> wins)</strong> without degrading small retroperitoneal glands (<code>Task07_Pancreas</code>: <strong><code>0.4266</code> vs. <code>ANTs 0.2953</code>, <code>+13.13 pp</code></strong>).</li>
+        <li><strong>Law 1 — Calibrated Hounsfield Attenuation &amp; Signed <code>cc</code> Polarity:</strong> Standard <code>arr &gt; 0</code> percentile normalization clipped pulmonary parenchyma (<code>&minus;800 HU</code>), adipose fat (<code>&minus;90 HU</code>), and water (<code>0 HU</code>) to zero, while squared <code>cc2</code> (<em>r</em>&sup2;) rewarded anti-correlated (<em>r</em> = &minus;1) organ/bowel-gas interfaces. Anchoring calibrated HU volumes at physical air (<code>&minus;1000 HU</code>) and pairing simultaneous multi-band HU channels with signed <code>cc</code> (<em>r</em>) and <code>10 mm</code> physical coarse scale-space lifted 5-pair <code>Task09_Spleen</code> to <strong><code>{spleen_syntx:.4f}</code> vs. <code>ANTs {spleen_ants:.4f}</code> (<code>{spleen_delta_pp:+.2f} pp</code>, <code>{spleen_wins}/{spleen_n}</code> wins)</strong> without degrading small retroperitoneal glands (<code>Task07_Pancreas</code>: <strong><code>{pancreas_syntx:.4f}</code> vs. <code>ANTs {pancreas_ants:.4f}</code>, <code>{pancreas_delta_pp:+.2f} pp</code></strong>).</li>
         <li><strong>Law 2 — 1-D Hull-Fraction CT Cross-Sectional Tomography &amp; Symmetric Slab Masking:</strong> When whole-torso CT (<code>680 mm</code> neck-to-thighs) is registered against an abdomen-only slab (<code>410 mm</code>) or vice versa, unmasked <code>padding_mode='zeros'</code> treats unacquired chest/thigh slices as <code>0.0</code> air and stretches the abdomen by <code>1.6&times;</code>. Normalizing 4-band cross-sectional tissue curves by per-slice body-hull area (<code>prof[k] / n_hull</code>, invariant to shoulders) with 1-D moving-slab masking (<code>|y<sub>axial</sub>| &le; 0.99</code>, retaining transverse X/Y air) resolved both <code>spleen_21 &larr; spleen_33</code> (<code>0.0000 &rarr; 0.7197</code>) and 5-pair <code>Task03_Liver</code> (<strong><code>{liver_syntx:.4f}</code> vs. <code>ANTs {liver_ants:.4f}</code>, <code>{liver_delta_pp:+.2f} pp</code></strong>).</li>
         <li><strong>Law 3 — Internal-Window FOV Support &amp; Multi-Channel 3-D MIND:</strong> Truncated pelvic and hippocampal MRI windows cut directly through surrounding anatomy on all six faces (<code>border_fg_frac &ge; 0.25</code>). Evaluating 32-bin Mattes MI + 6-axis physical-LPS MIND strictly on in-bounds physical support with <code>0.84 &middot; expected_ov</code> overlap enforcement raised uncropped <code>Task05_Prostate</code> to <strong><code>{prostate_syntx:.4f}</code> vs. <code>ANTs {prostate_ants:.4f}</code> (<code>{prostate_delta_pp:+.2f} pp</code>, <code>5/5</code> wins, <code>0.0000%</code> folds)</strong>.</li>
       </ul>
@@ -2324,7 +2357,7 @@ def build_html_report(
         </div>
         <div class="lim-card">
           <h4>4. Residual Sub-Percent Boundary Creases on High-Strain Body Pairs</h4>
-          <p>Six of the ten MSD tasks achieve exact <code>0.0000%</code> Liouville folding across all pairs; extreme inter-subject respiratory or splenomegaly strain on <code>Heart</code>, <code>Liver</code>, <code>Pancreas</code>, and <code>Spleen</code> leaves <code>0.0009% &ndash; 0.0076%</code> boundary Jacobian non-positivity after fixed-budget sparse polish, which <code>antsxqc</code> transparently grades rather than masking.</p>
+          <p>{fold_lim_html}</p>
         </div>
       </div>
     </section>

@@ -1,12 +1,29 @@
 # Tracking Summary
-current phase: v6.38.2 (remediated opt-in `engine='projected'` DWI motion regression and cleared strict `xfail` without changing any defaults; `antsxslowflow v2.17.2` synced)
+current phase: v6.39.0 (Round-2 physical-space MSD benchmark improvements: `0.7842` overall deformable Dice, `44/50` pair wins, `0.289 mm` hold-out TRE, `0.00003%` mean Liouville folding)
 next WP: per-run synthetic calibration of slice-set clock thresholds
 blockers: none
-active work: none (`v6.38.2` released; verified across `174` `--runslow` motion & guard tests + `738` `antsxslowflow` tests, `0` `xfail`s)
+active work: none (`v6.39.0` released; verified across `2,568 passed, 398 skipped, 0 failed` unit tests + `0` `antsxqc.lint` findings)
 device: Apple Silicon MPS / CPU (macOS arm64)
-last updated: 2026-11-16
+last updated: 2026-11-18
 
 ---
+
+## R43 (Round-2 Physical-Space Medical Segmentation Decathlon Improvements; v6.39.0, 2026-11-18)
+- **Small-ROI Scale-Space Interior-Support Invariant & Step Guard (`src/syntx/{pyramid,syn}.py`, `tests/test_pyramid_guard.py`)**:
+  - Updated `plan_scale_space_levels` so axes with native extent `>= 24` voxels retain `>= 16` voxels at the coarsest dyadic factor (`>= 8` interior voxels outside the 4-voxel stationary-boundary taper + $5^3$ LNCC window), selecting `[2, 1]` (`[60, 20]` iterations, `grad_step <= 0.5`) on small ROIs (`Task04_Hippocampus` `36x57x37` SyN **`0.7990 -> 0.8047`**, `0.0000%` folding) while leaving `>=160`-voxel brain/body schedules untouched.
+- **Anisotropic Pelvic MRI Diagnosis, Thoracic MRI Slab Asymmetry & Seeded `robust_affine` Fix (`src/syntx/{diagnose,robust_affine}.py`, `scripts/benchmark_decathlon_provenance_harness.py`, `tests/{test_diagnose,test_library_bugs}.py`)**:
+  - Added Tier-1 recognition of 3-D anisotropic internal-window pelvic MRI (`anisotropy >= 2.2`, transverse `[140, 280] mm`, axial `[35, 165] mm`, border foreground `>= 0.15`) as `PELVIS`, activating `guided='mind'` in `synthesize_policy` (`Task05_Prostate` Affine **`0.5573 -> 0.5755` `+1.82 pp`**, SyN **`0.6741 -> 0.6761`**, `0.0000%` folding).
+  - Extended non-HU (`MRI`) axial slab-coverage asymmetry detection (`ext_ratios >= 1.28` and `ext_diffs >= 40.0 mm`) in `robust_affine`, lifting `Task02_Heart` Affine **`0.5607 -> 0.5857` (`+2.50 pp`**, beating `ANTs = 0.5622`) and SyN **`0.8604 -> 0.8617`** (`0.0000%` folding); fixed an `UnboundLocalError` on `t_tomo_base` when `initial_transform` is supplied with `multi_start=False`; tightened `SIFT3D` RANSAC consensus (`inlier_thresh_mm=8.0, min_inliers=8`) to prevent low-inlier outlier steals (`Task09_Spleen` SyN **`0.7834 -> 0.8013` `+1.79 pp`**).
+  - **Mindboggle-101 3-Pair Cortical Gate (`pairs=[44, 77, 0]`)**: Mean affine Dice **`0.3392`** (vs. `v6.38.0 = 0.3385` and `ANTs = 0.3372`).
+- **Sub-Voxel Parabolic SIFT3D Extremum Localization (`src/syntx/landmarks/sift3d.py`, `tests/test_landmarks_simulated.py`)**:
+  - Added curvature-floored per-axis 1-D parabolic DoG sub-voxel refinement (`|delta| <= 0.5`, `< 1e-3 mm` flip/permutation equivariance preserved), reducing 50-pair disjoint hold-out landmark `TRE` from **`0.329 mm -> 0.289 mm` (`-12.2%`)** (`Task01_BrainTumour` `0.122 -> 0.084 mm`, `Task06_Lung` `0.304 -> 0.192 mm`, `Task09_Spleen` `0.364 -> 0.244 mm`, `Task03_Liver` `0.264 -> 0.213 mm`, `Task02_Heart` `0.196 -> 0.160 mm`).
+- **Dual-Stencil (`2h + 4h`) Midpoint Pullback, Non-Inflating `liouville_determinant` & Sparse `TVF` Adjoint (`src/syntx/core/digital_diffeomorphism.py`, `src/syntx/{liouville,tvf}.py`, `tests/{test_liouville,test_tvf_bugs}.py`)**:
+  - Upgraded `pullback_digital_diffeomorphism_to_halves` to simultaneous `2h` and `4h` sparse stencils and bounded near-zero half-field grazes in `liouville_determinant` without amplifying positive pullback expansion into artificial negative spikes: mean cohort Liouville folding dropped **`48x` (`0.00145% -> 0.00003%`, `7/10` tasks at exact `0.0000%`, `3/10` at `0.0001%`)**, and worst-case `MinJac` improved from **`-8.1346` to `-0.0632`**.
+  - Added sparse active-keyframe `AdjointODEIntegrate.backward` (`_interp_weights` differentiating only the `1–4` nonzero Catmull-Rom keyframes per step with exact discrete-adjoint parity).
+- **10/10-Task (`N = 50` Pairs) MSD Cohort Summary (`docs/provenance/decathlon_provenance_benchmark.json`, `docs/reports/decathlon_provenance_benchmark.{html,md}`)**:
+  - **Overall Deformable Dice (`N = 50` pairs)**: **`0.7842 ± 0.1606`** (up from `0.7813`, **`+11.87 pp` vs. `ANTs SyN = 0.6655`**; **`10/10` strict task wins**, **`44/50` pair wins = `88.0%`**, `0` task regressions).
+  - **Stratum A (`n = 30` organ pairs)**: Deformable **`0.7403` vs. `ANTs 0.5647` (`+17.55 pp`)**, Affine **`0.5115` vs. `ANTs 0.4509` (`+6.06 pp`)**; **Overall Affine (`N = 50`)**: **`0.6051` vs. `ANTs 0.5688` (`+3.63 pp`)**.
+- **Verification**: `python3 -m antsxqc.lint src/syntx` (`0 finding(s)`, no `.antsxqc-allow`), full `pytest tests/ -q` suite (`2,568 passed, 398 skipped, 0 failed`), and `build_decathlon_provenance_html_report.py --device mps --image-format webp` (`16.68 MB` self-contained 10-task interactive light/dark HTML report + `2x5` multi-organ QC mosaic).
 
 ## R42 (Opt-In `engine='projected'` DWI Motion Regression Fix & Strict `xfail` Removal; v6.38.2, 2026-11-16)
 - **Root-Cause Diagnosis (`src/syntx/{motion_design,motion_reference}.py`, `tests/{test_motion_design,test_motion_reference}.py`)**:

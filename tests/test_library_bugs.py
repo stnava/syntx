@@ -334,3 +334,39 @@ class TestPhysicalAttenuationAndAcquisitionSupport:
         assert np.allclose(res_auto["warpedmovout"].origin, org)
 
 
+def test_robust_affine_seeded_single_start_ct_slab_asymmetry_no_unbound_tomo(tmp_path):
+    """robust_affine(..., initial_transform=..., multi_start=False) on an asymmetric-slab CT pair
+    must not fail with UnboundLocalError on t_tomo_base."""
+    from syntx.robust_affine import robust_affine
+
+    arr_f = np.full((36, 36, 48), -1000.0, dtype=np.float32)
+    arr_f[8:28, 8:28, 4:44] = 45.0
+    arr_f[10:26, 10:26, 18:30] = 95.0
+    arr_f[16:20, 24:28, 4:44] = 450.0  # vertebral column
+
+    arr_m = arr_f[:, :, 12:38].copy()
+    fi = ants.from_numpy(arr_f, spacing=(5.0, 5.0, 5.0), origin=(-90.0, -90.0, -120.0))
+    mi = ants.from_numpy(arr_m, spacing=(5.0, 5.0, 5.0), origin=(-90.0, -90.0, -60.0))
+
+    tx = ants.create_ants_transform(transform_type="AffineTransform", dimension=3)
+    tx.set_parameters(np.concatenate([np.eye(3).ravel(), np.zeros(3)]))
+    tx.set_fixed_parameters(np.zeros(3))
+    init_mat = str(tmp_path / "seed.mat")
+    ants.write_transform(tx, init_mat)
+
+    res = robust_affine(
+        fi,
+        mi,
+        mode="pytorch",
+        initial_transform=init_mat,
+        multi_start=False,
+        levels=[2, 1],
+        iterations=[3, 2],
+        device="cpu",
+        verbose=False,
+    )
+    assert len(res["fwdtransforms"]) == 1
+    assert np.all(np.isfinite(res["warpedmovout"].numpy()))
+
+
+

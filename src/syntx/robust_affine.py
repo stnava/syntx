@@ -1092,11 +1092,12 @@ def _analyze_volume_support_3d(img: ants.ANTsImage, img_norm: ants.ANTsImage) ->
     org = np.asarray(img.origin[:3], dtype=np.float64)
     dr = np.asarray(img.direction, dtype=np.float64).reshape(3, 3)
     ext_world = np.abs(dr) @ (np.asarray(img.shape[:3], dtype=np.float64) * sp)
-    end_touch_img = np.array([
-        0.5 * (float(fg[0, :, :].mean()) + float(fg[-1, :, :].mean())),
-        0.5 * (float(fg[:, 0, :].mean()) + float(fg[:, -1, :].mean())),
-        0.5 * (float(fg[:, :, 0].mean()) + float(fg[:, :, -1].mean())),
+    face_touch_img = np.array([
+        [float(fg[0, :, :].mean()), float(fg[-1, :, :].mean())],
+        [float(fg[:, 0, :].mean()), float(fg[:, -1, :].mean())],
+        [float(fg[:, :, 0].mean()), float(fg[:, :, -1].mean())],
     ], dtype=np.float64)
+    end_touch_img = 0.5 * (face_touch_img[:, 0] + face_touch_img[:, 1])
     end_touch_lps = np.abs(dr) @ end_touch_img
     is_internal_fov = bool(
         not is_hu
@@ -1133,6 +1134,7 @@ def _analyze_volume_support_3d(img: ants.ANTsImage, img_norm: ants.ANTsImage) ->
         "is_hu": is_hu,
         "is_internal_fov": is_internal_fov,
         "border_fg_frac": border_fg_frac,
+        "face_touch_img": face_touch_img,
         "end_touch_lps": end_touch_lps,
         "center_lps": center_lps,
         "span_lps": span_lps,
@@ -1553,6 +1555,7 @@ def _run_pytorch_affine_solver(fixed: ants.ANTsImage, moving: ants.ANTsImage, in
                 if (
                     (ext_ratios[i] >= 1.30 and ext_diffs[i] >= 60.0)
                     or (ext_ratios[i] >= 1.18 and ext_diffs[i] >= 90.0)
+                    or (not support_f['is_hu'] and not support_m['is_hu'] and ext_ratios[i] >= 1.28 and ext_diffs[i] >= 40.0)
                 )
                 and (et_f[i] >= 0.10 or et_m[i] >= 0.10)
             ]
@@ -1573,9 +1576,14 @@ def _run_pytorch_affine_solver(fixed: ants.ANTsImage, moving: ants.ANTsImage, in
             np.argmax(np.abs(np.asarray(moving.direction, dtype=np.float64).reshape(3, 3)[asym_axes[0], :]))
         )
     ct_tomo = None
+    t_tomo_base = None
+    A_tomo_base = None
     if has_slab_asymmetry and support_f is not None and support_f['is_hu'] and support_m['is_hu']:
         try:
             ct_tomo = _ct_axial_tomography_anchor_3d(fixed, moving, asym_axis_lps=asym_axes[0])
+            if ct_tomo is not None:
+                A_tomo_base = ct_tomo['A_tomo']
+                t_tomo_base = A_tomo_base @ (com_f - ct_tomo['c_anchor_f']) + ct_tomo['c_anchor_m'] - com_f
         except Exception:
             ct_tomo = None
     use_mind_guidance = bool((is_internal_fov_pair or (has_slab_asymmetry and ct_tomo is None)) and dim == 3 and _level_builder is None)
@@ -1859,6 +1867,8 @@ def _run_pytorch_affine_solver(fixed: ants.ANTsImage, moving: ants.ANTsImage, in
             loss = loss + ov_w * ov_deficit + 0.05 * F.relu(max_abs_y - 1.0).mean()
         return loss
 
+    coarse = levels[0]
+
     # 3. candidate starts, scored at the coarsest level -------------------------------------
     cands = []
     if initial_tx_path is not None and os.path.exists(str(initial_tx_path)):
@@ -1927,12 +1937,8 @@ def _run_pytorch_affine_solver(fixed: ants.ANTsImage, moving: ants.ANTsImage, in
             cands.append((f'Identity_Scan{k}', np.eye(dim), t_sc))
 
         # Axial coverage-asymmetry candidate generation: 1-D CT cross-sectional tomography anchor (or non-CT slab sweep)
-        t_tomo_base = None
-        A_tomo_base = None
         if ct_tomo is not None and multi_start and dim == 3:
-            A_tomo_base = ct_tomo['A_tomo']
             cf_a, cm_a = ct_tomo['c_anchor_f'], ct_tomo['c_anchor_m']
-            t_tomo_base = A_tomo_base @ (com_f - cf_a) + cm_a - com_f
             t_tomo_rig = (cm_a - cf_a)
             cands.append(('CT_Tomo_Scaled', A_tomo_base, t_tomo_base))
             cands.append(('CT_Tomo_Rigid', np.eye(3), t_tomo_rig))
@@ -2017,7 +2023,6 @@ def _run_pytorch_affine_solver(fixed: ants.ANTsImage, moving: ants.ANTsImage, in
                     else:
                         cands.append((f'{base_name}_rot_{deg:+.0f}deg', np.array([[np.cos(rad), -np.sin(rad)], [np.sin(rad), np.cos(rad)]]), t_base))
 
-    coarse = levels[0]
     scored = []
     with torch.no_grad():
         for name, B, tt in cands:
