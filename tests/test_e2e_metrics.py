@@ -346,7 +346,13 @@ def test_syn_jax_step_with_swin_unetr_loss():
         levels=[1],  # pragma: no cover
         epochs_per_level=1,  # pragma: no cover
         affine_epochs=0,  # pragma: no cover
-        similarity_metric=loss_fn  # pragma: no cover
+        similarity_metric=loss_fn,  # pragma: no cover
+        fixed_spacing=[1.0, 1.0, 1.0],  # pragma: no cover
+        fixed_origin=[0.0, 0.0, 0.0],  # pragma: no cover
+        fixed_direction=np.eye(3),  # pragma: no cover
+        moving_spacing=[1.0, 1.0, 1.0],  # pragma: no cover
+        moving_origin=[0.0, 0.0, 0.0],  # pragma: no cover
+        moving_direction=np.eye(3),  # pragma: no cover
     )  # pragma: no cover
     assert len(model.syn_losses) == 1  # pragma: no cover
 
@@ -372,7 +378,13 @@ def test_multimetric_syn_jax_registration():
         levels=[1],  # pragma: no cover
         epochs_per_level=1,  # pragma: no cover
         affine_epochs=0,  # pragma: no cover
-        similarity_metric=jax_combined_loss  # pragma: no cover
+        similarity_metric=jax_combined_loss,  # pragma: no cover
+        fixed_spacing=[1.0, 1.0, 1.0],  # pragma: no cover
+        fixed_origin=[0.0, 0.0, 0.0],  # pragma: no cover
+        fixed_direction=np.eye(3),  # pragma: no cover
+        moving_spacing=[1.0, 1.0, 1.0],  # pragma: no cover
+        moving_origin=[0.0, 0.0, 0.0],  # pragma: no cover
+        moving_direction=np.eye(3),  # pragma: no cover
     )  # pragma: no cover
     assert len(model.syn_losses) == 1  # pragma: no cover
 

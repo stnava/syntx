@@ -199,6 +199,11 @@ def test_greedy_initial_warp_formats_and_export_contract():
         scales=[1],
         iterations=[2],
         spacing=fixed.spacing,
+        origin=fixed.origin,
+        direction=fixed.direction,
+        moving_spacing=moving.spacing,
+        moving_origin=moving.origin,
+        moving_direction=moving.direction,
         initial_warp=u0_norm,
     )
     assert tuple(disp_fit.shape) == (1, *fi_t.shape[2:], 3)

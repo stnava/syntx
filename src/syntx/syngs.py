@@ -273,17 +273,20 @@ class GeodesicShootingModel(nn.Module):
     def _apply_sobolev_green_operator(self, m, fluid_sigma=3.0, alpha=None, spacing=None):
         """Sobolev smoothing of ``m`` (``core.smoothing.apply_sobolev_green_operator``)."""
         from .core.smoothing import apply_sobolev_green_operator
-        return apply_sobolev_green_operator(m, fluid_sigma=fluid_sigma, alpha=alpha, spacing=spacing)
+        sp = spacing if spacing is not None else self.spacing
+        return apply_sobolev_green_operator(m, fluid_sigma=fluid_sigma, alpha=alpha, spacing=sp)
 
-    def _apply_dsti_green_operator(self, m, fluid_sigma=3.0, alpha=None):
+    def _apply_dsti_green_operator(self, m, fluid_sigma=3.0, alpha=None, spacing=None):
         """DST (Dirichlet) smoothing of ``m`` (``core.smoothing.apply_dsti_green_operator``)."""
         from .core.smoothing import apply_dsti_green_operator
-        return apply_dsti_green_operator(m, fluid_sigma=fluid_sigma, alpha=alpha)
+        sp = spacing if spacing is not None else self.spacing
+        return apply_dsti_green_operator(m, fluid_sigma=fluid_sigma, alpha=alpha, spacing=sp)
 
-    def _apply_dsti1_green_operator(self, m, fluid_sigma=3.0, alpha=None):
+    def _apply_dsti1_green_operator(self, m, fluid_sigma=3.0, alpha=None, spacing=None):
         """DST-I (Dirichlet) smoothing of ``m`` (``core.smoothing.apply_dsti1_green_operator``)."""
         from .core.smoothing import apply_dsti1_green_operator
-        return apply_dsti1_green_operator(m, fluid_sigma=fluid_sigma, alpha=alpha)
+        sp = spacing if spacing is not None else self.spacing
+        return apply_dsti1_green_operator(m, fluid_sigma=fluid_sigma, alpha=alpha, spacing=sp)
 
     def apply_green_operator(self, m, shape, spacing_zyx):
         """
@@ -307,7 +310,8 @@ class GeodesicShootingModel(nn.Module):
             
         if self.regularizer in ('dsti', 'dsti1', 'dst_i', 'dirichlet'):
             from .core.smoothing import apply_dsti1_green_operator
-            return apply_dsti1_green_operator(m, fluid_sigma=1.0, alpha=self.alpha)  # fluid_sigma: gate only
+            spacing_itk = tuple(reversed(spacing_zyx))
+            return apply_dsti1_green_operator(m, fluid_sigma=1.0, alpha=self.alpha, spacing=spacing_itk)  # fluid_sigma: gate only
 
         if self.regularizer in ('bspline', 'bsplinesyn'):
             from .core.smoothing import smooth_displacement_field_bspline
@@ -341,6 +345,8 @@ class GeodesicShootingModel(nn.Module):
                 alpha=self.alpha,
                 fluid_sigma=self.fluid_sigma or 3.0,
                 spacing=spacing_itk,
+                origin=self.origin,
+                direction=self.direction,
                 **getattr(self, 'extra_reg_kwargs', {}),
             )
             return reg_fn(m * bmask) * bmask
@@ -776,16 +782,20 @@ class GeodesicShootingModel(nn.Module):
         
         self.similarity_metric = similarity_metric
         self.mattes_bins = int(kwargs.get('mattes_bins', getattr(self, 'mattes_bins', 32)))
-        
-        if fixed_spacing is not None: self.spacing = list(fixed_spacing)
-        if fixed_origin is not None: self.origin = list(fixed_origin)
-        if fixed_direction is not None:
-            self.direction = fixed_direction.tolist() if hasattr(fixed_direction, 'tolist') else list(fixed_direction)
 
-        if moving_spacing is not None: self.moving_spacing = list(moving_spacing)
-        if moving_origin is not None: self.moving_origin = list(moving_origin)
-        if moving_direction is not None:
-            self.moving_direction = moving_direction.tolist() if hasattr(moving_direction, 'tolist') else list(moving_direction)
+        from .core.regularizers import resolve_required_image_geometry
+        fixed_spacing, fixed_origin, fixed_direction = resolve_required_image_geometry(
+            fixed_image, fixed_spacing, fixed_origin, fixed_direction, self.dim, "fixed", "GeodesicShootingModel.fit"
+        )
+        moving_spacing, moving_origin, moving_direction = resolve_required_image_geometry(
+            moving_image, moving_spacing, moving_origin, moving_direction, self.dim, "moving", "GeodesicShootingModel.fit"
+        )
+        self.spacing = list(fixed_spacing)
+        self.origin = list(fixed_origin)
+        self.direction = fixed_direction.tolist()
+        self.moving_spacing = list(moving_spacing)
+        self.moving_origin = list(moving_origin)
+        self.moving_direction = moving_direction.tolist()
 
         smoothing_sigmas = kwargs.get('smoothing_sigmas', None)       # None: the central planner's rule (0.5 x coarsening factor per axis)
         fixed_pyr = build_pyramid(fixed_image, self.spacing, levels, 'deformable', sigma=smoothing_sigmas)
@@ -853,6 +863,8 @@ class GeodesicShootingModel(nn.Module):
                         alpha=self.alpha,
                         fluid_sigma=self.fluid_sigma or 3.0,
                         spacing=spacing_rel_f,
+                        origin=self.origin,
+                        direction=self.direction,
                         **getattr(self, 'extra_reg_kwargs', {}),
                     )
                     cont_reg_fn = lambda d, _fn=_raw_cont_fn, _bm=_bmask_lvl: _fn(d * _bm) * _bm
@@ -1493,6 +1505,9 @@ def syngs_registration(
             fixed_spacing=spacing,
             fixed_origin=origin,
             fixed_direction=direction,
+            moving_spacing=moving_spacing,
+            moving_origin=moving_origin,
+            moving_direction=moving_direction,
             lncc_radius=syn_sampling,
             optimizer_type=optimizer,
             cfl_step=grad_step,

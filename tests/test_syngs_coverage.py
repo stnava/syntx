@@ -49,6 +49,12 @@ def test_geodesic_shooting_model_2d():
         fixed, moving,
         epochs_per_level=[2],
         levels=[1],
+        fixed_spacing=[1.0, 1.0],
+        fixed_origin=[0.0, 0.0],
+        fixed_direction=np.eye(2),
+        moving_spacing=[1.0, 1.0],
+        moving_origin=[0.0, 0.0],
+        moving_direction=np.eye(2),
         verbose=False
     )
 
@@ -137,6 +143,12 @@ def test_geodesic_shooting_model_jax_2d():
         I_jax, J_jax,
         levels=[1],
         epochs_per_level=[2],
+        fixed_spacing=[1.0, 1.0],
+        fixed_origin=[0.0, 0.0],
+        fixed_direction=np.eye(2),
+        moving_spacing=[1.0, 1.0],
+        moving_origin=[0.0, 0.0],
+        moving_direction=np.eye(2),
         verbose=False
     )
 

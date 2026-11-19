@@ -106,7 +106,13 @@ def run_test_2d(similarity_metric):
         levels=[2, 1], 
         epochs_per_level=30, 
         cfl_voxels=0.15,
-        similarity_metric=similarity_metric
+        similarity_metric=similarity_metric,
+        fixed_spacing=fixed_img.spacing,
+        fixed_origin=fixed_img.origin,
+        fixed_direction=fixed_img.direction,
+        moving_spacing=moving_img.spacing,
+        moving_origin=moving_img.origin,
+        moving_direction=moving_img.direction,
     )
     
     with torch.no_grad():
@@ -161,7 +167,13 @@ def run_test_3d(similarity_metric):
         levels=[2, 1], 
         epochs_per_level=30, 
         cfl_voxels=0.15,
-        similarity_metric=similarity_metric
+        similarity_metric=similarity_metric,
+        fixed_spacing=fixed_img.spacing,
+        fixed_origin=fixed_img.origin,
+        fixed_direction=fixed_img.direction,
+        moving_spacing=moving_img.spacing,
+        moving_origin=moving_img.origin,
+        moving_direction=moving_img.direction,
     )
     
     with torch.no_grad():
@@ -237,7 +249,13 @@ def test_pytorch_syn_2d_vgg19_lncc():
         cfl_voxels=0.15,
         similarity_metric='vgg19',
         vgg_mode='lncc',
-        vgg_layers=[4]
+        vgg_layers=[4],
+        fixed_spacing=fixed_img.spacing,
+        fixed_origin=fixed_img.origin,
+        fixed_direction=fixed_img.direction,
+        moving_spacing=fixed_img.spacing,
+        moving_origin=fixed_img.origin,
+        moving_direction=fixed_img.direction,
     )
     
     with torch.no_grad():
@@ -291,7 +309,13 @@ def test_pytorch_syn_3d_vgg19_lncc3d():
         epochs_per_level=10, 
         cfl_voxels=0.15,
         similarity_metric='vgg19',
-        vgg_mode='lncc_3d'
+        vgg_mode='lncc_3d',
+        fixed_spacing=fixed_img.spacing,
+        fixed_origin=fixed_img.origin,
+        fixed_direction=fixed_img.direction,
+        moving_spacing=moving_img.spacing,
+        moving_origin=moving_img.origin,
+        moving_direction=moving_img.direction,
     )
     
     with torch.no_grad():

@@ -98,6 +98,12 @@ def test_tvf_fit_cfl_version_tracking_across_epochs(cfl_momentum):
         epochs_per_level=[n_epochs],
         optimizer_type='cfl',
         cfl_momentum=cfl_momentum,
+        fixed_spacing=[1.0, 1.0],
+        fixed_origin=[0.0, 0.0],
+        fixed_direction=np.eye(2),
+        moving_spacing=[1.0, 1.0],
+        moving_origin=[0.0, 0.0],
+        moving_direction=np.eye(2),
         verbose=False,
     )
 
@@ -135,6 +141,12 @@ def test_tvf_fit_adam_version_tracking():
         levels=[1],
         epochs_per_level=[2],
         optimizer_type='adam',
+        fixed_spacing=[1.0, 1.0],
+        fixed_origin=[0.0, 0.0],
+        fixed_direction=np.eye(2),
+        moving_spacing=[1.0, 1.0],
+        moving_origin=[0.0, 0.0],
+        moving_direction=np.eye(2),
         verbose=False,
     )
 

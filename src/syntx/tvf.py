@@ -626,15 +626,18 @@ class TVFModel(nn.Module):
 
     def _apply_sobolev_green_operator(self, m, fluid_sigma=3.0, alpha=None, spacing=None):
         """Sobolev smoothing of ``m`` (``core.smoothing.apply_sobolev_green_operator``)."""
-        return apply_sobolev_green_operator(m, fluid_sigma=fluid_sigma, alpha=alpha, spacing=spacing)
+        sp = spacing if spacing is not None else self.spacing
+        return apply_sobolev_green_operator(m, fluid_sigma=fluid_sigma, alpha=alpha, spacing=sp)
 
-    def _apply_dsti_green_operator(self, m, fluid_sigma=3.0, alpha=None):
+    def _apply_dsti_green_operator(self, m, fluid_sigma=3.0, alpha=None, spacing=None):
         """DST (Dirichlet) smoothing of ``m`` (``core.smoothing.apply_dsti_green_operator``)."""
-        return apply_dsti_green_operator(m, fluid_sigma=fluid_sigma, alpha=alpha)
+        sp = spacing if spacing is not None else self.spacing
+        return apply_dsti_green_operator(m, fluid_sigma=fluid_sigma, alpha=alpha, spacing=sp)
 
-    def _apply_dsti1_green_operator(self, m, fluid_sigma=3.0, alpha=None):
+    def _apply_dsti1_green_operator(self, m, fluid_sigma=3.0, alpha=None, spacing=None):
         """DST-I (Dirichlet) smoothing of ``m`` (``core.smoothing.apply_dsti1_green_operator``)."""
-        return apply_dsti1_green_operator(m, fluid_sigma=fluid_sigma, alpha=alpha)
+        sp = spacing if spacing is not None else self.spacing
+        return apply_dsti1_green_operator(m, fluid_sigma=fluid_sigma, alpha=alpha, spacing=sp)
 
     def upsample_velocity(self, v_coarse_cf, target_shape):
         """
@@ -1331,6 +1334,20 @@ class TVFModel(nn.Module):
         _unknown = sorted(set(kwargs) - _TVF_FIT_KWARGS)
         if _unknown:
             raise TypeError(f"TVFModel.fit() got unexpected keyword(s) {_unknown}")
+        from .core.regularizers import resolve_required_image_geometry
+        fixed_spacing, fixed_origin, fixed_direction = resolve_required_image_geometry(
+            fixed_image, fixed_spacing, fixed_origin, fixed_direction, self.dim, "fixed", "TVFModel.fit"
+        )
+        moving_spacing, moving_origin, moving_direction = resolve_required_image_geometry(
+            moving_image, moving_spacing, moving_origin, moving_direction, self.dim, "moving", "TVFModel.fit"
+        )
+        self.spacing = list(fixed_spacing)
+        self.origin = list(fixed_origin)
+        self.direction = fixed_direction.tolist()
+        self.moving_spacing = list(moving_spacing)
+        self.moving_origin = list(moving_origin)
+        self.moving_direction = moving_direction.tolist()
+
         device = fixed_image.device
         dtype = fixed_image.dtype
         ig_in = kwargs.pop('initial_grid', None)
@@ -1340,10 +1357,6 @@ class TVFModel(nn.Module):
         self.mattes_bins = int(kwargs.get('mattes_bins', kwargs.get('num_bins', getattr(self, 'mattes_bins', 32))))
         if 'solver' in kwargs or 'adjoint' in kwargs:
             self._set_solver(kwargs.get('solver', self.solver), kwargs.get('adjoint', getattr(self, 'adjoint', False)))
-        
-        if fixed_spacing is not None: self.spacing = fixed_spacing
-        if fixed_origin is not None: self.origin = fixed_origin
-        if fixed_direction is not None: self.direction = fixed_direction
 
         # Optimize velocity field across pyramid levels
         if verbose: print("Optimizing TVF...")
@@ -1459,10 +1472,22 @@ class TVFModel(nn.Module):
                     ra_reg = 'gaussian' if (self.fluid_sigma or 0) > 0 else 'none'
                     ra_alpha, ra_sigma = 0.0, float(self.fluid_sigma or 0.0)
                 max_step_norm = float(kwargs['max_step_norm'])
+                ra_cont_fn = None
+                if ra_reg in _TVF_CONTINUUM:
+                    from .core.regularizers import get_regularizer
+                    ra_cont_fn = get_regularizer(
+                        ra_reg,
+                        alpha=ra_alpha,
+                        spacing=vel_spacing,
+                        origin=self.origin,
+                        direction=self.direction,
+                        **{k: kwargs[k] for k in _TVF_EXTRA_REG_KEYS if k in kwargs},
+                    )
                 optimizer = RegAdam(
                     [self.velocity],
                     lr=lr,
                     regularizer=ra_reg,
+                    regularizer_fn=ra_cont_fn,
                     sobolev_alpha=ra_alpha,
                     gaussian_sigma=ra_sigma,
                     max_step_norm=max_step_norm,
@@ -1727,10 +1752,10 @@ class TVFModel(nn.Module):
                             g_smoothed = self._apply_sobolev_green_operator(g_process, fluid_sigma=1.0, alpha=fluid_alpha, spacing=adj_spacing)
                         elif regularizer_mode == 'dsti':
                             g_process.mul_(self._bmask_pre_cache)
-                            g_smoothed = self._apply_dsti_green_operator(g_process, fluid_sigma=1.0, alpha=fluid_alpha)
+                            g_smoothed = self._apply_dsti_green_operator(g_process, fluid_sigma=1.0, alpha=fluid_alpha, spacing=adj_spacing)
                         elif regularizer_mode == 'dsti1':
                             g_process.mul_(self._bmask_pre_cache)
-                            g_smoothed = self._apply_dsti1_green_operator(g_process, fluid_sigma=1.0, alpha=fluid_alpha)
+                            g_smoothed = self._apply_dsti1_green_operator(g_process, fluid_sigma=1.0, alpha=fluid_alpha, spacing=adj_spacing)
                         elif regularizer_mode in ['bspline', 'bsplinesyn']:
                             from .core.smoothing import smooth_displacement_field_bspline
                             g_smoothed = smooth_displacement_field_bspline(
@@ -1747,12 +1772,15 @@ class TVFModel(nn.Module):
                             from .core.regularizers import get_regularizer
                             g_process.mul_(self._bmask_pre_cache)
                             _extra_tvf = {k: kwargs[k] for k in _TVF_EXTRA_REG_KEYS if k in kwargs}
-                            _reg_key = (regularizer_mode, float(fluid_alpha) if fluid_alpha is not None else None, tuple(float(x) for x in adj_spacing), float(sigma_val or 3.0))
+                            _dir_key = tuple(float(x) for x in np.asarray(self.direction).ravel().tolist())
+                            _reg_key = (regularizer_mode, float(fluid_alpha) if fluid_alpha is not None else None, tuple(float(x) for x in adj_spacing), _dir_key, float(sigma_val or 3.0))
                             if getattr(self, '_tvf_reg_cache_key', None) != _reg_key or not _extra_tvf == getattr(self, '_tvf_reg_extra', None):
                                 self._tvf_reg_fn = get_regularizer(
                                     regularizer_mode,
                                     alpha=fluid_alpha,
                                     spacing=adj_spacing,
+                                    origin=self.origin,
+                                    direction=self.direction,
                                     fluid_sigma=sigma_val or 3.0,
                                     **_extra_tvf,
                                 )
@@ -1829,7 +1857,7 @@ class TVFModel(nn.Module):
                                 sl_last = [slice(None)] * (self.dim + 2)
                                 sl_last[d + 1] = -1
                                 vel_tapered[tuple(sl_last)] = 0.0
-                            vel_smoothed = self._apply_dsti_green_operator(vel_tapered, fluid_sigma=1.0, alpha=total_alpha)
+                            vel_smoothed = self._apply_dsti_green_operator(vel_tapered, fluid_sigma=1.0, alpha=total_alpha, spacing=vel_spacing)
                         elif regularizer_mode == 'dsti1':
                             vel_tapered = vel_batch.clone()
                             for d in range(self.dim):
@@ -1839,7 +1867,7 @@ class TVFModel(nn.Module):
                                 sl_last = [slice(None)] * (self.dim + 2)
                                 sl_last[d + 1] = -1
                                 vel_tapered[tuple(sl_last)] = 0.0
-                            vel_smoothed = self._apply_dsti1_green_operator(vel_tapered, fluid_sigma=1.0, alpha=total_alpha)
+                            vel_smoothed = self._apply_dsti1_green_operator(vel_tapered, fluid_sigma=1.0, alpha=total_alpha, spacing=vel_spacing)
                         elif regularizer_mode == 'sobolev':
                             vel_tapered = vel_batch.clone()
                             for d in range(self.dim):
@@ -1864,6 +1892,8 @@ class TVFModel(nn.Module):
                                 regularizer_mode,
                                 alpha=total_alpha,
                                 spacing=vel_spacing,
+                                origin=self.origin,
+                                direction=self.direction,
                                 fluid_sigma=elastic_sigma_val or 3.0,
                                 **{k: kwargs[k] for k in _TVF_EXTRA_REG_KEYS if k in kwargs},
                             )
@@ -2483,6 +2513,9 @@ def tvf_registration(
             fixed_spacing=spacing,
             fixed_origin=origin,
             fixed_direction=direction,
+            moving_spacing=moving_spacing,
+            moving_origin=moving_origin,
+            moving_direction=moving_direction,
             lncc_radius=syn_sampling,
             initial_grid=resolved_init.initial_grid_zyx.to(device=device, dtype=torch.float32) if resolved_init.has_initial_warp else None,
             **fit_kwargs
@@ -2652,6 +2685,9 @@ def tvf_registration(
             fixed_spacing=spacing,
             fixed_origin=origin,
             fixed_direction=direction,
+            moving_spacing=moving_spacing,
+            moving_origin=moving_origin,
+            moving_direction=moving_direction,
             lncc_radius=syn_sampling,
             initial_grid=resolved_init.initial_grid_zyx.detach().cpu().numpy() if resolved_init.has_initial_warp else None,
             **fit_kwargs

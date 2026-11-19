@@ -120,7 +120,11 @@ def test_tvf_cfl_cache_invalidation_pytorch_optimizers():
         fi[:, :, 4:12, 4:12] = 1.0
         mi[:, :, 6:14, 4:12] = 1.0
 
-        model.fit(fi, mi, levels=[1], epochs_per_level=[1], verbose=False, optimizer_type=opt_name)
+        model.fit(
+            fi, mi, levels=[1], epochs_per_level=[1], verbose=False, optimizer_type=opt_name,
+            fixed_spacing=[1.0, 1.0], fixed_origin=[0.0, 0.0], fixed_direction=np.eye(2),
+            moving_spacing=[1.0, 1.0], moving_origin=[0.0, 0.0], moving_direction=np.eye(2),
+        )
 
         v1 = model.velocity._version
         assert v1 > v0, f"Optimizer {opt_name} did not increment velocity._version"

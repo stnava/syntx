@@ -82,6 +82,10 @@ def test_synto_model_2d_advanced_options():
     moving = torch.randn(1, 1, 16, 16, device=device)
 
     # Fit with Sobolev regularizer and composite similarity metric
+    geom = dict(
+        fixed_spacing=[1.0, 1.0], fixed_origin=[0.0, 0.0], fixed_direction=np.eye(2),
+        moving_spacing=[1.0, 1.0], moving_origin=[0.0, 0.0], moving_direction=np.eye(2),
+    )
     model.fit(
         fixed, moving,
         levels=[1],
@@ -89,7 +93,8 @@ def test_synto_model_2d_advanced_options():
         similarity_metric='lncc',
         regularizer='sobolev',
         sobolev_alpha=0.1,
-        verbose=False
+        verbose=False,
+        **geom,
     )
 
     fwd_warp = model.warp_l2r
@@ -135,6 +140,12 @@ def test_tvf_model_advanced_options():
         alpha=0.1,
         multipoint_loss=[0.0, 0.5, 1.0],
         fast_smooth=True,
+        fixed_spacing=[1.0, 1.0],
+        fixed_origin=[0.0, 0.0],
+        fixed_direction=np.eye(2),
+        moving_spacing=[1.0, 1.0],
+        moving_origin=[0.0, 0.0],
+        moving_direction=np.eye(2),
         verbose=False
     )
 
@@ -161,12 +172,17 @@ def test_syn_jax_and_tvf_jax_advanced():
     I_jax = jnp.ones((1, 1, 16, 16), dtype=jnp.float32)
     J_jax = jnp.ones((1, 1, 16, 16), dtype=jnp.float32)
 
+    geom = dict(
+        fixed_spacing=[1.0, 1.0], fixed_origin=[0.0, 0.0], fixed_direction=np.eye(2),
+        moving_spacing=[1.0, 1.0], moving_origin=[0.0, 0.0], moving_direction=np.eye(2),
+    )
     model_syn_jax.fit(
         I_jax, J_jax,
         levels=[1],
         epochs_per_level=[2],
         affine_epochs=1,
-        verbose=False
+        verbose=False,
+        **geom,
     )
     assert model_syn_jax.warp_l2r is not None
 
@@ -184,6 +200,7 @@ def test_syn_jax_and_tvf_jax_advanced():
         levels=[1],
         epochs_per_level=[2],
         affine_epochs=1,
-        verbose=False
+        verbose=False,
+        **geom,
     )
     assert model_tvf_jax.get_forward_warp() is not None

@@ -129,7 +129,10 @@ def test_tvf_optimization_parity():
 
     model_pt.fit(
         fi_pt, mi_pt, levels=[2, 1], epochs_per_level=[10, 10],
-        lr=0.05, verbose=False
+        lr=0.05,
+        fixed_spacing=spacing, fixed_origin=[0.0, 0.0, 0.0], fixed_direction=np.eye(3),
+        moving_spacing=spacing, moving_origin=[0.0, 0.0, 0.0], moving_direction=np.eye(3),
+        verbose=False,
     )
 
     with torch.no_grad():
@@ -143,7 +146,10 @@ def test_tvf_optimization_parity():
 
     model_jax.fit(
         fi_jax, mi_jax, levels=[2, 1], epochs_per_level=[10, 10], affine_epochs=0,
-        lr=0.05, reg_weight=0.001, fluid_sigmas=[1.0, 0.5], verbose=False
+        lr=0.05, reg_weight=0.001, fluid_sigmas=[1.0, 0.5],
+        fixed_spacing=spacing, fixed_origin=[0.0, 0.0, 0.0], fixed_direction=np.eye(3),
+        moving_spacing=spacing, moving_origin=[0.0, 0.0, 0.0], moving_direction=np.eye(3),
+        verbose=False,
     )
 
     warp_jax = np.array(model_jax.get_forward_warp().squeeze())

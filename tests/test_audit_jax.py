@@ -99,7 +99,9 @@ def test_syn_jax_divergence_retry_reruns_with_halved_step(capsys):
 
     mdl = SyNTo(dim=2, grid_shape=(32, 32))
     mdl.fit(I, J, levels=[1], epochs_per_level=[30], affine_epochs=0, cfl_voxels=0.15,
-            similarity_metric=ascend, verbose=1)
+            similarity_metric=ascend, verbose=1,
+            fixed_spacing=[1.0, 1.0], fixed_origin=[0.0, 0.0], fixed_direction=np.eye(2),
+            moving_spacing=[1.0, 1.0], moving_origin=[0.0, 0.0], moving_direction=np.eye(2))
     out = capsys.readouterr().out
     assert "Retry 1/2 with CFL=0.0750" in out and "Retry 2/2 with CFL=0.0375" in out
     assert len(mdl.syn_losses) == 90                    # three attempts of 30 epochs
@@ -181,7 +183,9 @@ def test_syn_jax_optimizers_run(opt):
     J = jnp.array(m.numpy().T)[None, None]
     mdl = SyNTo(dim=2, grid_shape=(32, 32), elastic_sigma=0.5)
     mdl.fit(I, J, levels=[2, 1], epochs_per_level=[3, 2], affine_epochs=0, optimizer_type=opt,
-            optimizer_lr=0.05)
+            optimizer_lr=0.05,
+            fixed_spacing=[1.0, 1.0], fixed_origin=[0.0, 0.0], fixed_direction=np.eye(2),
+            moving_spacing=[1.0, 1.0], moving_origin=[0.0, 0.0], moving_direction=np.eye(2))
     assert np.isfinite(np.asarray(mdl.warp_l2r)).all() and len(mdl.syn_losses) == 5
 
 
@@ -214,7 +218,9 @@ def test_syn_jax_lbfgs_inverts_on_the_fixed_grid(monkeypatch):
     J = jnp.array(m.numpy().T)[None, None]
     mdl = sj.SyNTo(dim=2, grid_shape=(16, 16))
     mdl.fit(I, J, levels=[1], epochs_per_level=[1], affine_epochs=0, optimizer_type='lbfgs',
-            optimizer_lr=1.0, fixed_spacing=[1.0, 1.0], moving_spacing=[2.0, 3.0])
+            optimizer_lr=1.0,
+            fixed_spacing=[1.0, 1.0], fixed_origin=f.origin, fixed_direction=f.direction,
+            moving_spacing=[2.0, 3.0], moving_origin=m.origin, moving_direction=m.direction)
     assert seen and all(sp in ((1.0, 1.0), ()) for sp in seen), sorted(set(seen))
 
 
@@ -437,7 +443,9 @@ def test_syngs_jax_nonsymmetric_inverse_is_minus_v0(monkeypatch):
 
     monkeypatch.setattr(mdl, "forward", spy)
     mdl.fit(jnp.array(f.numpy().T)[None, None], jnp.array(m.numpy().T)[None, None], levels=[1],
-            epochs_per_level=[2], affine_epochs=0)
+            epochs_per_level=[2], affine_epochs=0,
+            fixed_spacing=f.spacing, fixed_origin=f.origin, fixed_direction=f.direction,
+            moving_spacing=m.spacing, moving_origin=m.origin, moving_direction=m.direction)
     assert seen and max(seen) < 1e-6, seen
 
 
@@ -526,7 +534,9 @@ def test_tvf_jax_convergence_loss_uses_training_settings(monkeypatch):
 
     monkeypatch.setattr(mdl, "forward", spy)
     mdl.fit(jnp.array(f.numpy().T)[None, None], jnp.array(m.numpy().T)[None, None], levels=[1],
-            epochs_per_level=[2], affine_epochs=0, lncc_radius=3, multipoint_loss=[0.0, 1.0])
+            epochs_per_level=[2], affine_epochs=0, lncc_radius=3, multipoint_loss=[0.0, 1.0],
+            fixed_spacing=f.spacing, fixed_origin=f.origin, fixed_direction=f.direction,
+            moving_spacing=m.spacing, moving_origin=m.origin, moving_direction=m.direction)
     assert calls and set(calls) == {((0.0, 1.0), 7)}, set(calls)
 
 
@@ -576,6 +586,11 @@ def test_syngs_jax_gradient_at_zero_velocity_is_finite_and_fit_moves_the_field()
         grad = np.asarray(jax.grad(lambda v: mdl.forward(fi, mi, velocity_0_fwd=v, velocity_0_inv=-v))(mdl.velocity_0_fwd))
         assert np.isfinite(grad).all() and np.abs(grad).max() > 0
         mdl2 = GeodesicShootingModelJAX(dim=dim, image_shape=(n,) * dim, velocity_shape=(n,) * dim)
-        mdl2.fit(f, m, levels=[2, 1], epochs_per_level=[3, 3], affine_epochs=0, fluid_sigmas=[1.0, 1.0], optimizer_type="cfl")
+        mdl2.fit(
+            f, m, levels=[2, 1], epochs_per_level=[3, 3], affine_epochs=0,
+            fluid_sigmas=[1.0, 1.0], optimizer_type="cfl",
+            fixed_spacing=[1.0] * dim, fixed_origin=[0.0] * dim, fixed_direction=np.eye(dim),
+            moving_spacing=[1.0] * dim, moving_origin=[0.0] * dim, moving_direction=np.eye(dim),
+        )
         v = np.asarray(mdl2.velocity_0_fwd)
         assert np.isfinite(v).all() and np.abs(v).max() > 0.0 and v.shape[1:-1] == (n,) * dim

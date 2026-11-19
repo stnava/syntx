@@ -209,8 +209,8 @@ class GreedyRegistrationModel(nn.Module):
     Parameters
     ----------
     dim : {2, 3}, default 3
-    learning_rate : float, default 0.45
-        Step size (``syntx.greedy`` passes 0.375): the update's largest displacement is
+    learning_rate : float, default 0.5625
+        Step size (``syntx.greedy`` passes 0.5625): the update's largest displacement is
         learning_rate / (grid size - 1) of the normalised domain.
     flow_sigma : float, default 1.8
         Gaussian sigma (voxels) smoothing the similarity gradient.
@@ -236,7 +236,7 @@ class GreedyRegistrationModel(nn.Module):
     def __init__(
         self,
         dim: int = 3,
-        learning_rate: float = 0.45,
+        learning_rate: float = 0.5625,
         flow_sigma: float = 1.8,
         total_sigma: float = 0.28,
         optimizer: str = 'adam',
@@ -352,19 +352,31 @@ class GreedyRegistrationModel(nn.Module):
         verbose: bool = False,
         spacing: Optional[Sequence[float]] = None,
         moving_spacing: Optional[Sequence[float]] = None,
+        origin: Optional[Sequence[float]] = None,
+        direction: Optional[Any] = None,
+        moving_origin: Optional[Sequence[float]] = None,
+        moving_direction: Optional[Any] = None,
         initial_warp: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """
         Multi-scale optimisation of the field. ``fixed_tensor`` / ``moving_tensor``:
         (1, 1, *spatial); ``theta``: (1, dim, dim + 1) affine in normalised coordinates
         (fixed -> moving); ``scales`` / ``iterations``: shrink factor and iterations per level.
-        ``spacing`` / ``moving_spacing`` (ITK x, y, z order; default unit spacing, and the fixed spacing for the moving image) feed the
-        central ``deformable`` pyramid, so a level is isotropic in millimetres and a thick axis is not shrunk with the thin ones.
+        ``spacing``, ``origin``, ``direction`` (ITK x, y, z order) are required and feed the
+        central ``deformable`` pyramid and physical-space regularisers. ``moving_spacing``,
+        ``moving_origin``, ``moving_direction`` default to the fixed geometry when omitted.
         ``initial_warp``: optional normalised ``[-1, 1]`` displacement field ``(1, *spatial, dim)``
         in tensor ``(z, y, x)`` spatial order and ``(x, y, z)`` component order to warm-start
         optimisation at the coarsest scale.
         Returns (and stores as ``self.warp``) the field; ``self.loss_history`` keeps the loss.
         """
+        from .core.regularizers import (
+            _parse_direction,
+            _require_spacing,
+            _validate_origin,
+            resolve_required_image_geometry,
+        )
+
         self.theta = theta
         full_shape = fixed_tensor.shape[2:]
         dim = self.dim
@@ -375,12 +387,26 @@ class GreedyRegistrationModel(nn.Module):
         def smooth_field(f, gaussians):
             return _separable_1d_filter(torch.movedim(f, -1, 1), gaussians).movedim(1, -1)
 
-        sp_f = tuple(float(x) for x in spacing) if spacing is not None else (1.0,) * dim
-        sp_m = tuple(float(x) for x in moving_spacing) if moving_spacing is not None else sp_f
+        sp_f, orig_f, dir_f = resolve_required_image_geometry(
+            fixed_tensor,
+            spacing,
+            origin,
+            direction,
+            dim,
+            "fixed",
+            "GreedyRegistrationModel.fit",
+            spacing_name="spacing",
+            origin_name="origin",
+            direction_name="direction",
+        )
+        sp_m = _require_spacing(moving_spacing, dim, "GreedyRegistrationModel.fit") if moving_spacing is not None else sp_f
+        orig_m = _validate_origin(moving_origin, dim, "GreedyRegistrationModel.fit") if moving_origin is not None else orig_f
+        dir_m = _parse_direction(moving_direction, dim, "GreedyRegistrationModel.fit") if moving_direction is not None else dir_f
+
         # the central pyramid: each image on its own grid, the warp lives on the FIXED level grid
-        fixed_lv = build_pyramid(fixed_tensor, sp_f, scales, 'deformable')
-        moving_lv = build_pyramid(moving_tensor, sp_m, scales, 'deformable', reference_spacing=sp_f)
-        mask_lv = build_pyramid(fixed_mask_tensor, sp_f, scales, 'deformable') if fixed_mask_tensor is not None else None
+        fixed_lv = build_pyramid(fixed_tensor, sp_f, scales, 'deformable', origin=orig_f, direction=dir_f)
+        moving_lv = build_pyramid(moving_tensor, sp_m, scales, 'deformable', origin=orig_m, direction=dir_m, reference_spacing=sp_f)
+        mask_lv = build_pyramid(fixed_mask_tensor, sp_f, scales, 'deformable', origin=orig_f, direction=dir_f) if fixed_mask_tensor is not None else None
 
         # Initialize displacement field u at the coarsest scale
         init_size = list(fixed_lv[0].shape)
@@ -476,6 +502,10 @@ class GreedyRegistrationModel(nn.Module):
                     self.regularizer,
                     alpha=self.sobolev_alpha,
                     sobolev_alpha=self.sobolev_alpha,
+                    spacing=fixed_lv[level_idx].spacing,
+                    origin=fixed_lv[level_idx].origin,
+                    direction=fixed_lv[level_idx].direction,
+                    vector_frame="voxel",
                     fluid_sigma=self.flow_sigma,
                     mask=mask_down,
                     fixed_mask=mask_down,
@@ -529,7 +559,7 @@ class GreedyRegistrationModel(nn.Module):
 
                 with torch.no_grad():
                     if grad_reg_fn is not None:
-                        grad = grad_reg_fn(grad)
+                        grad = grad_reg_fn(grad.flip(-1)).flip(-1)
                     elif self.flow_sigma > 0 and grad_gaussians is not None:
                         grad = smooth_field(grad, grad_gaussians)
 
@@ -548,12 +578,17 @@ class GreedyRegistrationModel(nn.Module):
                     # Apply RegAdam quotient smoothing if elected
                     if self.optimizer in ('regadam', 'reg_adam'):
                         if grad_reg_fn is not None:
-                            u_reg = grad_reg_fn(raw_update)
+                            u_reg = grad_reg_fn(raw_update.flip(-1)).flip(-1)
                         elif reg_gaussians is not None:
                             u_reg = smooth_field(raw_update, reg_gaussians)
                         elif self.sobolev_alpha > 0:
                             from .core.smoothing import apply_sobolev_green_operator
-                            u_reg = apply_sobolev_green_operator(raw_update.squeeze(0), fluid_sigma=self.sobolev_alpha, alpha=self.sobolev_alpha).unsqueeze(0)
+                            u_reg = apply_sobolev_green_operator(
+                                raw_update.squeeze(0),
+                                fluid_sigma=self.sobolev_alpha,
+                                alpha=self.sobolev_alpha,
+                                spacing=fixed_lv[level_idx].spacing,
+                            ).unsqueeze(0)
                         else:
                             u_reg = raw_update
                     else:
@@ -649,7 +684,7 @@ def greedy_registration(
     reg_iterations: Optional[Union[List[int], Tuple[int, ...]]] = None,
     iterations: Optional[Union[List[int], Tuple[int, ...]]] = None,
     scales: Optional[Union[List[int], Tuple[int, ...]]] = None,
-    learning_rate: float = 0.375,
+    learning_rate: float = 0.5625,
     flow_sigma: float = 1.8,
     total_sigma: float = 0.28,
     optimizer: str = 'adam',
@@ -683,8 +718,8 @@ def greedy_registration(
         reg = syntx.greedy(fixed, moving)
         reg['warpedmovout'], reg['fwdtransforms']        # [warp, affine] standard ANTs list
 
-    Defaults were tuned on Mindboggle pairs 77 / 44 / 0 (learning_rate 0.25 -> 0.375,
-    docs/provenance/best_parameters.json "syntx.greedy/tuned_greedy_2026_09_29").
+    Defaults were tuned on Mindboggle pairs 77 / 44 / 0 (learning_rate 0.375 -> 0.5625,
+    docs/provenance/best_parameters.json "syntx.greedy/canonical_2026_11_19").
 
     Parameters
     ----------
@@ -695,7 +730,7 @@ def greedy_registration(
         Both names are accepted interchangeably.
     scales : int or list of int, default None
         Shrink factor per level. None: [2**(L-1), ..., 1] for L = len(reg_iterations).
-    learning_rate : float, default 0.375
+    learning_rate : float, default 0.5625
         Step size (``grad_step=`` is an alias); see ``GreedyRegistrationModel``.
     flow_sigma : float, default 1.8
         Gaussian sigma in voxels for smoothing the gradient (not the ITK variance convention
@@ -850,7 +885,7 @@ def greedy_registration(
 
     _GREEDY_EXTRA_REG_KEYS = frozenset({
         'beta', 'gamma', 'poisson_ratio', 'darcy_permeability', 'bulk_modulus',
-        'num_iters', 'dilatation_weight', 'mask', 'alpha',
+        'num_iters', 'dilatation_weight', 'mask', 'alpha', 'h3_envelope', 's',
     })
     extra_reg_kwargs = {k: kwargs.pop(k) for k in list(kwargs.keys()) if k in _GREEDY_EXTRA_REG_KEYS}
     if 'alpha' in extra_reg_kwargs:
@@ -945,6 +980,10 @@ def greedy_registration(
         verbose=verbose,
         spacing=tuple(float(x) for x in fixed.spacing),
         moving_spacing=tuple(float(x) for x in moving.spacing),
+        origin=tuple(float(x) for x in fixed.origin),
+        direction=np.array(fixed.direction, dtype=np.float64),
+        moving_origin=tuple(float(x) for x in moving.origin),
+        moving_direction=np.array(moving.direction, dtype=np.float64),
         initial_warp=init_warp_t,
     )
     t1_opt = time.time() - t0_opt

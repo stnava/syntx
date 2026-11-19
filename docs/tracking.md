@@ -1,12 +1,24 @@
 # Tracking Summary
-current phase: v6.41.0 (Universal cross-solver `initial_warp` / `[warp, affine]` support across `greedy`, `syn`, `tvf`, `syngs`, `auto_reg` + PyTorch/JAX, `5.29x` multi-member parallel `.nii.gz` export, and 3-pair Mindboggle `VoxelMorph` hybrid warm-start evaluation)
+current phase: v6.42.0 (`syntx.greedy` autotuned `learning_rate = 0.5625` winner `+0.70 pp` 3-pair Dice, `mbhard` `1.73x–2.57x` speedup vs. `antstorch.greedy`, and strict physical-space `(spacing, origin, direction)` + $O(d)$ continuum regularizer enforcement)
 next WP: per-run synthetic calibration of slice-set clock thresholds
 blockers: none
-active work: none (`v6.41.0` released; `2,641 passed, 398 skipped, 0 failed`, `0` `antsxqc.lint` findings)
+active work: none (`v6.42.0` released; `2,683 passed, 398 skipped, 0 failed`, `0` `antsxqc.lint` findings)
 device: Apple Silicon MPS / CPU (macOS arm64)
-last updated: 2026-11-18
+last updated: 2026-11-19
 
 ---
+
+## R46 (`syntx.greedy` Autotuned Default `learning_rate = 0.5625`, `mbhard` Benchmark vs. `antstorch.greedy` & Strict Physical-Space Geometry Enforcement; v6.42.0, 2026-11-19)
+- **Autotuned `syntx.greedy` Winner (`src/syntx/greedy.py`, `src/syntx/benchmark/config.py`, `docs/provenance/{best_parameters,canonical,run_config}.json`, `docs/provenance/tuning/greedy_2026-11-19.md`)**:
+  - Executed `python -m syntx.benchmark.tune --method greedy` on Mindboggle-101 pairs `[77, 44, 0]` (`reg_iterations = [100, 100, 20]`, `noise = 0.00000` across rep 0 / rep 1): confirmed 2-rep feasible winner **`learning_rate = 0.5625`** (up from `0.375`), lifting 3-pair mean DKT Dice by **`+0.70 pp` (`0.5776 -> 0.5846`)** (`Pair 77: 0.5645 -> 0.5734`, `Pair 44: 0.5663 -> 0.5717`, `Pair 0: 0.6019 -> 0.6086`) with **`0.0000%` folding** and `minJ > 0` on all 3 pairs.
+  - **Isolated `mbhard` (`Pair 44`, $192 \times 256 \times 256$, MPS, $n = 3$ runs) vs. `antstorch.greedy` (`2b8bae8`, PR `#100`)**:
+    - `antstorch.greedy` default (`[100, 100, 20]`, `lr=0.375`): `8.731 s` E2E (`3.01 s` opt), `0.5663` NN / `0.5809` GL (`0.000%` fold)
+    - `syntx.greedy` pre-tune (`[100, 100, 20]`, `lr=0.375`): `4.921 s` E2E (`2.40 s` opt, **`1.77x` faster**), `0.5663` NN / `0.5802` GL (`0.000%` fold)
+    - **`syntx.greedy` autotuned default (`[100, 100, 20]`, `lr=0.5625`)**: **`5.058 s` E2E (`5.029 s` min; `2.44 s` opt)**, **`0.5717` NN / `0.5861` GL (`0.000%` fold)** — **`+0.54 pp` NN & `1.73x` faster** than `antstorch.greedy` default, and **`+0.08 pp` NN & `2.57x` faster** than `antstorch.greedy` `[100, 100, 50]` `regadam` (`13.010 s`, `0.5709` NN / `0.5849` GL).
+- **Strict Physical-Space `(spacing, origin, direction)` Enforcement & Exact $O(d)$ Continuum Conjugation (`src/syntx/core/regularizers.py`, `src/syntx/{pyramid,greedy,syn,syn_jax,tvf,tvf_jax,syngs,syngs_jax}.py`, `tests/test_physical_space_geometry_required.py`)**:
+  - Eliminated silent `spacing=None -> (1.0,) * dim` / `origin=0` / `direction=I` fallbacks across `_get_k_mesh_rfft`, `compute_divergence_nd`, `compute_curl_nd`, all continuum/spectral builders in `regularizers.py`, `pyramid.py`, and all 7 solver `.fit()` entry points (`greedy`, `syn`, `syn_jax`, `tvf`, `tvf_jax`, `syngs`, `syngs_jax`), raising `ValueError` immediately when physical geometry is omitted on raw-tensor calls.
+  - Added exact $O(d)$ direction-matrix conjugation ($D_{\text{zyx}} \mathcal{G}_{\mathbf{s}}(D_{\text{zyx}}^T \mathbf{v})$) across coupled continuum operators (`solenoidal`, `div_curl`, `navier`, `masked_incompressible`, `poroelastic`, `hyperelastic`, `compute_divergence_nd`, `compute_curl_nd`), verified `< 1e-5` equivariant across `LPS`, `RPI`, `PIR`, and $25^\circ$ oblique `SO(3)` frames, plus `.flip(-1)` + `vector_frame='voxel'` alignment in `greedy.py`.
+- **Gates**: `python3 -m antsxqc.lint src/syntx` (`0 finding(s)`, no `.antsxqc-allow`), `test_physical_space_geometry_required.py` + `test_canonical_parameters.py` + `test_tune.py` + guards (`143 passed, 34 skipped`), and full isolated `pytest tests/ -q` suite (`2,683 passed, 398 skipped, 0 failed`).
 
 ## R45 (Universal Cross-Solver `initial_warp` / `[warp, affine]` Contract, Multi-Member Parallel `.nii.gz` Export & 3-Pair Hybrid VoxelMorph Warm-Start Study; v6.41.0, 2026-11-18)
 - **Universal `initial_warp` / `initial_inverse_warp` / `initial_transform=[warp, affine]` Architecture (`src/syntx/core/initial_warp.py`, `src/syntx/{greedy,syn,syn_jax,tvf,tvf_jax,syngs,syngs_jax,spatial,provenance}.py`, `tests/test_hybrid_voxelmorph.py`)**:

@@ -724,6 +724,9 @@ class TVFModelJAX:
         fixed_spacing=None,
         fixed_origin=None,
         fixed_direction=None,
+        moving_spacing=None,
+        moving_origin=None,
+        moving_direction=None,
         **kwargs
     ):
         """
@@ -789,9 +792,19 @@ class TVFModelJAX:
             raise TypeError(f"TVFModelJAX.fit() got unused / unknown keyword(s) {_unknown}")
         if similarity_metric is not None:
             self.similarity_metric = check_similarity_metric_jax(similarity_metric, "the JAX TVF")
-        if fixed_spacing is not None: self.spacing = fixed_spacing
-        if fixed_origin is not None: self.origin = fixed_origin
-        if fixed_direction is not None: self.direction = fixed_direction
+        from .core.regularizers import resolve_required_image_geometry
+        fixed_spacing, fixed_origin, fixed_direction = resolve_required_image_geometry(
+            fixed_image, fixed_spacing, fixed_origin, fixed_direction, self.dim, "fixed", "TVFModelJAX.fit"
+        )
+        moving_spacing, moving_origin, moving_direction = resolve_required_image_geometry(
+            moving_image, moving_spacing, moving_origin, moving_direction, self.dim, "moving", "TVFModelJAX.fit"
+        )
+        self.spacing = list(fixed_spacing)
+        self.origin = list(fixed_origin)
+        self.direction = fixed_direction.tolist()
+        self.moving_spacing = list(moving_spacing)
+        self.moving_origin = list(moving_origin)
+        self.moving_direction = moving_direction.tolist()
 
         fixed_image = jnp.array(fixed_image.numpy() if hasattr(fixed_image, 'numpy') else fixed_image)
         moving_image = jnp.array(moving_image.numpy() if hasattr(moving_image, 'numpy') else moving_image)

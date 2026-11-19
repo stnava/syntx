@@ -156,7 +156,12 @@ def test_syn_cfl_shrink_ratio_follows_the_actual_spacings_on_a_thin_slab():
     shape = (11, 48, 48); sp = [1.0, 1.0, 3.0]
     f, m = _syn_pair(shape)
     model = SyNTo(dim=3, grid_shape=shape, spacing=sp)
-    model.fit(f, m, fixed_spacing=sp, moving_spacing=sp, levels=[4, 2, 1], epochs_per_level=[1, 1, 1], verbose=False)
+    model.fit(
+        f, m,
+        fixed_spacing=sp, fixed_origin=(0.0, 0.0, 0.0), fixed_direction=np.eye(3),
+        moving_spacing=sp, moving_origin=(0.0, 0.0, 0.0), moving_direction=np.eye(3),
+        levels=[4, 2, 1], epochs_per_level=[1, 1, 1], verbose=False,
+    )
     info = model.pyramid_info
     assert [i['level'] for i in info] == [4, 2, 1]
     fine = level_spacing(sp, shape, shape)
@@ -173,7 +178,12 @@ def test_syn_moving_image_has_its_own_level_grid_and_spacing():
     f = _smooth((32, 40, 36)); m = _smooth((28, 36, 40), seed=1)
     sp, msp = [1.0, 1.0, 1.0], [1.2, 1.0, 0.8]
     model = SyNTo(dim=3, grid_shape=(32, 40, 36), spacing=sp)
-    model.fit(f, m, fixed_spacing=sp, moving_spacing=msp, levels=[2, 1], epochs_per_level=[1, 1], verbose=False)
+    model.fit(
+        f, m,
+        fixed_spacing=sp, fixed_origin=(0.0, 0.0, 0.0), fixed_direction=np.eye(3),
+        moving_spacing=msp, moving_origin=(0.0, 0.0, 0.0), moving_direction=np.eye(3),
+        levels=[2, 1], epochs_per_level=[1, 1], verbose=False,
+    )
     for i in model.pyramid_info:
         assert tuple(i['moving_spacing']) == pytest.approx(tuple(level_spacing(msp, (28, 36, 40), i['moving_shape'])))
     assert model.pyramid_info[0]['moving_shape'] != model.pyramid_info[0]['fixed_shape']
@@ -186,7 +196,11 @@ def test_tvf_level_spacing_is_the_actual_velocity_grid_spacing():
     shape = (24, 24, 24); sp = [1.0, 1.0, 1.0]
     f, m = _syn_pair(shape)
     model = TVFModel(dim=3, image_shape=shape, velocity_shape=shape, spacing=sp, moving_shape=shape, moving_spacing=sp)
-    model.fit(f, m, levels=[4, 2, 1], epochs_per_level=[1, 1, 1])
+    model.fit(
+        f, m, levels=[4, 2, 1], epochs_per_level=[1, 1, 1],
+        fixed_spacing=sp, fixed_origin=(0.0, 0.0, 0.0), fixed_direction=np.eye(3),
+        moving_spacing=sp, moving_origin=(0.0, 0.0, 0.0), moving_direction=np.eye(3),
+    )
     info = model.pyramid_info
     assert [i['level'] for i in info] == [4, 2, 1]
     for i in info:
@@ -210,7 +224,11 @@ def test_greedy_levels_follow_the_spacing_and_moving_gets_its_own_sigma(monkeypa
         return out
     monkeypatch.setattr(G, 'build_pyramid', spy)
     model = G.GreedyRegistrationModel(dim=3, similarity_metric='cc2', lncc_radius=2)
-    model.fit(fixed, moving, torch.eye(3, 4)[None], scales=[4], iterations=[1], spacing=(1.0, 1.0, 1.0), moving_spacing=(1.0, 1.0, 1.0))
+    model.fit(
+        fixed, moving, torch.eye(3, 4)[None], scales=[4], iterations=[1],
+        spacing=(1.0, 1.0, 1.0), origin=(0.0, 0.0, 0.0), direction=np.eye(3),
+        moving_spacing=(1.0, 1.0, 1.0), moving_origin=(0.0, 0.0, 0.0), moving_direction=np.eye(3),
+    )
     for img in (fixed, moving):
         want = plan_levels(img.shape[2:], (1, 1, 1), [4], 'deformable')[0]
         assert seen[tuple(img.shape[2:])][:2] == (want.sigma_vox_zyx, want.shape_zyx)
@@ -221,7 +239,10 @@ def test_greedy_thick_axis_is_not_shrunk_with_the_thin_ones_and_thin_axis_does_n
     from syntx.greedy import GreedyRegistrationModel
     fixed, moving = _smooth((12, 48, 48)), torch.roll(_smooth((12, 48, 48)), (1, 2, -1), (2, 3, 4))
     model = GreedyRegistrationModel(dim=3, similarity_metric='cc2', lncc_radius=2)
-    warp = model.fit(fixed, moving, torch.eye(3, 4)[None], scales=[2, 1], iterations=[2, 2], spacing=(1.0, 1.0, 3.0))
+    warp = model.fit(
+        fixed, moving, torch.eye(3, 4)[None], scales=[2, 1], iterations=[2, 2],
+        spacing=(1.0, 1.0, 3.0), origin=(0.0, 0.0, 0.0), direction=np.eye(3),
+    )
     assert tuple(warp.shape) == (1, 12, 48, 48, 3) and torch.isfinite(warp).all()
 
 
@@ -281,7 +302,12 @@ def test_syn_jax_moving_image_has_its_own_level_grid():
     f = _smooth((32, 40, 36)).numpy().astype(np.float32); m = _smooth((28, 36, 40), seed=1).numpy().astype(np.float32)
     sp, msp = [1.0, 1.0, 1.0], [1.2, 1.0, 0.8]
     model = SyNToJax(dim=3, grid_shape=(32, 40, 36), spacing=sp)
-    model.fit(f, m, fixed_spacing=sp, moving_spacing=msp, levels=[2, 1], epochs_per_level=[1, 1], verbose=False)
+    model.fit(
+        f, m,
+        fixed_spacing=sp, fixed_origin=(0.0, 0.0, 0.0), fixed_direction=np.eye(3),
+        moving_spacing=msp, moving_origin=(0.0, 0.0, 0.0), moving_direction=np.eye(3),
+        levels=[2, 1], epochs_per_level=[1, 1], verbose=False,
+    )
     for i in model.pyramid_info:
         assert tuple(i['moving_spacing']) == pytest.approx(tuple(level_spacing(msp, (28, 36, 40), i['moving_shape'])))
     assert model.pyramid_info[0]['moving_shape'] != model.pyramid_info[0]['fixed_shape']       # was resampled onto the FIXED level grid
@@ -301,7 +327,11 @@ def test_jax_models_build_level_images_through_the_central_pyramid(which, monkey
     seen = []
     real = mod.pyramid_level_jax
     monkeypatch.setattr(mod, 'pyramid_level_jax', lambda image, level, *a, **k: (seen.append((level, k.get('sigma'))), real(image, level, *a, **k))[1])
-    model.fit(f, m, levels=[2, 1], epochs_per_level=[1, 1], affine_epochs=1, lncc_radius=2, smooth_pyramid=True)
+    model.fit(
+        f, m, levels=[2, 1], epochs_per_level=[1, 1], affine_epochs=1, lncc_radius=2, smooth_pyramid=True,
+        fixed_spacing=(1.0, 1.0, 1.0), fixed_origin=(0.0, 0.0, 0.0), fixed_direction=np.eye(3),
+        moving_spacing=(1.0, 1.0, 1.0), moving_origin=(0.0, 0.0, 0.0), moving_direction=np.eye(3),
+    )
     assert [lv for lv, _ in seen] == [2, 2, 1, 1] and all(sg is None for _, sg in seen)      # fixed + moving at every level, planner's sigma
 
 
@@ -313,5 +343,9 @@ def test_tvf_cfl_step_is_scaled_up_to_the_step_length():
     shape = (24, 24, 24)
     f, m = _syn_pair(shape)
     model = TVFModel(dim=3, image_shape=shape, velocity_shape=shape, spacing=[1.0] * 3, moving_shape=shape, moving_spacing=[1.0] * 3)
-    model.fit(f, m, levels=[1], epochs_per_level=[3], optimizer_type='cfl', cfl_step=0.5, cfl_momentum=0.0)
+    model.fit(
+        f, m, levels=[1], epochs_per_level=[3], optimizer_type='cfl', cfl_step=0.5, cfl_momentum=0.0,
+        fixed_spacing=[1.0] * 3, fixed_origin=[0.0] * 3, fixed_direction=np.eye(3),
+        moving_spacing=[1.0] * 3, moving_origin=[0.0] * 3, moving_direction=np.eye(3),
+    )
     assert float(model.velocity.abs().max()) > 0.1        # with the clamp: ~1e-3

@@ -100,7 +100,13 @@ def test_multimetric_fitting():
         epochs_per_level=[2, 1],
         similarity_metric=['lncc', 'resnet10'],
         syn_metric_weights=[0.6, 0.4],
-        vgg_layers=[2]
+        vgg_layers=[2],
+        fixed_spacing=[1.0, 1.0],
+        fixed_origin=[0.0, 0.0],
+        fixed_direction=[[1.0, 0.0], [0.0, 1.0]],
+        moving_spacing=[1.0, 1.0],
+        moving_origin=[0.0, 0.0],
+        moving_direction=[[1.0, 0.0], [0.0, 1.0]],
     )
     
     assert len(model.metrics) == 2

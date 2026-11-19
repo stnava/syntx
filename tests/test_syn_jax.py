@@ -101,7 +101,13 @@ def run_test_2d(similarity_metric):
         cfl_voxels=0.15,
         affine_epochs=30, 
         affine_lr=1e-2,
-        similarity_metric=similarity_metric
+        similarity_metric=similarity_metric,
+        fixed_spacing=fixed_img.spacing,
+        fixed_origin=fixed_img.origin,
+        fixed_direction=fixed_img.direction,
+        moving_spacing=moving_img.spacing,
+        moving_origin=moving_img.origin,
+        moving_direction=moving_img.direction,
     )
     
     # Apply forward warp
@@ -161,7 +167,13 @@ def run_test_3d(similarity_metric):
         cfl_voxels=0.15,
         affine_epochs=30, 
         affine_lr=1e-2,
-        similarity_metric=similarity_metric
+        similarity_metric=similarity_metric,
+        fixed_spacing=fixed_img.spacing,
+        fixed_origin=fixed_img.origin,
+        fixed_direction=fixed_img.direction,
+        moving_spacing=moving_img.spacing,
+        moving_origin=moving_img.origin,
+        moving_direction=moving_img.direction,
     )
     
     # Apply forward warp
@@ -505,7 +517,8 @@ def test_synto_jax_high_iteration_fold_free():
     import numpy as np
     from syntx.syn_jax import SyNTo, compute_jacobian_determinant_nd_jax
     
-    fixed_np = get_test_image_2d().numpy()
+    fixed_img = get_test_image_2d()
+    fixed_np = fixed_img.numpy()
     fixed_tensor = torch.tensor(fixed_np, dtype=torch.float32).unsqueeze(0).unsqueeze(0)
     
     fi_mean = fixed_np.mean()
@@ -523,7 +536,13 @@ def test_synto_jax_high_iteration_fold_free():
         epochs_per_level=[100, 100, 50], 
         cfl_voxels=0.50,  # Test with high CFL step size to ensure step bounding works
         affine_epochs=10, 
-        similarity_metric='lncc'
+        similarity_metric='lncc',
+        fixed_spacing=fixed_img.spacing,
+        fixed_origin=fixed_img.origin,
+        fixed_direction=fixed_img.direction,
+        moving_spacing=fixed_img.spacing,
+        moving_origin=fixed_img.origin,
+        moving_direction=fixed_img.direction,
     )
     
     # Compute Jacobian determinant

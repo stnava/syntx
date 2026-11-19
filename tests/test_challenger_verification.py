@@ -37,7 +37,13 @@ def test_deep_feature_degeneracy_trigger_pytorch():
             fixed_tensor, moving_tensor,
             levels=[1],
             epochs_per_level=3,
-            similarity_metric='vgg19'
+            similarity_metric='vgg19',
+            fixed_spacing=[1.0, 1.0],
+            fixed_origin=[0.0, 0.0],
+            fixed_direction=np.eye(2),
+            moving_spacing=[1.0, 1.0],
+            moving_origin=[0.0, 0.0],
+            moving_direction=np.eye(2),
         )
         
     # Since grid shape is 16 < 32, it should fall back to local ncc.
@@ -63,7 +69,13 @@ def test_deep_feature_degeneracy_trigger_pytorch():
             fixed_tensor_large, moving_tensor_large,
             levels=[1],
             epochs_per_level=3,
-            similarity_metric='vgg19'
+            similarity_metric='vgg19',
+            fixed_spacing=[1.0, 1.0],
+            fixed_origin=[0.0, 0.0],
+            fixed_direction=np.eye(2),
+            moving_spacing=[1.0, 1.0],
+            moving_origin=[0.0, 0.0],
+            moving_direction=np.eye(2),
         )
     assert call_count_large > 0, "Expected VGG19Extractor to be called for shape >= 32."
 
@@ -93,7 +105,13 @@ def test_deep_feature_degeneracy_trigger_jax():
             levels=[1],
             epochs_per_level=3,
             affine_epochs=[0],
-            similarity_metric='vgg19'
+            similarity_metric='vgg19',
+            fixed_spacing=[1.0, 1.0],
+            fixed_origin=[0.0, 0.0],
+            fixed_direction=np.eye(2),
+            moving_spacing=[1.0, 1.0],
+            moving_origin=[0.0, 0.0],
+            moving_direction=np.eye(2),
         )
         
     # Since grid shape is 16 < 32, JAX SyNTo should fall back to local_ncc_loss_nd_jax
@@ -119,7 +137,13 @@ def test_deep_feature_degeneracy_trigger_jax():
             levels=[1],
             epochs_per_level=3,
             affine_epochs=[0],
-            similarity_metric='vgg19'
+            similarity_metric='vgg19',
+            fixed_spacing=[1.0, 1.0],
+            fixed_origin=[0.0, 0.0],
+            fixed_direction=np.eye(2),
+            moving_spacing=[1.0, 1.0],
+            moving_origin=[0.0, 0.0],
+            moving_direction=np.eye(2),
         )
     assert call_count_large > 0, "Expected VGG19Extractor to be called for shape >= 32 under JAX."
 

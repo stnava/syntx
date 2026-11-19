@@ -174,6 +174,8 @@ def plan_levels(shape_zyx: Sequence[int], spacing_xyz: Sequence[float], levels: 
         (the phase-correlation downsampler of the affine solver) pass the same sizes.
     """
     pol = get_policy(policy)
+    if spacing_xyz is None:
+        raise ValueError("plan_levels: 'spacing_xyz' is required and cannot be None")
     n_zyx = tuple(int(x) for x in shape_zyx)
     sp = tuple(float(x) for x in spacing_xyz)
     dim = len(n_zyx)
@@ -467,6 +469,8 @@ def build_pyramid(image: torch.Tensor, spacing: Sequence[float], levels: Sequenc
     ``origin`` / ``direction`` (ANTs convention, default zeros / identity) feed ``Level.physical_coordinates`` and ``warp_to_moving_norm``.
     A level that is the identity returns ``image`` itself (shared storage).
     """
+    if spacing is None:
+        raise ValueError("build_pyramid: 'spacing' is required and cannot be None")
     spacing = tuple(float(x) for x in spacing)
     dim = _check_image(image, spacing)
     pol = get_policy(policy)
@@ -541,6 +545,8 @@ def build_pyramid_jax(image, spacing: Sequence[float], levels: Sequence[float], 
     operators to float32 rounding.
     ``Level.valid`` is a torch bool tensor (a metric mask, not a JAX computation). jax is imported lazily; without it ``ImportError``."""
     _, jnp = _import_jax()
+    if spacing is None:
+        raise ValueError("build_pyramid_jax: 'spacing' is required and cannot be None")
     spacing = tuple(float(x) for x in spacing)
     if image.ndim not in (4, 5) or len(spacing) != image.ndim - 2:
         raise PyramidLevelError(f"image must be (B, C, *spatial) with 2 or 3 spatial axes and one spacing per axis, got {image.shape}")

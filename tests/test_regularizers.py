@@ -88,9 +88,9 @@ def test_solenoidal_projection_annihilates_divergence_2d_and_3d():
 
     # Test unbatched input shape
     v_unbatched = torch.randn(14, 14, 2, dtype=torch.float32)
-    v_sol_un = project_solenoidal(v_unbatched)
+    v_sol_un = project_solenoidal(v_unbatched, spacing=(1.0, 1.0))
     assert v_sol_un.shape == (14, 14, 2)
-    div_un = compute_divergence_nd(v_sol_un, method='spectral')
+    div_un = compute_divergence_nd(v_sol_un, spacing=(1.0, 1.0), method='spectral')
     assert float(div_un.abs().max().item()) < 1e-5
 
 
@@ -124,7 +124,7 @@ def test_counterfactual_pure_divergence_vs_pure_rotational_2d():
     ], dim=-1).unsqueeze(0)
 
     # Counterfactual 1: Pure gradient field is annihilated
-    v_sol_from_grad = project_solenoidal(v_grad)
+    v_sol_from_grad = project_solenoidal(v_grad, spacing=(1.0, 1.0))
     grad_norm_init = float(v_grad.norm().item())
     grad_norm_proj = float(v_sol_from_grad.norm().item())
     assert (grad_norm_proj / grad_norm_init) < 1e-4, (
@@ -132,7 +132,7 @@ def test_counterfactual_pure_divergence_vs_pure_rotational_2d():
     )
 
     # Counterfactual 2: Pure rotational field is preserved exactly
-    v_sol_from_rot = project_solenoidal(v_rot)
+    v_sol_from_rot = project_solenoidal(v_rot, spacing=(1.0, 1.0))
     rot_diff = float((v_sol_from_rot - v_rot).norm().item())
     rot_norm_init = float(v_rot.norm().item())
     assert (rot_diff / rot_norm_init) < 1e-4, (
@@ -148,11 +148,11 @@ def test_solenoidal_sobolev_operator():
     m = torch.randn(1, 20, 20, 2, dtype=torch.float32)
 
     # Apply solenoidal Sobolev smoothing
-    v_smoothed = apply_solenoidal_sobolev_operator(m, alpha=2.0, fluid_sigma=3.0, s=2.0)
+    v_smoothed = apply_solenoidal_sobolev_operator(m, alpha=2.0, fluid_sigma=3.0, spacing=(1.0, 1.0), s=2.0)
     assert v_smoothed.shape == m.shape
 
     # 1. Spectral divergence is zero
-    div_spec = compute_divergence_nd(v_smoothed, method='spectral')
+    div_spec = compute_divergence_nd(v_smoothed, spacing=(1.0, 1.0), method='spectral')
     assert float(div_spec.abs().max().item()) < 1e-5
 
     # 2. High-frequency energy is heavily attenuated (smoothing property)
@@ -179,8 +179,8 @@ def test_div_curl_green_operator_decoupling():
     v_rot = torch.stack([torch.cos(gx) * torch.cos(gy), torch.sin(gx) * torch.sin(gy)], dim=-1).unsqueeze(0)
 
     # Case A: Heavy dilatation penalty (beta = 100.0, gamma = 1.0)
-    out_grad = apply_div_curl_green_operator(v_grad, alpha=1.0, beta=100.0, gamma=1.0)
-    out_rot = apply_div_curl_green_operator(v_rot, alpha=1.0, beta=100.0, gamma=1.0)
+    out_grad = apply_div_curl_green_operator(v_grad, alpha=1.0, beta=100.0, gamma=1.0, spacing=(1.0, 1.0))
+    out_rot = apply_div_curl_green_operator(v_rot, alpha=1.0, beta=100.0, gamma=1.0, spacing=(1.0, 1.0))
 
     gain_grad = float(out_grad.norm().item()) / float(v_grad.norm().item())
     gain_rot = float(out_rot.norm().item()) / float(v_rot.norm().item())
@@ -191,8 +191,8 @@ def test_div_curl_green_operator_decoupling():
     )
 
     # Case B: Balanced isotropic (beta = gamma = 1.0)
-    out_grad_iso = apply_div_curl_green_operator(v_grad, alpha=1.0, beta=1.0, gamma=1.0)
-    out_rot_iso = apply_div_curl_green_operator(v_rot, alpha=1.0, beta=1.0, gamma=1.0)
+    out_grad_iso = apply_div_curl_green_operator(v_grad, alpha=1.0, beta=1.0, gamma=1.0, spacing=(1.0, 1.0))
+    out_rot_iso = apply_div_curl_green_operator(v_rot, alpha=1.0, beta=1.0, gamma=1.0, spacing=(1.0, 1.0))
 
     gain_grad_iso = float(out_grad_iso.norm().item()) / float(v_grad.norm().item())
     gain_rot_iso = float(out_rot_iso.norm().item()) / float(v_rot.norm().item())
@@ -210,16 +210,16 @@ def test_navier_green_operator_poisson_ratio():
     m = torch.randn(1, 16, 16, 2, dtype=torch.float32)
 
     # nu = 0.50 (incompressible limit)
-    v_stokes = apply_navier_green_operator(m, alpha=1.0, poisson_ratio=0.50)
-    div_stokes = compute_divergence_nd(v_stokes, method='spectral')
+    v_stokes = apply_navier_green_operator(m, alpha=1.0, poisson_ratio=0.50, spacing=(1.0, 1.0))
+    div_stokes = compute_divergence_nd(v_stokes, spacing=(1.0, 1.0), method='spectral')
     assert float(div_stokes.abs().max().item()) < 1e-5, "Stokes limit did not produce zero divergence"
 
     # nu = 0.30 (compressible) vs nu = 0.49 (nearly incompressible soft tissue)
-    v_comp = apply_navier_green_operator(m, alpha=1.0, poisson_ratio=0.30)
-    v_soft = apply_navier_green_operator(m, alpha=1.0, poisson_ratio=0.49)
+    v_comp = apply_navier_green_operator(m, alpha=1.0, poisson_ratio=0.30, spacing=(1.0, 1.0))
+    v_soft = apply_navier_green_operator(m, alpha=1.0, poisson_ratio=0.49, spacing=(1.0, 1.0))
 
-    div_comp_rms = float(compute_divergence_nd(v_comp, method='spectral').pow(2).mean().sqrt().item())
-    div_soft_rms = float(compute_divergence_nd(v_soft, method='spectral').pow(2).mean().sqrt().item())
+    div_comp_rms = float(compute_divergence_nd(v_comp, spacing=(1.0, 1.0), method='spectral').pow(2).mean().sqrt().item())
+    div_soft_rms = float(compute_divergence_nd(v_soft, spacing=(1.0, 1.0), method='spectral').pow(2).mean().sqrt().item())
 
     # Divergence in soft tissue (nu=0.49) should be significantly lower than compressible (nu=0.30)
     assert div_soft_rms < 0.10 * div_comp_rms, (
@@ -245,10 +245,10 @@ def test_masked_incompressible_filter():
     gy, gx = torch.meshgrid(y, x, indexing='ij')
     mask = (gx**2 + gy**2 <= 0.25).float().unsqueeze(0)  # inner disk
 
-    v_filtered = apply_masked_incompressible_filter(v, mask=mask, num_iters=3)
+    v_filtered = apply_masked_incompressible_filter(v, mask=mask, spacing=(1.0, 1.0), num_iters=3)
 
-    div_orig = compute_divergence_nd(v, method='spectral')
-    div_filt = compute_divergence_nd(v_filtered, method='spectral')
+    div_orig = compute_divergence_nd(v, spacing=(1.0, 1.0), method='spectral')
+    div_filt = compute_divergence_nd(v_filtered, spacing=(1.0, 1.0), method='spectral')
 
     # Measure divergence inside mask vs outside mask
     inside_orig = float((div_orig * mask).pow(2).sum().sqrt().item())
@@ -360,7 +360,7 @@ def test_regadam_with_continuum_regularizers():
 
     for reg_name in ['solenoidal', 'div_curl', 'navier', 'beltrami', 'poroelastic', 'hyperelastic']:
         p = torch.nn.Parameter(torch.randn(1, 12, 12, 2, dtype=torch.float32))
-        opt = RegAdam([p], lr=0.10, regularizer=reg_name, max_step_norm=0.50)
+        opt = RegAdam([p], lr=0.10, regularizer=reg_name, max_step_norm=0.50, spacing=(1.0, 1.0))
 
         # Forward loss and gradient step
         loss = (p ** 2).sum()
@@ -387,7 +387,7 @@ def test_beltrami_quasiconformal_shear_damping():
     H, W, D = 16, 16, 16
     v = torch.randn(1, H, W, D, 3) * 0.1
 
-    v_beltrami = apply_beltrami_regularizer(v, alpha=2.0)
+    v_beltrami = apply_beltrami_regularizer(v, alpha=2.0, spacing=(1.0, 1.0, 1.0))
     assert v_beltrami.shape == v.shape
     assert not torch.isnan(v_beltrami).any()
 
@@ -396,7 +396,7 @@ def test_beltrami_quasiconformal_shear_damping():
 
     # In 2D: verify conformal behavior
     v2d = torch.randn(1, 20, 20, 2) * 0.1
-    v2d_beltrami = apply_beltrami_regularizer(v2d, alpha=2.0)
+    v2d_beltrami = apply_beltrami_regularizer(v2d, alpha=2.0, spacing=(1.0, 1.0))
     assert v2d_beltrami.shape == v2d.shape
     assert not torch.isnan(v2d_beltrami).any()
 
@@ -418,12 +418,12 @@ def test_poroelastic_consolidation_filter():
     gy, gx = torch.meshgrid(y, x, indexing='ij')
     mask = (gx**2 + gy**2 <= 0.36).float().unsqueeze(0)  # inner parenchyma
 
-    v_poro = apply_poroelastic_filter(v, alpha=2.0, darcy_permeability=0.1, mask=mask)
+    v_poro = apply_poroelastic_filter(v, alpha=2.0, darcy_permeability=0.1, mask=mask, spacing=(1.0, 1.0))
     assert v_poro.shape == v.shape
     assert not torch.isnan(v_poro).any()
 
-    div_orig = compute_divergence_nd(v, method='spectral')
-    div_poro = compute_divergence_nd(v_poro, method='spectral')
+    div_orig = compute_divergence_nd(v, spacing=(1.0, 1.0), method='spectral')
+    div_poro = compute_divergence_nd(v_poro, spacing=(1.0, 1.0), method='spectral')
 
     inside_orig = float((div_orig * mask).pow(2).sum().sqrt().item())
     inside_poro = float((div_poro * mask).pow(2).sum().sqrt().item())
@@ -448,13 +448,13 @@ def test_hyperelastic_field_regularizer():
 
     # Construct divergent field
     v = torch.stack([gy, gx], dim=-1).unsqueeze(0)  # div(v) = 2.0 everywhere
-    v_hyp = apply_hyperelastic_regularizer(v, alpha=1.0, bulk_modulus=20.0)
+    v_hyp = apply_hyperelastic_regularizer(v, alpha=1.0, bulk_modulus=20.0, spacing=(1.0, 1.0))
 
     assert v_hyp.shape == v.shape
     assert not torch.isnan(v_hyp).any()
 
-    div_orig = compute_divergence_nd(v, method='spectral')
-    div_hyp = compute_divergence_nd(v_hyp, method='spectral')
+    div_orig = compute_divergence_nd(v, spacing=(1.0, 1.0), method='spectral')
+    div_hyp = compute_divergence_nd(v_hyp, spacing=(1.0, 1.0), method='spectral')
     assert div_hyp.abs().mean() < div_orig.abs().mean(), "Hyperelastic filter failed to damp volumetric dilation"
 
 
@@ -478,7 +478,7 @@ def test_all_continuum_paradigms_in_registry():
 
     field = torch.randn(1, 16, 16, 2)
     for p in paradigms:
-        reg_fn = get_regularizer(p, alpha=1.0, fluid_sigma=2.0)
+        reg_fn = get_regularizer(p, alpha=1.0, fluid_sigma=2.0, spacing=(1.0, 1.0))
         out = reg_fn(field)
         assert out.shape == field.shape, f"Shape mismatch for regularizer {p}"
         assert not torch.isnan(out).any(), f"NaN for regularizer {p}"
@@ -563,10 +563,10 @@ def test_relative_aspect_ratio_pyramid_scale_invariance():
     # 1. Isotropic pyramid levels must be bitwise identical
     _, k_sq_fine_iso, _ = _get_k_mesh_rfft(shape, spacing=(1.0, 1.0, 1.0), device=device, relative_spacing=True)
     _, k_sq_coarse_iso, _ = _get_k_mesh_rfft(shape, spacing=(4.0, 4.0, 4.0), device=device, relative_spacing=True)
-    _, k_sq_none, _ = _get_k_mesh_rfft(shape, spacing=None, device=device, relative_spacing=True)
+    with pytest.raises(ValueError, match="spacing"):
+        _get_k_mesh_rfft(shape, spacing=None, device=device, relative_spacing=True)
 
     assert torch.allclose(k_sq_fine_iso, k_sq_coarse_iso)
-    assert torch.allclose(k_sq_fine_iso, k_sq_none)
 
     # 2. Anisotropic pyramid levels must be bitwise identical
     k_mesh_fine_aniso, k_sq_fine_aniso, _ = _get_k_mesh_rfft(

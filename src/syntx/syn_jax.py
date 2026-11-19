@@ -3188,6 +3188,28 @@ class SyNJAX:
             if parsed_M is not None:
                 init_M_phys = parsed_M
                 init_t_phys = parsed_t
+        from .core.regularizers import resolve_required_image_geometry
+        fixed_spacing, fixed_origin, fixed_direction_np = resolve_required_image_geometry(
+            fixed_image,
+            kwargs.get('fixed_spacing', None),
+            kwargs.get('fixed_origin', None),
+            kwargs.get('fixed_direction', None),
+            self.dim,
+            "fixed",
+            "SyNJAX.fit",
+        )
+        moving_spacing, moving_origin, moving_direction_np = resolve_required_image_geometry(
+            moving_image,
+            kwargs.get('moving_spacing', None),
+            kwargs.get('moving_origin', None),
+            kwargs.get('moving_direction', None),
+            self.dim,
+            "moving",
+            "SyNJAX.fit",
+        )
+        fixed_direction = tuple(tuple(float(x) for x in row) for row in fixed_direction_np)
+        moving_direction = tuple(tuple(float(x) for x in row) for row in moving_direction_np)
+
         I_raw = to_jax_array(fixed_image)
         J_raw = to_jax_array(moving_image)
         if I_raw.ndim == self.dim:
@@ -3200,39 +3222,6 @@ class SyNJAX:
         J_jax = (J_raw - j_min) / (j_max - j_min + 1e-8)
         spatial_shape = I_jax.shape[2:]
         self.grid_shape = spatial_shape
-        
-        fixed_spacing = kwargs.get('fixed_spacing', None)
-        fixed_origin = kwargs.get('fixed_origin', None)
-        fixed_direction = kwargs.get('fixed_direction', None)
-        moving_spacing = kwargs.get('moving_spacing', None)
-        moving_origin = kwargs.get('moving_origin', None)
-        moving_direction = kwargs.get('moving_direction', None)
-        
-        if fixed_spacing is None:
-            fixed_spacing = self.spacing if self.spacing is not None else [1.0] * self.dim
-            
-        if fixed_origin is None:
-            fixed_origin = [0.0] * self.dim
-            
-        if fixed_direction is None:
-            fixed_direction = self.direction if self.direction is not None else np.eye(self.dim)
-            
-        if moving_spacing is None:
-            moving_spacing = [1.0] * self.dim
-            
-
-        if moving_origin is None:
-            moving_origin = [0.0] * self.dim
-            
-        if moving_direction is None:
-            moving_direction = np.eye(self.dim)
-            
-        fixed_spacing = tuple(fixed_spacing)
-        fixed_origin = tuple(fixed_origin)
-        fixed_direction = tuple(tuple(float(x) for x in row) for row in fixed_direction)
-        moving_spacing = tuple(moving_spacing)
-        moving_origin = tuple(moving_origin)
-        moving_direction = tuple(tuple(float(x) for x in row) for row in moving_direction)
         
         # Standardize iteration lists to match hierarchy levels length
         if isinstance(epochs_per_level, int):

@@ -33,6 +33,12 @@ def test_problem_1_temporal_gradient_weighting():
         epochs_per_level=[1],
         levels=[1],
         use_analytical_gradients=True,
+        fixed_spacing=[1.0, 1.0],
+        fixed_origin=[0.0, 0.0],
+        fixed_direction=np.eye(2),
+        moving_spacing=[1.0, 1.0],
+        moving_origin=[0.0, 0.0],
+        moving_direction=np.eye(2),
         verbose=False
     )
 

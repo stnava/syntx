@@ -200,6 +200,12 @@ def test_m1_adversarial_tvf_3d_hit_rate():
         moving,
         epochs_per_level=[30],
         regularizer='dsti',
+        fixed_spacing=[1.0, 1.0, 1.0],
+        fixed_origin=[0.0, 0.0, 0.0],
+        fixed_direction=np.eye(3),
+        moving_spacing=[1.0, 1.0, 1.0],
+        moving_origin=[0.0, 0.0, 0.0],
+        moving_direction=np.eye(3),
         verbose=False,
     )
 

@@ -396,6 +396,12 @@ def test_syn_multichannel_per_term_backward_equivalence_weakref_and_none_grad():
         similarity_metric=["mse", "mse"],
         syn_metric_weights=[0.0, 0.0],
         cfl_voxels=0.25,
+        fixed_spacing=(1.0, 1.0, 1.0),
+        fixed_origin=(0.0, 0.0, 0.0),
+        fixed_direction=np.eye(3),
+        moving_spacing=(1.0, 1.0, 1.0),
+        moving_origin=(0.0, 0.0, 0.0),
+        moving_direction=np.eye(3),
     )
     assert torch.isfinite(syn_model.warp_l2r).all() and torch.isfinite(syn_model.warp_r2l).all()
 
@@ -639,8 +645,8 @@ def test_greedy_speedups_warp_parity_affine_grid_and_dsti_alpha():
     fi_t = torch.rand(1, 1, 16, 16, 16, dtype=torch.float32)
     mi_t = torch.rand(1, 1, 16, 16, 16, dtype=torch.float32)
     theta_id = torch.eye(3, 4, dtype=torch.float32).unsqueeze(0)
-    w_fit_fast = g_fast.fit(fi_t, mi_t, theta_id, scales=[2, 1], iterations=[3, 2])
-    w_fit_slow = g_slow.fit(fi_t, mi_t, theta_id, scales=[2, 1], iterations=[3, 2])
+    w_fit_fast = g_fast.fit(fi_t, mi_t, theta_id, scales=[2, 1], iterations=[3, 2], spacing=(1.0, 1.0, 1.0), origin=(0.0, 0.0, 0.0), direction=np.eye(3))
+    w_fit_slow = g_slow.fit(fi_t, mi_t, theta_id, scales=[2, 1], iterations=[3, 2], spacing=(1.0, 1.0, 1.0), origin=(0.0, 0.0, 0.0), direction=np.eye(3))
     assert float((w_fit_fast - w_fit_slow).abs().max().item()) < 1e-6
     fi_down = torch.rand(1, 1, 14, 16, 18)
     moved1 = torch.rand(1, 1, 14, 16, 18, requires_grad=True)

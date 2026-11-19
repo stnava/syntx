@@ -151,7 +151,10 @@ def test_tvf_model_fit_2d_and_3d():
 
     model_2d_pt.fit(
         fi_2d_pt, mi_2d_pt,
-        levels=[2, 1], epochs_per_level=[5, 5], verbose=False
+        levels=[2, 1], epochs_per_level=[5, 5],
+        fixed_spacing=[1.0, 1.0], fixed_origin=[0.0, 0.0], fixed_direction=np.eye(2),
+        moving_spacing=[1.0, 1.0], moving_origin=[0.0, 0.0], moving_direction=np.eye(2),
+        verbose=False,
     )
     warp_2d_pt = model_2d_pt.get_forward_warp()
     assert warp_2d_pt.shape == (1, 32, 32, 2)
@@ -167,7 +170,10 @@ def test_tvf_model_fit_2d_and_3d():
 
     model_2d_jax.fit(
         fi_2d_jax, mi_2d_jax,
-        levels=[2, 1], epochs_per_level=[5, 5], affine_epochs=0, verbose=False
+        levels=[2, 1], epochs_per_level=[5, 5], affine_epochs=0,
+        fixed_spacing=[1.0, 1.0], fixed_origin=[0.0, 0.0], fixed_direction=np.eye(2),
+        moving_spacing=[1.0, 1.0], moving_origin=[0.0, 0.0], moving_direction=np.eye(2),
+        verbose=False,
     )
     warp_2d_jax = model_2d_jax.get_forward_warp()
     assert warp_2d_jax.shape == (1, 32, 32, 2)
@@ -184,7 +190,10 @@ def test_tvf_model_fit_2d_and_3d():
 
     model_3d_pt.fit(
         fi_3d_pt, mi_3d_pt,
-        levels=[2, 1], epochs_per_level=[5, 5], verbose=False
+        levels=[2, 1], epochs_per_level=[5, 5],
+        fixed_spacing=[1.0, 1.0, 1.0], fixed_origin=[0.0, 0.0, 0.0], fixed_direction=np.eye(3),
+        moving_spacing=[1.0, 1.0, 1.0], moving_origin=[0.0, 0.0, 0.0], moving_direction=np.eye(3),
+        verbose=False,
     )
     warp_3d_pt = model_3d_pt.get_forward_warp()
     assert warp_3d_pt.shape == (1, 16, 16, 16, 3)
@@ -200,7 +209,10 @@ def test_tvf_model_fit_2d_and_3d():
 
     model_3d_jax.fit(
         fi_3d_jax, mi_3d_jax,
-        levels=[2, 1], epochs_per_level=[5, 5], affine_epochs=0, verbose=False
+        levels=[2, 1], epochs_per_level=[5, 5], affine_epochs=0,
+        fixed_spacing=[1.0, 1.0, 1.0], fixed_origin=[0.0, 0.0, 0.0], fixed_direction=np.eye(3),
+        moving_spacing=[1.0, 1.0, 1.0], moving_origin=[0.0, 0.0, 0.0], moving_direction=np.eye(3),
+        verbose=False,
     )
     warp_3d_jax = model_3d_jax.get_forward_warp()
     assert warp_3d_jax.shape == (1, 16, 16, 16, 3)
@@ -279,7 +291,10 @@ def test_tvf_lars_optimizer_integration():
     model.fit(
         fi, mi,
         levels=[2, 1], epochs_per_level=[5, 5],
-        optimizer_type='lars', lr=0.1, trust_coefficient=0.05, verbose=False
+        optimizer_type='lars', lr=0.1, trust_coefficient=0.05,
+        fixed_spacing=[1.0, 1.0, 1.0], fixed_origin=[0.0, 0.0, 0.0], fixed_direction=np.eye(3),
+        moving_spacing=[1.0, 1.0, 1.0], moving_origin=[0.0, 0.0, 0.0], moving_direction=np.eye(3),
+        verbose=False,
     )
     loss_fit = model.forward(fi, mi).item()
     assert loss_fit <= loss_init, f"LARS fit loss did not decrease: {loss_init:.4f} -> {loss_fit:.4f}"

@@ -251,9 +251,13 @@ def test_syngs_affine_prealignment():
     moving = torch.randn(1, 1, 16, 16)
 
     # the affine is set beforehand (syntx.syngs -> robust_affine); fit() has no affine stage
+    geom = dict(
+        fixed_spacing=[1.0, 1.0], fixed_origin=[0.0, 0.0], fixed_direction=np.eye(2),
+        moving_spacing=[1.0, 1.0], moving_origin=[0.0, 0.0], moving_direction=np.eye(2),
+    )
     with pytest.raises(TypeError, match="affine_epochs"):
-        model.fit(fixed, moving, levels=[1], epochs_per_level=[1], affine_epochs=2, verbose=False)
-    model.fit(fixed, moving, levels=[1], epochs_per_level=[1], verbose=False)
+        model.fit(fixed, moving, levels=[1], epochs_per_level=[1], affine_epochs=2, verbose=False, **geom)
+    model.fit(fixed, moving, levels=[1], epochs_per_level=[1], verbose=False, **geom)
     assert model.get_forward_warp() is not None
 
 
@@ -277,6 +281,12 @@ def test_syn_jax_lbfgs():
         epochs_per_level=[2],
         affine_epochs=0,
         optimizer_type='lbfgs',
+        fixed_spacing=[1.0, 1.0],
+        fixed_origin=[0.0, 0.0],
+        fixed_direction=np.eye(2),
+        moving_spacing=[1.0, 1.0],
+        moving_origin=[0.0, 0.0],
+        moving_direction=np.eye(2),
         verbose=False
     )
     assert model_syn.warp_l2r is not None

@@ -601,20 +601,23 @@ class SyNTo(nn.Module):
         self._restrict_mask_cache = (device, dtype, mask)
         return mask
 
-    def _apply_sobolev_green_operator(self, m, fluid_sigma=3.0, alpha=None):
+    def _apply_sobolev_green_operator(self, m, fluid_sigma=3.0, alpha=None, spacing=None):
         """Sobolev smoothing of field ``m`` (see ``core.smoothing.apply_sobolev_green_operator``)."""
         from .core.smoothing import apply_sobolev_green_operator
-        return apply_sobolev_green_operator(m, fluid_sigma=fluid_sigma, alpha=alpha)
+        sp = spacing if spacing is not None else self.spacing
+        return apply_sobolev_green_operator(m, fluid_sigma=fluid_sigma, alpha=alpha, spacing=sp)
 
-    def _apply_dsti_green_operator(self, m, fluid_sigma=3.0, alpha=None):
+    def _apply_dsti_green_operator(self, m, fluid_sigma=3.0, alpha=None, spacing=None):
         """DST-based (Dirichlet) smoothing of ``m`` (``core.smoothing.apply_dsti_green_operator``)."""
         from .core.smoothing import apply_dsti_green_operator
-        return apply_dsti_green_operator(m, fluid_sigma=fluid_sigma, alpha=alpha)
+        sp = spacing if spacing is not None else self.spacing
+        return apply_dsti_green_operator(m, fluid_sigma=fluid_sigma, alpha=alpha, spacing=sp)
 
-    def _apply_dsti1_green_operator(self, m, fluid_sigma=3.0, alpha=None):
+    def _apply_dsti1_green_operator(self, m, fluid_sigma=3.0, alpha=None, spacing=None):
         """DST-I (Dirichlet) smoothing of ``m`` (``core.smoothing.apply_dsti1_green_operator``)."""
         from .core.smoothing import apply_dsti1_green_operator
-        return apply_dsti1_green_operator(m, fluid_sigma=fluid_sigma, alpha=alpha)
+        sp = spacing if spacing is not None else self.spacing
+        return apply_dsti1_green_operator(m, fluid_sigma=fluid_sigma, alpha=alpha, spacing=sp)
 
     def _apply_bspline_operator(self, m, spacing=None, origin=None, fluid_sigma=None, **kwargs):
         """B-spline smoothing of ``m`` (``core.smoothing.smooth_displacement_field_bspline``; mesh_size / spline_distance / spline_order / enforce_stationary_boundary from kwargs)."""
@@ -689,6 +692,7 @@ class SyNTo(nn.Module):
             raise ValueError(f"unknown optimizer {optimizer_type!r} for the PyTorch SyN; use one of "
                              f"{sorted(SYN_OPTIMIZERS_PYTORCH)}")
         optimizer_lr = resolve_optimizer_lr(optimizer_type, kwargs.get('optimizer_lr'))
+        from .core.regularizers import resolve_required_image_geometry
         fixed_spacing = kwargs.get('fixed_spacing', None)
         fixed_origin = kwargs.get('fixed_origin', None)
         fixed_direction = kwargs.get('fixed_direction', None)
@@ -696,19 +700,12 @@ class SyNTo(nn.Module):
         moving_origin = kwargs.get('moving_origin', None)
         moving_direction = kwargs.get('moving_direction', None)
 
-        if hasattr(fixed_image, 'spacing') and fixed_spacing is None:
-            fixed_spacing = fixed_image.spacing
-        if hasattr(fixed_image, 'origin') and fixed_origin is None:
-            fixed_origin = fixed_image.origin
-        if hasattr(fixed_image, 'direction') and fixed_direction is None:
-            fixed_direction = fixed_image.direction
-
-        if hasattr(moving_image, 'spacing') and moving_spacing is None:
-            moving_spacing = moving_image.spacing
-        if hasattr(moving_image, 'origin') and moving_origin is None:
-            moving_origin = moving_image.origin
-        if hasattr(moving_image, 'direction') and moving_direction is None:
-            moving_direction = moving_image.direction
+        fixed_spacing, fixed_origin, fixed_direction = resolve_required_image_geometry(
+            fixed_image, fixed_spacing, fixed_origin, fixed_direction, self.dim, "fixed", "SyNTo.fit"
+        )
+        moving_spacing, moving_origin, moving_direction = resolve_required_image_geometry(
+            moving_image, moving_spacing, moving_origin, moving_direction, self.dim, "moving", "SyNTo.fit"
+        )
 
         fit_device = kwargs.get('device', None)
         if fit_device is None:
@@ -775,25 +772,6 @@ class SyNTo(nn.Module):
             self._rng = None
         dim = self.dim
         spatial_shape = fixed_image.shape[2:]
-        
-        if fixed_spacing is None:
-            fixed_spacing = self.spacing if self.spacing is not None else [1.0] * self.dim
-            
-        if fixed_origin is None:
-            fixed_origin = [0.0] * self.dim
-            
-        if fixed_direction is None:
-            fixed_direction = np.eye(self.dim)
-            
-        if moving_spacing is None:
-            moving_spacing = [1.0] * self.dim
-            
-
-        if moving_origin is None:
-            moving_origin = [0.0] * self.dim
-            
-        if moving_direction is None:
-            moving_direction = np.eye(self.dim)
 
         self.moving_shape = moving_image.shape[2:]
         self.moving_spacing = moving_spacing
@@ -1831,41 +1809,41 @@ class SyNTo(nn.Module):
                     elif regularizer == 'sobolev':
                         if fast_smooth:
                             # FFT Sobolev Green's operator only (standard mode)
-                            grad_l = self._apply_sobolev_green_operator(warp_l2r.grad, fluid_sigma=curr_fluid_sig, alpha=alpha_sobolev)
+                            grad_l = self._apply_sobolev_green_operator(warp_l2r.grad, fluid_sigma=curr_fluid_sig, alpha=alpha_sobolev, spacing=curr_spacing_fixed)
                             warp_l2r.grad = None
-                            grad_r = self._apply_sobolev_green_operator(warp_r2l.grad, fluid_sigma=curr_fluid_sig, alpha=alpha_sobolev)
+                            grad_r = self._apply_sobolev_green_operator(warp_r2l.grad, fluid_sigma=curr_fluid_sig, alpha=alpha_sobolev, spacing=curr_spacing_fixed)
                             warp_r2l.grad = None
                         else:
                             # FFT Sobolev Green's operator + spatial Gaussian post-filter (conservative mode)
-                            grad_l = separable_gaussian_filter(self._apply_sobolev_green_operator(warp_l2r.grad, fluid_sigma=curr_fluid_sig, alpha=alpha_sobolev), curr_fluid_sig * 0.5, kernel_type=kernel_type)
+                            grad_l = separable_gaussian_filter(self._apply_sobolev_green_operator(warp_l2r.grad, fluid_sigma=curr_fluid_sig, alpha=alpha_sobolev, spacing=curr_spacing_fixed), curr_fluid_sig * 0.5, kernel_type=kernel_type)
                             warp_l2r.grad = None
-                            grad_r = separable_gaussian_filter(self._apply_sobolev_green_operator(warp_r2l.grad, fluid_sigma=curr_fluid_sig, alpha=alpha_sobolev), curr_fluid_sig * 0.5, kernel_type=kernel_type)
+                            grad_r = separable_gaussian_filter(self._apply_sobolev_green_operator(warp_r2l.grad, fluid_sigma=curr_fluid_sig, alpha=alpha_sobolev, spacing=curr_spacing_fixed), curr_fluid_sig * 0.5, kernel_type=kernel_type)
                             warp_r2l.grad = None
                     elif regularizer in ['dsti', 'dst1', 'dst_i']:
                         if fast_smooth:
                             # FFT DST-I Green's operator only (standard mode)
-                            grad_l = self._apply_dsti_green_operator(warp_l2r.grad, fluid_sigma=curr_fluid_sig, alpha=alpha_sobolev)
+                            grad_l = self._apply_dsti_green_operator(warp_l2r.grad, fluid_sigma=curr_fluid_sig, alpha=alpha_sobolev, spacing=curr_spacing_fixed)
                             warp_l2r.grad = None
-                            grad_r = self._apply_dsti_green_operator(warp_r2l.grad, fluid_sigma=curr_fluid_sig, alpha=alpha_sobolev)
+                            grad_r = self._apply_dsti_green_operator(warp_r2l.grad, fluid_sigma=curr_fluid_sig, alpha=alpha_sobolev, spacing=curr_spacing_fixed)
                             warp_r2l.grad = None
                         else:
                             # FFT DST-I Green's operator + spatial Gaussian post-filter (conservative mode)
-                            grad_l = separable_gaussian_filter(self._apply_dsti_green_operator(warp_l2r.grad, fluid_sigma=curr_fluid_sig, alpha=alpha_sobolev), curr_fluid_sig * 0.5, kernel_type=kernel_type)
+                            grad_l = separable_gaussian_filter(self._apply_dsti_green_operator(warp_l2r.grad, fluid_sigma=curr_fluid_sig, alpha=alpha_sobolev, spacing=curr_spacing_fixed), curr_fluid_sig * 0.5, kernel_type=kernel_type)
                             warp_l2r.grad = None
-                            grad_r = separable_gaussian_filter(self._apply_dsti_green_operator(warp_r2l.grad, fluid_sigma=curr_fluid_sig, alpha=alpha_sobolev), curr_fluid_sig * 0.5, kernel_type=kernel_type)
+                            grad_r = separable_gaussian_filter(self._apply_dsti_green_operator(warp_r2l.grad, fluid_sigma=curr_fluid_sig, alpha=alpha_sobolev, spacing=curr_spacing_fixed), curr_fluid_sig * 0.5, kernel_type=kernel_type)
                             warp_r2l.grad = None
                     elif regularizer == 'dsti1':
                         if fast_smooth:
                             # Separable 1D DST-I Green's operator only (MPS-safe mode)
-                            grad_l = self._apply_dsti1_green_operator(warp_l2r.grad, fluid_sigma=curr_fluid_sig, alpha=alpha_sobolev)
+                            grad_l = self._apply_dsti1_green_operator(warp_l2r.grad, fluid_sigma=curr_fluid_sig, alpha=alpha_sobolev, spacing=curr_spacing_fixed)
                             warp_l2r.grad = None
-                            grad_r = self._apply_dsti1_green_operator(warp_r2l.grad, fluid_sigma=curr_fluid_sig, alpha=alpha_sobolev)
+                            grad_r = self._apply_dsti1_green_operator(warp_r2l.grad, fluid_sigma=curr_fluid_sig, alpha=alpha_sobolev, spacing=curr_spacing_fixed)
                             warp_r2l.grad = None
                         else:
                             # Separable 1D DST-I + spatial Gaussian post-filter
-                            grad_l = separable_gaussian_filter(self._apply_dsti1_green_operator(warp_l2r.grad, fluid_sigma=curr_fluid_sig, alpha=alpha_sobolev), curr_fluid_sig * 0.5, kernel_type=kernel_type)
+                            grad_l = separable_gaussian_filter(self._apply_dsti1_green_operator(warp_l2r.grad, fluid_sigma=curr_fluid_sig, alpha=alpha_sobolev, spacing=curr_spacing_fixed), curr_fluid_sig * 0.5, kernel_type=kernel_type)
                             warp_l2r.grad = None
-                            grad_r = separable_gaussian_filter(self._apply_dsti1_green_operator(warp_r2l.grad, fluid_sigma=curr_fluid_sig, alpha=alpha_sobolev), curr_fluid_sig * 0.5, kernel_type=kernel_type)
+                            grad_r = separable_gaussian_filter(self._apply_dsti1_green_operator(warp_r2l.grad, fluid_sigma=curr_fluid_sig, alpha=alpha_sobolev, spacing=curr_spacing_fixed), curr_fluid_sig * 0.5, kernel_type=kernel_type)
                             warp_r2l.grad = None
                     elif regularizer in ['bspline', 'bsplinesyn']:
                         grad_l = self._apply_bspline_operator(
@@ -1891,14 +1869,17 @@ class SyNTo(nn.Module):
                                 f_mask = torch.from_numpy(f_mask.numpy().astype(np.float32)).to(device)
                             else:
                                 f_mask = torch.as_tensor(f_mask, dtype=dtype, device=device)
-                        _reg_key_syn = (regularizer, float(alpha_sobolev), tuple(float(x) for x in curr_spacing_fixed), float(curr_fluid_sig), id(f_mask))
+                        _dir_key_syn = tuple(float(x) for x in np.asarray(fixed_direction).ravel().tolist())
+                        _reg_key_syn = (regularizer, float(alpha_sobolev), tuple(float(x) for x in curr_spacing_fixed), _dir_key_syn, float(curr_fluid_sig), id(f_mask))
                         if getattr(self, '_syn_reg_cache_key', None) != _reg_key_syn:
-                            extra_kwargs = {k: v for k, v in kwargs.items() if k not in ('fixed_mask', 'mask', 'regularizer', 'alpha', 'sobolev_alpha', 'spacing', 'fluid_sigma')}
+                            extra_kwargs = {k: v for k, v in kwargs.items() if k not in ('fixed_mask', 'mask', 'regularizer', 'alpha', 'sobolev_alpha', 'spacing', 'fluid_sigma', 'origin', 'direction')}
                             self._syn_reg_fn = get_regularizer(
                                 regularizer,
                                 alpha=alpha_sobolev,
                                 sobolev_alpha=alpha_sobolev,
                                 spacing=curr_spacing_fixed,
+                                origin=fixed_origin,
+                                direction=fixed_direction,
                                 fluid_sigma=curr_fluid_sig,
                                 fixed_mask=f_mask,
                                 mask=f_mask,
@@ -1912,9 +1893,9 @@ class SyNTo(nn.Module):
                     else:
                         if fast_smooth:
                             # Spectral Gaussian: Sobolev Green's with soft alpha (FFT-based)
-                            grad_l = self._apply_sobolev_green_operator(warp_l2r.grad, fluid_sigma=curr_fluid_sig, alpha=curr_fluid_sig / 2.0)
+                            grad_l = self._apply_sobolev_green_operator(warp_l2r.grad, fluid_sigma=curr_fluid_sig, alpha=curr_fluid_sig / 2.0, spacing=curr_spacing_fixed)
                             warp_l2r.grad = None
-                            grad_r = self._apply_sobolev_green_operator(warp_r2l.grad, fluid_sigma=curr_fluid_sig, alpha=curr_fluid_sig / 2.0)
+                            grad_r = self._apply_sobolev_green_operator(warp_r2l.grad, fluid_sigma=curr_fluid_sig, alpha=curr_fluid_sig / 2.0, spacing=curr_spacing_fixed)
                             warp_r2l.grad = None
                         else:
                             # Spatial Gaussian: separable convolution filter
@@ -2149,11 +2130,11 @@ class SyNTo(nn.Module):
                         # Spatial pre-smoothing of Adam quotient for RegAdam
                         if optimizer_type in ['reg_adam', 'regadam', 'sobolev_adam', 'gaussian_adam', 'dsti_adam']:
                             if regularizer == 'sobolev':
-                                u_reg_l = self._apply_sobolev_green_operator(u_raw_l, fluid_sigma=curr_fluid_sig, alpha=alpha_sobolev)
-                                u_reg_r = self._apply_sobolev_green_operator(u_raw_r, fluid_sigma=curr_fluid_sig, alpha=alpha_sobolev)
+                                u_reg_l = self._apply_sobolev_green_operator(u_raw_l, fluid_sigma=curr_fluid_sig, alpha=alpha_sobolev, spacing=curr_spacing_fixed)
+                                u_reg_r = self._apply_sobolev_green_operator(u_raw_r, fluid_sigma=curr_fluid_sig, alpha=alpha_sobolev, spacing=curr_spacing_fixed)
                             elif regularizer in ['dsti', 'dst1', 'dsti1']:
-                                u_reg_l = self._apply_dsti1_green_operator(u_raw_l, fluid_sigma=curr_fluid_sig, alpha=alpha_sobolev)
-                                u_reg_r = self._apply_dsti1_green_operator(u_raw_r, fluid_sigma=curr_fluid_sig, alpha=alpha_sobolev)
+                                u_reg_l = self._apply_dsti1_green_operator(u_raw_l, fluid_sigma=curr_fluid_sig, alpha=alpha_sobolev, spacing=curr_spacing_fixed)
+                                u_reg_r = self._apply_dsti1_green_operator(u_raw_r, fluid_sigma=curr_fluid_sig, alpha=alpha_sobolev, spacing=curr_spacing_fixed)
                             elif regularizer in ['bspline', 'bsplinesyn']:
                                 u_reg_l = self._apply_bspline_operator(
                                     u_raw_l,
@@ -2176,12 +2157,14 @@ class SyNTo(nn.Module):
                                         f_mask = torch.from_numpy(f_mask.numpy().astype(np.float32)).to(device)
                                     else:
                                         f_mask = torch.as_tensor(f_mask, dtype=dtype, device=device)
-                                extra_kwargs = {k: v for k, v in kwargs.items() if k not in ('fixed_mask', 'mask', 'regularizer', 'alpha', 'sobolev_alpha', 'spacing', 'fluid_sigma')}
+                                extra_kwargs = {k: v for k, v in kwargs.items() if k not in ('fixed_mask', 'mask', 'regularizer', 'alpha', 'sobolev_alpha', 'spacing', 'fluid_sigma', 'origin', 'direction')}
                                 reg_fn = get_regularizer(
                                     regularizer,
                                     alpha=alpha_sobolev,
                                     sobolev_alpha=alpha_sobolev,
                                     spacing=curr_spacing_fixed,
+                                    origin=fixed_origin,
+                                    direction=fixed_direction,
                                     fluid_sigma=curr_fluid_sig,
                                     fixed_mask=f_mask,
                                     mask=f_mask,

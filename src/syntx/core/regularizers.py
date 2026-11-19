@@ -36,6 +36,176 @@ import torch
 import torch.nn.functional as F
 
 # -----------------------------------------------------------------------------
+# Physical-space geometry validation & O(d) direction conjugation
+# -----------------------------------------------------------------------------
+def _require_spacing(spacing: Any, dim: int, caller: str) -> Tuple[float, ...]:
+    """Validate and return physical voxel spacing (ANTs x, y, z order) as a tuple of ``dim`` positive finite floats."""
+    if spacing is None:
+        raise ValueError(
+            f"{caller}: physical voxel 'spacing' (sequence of {dim} positive floats in ANTs order) is required"
+        )
+    if isinstance(spacing, torch.Tensor):
+        sp_list = spacing.detach().cpu().tolist()
+    elif hasattr(spacing, "tolist"):
+        sp_list = spacing.tolist()
+    else:
+        try:
+            sp_list = list(spacing)
+        except TypeError as exc:
+            raise ValueError(f"{caller}: invalid spacing {spacing!r}") from exc
+    if len(sp_list) != dim:
+        raise ValueError(
+            f"{caller}: spacing length must equal spatial dim {dim}, got {len(sp_list)} ({sp_list!r})"
+        )
+    out: List[float] = []
+    for val in sp_list:
+        f = float(val)
+        if not math.isfinite(f) or f <= 0.0:
+            raise ValueError(
+                f"{caller}: spacing entries must be finite and > 0, got {sp_list!r}"
+            )
+        out.append(f)
+    return tuple(out)
+
+
+def _validate_spacing_sequence(spacing: Any, caller: str) -> Tuple[float, ...]:
+    """Validate spacing at regularizer-factory build time before a tensor's dim is seen."""
+    if spacing is None:
+        raise ValueError(
+            f"{caller}: physical voxel 'spacing' (sequence of positive floats in ANTs order) is required"
+        )
+    if isinstance(spacing, torch.Tensor):
+        sp_list = spacing.detach().cpu().tolist()
+    elif hasattr(spacing, "tolist"):
+        sp_list = spacing.tolist()
+    else:
+        try:
+            sp_list = list(spacing)
+        except TypeError as exc:
+            raise ValueError(f"{caller}: invalid spacing {spacing!r}") from exc
+    if len(sp_list) not in (2, 3):
+        raise ValueError(
+            f"{caller}: spacing must have 2 or 3 entries, got {len(sp_list)} ({sp_list!r})"
+        )
+    return _require_spacing(sp_list, len(sp_list), caller)
+
+
+def _parse_direction(direction: Any, dim: int, caller: str) -> Optional[np.ndarray]:
+    """Validate an ITK LPS direction matrix of shape (dim, dim) or flat length dim*dim."""
+    if direction is None:
+        return None
+    if isinstance(direction, torch.Tensor):
+        arr = direction.detach().cpu().numpy().astype(np.float64)
+    else:
+        arr = np.asarray(direction, dtype=np.float64)
+    if arr.ndim == 1 and arr.size == dim * dim:
+        arr = arr.reshape(dim, dim)
+    elif arr.shape != (dim, dim):
+        raise ValueError(
+            f"{caller}: direction must have shape ({dim}, {dim}) or flat length {dim * dim}, got {arr.shape}"
+        )
+    if not np.all(np.isfinite(arr)):
+        raise ValueError(f"{caller}: direction contains non-finite entries")
+    det = float(np.linalg.det(arr))
+    if abs(det) <= 1e-3:
+        raise ValueError(
+            f"{caller}: direction matrix is singular or near-singular (|det|={abs(det):.3e} <= 1e-3)"
+        )
+    return arr
+
+
+def _validate_origin(origin: Any, dim: int, caller: str) -> Optional[Tuple[float, ...]]:
+    """Validate an ITK origin sequence of length ``dim`` with finite floats."""
+    if origin is None:
+        return None
+    if isinstance(origin, torch.Tensor):
+        o_list = origin.detach().cpu().tolist()
+    elif hasattr(origin, "tolist"):
+        o_list = origin.tolist()
+    else:
+        try:
+            o_list = list(origin)
+        except TypeError as exc:
+            raise ValueError(f"{caller}: invalid origin {origin!r}") from exc
+    if len(o_list) != dim:
+        raise ValueError(f"{caller}: origin length must equal dim {dim}, got {len(o_list)}")
+    out: List[float] = []
+    for val in o_list:
+        f = float(val)
+        if not math.isfinite(f):
+            raise ValueError(f"{caller}: origin entries must be finite, got {o_list!r}")
+        out.append(f)
+    return tuple(out)
+
+
+def _validate_vector_frame(vector_frame: str, caller: str) -> str:
+    vf = str(vector_frame).lower()
+    if vf not in ("physical", "voxel"):
+        raise ValueError(f"{caller}: vector_frame must be 'physical' or 'voxel', got {vector_frame!r}")
+    return vf
+
+
+def _prepare_direction_conjugation(
+    direction: Any,
+    origin: Any,
+    vector_frame: str,
+    dim: int,
+    device: torch.device,
+    dtype: torch.dtype,
+    caller: str,
+) -> Tuple[Optional[torch.Tensor], Optional[np.ndarray]]:
+    """Validate (direction, origin, vector_frame) and return (D_zyx_torch, D_lps_np) when conjugation is needed."""
+    vf = _validate_vector_frame(vector_frame, caller)
+    _validate_origin(origin, dim, caller)
+    d_lps = _parse_direction(direction, dim, caller)
+    if d_lps is None or vf == "voxel":
+        return None, d_lps
+    d_zyx = d_lps[::-1, ::-1].copy()
+    if np.allclose(d_zyx, np.eye(dim), atol=1e-6):
+        return None, d_lps
+    return torch.as_tensor(d_zyx, device=device, dtype=dtype), d_lps
+
+
+def resolve_required_image_geometry(
+    image: Any,
+    spacing: Any,
+    origin: Any,
+    direction: Any,
+    dim: int,
+    role: str,
+    caller: str,
+    spacing_name: Optional[str] = None,
+    origin_name: Optional[str] = None,
+    direction_name: Optional[str] = None,
+) -> Tuple[Tuple[float, ...], Tuple[float, ...], np.ndarray]:
+    """Extract (from ANTsImage-like ``image``) or strictly validate physical geometry ``(spacing, origin, direction)``."""
+    if hasattr(image, 'spacing') and spacing is None:
+        spacing = image.spacing
+    if hasattr(image, 'origin') and origin is None:
+        origin = image.origin
+    if hasattr(image, 'direction') and direction is None:
+        direction = image.direction
+    sp_lbl = spacing_name or f"{role}_spacing"
+    orig_lbl = origin_name or f"{role}_origin"
+    dir_lbl = direction_name or f"{role}_direction"
+    if spacing is None or origin is None or direction is None:
+        missing = [
+            name for name, val in (
+                (sp_lbl, spacing),
+                (orig_lbl, origin),
+                (dir_lbl, direction),
+            ) if val is None
+        ]
+        raise ValueError(
+            f"{caller}: explicit {', '.join(missing)} required when {role}_image is not an ANTsImage"
+        )
+    sp = _require_spacing(spacing, dim, caller)
+    orig = _validate_origin(origin, dim, caller)
+    d_lps = _parse_direction(direction, dim, caller)
+    return sp, orig, d_lps
+
+
+# -----------------------------------------------------------------------------
 # Spectral grid cache for rfftn
 # -----------------------------------------------------------------------------
 _K_MESH_CACHE: collections.OrderedDict = collections.OrderedDict()
@@ -56,11 +226,11 @@ def _get_k_mesh_rfft(
     ----------
     spatial_shape : sequence of int
         Spatial shape in tensor order (H, W) or (D, H, W).
-    spacing : sequence of float, optional
-        Voxel spacing in ANTs (x, y, z) order (reversed internally to tensor order).
+    spacing : sequence of float
+        Required voxel spacing in ANTs (x, y, z) order (reversed internally to tensor order).
     device : torch.device
     relative_spacing : bool, default True
-        If True and spacing is provided, normalizes spacing by min(spacing) (s_rel = s / min(s)),
+        If True, normalizes spacing by min(spacing) (s_rel = s / min(s)),
         preserving directional physical aspect ratios while ensuring pyramid scale invariance
         (GEMINI.md Rule 2).
 
@@ -74,12 +244,12 @@ def _get_k_mesh_rfft(
         k_sq with 0.0 replaced by 1.0 to prevent division by zero at DC.
     """
     dim = len(spatial_shape)
-    if spacing is not None and relative_spacing:
-        valid_sp = [float(s) for s in spacing if float(s) > 0]
-        min_sp = min(valid_sp) if valid_sp else 1.0
-        normalized_spacing = tuple(float(s) / max(min_sp, 1e-6) for s in spacing)
+    sp = _require_spacing(spacing, dim, "_get_k_mesh_rfft")
+    if relative_spacing:
+        min_sp = min(sp)
+        normalized_spacing = tuple(s / min_sp for s in sp)
     else:
-        normalized_spacing = tuple(float(x) for x in spacing) if spacing is not None else None
+        normalized_spacing = sp
 
     cache_key = (tuple(spatial_shape), normalized_spacing, str(device), relative_spacing)
 
@@ -88,12 +258,12 @@ def _get_k_mesh_rfft(
             _K_MESH_CACHE.move_to_end(cache_key)
             return _K_MESH_CACHE[cache_key]
 
-    spacing_zyx = tuple(reversed(normalized_spacing)) if normalized_spacing is not None else (1.0,) * dim
+    spacing_zyx = tuple(reversed(normalized_spacing))
     k_axes_diff = []
     k_axes_true = []
     for d in range(dim):
         n_d = spatial_shape[d]
-        sp_d = float(spacing_zyx[d]) if d < len(spacing_zyx) else 1.0
+        sp_d = float(spacing_zyx[d])
         if d == dim - 1:
             kd_true = torch.fft.rfftfreq(n_d, d=max(sp_d, 1e-6), device=device) * (2.0 * math.pi)
             kd_diff = kd_true.clone()
@@ -144,13 +314,13 @@ def _get_inv_ksq_cached(
     relative_spacing: bool = True,
 ) -> Tuple[List[torch.Tensor], torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Return cached ``(k_mesh, k_sq, k_sq_safe, inv_ksq_true_zero_dc, inv_ksq_diff_zero_dc)``."""
-    k_mesh, k_sq, k_sq_safe = _get_k_mesh_rfft(spatial_shape, spacing, device, relative_spacing=relative_spacing)
-    if spacing is not None and relative_spacing:
-        valid_sp = [float(s) for s in spacing if float(s) > 0]
-        min_sp = min(valid_sp) if valid_sp else 1.0
-        norm_sp = tuple(float(s) / max(min_sp, 1e-6) for s in spacing)
+    sp = _require_spacing(spacing, len(spatial_shape), "_get_inv_ksq_cached")
+    k_mesh, k_sq, k_sq_safe = _get_k_mesh_rfft(spatial_shape, sp, device, relative_spacing=relative_spacing)
+    if relative_spacing:
+        min_sp = min(sp)
+        norm_sp = tuple(s / min_sp for s in sp)
     else:
-        norm_sp = tuple(float(x) for x in spacing) if spacing is not None else None
+        norm_sp = sp
     key = (tuple(spatial_shape), norm_sp, str(device), relative_spacing)
     with _K_MESH_LOCK:
         if key in _INV_KSQ_CACHE:
@@ -178,18 +348,15 @@ def _get_sobolev_envelope_cached(
     device: torch.device,
 ) -> torch.Tensor:
     """Return cached ``(1.0 / (1.0 + alpha * k_sq)).pow(s)`` float32 spectral envelope."""
-    if spacing is not None:
-        valid_sp = [float(s) for s in spacing if float(s) > 0]
-        min_sp = min(valid_sp) if valid_sp else 1.0
-        norm_sp = tuple(float(s) / max(min_sp, 1e-6) for s in spacing)
-    else:
-        norm_sp = None
+    sp = _require_spacing(spacing, len(spatial_shape), "_get_sobolev_envelope_cached")
+    min_sp = min(sp)
+    norm_sp = tuple(s / min_sp for s in sp)
     key = (tuple(spatial_shape), norm_sp, float(alpha_val), float(s_val), str(device))
     with _K_MESH_LOCK:
         if key in _SOBOLEV_ENVELOPE_CACHE:
             _SOBOLEV_ENVELOPE_CACHE.move_to_end(key)
             return _SOBOLEV_ENVELOPE_CACHE[key]
-    _, k_sq, _ = _get_k_mesh_rfft(spatial_shape, spacing, device, relative_spacing=True)
+    _, k_sq, _ = _get_k_mesh_rfft(spatial_shape, sp, device, relative_spacing=True)
     env = (1.0 / (1.0 + float(alpha_val) * k_sq)).pow(float(s_val))
     with _K_MESH_LOCK:
         _SOBOLEV_ENVELOPE_CACHE[key] = env
@@ -205,6 +372,9 @@ def compute_divergence_nd(
     v: torch.Tensor,
     spacing: Optional[Sequence[float]] = None,
     method: str = 'central',
+    direction: Optional[Any] = None,
+    origin: Optional[Any] = None,
+    vector_frame: str = 'physical',
 ) -> torch.Tensor:
     """
     Compute divergence div(v) = sum_d d v_d / d x_d of a vector field.
@@ -213,11 +383,17 @@ def compute_divergence_nd(
     ----------
     v : Tensor (B, *spatial, dim) or (*spatial, dim)
         Vector field with spatial axes and components in tensor order.
-    spacing : sequence of float, optional
-        Voxel spacing in ANTs (x, y, z) order.
+    spacing : sequence of float
+        Required voxel spacing in ANTs (x, y, z) order.
     method : {'central', 'spectral'}, default 'central'
         - 'central': finite difference via torch.gradient with correct spacing.
         - 'spectral': exact spectral differentiation via FFT (periodic boundary).
+    direction : array-like, optional
+        ITK LPS direction cosine matrix (dim, dim) or flat length dim*dim.
+    origin : sequence of float, optional
+        ITK physical origin (validated if provided).
+    vector_frame : {'physical', 'voxel'}, default 'physical'
+        Frame of vector components.
 
     Returns
     -------
@@ -229,21 +405,29 @@ def compute_divergence_nd(
 
     dim = v.shape[-1]
     spatial_shape = v.shape[1:-1]
-    spacing_zyx = tuple(reversed(spacing)) if spacing is not None else [1.0] * dim
+    sp = _require_spacing(spacing, dim, "compute_divergence_nd")
+    spacing_zyx = tuple(reversed(sp))
+    orig_dtype = v.dtype
+    compute_dtype = torch.float32 if orig_dtype in (torch.float16, torch.bfloat16) else orig_dtype
+    D_t, _ = _prepare_direction_conjugation(
+        direction, origin, vector_frame, dim, v.device, compute_dtype, "compute_divergence_nd"
+    )
+    if D_t is not None:
+        v = (v.to(compute_dtype) @ D_t)
 
     if method == 'spectral':
         device = v.device
         v_cf = torch.movedim(v, -1, 1).to(torch.float32)
         spatial_dims = tuple(range(2, 2 + dim))
         v_fft = torch.fft.rfftn(v_cf, dim=spatial_dims)
-        k_mesh, _, _ = _get_k_mesh_rfft(spatial_shape, spacing, device, relative_spacing=False)
+        k_mesh, _, _ = _get_k_mesh_rfft(spatial_shape, sp, device, relative_spacing=False)
 
         k_dot_v = torch.zeros_like(v_fft[:, 0, ...])
         for d in range(dim):
             k_dot_v = k_dot_v + k_mesh[d] * v_fft[:, d, ...]
 
         div_dims = tuple(range(1, 1 + dim))
-        div_val = torch.fft.irfftn(1j * k_dot_v, s=spatial_shape, dim=div_dims).to(dtype=v.dtype)
+        div_val = torch.fft.irfftn(1j * k_dot_v, s=spatial_shape, dim=div_dims).to(dtype=orig_dtype)
         return div_val[0] if unbatched else div_val
 
     # Standard central difference
@@ -253,12 +437,16 @@ def compute_divergence_nd(
         grad_d = torch.gradient(v[..., d], spacing=sp_d, dim=1 + d)[0]
         div_sum = div_sum + grad_d
 
+    div_sum = div_sum.to(dtype=orig_dtype)
     return div_sum[0] if unbatched else div_sum
 
 
 def compute_curl_nd(
     v: torch.Tensor,
     spacing: Optional[Sequence[float]] = None,
+    direction: Optional[Any] = None,
+    origin: Optional[Any] = None,
+    vector_frame: str = 'physical',
 ) -> torch.Tensor:
     """
     Compute vorticity / curl of a 2-D or 3-D vector field.
@@ -269,8 +457,13 @@ def compute_curl_nd(
     Parameters
     ----------
     v : Tensor (B, *spatial, dim) or (*spatial, dim)
-    spacing : sequence of float, optional
-        Voxel spacing in ANTs (x, y, z) order.
+    spacing : sequence of float
+        Required voxel spacing in ANTs (x, y, z) order.
+    direction : array-like, optional
+        ITK LPS direction cosine matrix (dim, dim) or flat length dim*dim.
+    origin : sequence of float, optional
+        ITK physical origin (validated if provided).
+    vector_frame : {'physical', 'voxel'}, default 'physical'
 
     Returns
     -------
@@ -284,7 +477,18 @@ def compute_curl_nd(
     if dim not in (2, 3):
         raise ValueError(f"compute_curl_nd supports dim=2 or dim=3, got dim={dim}")
 
-    spacing_zyx = tuple(reversed(spacing)) if spacing is not None else [1.0] * dim
+    sp = _require_spacing(spacing, dim, "compute_curl_nd")
+    spacing_zyx = tuple(reversed(sp))
+    orig_dtype = v.dtype
+    compute_dtype = torch.float32 if orig_dtype in (torch.float16, torch.bfloat16) else orig_dtype
+    D_t, D_lps = _prepare_direction_conjugation(
+        direction, origin, vector_frame, dim, v.device, compute_dtype, "compute_curl_nd"
+    )
+    if D_t is not None:
+        v = (v.to(compute_dtype) @ D_t)
+        det_d = float(np.linalg.det(D_lps))
+    else:
+        det_d = 1.0
 
     if dim == 2:
         # Spatial axis 0 is y (step spacing_zyx[0]), comp 0 is v_y
@@ -292,13 +496,10 @@ def compute_curl_nd(
         # curl = d v_x / d y - d v_y / d x
         dvx_dy = torch.gradient(v[..., 1], spacing=float(spacing_zyx[0]), dim=1)[0]
         dvy_dx = torch.gradient(v[..., 0], spacing=float(spacing_zyx[1]), dim=2)[0]
-        curl_2d = dvx_dy - dvy_dx
+        curl_2d = (det_d * (dvx_dy - dvy_dx)).to(dtype=orig_dtype)
         return curl_2d[0] if unbatched else curl_2d
 
     # dim == 3: axes 0: z, 1: y, 2: x; comps 0: v_z, 1: v_y, 2: v_x
-    # curl_z = d v_x / d y - d v_y / d x = d v_2 / d x_1 - d v_1 / d x_2
-    # curl_y = d v_z / d x - d v_x / d z = d v_0 / d x_2 - d v_2 / d x_0
-    # curl_x = d v_y / d z - d v_z / d y = d v_1 / d x_0 - d v_0 / d x_1
     sp_z, sp_y, sp_x = float(spacing_zyx[0]), float(spacing_zyx[1]), float(spacing_zyx[2])
     dv2_dy = torch.gradient(v[..., 2], spacing=sp_y, dim=2)[0]
     dv1_dx = torch.gradient(v[..., 1], spacing=sp_x, dim=3)[0]
@@ -313,15 +514,57 @@ def compute_curl_nd(
     curl_x = dv1_dz - dv0_dy
 
     curl_3d = torch.stack([curl_z, curl_y, curl_x], dim=-1)
+    if D_t is not None:
+        curl_3d = det_d * (curl_3d @ D_t.t())
+    curl_3d = curl_3d.to(dtype=orig_dtype)
     return curl_3d[0] if unbatched else curl_3d
 
 
 # -----------------------------------------------------------------------------
 # Incompressible & Continuum Mechanics Operators
 # -----------------------------------------------------------------------------
+def _enter_grid_frame(
+    v: torch.Tensor,
+    spacing: Optional[Sequence[float]],
+    direction: Optional[Any],
+    origin: Optional[Any],
+    vector_frame: str,
+    caller: str,
+) -> Tuple[torch.Tensor, Tuple[float, ...], Optional[torch.Tensor], torch.dtype, bool]:
+    """Validate physical geometry and rotate vector field into grid-axis frame when needed."""
+    unbatched = (v.dim() == v.shape[-1] + 1)
+    if unbatched:
+        v = v.unsqueeze(0)
+    dim = v.shape[-1]
+    sp = _require_spacing(spacing, dim, caller)
+    orig_dtype = v.dtype
+    D_t, _ = _prepare_direction_conjugation(
+        direction, origin, vector_frame, dim, v.device, torch.float32, caller
+    )
+    if D_t is not None:
+        v = v.to(torch.float32) @ D_t
+    return v, sp, D_t, orig_dtype, unbatched
+
+
+def _exit_grid_frame(
+    v_grid: torch.Tensor,
+    D_t: Optional[torch.Tensor],
+    orig_dtype: torch.dtype,
+    unbatched: bool,
+) -> torch.Tensor:
+    """Rotate vector field back from grid-axis frame to physical LPS-reversed components."""
+    if D_t is not None:
+        v_grid = v_grid.to(torch.float32) @ D_t.t()
+    v_out = v_grid.to(dtype=orig_dtype)
+    return v_out[0] if unbatched else v_out
+
+
 def project_solenoidal(
     v: torch.Tensor,
     spacing: Optional[Sequence[float]] = None,
+    direction: Optional[Any] = None,
+    origin: Optional[Any] = None,
+    vector_frame: str = 'physical',
 ) -> torch.Tensor:
     """
     Project vector field v onto the divergence-free (solenoidal) subspace: P v = v - grad Delta^-1 div v.
@@ -333,27 +576,31 @@ def project_solenoidal(
     ----------
     v : Tensor (B, *spatial, dim) or (*spatial, dim)
         Vector field in tensor order.
-    spacing : sequence of float, optional
-        Voxel spacing in ANTs (x, y, z) order.
+    spacing : sequence of float
+        Required voxel spacing in ANTs (x, y, z) order.
+    direction : array-like, optional
+        ITK LPS direction cosine matrix (dim, dim) or flat length dim*dim.
+    origin : sequence of float, optional
+        ITK physical origin (validated if provided).
+    vector_frame : {'physical', 'voxel'}, default 'physical'
 
     Returns
     -------
     Tensor of the same shape and dtype as v, with spectral divergence analytically zero.
     """
-    unbatched = (v.dim() == v.shape[-1] + 1)
-    if unbatched:
-        v = v.unsqueeze(0)
-
+    v, sp, D_t, orig_dtype, unbatched = _enter_grid_frame(
+        v, spacing, direction, origin, vector_frame, "project_solenoidal"
+    )
     dim = v.shape[-1]
     spatial_shape = v.shape[1:-1]
-    device, dtype = v.device, v.dtype
+    device = v.device
     spatial_dims = tuple(range(2, 2 + dim))
 
     v_cf = torch.movedim(v, -1, 1).to(torch.float32).contiguous()
     v_fft = torch.fft.rfftn(v_cf, dim=spatial_dims)
     del v_cf
 
-    k_mesh, _, _, _, inv_ksq_diff = _get_inv_ksq_cached(spatial_shape, spacing, device)
+    k_mesh, _, _, _, inv_ksq_diff = _get_inv_ksq_cached(spatial_shape, sp, device)
 
     # Compute longitudinal component: (k . v_hat) / |k|^2 and subtract in-place
     k_dot_v = v_fft[:, 0, ...] * k_mesh[0]
@@ -367,8 +614,8 @@ def project_solenoidal(
 
     v_sol_cf = torch.fft.irfftn(v_fft, s=spatial_shape, dim=spatial_dims)
     del v_fft
-    v_sol = torch.movedim(v_sol_cf, 1, -1).to(dtype=dtype)
-    return v_sol[0] if unbatched else v_sol
+    v_sol = torch.movedim(v_sol_cf, 1, -1)
+    return _exit_grid_frame(v_sol, D_t, orig_dtype, unbatched)
 
 
 def apply_solenoidal_sobolev_operator(
@@ -377,6 +624,9 @@ def apply_solenoidal_sobolev_operator(
     fluid_sigma: float = 3.0,
     spacing: Optional[Sequence[float]] = None,
     s: float = 2.0,
+    direction: Optional[Any] = None,
+    origin: Optional[Any] = None,
+    vector_frame: str = 'physical',
 ) -> torch.Tensor:
     """
     Smooth field m with the Sobolev Green's operator K = (1 + alpha |k|^2)^-s AND project onto
@@ -388,34 +638,39 @@ def apply_solenoidal_sobolev_operator(
     alpha : float, optional
         Kernel width (squared spacing units). If None, defaults to fluid_sigma / 2.0.
     fluid_sigma : float, default 3.0
-    spacing : sequence of float, optional
+    spacing : sequence of float
+        Required voxel spacing in ANTs (x, y, z) order.
     s : float, default 2.0
         Sobolev operator power.
+    direction : array-like, optional
+        ITK LPS direction cosine matrix.
+    origin : sequence of float, optional
+    vector_frame : {'physical', 'voxel'}, default 'physical'
 
     Returns
     -------
     Tensor of the same shape and dtype as m.
     """
-    unbatched = (m.dim() == m.shape[-1] + 1)
-    if unbatched:
-        m = m.unsqueeze(0)
-
-    dim = m.shape[-1]
-    spatial_shape = m.shape[1:-1]
-    device, dtype = m.device, m.dtype
-    spatial_dims = tuple(range(2, 2 + dim))
-
     alpha_val = float(alpha) if alpha is not None else float(fluid_sigma) / 2.0
     if alpha_val <= 0:
-        v_sol = project_solenoidal(m, spacing=spacing)
-        return v_sol[0] if unbatched else v_sol
+        return project_solenoidal(
+            m, spacing=spacing, direction=direction, origin=origin, vector_frame=vector_frame
+        )
+
+    m, sp, D_t, orig_dtype, unbatched = _enter_grid_frame(
+        m, spacing, direction, origin, vector_frame, "apply_solenoidal_sobolev_operator"
+    )
+    dim = m.shape[-1]
+    spatial_shape = m.shape[1:-1]
+    device = m.device
+    spatial_dims = tuple(range(2, 2 + dim))
 
     m_cf = torch.movedim(m, -1, 1).to(torch.float32).contiguous()
     m_fft = torch.fft.rfftn(m_cf, dim=spatial_dims)
     del m_cf
 
-    k_mesh, _, _, _, inv_ksq_diff = _get_inv_ksq_cached(spatial_shape, spacing, device)
-    K_sobolev = _get_sobolev_envelope_cached(spatial_shape, spacing, alpha_val, float(s), device)
+    k_mesh, _, _, _, inv_ksq_diff = _get_inv_ksq_cached(spatial_shape, sp, device)
+    K_sobolev = _get_sobolev_envelope_cached(spatial_shape, sp, alpha_val, float(s), device)
 
     # Solenoidal projection + Sobolev filter in-place on m_fft
     k_dot_m = m_fft[:, 0, ...] * k_mesh[0]
@@ -429,8 +684,8 @@ def apply_solenoidal_sobolev_operator(
 
     v_sol_cf = torch.fft.irfftn(m_fft, s=spatial_shape, dim=spatial_dims)
     del m_fft
-    v_sol = torch.movedim(v_sol_cf, 1, -1).to(dtype=dtype)
-    return v_sol[0] if unbatched else v_sol
+    v_sol = torch.movedim(v_sol_cf, 1, -1)
+    return _exit_grid_frame(v_sol, D_t, orig_dtype, unbatched)
 
 
 def apply_div_curl_green_operator(
@@ -444,6 +699,9 @@ def apply_div_curl_green_operator(
     spacing: Optional[Sequence[float]] = None,
     h3_envelope: bool = True,
     envelope_power: float = 2.0,
+    direction: Optional[Any] = None,
+    origin: Optional[Any] = None,
+    vector_frame: str = 'physical',
 ) -> torch.Tensor:
     """
     Decoupled Helmholtz Green's operator independently parameterizing dilatation (div) and shear (curl):
@@ -461,25 +719,28 @@ def apply_div_curl_green_operator(
     fluid_sigma : float, default 3.0
     total_sigma, elastic_sigma : float, optional
         If provided and beta is not explicitly set, scales the dilatation-to-shear resistance ratio.
-    spacing : sequence of float, optional
+    spacing : sequence of float
+        Required voxel spacing in ANTs (x, y, z) order.
     h3_envelope : bool, default True
         If True, applies an isotropic Sobolev multiscale envelope K_sobolev = (1 + alpha |k|^2)^(-envelope_power)
         to the decoupled operator, imposing O(|k|^-6) high-frequency decay to eliminate non-physical shear
         micro-striations (ribs) and guarantee positive Liouville Jacobians under pure fluid SyN (total_sigma=0.0).
     envelope_power : float, default 2.0
         Power of the Sobolev envelope filter (2.0 = H^3 tri-harmonic total decay).
+    direction : array-like, optional
+    origin : sequence of float, optional
+    vector_frame : {'physical', 'voxel'}, default 'physical'
 
     Returns
     -------
     Tensor of the same shape and dtype as m.
     """
-    unbatched = (m.dim() == m.shape[-1] + 1)
-    if unbatched:
-        m = m.unsqueeze(0)
-
+    m, sp, D_t, orig_dtype, unbatched = _enter_grid_frame(
+        m, spacing, direction, origin, vector_frame, "apply_div_curl_green_operator"
+    )
     dim = m.shape[-1]
-    spatial_shape = v_shape = m.shape[1:-1]
-    device, dtype = m.device, m.dtype
+    spatial_shape = m.shape[1:-1]
+    device = m.device
     spatial_dims = tuple(range(2, 2 + dim))
 
     alpha_val = float(alpha) if alpha is not None else max(float(fluid_sigma) / 2.0, 1e-4)
@@ -499,7 +760,7 @@ def apply_div_curl_green_operator(
     m_fft = torch.fft.rfftn(m_cf, dim=spatial_dims)
     del m_cf
 
-    k_mesh, k_sq, k_sq_safe, _, inv_ksq_diff = _get_inv_ksq_cached(spatial_shape, spacing, device)
+    k_mesh, k_sq, k_sq_safe, _, inv_ksq_diff = _get_inv_ksq_cached(spatial_shape, sp, device)
 
     # Eigenvalue filters: filt_div for longitudinal (k-parallel), filt_curl for transverse (k-perp)
     filt_div = 1.0 / (alpha_val + beta_val * k_sq_safe)
@@ -507,7 +768,7 @@ def apply_div_curl_green_operator(
 
     # Apply multiscale Sobolev envelope if requested
     if h3_envelope and envelope_power > 0:
-        K_sobolev = _get_sobolev_envelope_cached(spatial_shape, spacing, alpha_val, float(envelope_power), device)
+        K_sobolev = _get_sobolev_envelope_cached(spatial_shape, sp, alpha_val, float(envelope_power), device)
         filt_div = filt_div * K_sobolev
         filt_curl = filt_curl * K_sobolev
 
@@ -528,8 +789,8 @@ def apply_div_curl_green_operator(
 
     v_cf = torch.fft.irfftn(m_fft, s=spatial_shape, dim=spatial_dims)
     del m_fft
-    v_out = torch.movedim(v_cf, 1, -1).to(dtype=dtype)
-    return v_out[0] if unbatched else v_out
+    v_out = torch.movedim(v_cf, 1, -1)
+    return _exit_grid_frame(v_out, D_t, orig_dtype, unbatched)
 
 
 def apply_navier_green_operator(
@@ -541,6 +802,9 @@ def apply_navier_green_operator(
     elastic_sigma: Optional[float] = None,
     spacing: Optional[Sequence[float]] = None,
     s: float = 1.0,
+    direction: Optional[Any] = None,
+    origin: Optional[Any] = None,
+    vector_frame: str = 'physical',
 ) -> torch.Tensor:
     """
     Navier-Cauchy continuum elastic Green's operator:
@@ -558,20 +822,23 @@ def apply_navier_green_operator(
     poisson_ratio : float, default 0.49
         Poisson's ratio in [0.0, 0.50].
     total_sigma, elastic_sigma : float, optional
-    spacing : sequence of float, optional
+    spacing : sequence of float
+        Required voxel spacing in ANTs (x, y, z) order.
     s : float, default 1.0
+    direction : array-like, optional
+    origin : sequence of float, optional
+    vector_frame : {'physical', 'voxel'}, default 'physical'
 
     Returns
     -------
     Tensor of the same shape and dtype as m.
     """
-    unbatched = (m.dim() == m.shape[-1] + 1)
-    if unbatched:
-        m = m.unsqueeze(0)
-
+    m, sp, D_t, orig_dtype, unbatched = _enter_grid_frame(
+        m, spacing, direction, origin, vector_frame, "apply_navier_green_operator"
+    )
     dim = m.shape[-1]
     spatial_shape = m.shape[1:-1]
-    device, dtype = m.device, m.dtype
+    device = m.device
     spatial_dims = tuple(range(2, 2 + dim))
 
     alpha_val = float(alpha) if alpha is not None else max(float(fluid_sigma) / 2.0, 1e-4)
@@ -585,8 +852,8 @@ def apply_navier_green_operator(
     m_fft = torch.fft.rfftn(m_cf, dim=spatial_dims)
     del m_cf
 
-    k_mesh, _, _, _, inv_ksq_diff = _get_inv_ksq_cached(spatial_shape, spacing, device)
-    K_base = _get_sobolev_envelope_cached(spatial_shape, spacing, alpha_val, float(s), device)
+    k_mesh, _, _, _, inv_ksq_diff = _get_inv_ksq_cached(spatial_shape, sp, device)
+    K_base = _get_sobolev_envelope_cached(spatial_shape, sp, alpha_val, float(s), device)
 
     k_dot_m = m_fft[:, 0, ...] * k_mesh[0]
     for d in range(1, dim):
@@ -599,8 +866,8 @@ def apply_navier_green_operator(
 
     v_cf = torch.fft.irfftn(m_fft, s=spatial_shape, dim=spatial_dims)
     del m_fft
-    v_out = torch.movedim(v_cf, 1, -1).to(dtype=dtype)
-    return v_out[0] if unbatched else v_out
+    v_out = torch.movedim(v_cf, 1, -1)
+    return _exit_grid_frame(v_out, D_t, orig_dtype, unbatched)
 
 
 def _prepare_mask_tensor(
@@ -646,6 +913,9 @@ def apply_masked_incompressible_filter(
     alpha: Optional[float] = None,
     spacing: Optional[Sequence[float]] = None,
     num_iters: int = 3,
+    direction: Optional[Any] = None,
+    origin: Optional[Any] = None,
+    vector_frame: str = 'physical',
 ) -> torch.Tensor:
     """
     Tissue-specific incompressibility projection (Chorin projection method):
@@ -658,37 +928,42 @@ def apply_masked_incompressible_filter(
     mask : Tensor, ANTsImage, or numpy array, optional
         Anatomical tissue mask with values in [0, 1]. If None, reduces to global solenoidal projection.
     alpha : float, optional
-    spacing : sequence of float, optional
+    spacing : sequence of float
+        Required voxel spacing in ANTs (x, y, z) order.
     num_iters : int, default 3
         Number of projection correction iterations.
+    direction : array-like, optional
+    origin : sequence of float, optional
+    vector_frame : {'physical', 'voxel'}, default 'physical'
 
     Returns
     -------
     Tensor of the same shape and dtype as v.
     """
     if mask is None:
-        return project_solenoidal(v, spacing=spacing)
+        return project_solenoidal(
+            v, spacing=spacing, direction=direction, origin=origin, vector_frame=vector_frame
+        )
 
-    unbatched = (v.dim() == v.shape[-1] + 1)
-    if unbatched:
-        v = v.unsqueeze(0)
-
+    v, sp, D_t, orig_dtype, unbatched = _enter_grid_frame(
+        v, spacing, direction, origin, vector_frame, "apply_masked_incompressible_filter"
+    )
     dim = v.shape[-1]
     spatial_shape = v.shape[1:-1]
-    device, dtype = v.device, v.dtype
+    device = v.device
     spatial_dims = tuple(range(2, 2 + dim))
 
     mask_t = _prepare_mask_tensor(mask, spatial_shape, device, batch_size=v.shape[0])
     mask_sp = mask_t[:, 0, ...]
 
-    k_mesh, k_sq, k_sq_safe = _get_k_mesh_rfft(spatial_shape, spacing, device)
+    k_mesh, k_sq, k_sq_safe = _get_k_mesh_rfft(spatial_shape, sp, device)
     mask_zero = (k_sq == 0.0)
 
-    curr_v = v.clone()
+    curr_v = v.clone().to(torch.float32)
 
     for _ in range(max(1, int(num_iters))):
         # 1. Compute spectral divergence of current velocity
-        v_cf = torch.movedim(curr_v, -1, 1).to(torch.float32)
+        v_cf = torch.movedim(curr_v, -1, 1)
         v_fft = torch.fft.rfftn(v_cf, dim=spatial_dims)
 
         k_dot_v = torch.zeros_like(v_fft[:, 0, ...])
@@ -717,9 +992,9 @@ def apply_masked_incompressible_filter(
         ], dim=1)
 
         delta_v = torch.fft.irfftn(delta_v_fft, s=spatial_shape, dim=spatial_dims)
-        curr_v = curr_v - torch.movedim(delta_v, 1, -1).to(dtype=dtype)
+        curr_v = curr_v - torch.movedim(delta_v, 1, -1)
 
-    return curr_v[0] if unbatched else curr_v
+    return _exit_grid_frame(curr_v, D_t, orig_dtype, unbatched)
 
 
 def apply_beltrami_regularizer(
@@ -729,6 +1004,9 @@ def apply_beltrami_regularizer(
     dilatation_weight: Optional[float] = None,
     spacing: Optional[Sequence[float]] = None,
     s: float = 2.0,
+    direction: Optional[Any] = None,
+    origin: Optional[Any] = None,
+    vector_frame: str = 'physical',
 ) -> torch.Tensor:
     """
     Quasiconformal / Beltrami distortion operator.
@@ -749,26 +1027,29 @@ def apply_beltrami_regularizer(
     alpha : float, optional
     fluid_sigma : float, default 3.0
     dilatation_weight : float, optional
-    spacing : sequence of float, optional
-    s : float, default 1.0
+    spacing : sequence of float
+        Required voxel spacing in ANTs (x, y, z) order.
+    s : float, default 2.0
+    direction : array-like, optional
+    origin : sequence of float, optional
+    vector_frame : {'physical', 'voxel'}, default 'physical'
 
     Returns
     -------
     Tensor of the same shape and dtype as v.
     """
-    unbatched = (v.dim() == v.shape[-1] + 1)
-    if unbatched:
-        v = v.unsqueeze(0)
-
+    v, sp, D_t, orig_dtype, unbatched = _enter_grid_frame(
+        v, spacing, direction, origin, vector_frame, "apply_beltrami_regularizer"
+    )
     dim = v.shape[-1]
     spatial_shape = v.shape[1:-1]
-    device, dtype = v.device, v.dtype
+    device = v.device
     spatial_dims = tuple(range(2, 2 + dim))
 
     if alpha is None:
         alpha = float(fluid_sigma) ** 2 / 2.0
 
-    k_mesh, _, _, inv_ksq_true, _ = _get_inv_ksq_cached(spatial_shape, spacing, device)
+    k_mesh, _, _, inv_ksq_true, _ = _get_inv_ksq_cached(spatial_shape, sp, device)
 
     # Conformal shear factor: eta = (d - 2) / (2 * (d - 1))
     # d=2 -> 0.0, d=3 -> 0.25
@@ -777,7 +1058,7 @@ def apply_beltrami_regularizer(
     else:
         eta = (float(dim) - 2.0) / (2.0 * (float(dim) - 1.0)) if dim > 1 else 0.0
 
-    K_base = _get_sobolev_envelope_cached(spatial_shape, spacing, float(alpha), float(s), device)
+    K_base = _get_sobolev_envelope_cached(spatial_shape, sp, float(alpha), float(s), device)
 
     v_cf = torch.movedim(v, -1, 1).to(torch.float32).contiguous()
     v_fft = torch.fft.rfftn(v_cf, dim=spatial_dims)
@@ -796,8 +1077,8 @@ def apply_beltrami_regularizer(
 
     v_out_cf = torch.fft.irfftn(v_fft, s=spatial_shape, dim=spatial_dims)
     del v_fft
-    v_out = torch.movedim(v_out_cf, 1, -1).to(dtype=dtype)
-    return v_out[0] if unbatched else v_out
+    v_out = torch.movedim(v_out_cf, 1, -1)
+    return _exit_grid_frame(v_out, D_t, orig_dtype, unbatched)
 
 
 def apply_poroelastic_filter(
@@ -810,6 +1091,9 @@ def apply_poroelastic_filter(
     fluid_sigma: float = 3.0,
     spacing: Optional[Sequence[float]] = None,
     s: float = 2.0,
+    direction: Optional[Any] = None,
+    origin: Optional[Any] = None,
+    vector_frame: str = 'physical',
 ) -> torch.Tensor:
     """
     Two-Phase Poroelastic / Biot consolidation filter.
@@ -834,21 +1118,24 @@ def apply_poroelastic_filter(
     total_sigma, elastic_sigma : float, optional
     mask : Tensor, optional
     fluid_sigma : float, default 3.0
-    spacing : sequence of float, optional
+    spacing : sequence of float
+        Required voxel spacing in ANTs (x, y, z) order.
     s : float, default 2.0
         Sobolev operator power (2.0 = H^2 biharmonic regularity).
+    direction : array-like, optional
+    origin : sequence of float, optional
+    vector_frame : {'physical', 'voxel'}, default 'physical'
 
     Returns
     -------
     Tensor of the same shape and dtype as v.
     """
-    unbatched = (v.dim() == v.shape[-1] + 1)
-    if unbatched:
-        v = v.unsqueeze(0)
-
+    v, sp, D_t, orig_dtype, unbatched = _enter_grid_frame(
+        v, spacing, direction, origin, vector_frame, "apply_poroelastic_filter"
+    )
     dim = v.shape[-1]
     spatial_shape = v.shape[1:-1]
-    device, dtype = v.device, v.dtype
+    device = v.device
     spatial_dims = tuple(range(2, 2 + dim))
 
     if alpha is None:
@@ -864,7 +1151,7 @@ def apply_poroelastic_filter(
         kappa = 0.20
 
     # 1. Spectral Helmholtz decomposition: v = v_solid + v_fluid
-    k_mesh, k_sq, k_sq_safe = _get_k_mesh_rfft(spatial_shape, spacing, device)
+    k_mesh, k_sq, k_sq_safe = _get_k_mesh_rfft(spatial_shape, sp, device)
     mask_zero = (k_sq == 0.0)
 
     v_cf = torch.movedim(v, -1, 1).to(torch.float32)
@@ -897,9 +1184,9 @@ def apply_poroelastic_filter(
         fluid_weight = (1.0 - mask_t.clamp(0.0, 1.0))
         v_fluid_cf = v_fluid_cf * fluid_weight
 
-    v_out_cf = (v_solid_cf + kappa * v_fluid_cf).to(dtype=dtype)
+    v_out_cf = v_solid_cf + kappa * v_fluid_cf
     v_out = torch.movedim(v_out_cf, 1, -1)
-    return v_out[0] if unbatched else v_out
+    return _exit_grid_frame(v_out, D_t, orig_dtype, unbatched)
 
 
 def apply_hyperelastic_regularizer(
@@ -913,6 +1200,9 @@ def apply_hyperelastic_regularizer(
     s: float = 2.0,
     h3_envelope: bool = True,
     envelope_power: Optional[float] = None,
+    direction: Optional[Any] = None,
+    origin: Optional[Any] = None,
+    vector_frame: str = 'physical',
 ) -> torch.Tensor:
     """
     Hyperelastic volumetric strain regularizer.
@@ -929,10 +1219,14 @@ def apply_hyperelastic_regularizer(
         Bulk modulus K relative to shear modulus. Default 10.0 (near incompressibility).
     total_sigma, elastic_sigma : float, optional
     fluid_sigma : float, default 3.0
-    spacing : sequence of float, optional
+    spacing : sequence of float
+        Required voxel spacing in ANTs (x, y, z) order.
     s : float, default 2.0
     h3_envelope : bool, default True
     envelope_power : float, optional
+    direction : array-like, optional
+    origin : sequence of float, optional
+    vector_frame : {'physical', 'voxel'}, default 'physical'
 
     Returns
     -------
@@ -960,6 +1254,9 @@ def apply_hyperelastic_regularizer(
         spacing=spacing,
         h3_envelope=h3_envelope,
         envelope_power=p,
+        direction=direction,
+        origin=origin,
+        vector_frame=vector_frame,
     )
 
 
@@ -989,17 +1286,51 @@ def list_regularizers() -> List[str]:
     return sorted(_REGISTRY.keys())
 
 
+def _validate_continuum_builder_geom(
+    spacing: Optional[Sequence[float]],
+    direction: Optional[Any],
+    origin: Optional[Any],
+    vector_frame: str,
+    caller: str,
+) -> Tuple[Tuple[float, ...], str]:
+    sp = _validate_spacing_sequence(spacing, caller)
+    dim = len(sp)
+    _parse_direction(direction, dim, caller)
+    _validate_origin(origin, dim, caller)
+    vf = _validate_vector_frame(vector_frame, caller)
+    return sp, vf
+
+
 def _build_sobolev(
     alpha: Optional[float] = None,
     sobolev_alpha: Optional[float] = None,
     fluid_sigma: float = 3.0,
     spacing: Optional[Sequence[float]] = None,
     s: float = 2.0,
+    direction: Optional[Any] = None,
+    origin: Optional[Any] = None,
+    vector_frame: str = 'physical',
     **kwargs,
 ) -> Callable[[torch.Tensor], torch.Tensor]:
     from .smoothing import apply_sobolev_green_operator
+    sp, vf = _validate_continuum_builder_geom(spacing, direction, origin, vector_frame, "get_regularizer('sobolev')")
     a = sobolev_alpha if sobolev_alpha is not None else alpha
-    return lambda v: apply_sobolev_green_operator(v, fluid_sigma=fluid_sigma, alpha=a, spacing=spacing)
+
+    def _fn(v: torch.Tensor) -> torch.Tensor:
+        dim = len(sp)
+        unbatched = (v.ndim == dim + 1)
+        vb = v.unsqueeze(0) if unbatched else v
+        _require_spacing(sp, vb.ndim - 2, "get_regularizer('sobolev')")
+        if vb.shape[-1] == dim and direction is not None:
+            vb, _, D_t, orig_dtype, _ = _enter_grid_frame(
+                vb, sp, direction, origin, vf, "get_regularizer('sobolev')"
+            )
+            out = apply_sobolev_green_operator(vb, fluid_sigma=fluid_sigma, alpha=a, spacing=sp)
+            return _exit_grid_frame(out, D_t, orig_dtype, unbatched)
+        out = apply_sobolev_green_operator(vb, fluid_sigma=fluid_sigma, alpha=a, spacing=sp)
+        return out[0] if unbatched else out
+
+    return _fn
 
 
 def _build_gaussian(
@@ -1013,7 +1344,7 @@ def _build_gaussian(
     sig = gaussian_sigma if gaussian_sigma is not None else (sigma if sigma is not None else fluid_sigma)
     if sig is None or sig <= 0:
         return lambda v: v
-    return lambda v: separable_gaussian_filter(v, sigma=sig, spacing=spacing)
+    return lambda v: separable_gaussian_filter(v, sigma=sig)
 
 
 def _build_compact_gaussian(
@@ -1035,11 +1366,30 @@ def _build_dsti(
     fluid_sigma: float = 3.0,
     spacing: Optional[Sequence[float]] = None,
     s: float = 2.0,
+    direction: Optional[Any] = None,
+    origin: Optional[Any] = None,
+    vector_frame: str = 'physical',
     **kwargs,
 ) -> Callable[[torch.Tensor], torch.Tensor]:
     from .smoothing import apply_dsti_green_operator
+    sp, vf = _validate_continuum_builder_geom(spacing, direction, origin, vector_frame, "get_regularizer('dsti')")
     a = dsti_alpha if dsti_alpha is not None else alpha
-    return lambda v: apply_dsti_green_operator(v, fluid_sigma=fluid_sigma, alpha=a, spacing=spacing, s=s)
+
+    def _fn(v: torch.Tensor) -> torch.Tensor:
+        dim = len(sp)
+        unbatched = (v.ndim == dim + 1)
+        vb = v.unsqueeze(0) if unbatched else v
+        _require_spacing(sp, vb.ndim - 2, "get_regularizer('dsti')")
+        if vb.shape[-1] == dim and direction is not None:
+            vb, _, D_t, orig_dtype, _ = _enter_grid_frame(
+                vb, sp, direction, origin, vf, "get_regularizer('dsti')"
+            )
+            out = apply_dsti_green_operator(vb, fluid_sigma=fluid_sigma, alpha=a, spacing=sp, s=s)
+            return _exit_grid_frame(out, D_t, orig_dtype, unbatched)
+        out = apply_dsti_green_operator(vb, fluid_sigma=fluid_sigma, alpha=a, spacing=sp, s=s)
+        return out[0] if unbatched else out
+
+    return _fn
 
 
 def _build_bspline(
@@ -1062,19 +1412,30 @@ def _build_solenoidal(
     spacing: Optional[Sequence[float]] = None,
     s: float = 2.0,
     sobolev_envelope: bool = True,
+    direction: Optional[Any] = None,
+    origin: Optional[Any] = None,
+    vector_frame: str = 'physical',
     **kwargs,
 ) -> Callable[[torch.Tensor], torch.Tensor]:
+    sp, vf = _validate_continuum_builder_geom(spacing, direction, origin, vector_frame, "get_regularizer('solenoidal')")
     a = sobolev_alpha if sobolev_alpha is not None else alpha
     if not sobolev_envelope:
-        return lambda v: project_solenoidal(v, spacing=spacing)
-    return lambda v: apply_solenoidal_sobolev_operator(v, alpha=a, fluid_sigma=fluid_sigma, spacing=spacing, s=s)
+        return lambda v: project_solenoidal(v, spacing=sp, direction=direction, origin=origin, vector_frame=vf)
+    return lambda v: apply_solenoidal_sobolev_operator(
+        v, alpha=a, fluid_sigma=fluid_sigma, spacing=sp, s=s,
+        direction=direction, origin=origin, vector_frame=vf,
+    )
 
 
 def _build_leray_pure(
     spacing: Optional[Sequence[float]] = None,
+    direction: Optional[Any] = None,
+    origin: Optional[Any] = None,
+    vector_frame: str = 'physical',
     **kwargs,
 ) -> Callable[[torch.Tensor], torch.Tensor]:
-    return lambda v: project_solenoidal(v, spacing=spacing)
+    sp, vf = _validate_continuum_builder_geom(spacing, direction, origin, vector_frame, "get_regularizer('leray_pure')")
+    return lambda v: project_solenoidal(v, spacing=sp, direction=direction, origin=origin, vector_frame=vf)
 
 
 def _build_solenoidal_sobolev(
@@ -1083,10 +1444,17 @@ def _build_solenoidal_sobolev(
     fluid_sigma: float = 3.0,
     spacing: Optional[Sequence[float]] = None,
     s: float = 2.0,
+    direction: Optional[Any] = None,
+    origin: Optional[Any] = None,
+    vector_frame: str = 'physical',
     **kwargs,
 ) -> Callable[[torch.Tensor], torch.Tensor]:
+    sp, vf = _validate_continuum_builder_geom(spacing, direction, origin, vector_frame, "get_regularizer('solenoidal_sobolev')")
     a = sobolev_alpha if sobolev_alpha is not None else alpha
-    return lambda v: apply_solenoidal_sobolev_operator(v, alpha=a, fluid_sigma=fluid_sigma, spacing=spacing, s=s)
+    return lambda v: apply_solenoidal_sobolev_operator(
+        v, alpha=a, fluid_sigma=fluid_sigma, spacing=sp, s=s,
+        direction=direction, origin=origin, vector_frame=vf,
+    )
 
 
 def _build_div_curl(
@@ -1101,14 +1469,19 @@ def _build_div_curl(
     h3_envelope: bool = True,
     envelope_power: float = 2.0,
     s: Optional[float] = None,
+    direction: Optional[Any] = None,
+    origin: Optional[Any] = None,
+    vector_frame: str = 'physical',
     **kwargs,
 ) -> Callable[[torch.Tensor], torch.Tensor]:
+    sp, vf = _validate_continuum_builder_geom(spacing, direction, origin, vector_frame, "get_regularizer('div_curl')")
     a = sobolev_alpha if sobolev_alpha is not None else alpha
     p = envelope_power if s is None else s
     return lambda v: apply_div_curl_green_operator(
         v, alpha=a, beta=beta, gamma=gamma, fluid_sigma=fluid_sigma,
-        total_sigma=total_sigma, elastic_sigma=elastic_sigma, spacing=spacing,
-        h3_envelope=h3_envelope, envelope_power=p
+        total_sigma=total_sigma, elastic_sigma=elastic_sigma, spacing=sp,
+        h3_envelope=h3_envelope, envelope_power=p,
+        direction=direction, origin=origin, vector_frame=vf,
     )
 
 
@@ -1121,12 +1494,17 @@ def _build_navier(
     elastic_sigma: Optional[float] = None,
     spacing: Optional[Sequence[float]] = None,
     s: float = 1.0,
+    direction: Optional[Any] = None,
+    origin: Optional[Any] = None,
+    vector_frame: str = 'physical',
     **kwargs,
 ) -> Callable[[torch.Tensor], torch.Tensor]:
+    sp, vf = _validate_continuum_builder_geom(spacing, direction, origin, vector_frame, "get_regularizer('navier')")
     a = sobolev_alpha if sobolev_alpha is not None else alpha
     return lambda v: apply_navier_green_operator(
         v, alpha=a, fluid_sigma=fluid_sigma, poisson_ratio=poisson_ratio,
-        total_sigma=total_sigma, elastic_sigma=elastic_sigma, spacing=spacing, s=s
+        total_sigma=total_sigma, elastic_sigma=elastic_sigma, spacing=sp, s=s,
+        direction=direction, origin=origin, vector_frame=vf,
     )
 
 
@@ -1138,12 +1516,17 @@ def _build_masked_incompressible(
     spacing: Optional[Sequence[float]] = None,
     num_iters: int = 3,
     fluid_sigma: float = 3.0,
+    direction: Optional[Any] = None,
+    origin: Optional[Any] = None,
+    vector_frame: str = 'physical',
     **kwargs,
 ) -> Callable[[torch.Tensor], torch.Tensor]:
+    sp, vf = _validate_continuum_builder_geom(spacing, direction, origin, vector_frame, "get_regularizer('masked_incompressible')")
     m = mask if mask is not None else fixed_mask
     a = sobolev_alpha if sobolev_alpha is not None else alpha
     return lambda v: apply_masked_incompressible_filter(
-        v, mask=m, alpha=a, spacing=spacing, num_iters=num_iters
+        v, mask=m, alpha=a, spacing=sp, num_iters=num_iters,
+        direction=direction, origin=origin, vector_frame=vf,
     )
 
 
@@ -1154,12 +1537,17 @@ def _build_beltrami(
     dilatation_weight: Optional[float] = None,
     spacing: Optional[Sequence[float]] = None,
     s: float = 2.0,
+    direction: Optional[Any] = None,
+    origin: Optional[Any] = None,
+    vector_frame: str = 'physical',
     **kwargs,
 ) -> Callable[[torch.Tensor], torch.Tensor]:
+    sp, vf = _validate_continuum_builder_geom(spacing, direction, origin, vector_frame, "get_regularizer('beltrami')")
     a = sobolev_alpha if sobolev_alpha is not None else alpha
     return lambda v: apply_beltrami_regularizer(
         v, alpha=a, fluid_sigma=fluid_sigma, dilatation_weight=dilatation_weight,
-        spacing=spacing, s=s
+        spacing=sp, s=s,
+        direction=direction, origin=origin, vector_frame=vf,
     )
 
 
@@ -1174,14 +1562,19 @@ def _build_poroelastic(
     fluid_sigma: float = 3.0,
     spacing: Optional[Sequence[float]] = None,
     s: float = 2.0,
+    direction: Optional[Any] = None,
+    origin: Optional[Any] = None,
+    vector_frame: str = 'physical',
     **kwargs,
 ) -> Callable[[torch.Tensor], torch.Tensor]:
+    sp, vf = _validate_continuum_builder_geom(spacing, direction, origin, vector_frame, "get_regularizer('poroelastic')")
     a = sobolev_alpha if sobolev_alpha is not None else alpha
     m = mask if mask is not None else fixed_mask
     return lambda v: apply_poroelastic_filter(
         v, alpha=a, darcy_permeability=darcy_permeability, total_sigma=total_sigma,
         elastic_sigma=elastic_sigma, mask=m, fluid_sigma=fluid_sigma,
-        spacing=spacing, s=s
+        spacing=sp, s=s,
+        direction=direction, origin=origin, vector_frame=vf,
     )
 
 
@@ -1196,14 +1589,19 @@ def _build_hyperelastic(
     s: float = 2.0,
     h3_envelope: bool = True,
     envelope_power: Optional[float] = None,
+    direction: Optional[Any] = None,
+    origin: Optional[Any] = None,
+    vector_frame: str = 'physical',
     **kwargs,
 ) -> Callable[[torch.Tensor], torch.Tensor]:
+    sp, vf = _validate_continuum_builder_geom(spacing, direction, origin, vector_frame, "get_regularizer('hyperelastic')")
     a = sobolev_alpha if sobolev_alpha is not None else alpha
     p = envelope_power if envelope_power is not None else s
     return lambda v: apply_hyperelastic_regularizer(
         v, alpha=a, bulk_modulus=bulk_modulus, total_sigma=total_sigma,
         elastic_sigma=elastic_sigma, fluid_sigma=fluid_sigma,
-        spacing=spacing, s=p, h3_envelope=h3_envelope, envelope_power=p
+        spacing=sp, s=p, h3_envelope=h3_envelope, envelope_power=p,
+        direction=direction, origin=origin, vector_frame=vf,
     )
 
 
