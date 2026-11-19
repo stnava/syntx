@@ -518,11 +518,11 @@ def _evaluate_mindboggle_pair_impl(
         # inverse, so the inverse-consistency metrics of this arm are NaN.
         greedy_kwargs = {}
         if config is not None:
-            _map = {"grad_step": "learning_rate", "learning_rate": "learning_rate",
-                    "flow_sigma": "flow_sigma", "total_sigma": "total_sigma",
-                    "optimizer": "optimizer", "regadam_sigma": "regadam_sigma",
-                    "similarity_metric": "similarity_metric", "reg_iterations": "reg_iterations",
-                    "lncc_radius": "lncc_radius"}
+            _map = {"grad_step": "learning_rate", "learning_rate": "learning_rate", "flow_sigma": "flow_sigma",
+                    "total_sigma": "total_sigma", "optimizer": "optimizer", "regadam_sigma": "regadam_sigma",
+                    "cfl_momentum": "cfl_momentum", "regularizer": "regularizer", "sobolev_alpha": "sobolev_alpha",
+                    "similarity_metric": "similarity_metric", "reg_iterations": "reg_iterations", "lncc_radius": "lncc_radius",
+                    **{k: k for k in __import__("syntx.core.regularizers", fromlist=["REGULARIZER_EXTRA_KEYS"]).REGULARIZER_EXTRA_KEYS}}
             greedy_kwargs = {_map[k]: v for k, v in model_cfg.items() if k in _map}
         for k, v in explicit_syn.items():
             greedy_kwargs[{"grad_step": "learning_rate"}.get(k, k)] = v

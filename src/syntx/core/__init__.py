@@ -81,6 +81,7 @@ from .digital_diffeomorphism import (
     pullback_digital_diffeomorphism_to_halves,
 )
 from .optimizers import (
+    FieldStepOptimizer,
     LARS,
     GaussianAdam,
     RegAdam,
@@ -89,6 +90,7 @@ from .optimizers import (
     check_convergence,
     compute_cfl_step,
     get_cfl_max_norm,
+    validate_regularizer_optimizer_pair,
 )
 from .pipeline import (
     auto_detect_device,
@@ -96,6 +98,9 @@ from .pipeline import (
     normalize_and_tensorize,
 )
 from .regularizers import (
+    COUPLED_CONTINUUM_REGULARIZERS,
+    REGULARIZER_EXTRA_KEYS,
+    SPECTRAL_REGULARIZERS,
     apply_beltrami_regularizer,
     apply_div_curl_green_operator,
     apply_hyperelastic_regularizer,
@@ -103,6 +108,7 @@ from .regularizers import (
     apply_navier_green_operator,
     apply_poroelastic_filter,
     apply_solenoidal_sobolev_operator,
+    build_level_regularizer,
     compute_curl_nd,
     compute_divergence_nd,
     get_regularizer,
@@ -133,7 +139,11 @@ from .utils import (
 )
 
 __all__ = [
+    'COUPLED_CONTINUUM_REGULARIZERS',
+    'FieldStepOptimizer',
     'LARS',
+    'REGULARIZER_EXTRA_KEYS',
+    'SPECTRAL_REGULARIZERS',
     'ANTsPseudoLNCC',
     'AnalyticalGridSample',
     'AnalyticalLNCC',
@@ -161,7 +171,9 @@ __all__ = [
     'b_spline_3',
     'box_cc2_loss_nd',
     'box_lncc_loss_nd',
+    'build_level_regularizer',
     'calculate_inverse_identity_error',
+    'validate_regularizer_optimizer_pair',
     'LossSlopeStop',
     'loss_slope',
     'DEFAULT_SLOPE_THRESHOLD',

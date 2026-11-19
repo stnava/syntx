@@ -36,7 +36,13 @@ from .core.losses import (
     get_similarity_loss,
 )
 from .core.smoothing import separable_gaussian_filter
-from .core.optimizers import RegAdam, LARS
+from .core.optimizers import RegAdam, LARS, validate_regularizer_optimizer_pair
+from .core.regularizers import (
+    COUPLED_CONTINUUM_REGULARIZERS,
+    REGULARIZER_EXTRA_KEYS,
+    SPECTRAL_REGULARIZERS,
+    build_level_regularizer,
+)
 from .core.grid import compose_grids, resize_field, sample_field_cf
 from .spatial import (
     reverse_metadata,
@@ -62,22 +68,6 @@ from .core.utils import check_loss_collapse, require_finite_images
 # sweep 2026-09-19); 2-D: the calibrated legacy value. Shared by syngs_registration(), the model
 # and integrate_momentum() so a saved momentum field reconstructs exactly.
 SYNGS_DEFAULT_ALPHA = {2: 0.060, 3: 0.448}
-
-_SYNGS_CONTINUUM_REGS = frozenset({
-    'solenoidal', 'leray', 'incompressible', 'solenoidal_sobolev',
-    'div_curl', 'helmholtz',
-    'navier', 'stokes', 'elastic',
-    'masked_incompressible',
-    'hyperelastic', 'simo_pister', 'log_jacobian',
-    'beltrami', 'quasiconformal', 'conformal',
-    'poroelastic', 'darcy_stokes', 'biot',
-})
-
-_REG_EXTRA_KEYS = frozenset({
-    'beta', 'gamma', 'poisson_ratio', 'darcy_permeability', 'bulk_modulus',
-    'num_iters', 'dilatation_weight', 'mask', 'fixed_mask',
-    's', 'h3_envelope', 'envelope_power',
-})
 
 
 def default_alpha(dim: int) -> float:
@@ -151,7 +141,7 @@ class GeodesicShootingModel(nn.Module):
         unknown = sorted(set(kwargs) - {'similarity_metric', 'mattes_bins', 'bootstrap_mode',
                                         'bootstrap_orig_weight', 'bootstrap_jitter_scale',
                                         'regularizer', 'spline_distance', 'mesh_size',
-                                        'transport_mode'} - _REG_EXTRA_KEYS)
+                                        'transport_mode'} - REGULARIZER_EXTRA_KEYS)
         if unknown:
             raise TypeError(f"GeodesicShootingModel() got unexpected keyword(s) {unknown}")
         self.dim = dim
@@ -197,12 +187,12 @@ class GeodesicShootingModel(nn.Module):
             self.regularizer = 'dsti1'
         elif self.regularizer in ('bspline', 'bsplinesyn'):
             self.regularizer = 'bspline'
-        elif self.regularizer in _SYNGS_CONTINUUM_REGS or self.regularizer == 'sobolev':
+        elif self.regularizer in COUPLED_CONTINUUM_REGULARIZERS or self.regularizer == 'sobolev':
             pass
         else:
             raise ValueError(f"unknown regularizer {self.regularizer!r}: use 'sobolev', 'gaussian', "
                              "'dsti' / 'dsti1', 'bspline' or continuum regularizers")
-        self.extra_reg_kwargs = {k: kwargs[k] for k in _REG_EXTRA_KEYS if k in kwargs}
+        self.extra_reg_kwargs = {k: kwargs[k] for k in REGULARIZER_EXTRA_KEYS if k in kwargs and k != 'alpha'}
         self.spline_distance = kwargs.get('spline_distance', None)
         self.mesh_size = kwargs.get('mesh_size', None)
         self.transport_mode = str(kwargs.get('transport_mode', 'transport')).lower()
@@ -326,8 +316,7 @@ class GeodesicShootingModel(nn.Module):
                 coord_convention='xyz',
             )
 
-        if self.regularizer in _SYNGS_CONTINUUM_REGS:
-            from .core.regularizers import get_regularizer
+        if self.regularizer in COUPLED_CONTINUUM_REGULARIZERS:
             spacing_itk = tuple(reversed(spacing_zyx))
             bmask_cache = getattr(self, '_continuum_bmask_cache', None)
             if bmask_cache is None:
@@ -340,14 +329,15 @@ class GeodesicShootingModel(nn.Module):
                 if len(bmask_cache) > 32:
                     bmask_cache.clear()
                 bmask_cache[bkey] = bmask
-            reg_fn = get_regularizer(
+            reg_fn = build_level_regularizer(
                 self.regularizer,
                 alpha=self.alpha,
                 fluid_sigma=self.fluid_sigma or 3.0,
                 spacing=spacing_itk,
                 origin=self.origin,
                 direction=self.direction,
-                **getattr(self, 'extra_reg_kwargs', {}),
+                param_domain="physical_mm",
+                extra_reg_kwargs=getattr(self, 'extra_reg_kwargs', {}),
             )
             return reg_fn(m * bmask) * bmask
 
@@ -802,7 +792,9 @@ class GeodesicShootingModel(nn.Module):
         moving_pyr = build_pyramid(moving_image, self.moving_spacing, levels, 'deformable', sigma=smoothing_sigmas, reference_spacing=self.spacing)
 
         if verbose: print("Optimizing Geodesic Shooting momentum...")
-        opt_name = str(optimizer_type).lower()
+        opt_name = validate_regularizer_optimizer_pair(
+            self.regularizer, optimizer_type, caller="GeodesicShootingModel.fit"
+        )
 
         for idx, level in enumerate(levels):
             epochs = epochs_per_level[min(idx, len(epochs_per_level) - 1)]
@@ -852,20 +844,20 @@ class GeodesicShootingModel(nn.Module):
 
             if opt_name in ('reg_adam', 'regadam', 'sobolev_adam', 'sobolevadam'):
                 cont_reg_fn = None
-                if self.regularizer in _SYNGS_CONTINUUM_REGS:
-                    from .core.regularizers import get_regularizer
+                if self.regularizer in COUPLED_CONTINUUM_REGULARIZERS:
                     _lvl_shape = tuple(int(s) for s in self.velocity_0_fwd.shape[1:-1])
                     _bmask_lvl = self._create_boundary_mask(
                         _lvl_shape, self.velocity_0_fwd.device, self.velocity_0_fwd.dtype, border_width=4
                     )
-                    _raw_cont_fn = get_regularizer(
+                    _raw_cont_fn = build_level_regularizer(
                         self.regularizer,
                         alpha=self.alpha,
                         fluid_sigma=self.fluid_sigma or 3.0,
                         spacing=spacing_rel_f,
                         origin=self.origin,
                         direction=self.direction,
-                        **getattr(self, 'extra_reg_kwargs', {}),
+                        param_domain="physical_mm",
+                        extra_reg_kwargs=getattr(self, 'extra_reg_kwargs', {}),
                     )
                     cont_reg_fn = lambda d, _fn=_raw_cont_fn, _bm=_bmask_lvl: _fn(d * _bm) * _bm
                 optimizer = RegAdam(
@@ -878,6 +870,8 @@ class GeodesicShootingModel(nn.Module):
                     gaussian_sigma=self.fluid_sigma,
                     max_step_norm=max_step,
                     spacing=spacing_rel_f,
+                    origin=self.origin,
+                    direction=self.direction,
                     **({"eps_rel": float(kwargs["adam_eps_rel"])} if kwargs.get("adam_eps_rel") is not None else {})
                 )
             elif opt_name == 'adam':
@@ -1115,7 +1109,7 @@ def syngs_registration(
                 'fast_smooth', 'affine_iterations', 'aff_metric', 'aff_sampling', 'iterations',
                 'compose_polish_tol', 'compose_polish_steps',
                 'digital_diffeomorphism', 'digital_diffeomorphism_floor',
-                'digital_diffeomorphism_steps'} | _REG_EXTRA_KEYS
+                'digital_diffeomorphism_steps'} | (REGULARIZER_EXTRA_KEYS - {'alpha'})
     if reg_iterations is None:
         reg_iterations = iterations
     if reg_iterations is None and 'iterations' in kwargs:
@@ -1173,7 +1167,8 @@ def syngs_registration(
     # than silently ignored:  gaussian / bspline -> flow_sigma (Gaussian sigma, 0 = off);
     # sobolev / dsti / dsti1 -> alpha (0 = off).
     reg_mode = str(kwargs.get('regularizer', 'sobolev')).lower()
-    _SPECTRAL_REGS = {'sobolev', 'dsti', 'dsti1'} | _SYNGS_CONTINUUM_REGS
+    optimizer = validate_regularizer_optimizer_pair(reg_mode, optimizer, caller="syntx.syngs")
+    _SPECTRAL_REGS = SPECTRAL_REGULARIZERS
     _SIGMA_REGS = {'gaussian', 'gauss', 'bspline', 'bsplinesyn'}
     if reg_mode in _SPECTRAL_REGS:
         if flow_sigma is not None:
@@ -1295,7 +1290,7 @@ def syngs_registration(
             bootstrap_jitter_scale=float(kwargs.pop('bootstrap_jitter_scale', 0.25)),
             transport_mode=kwargs.pop('transport_mode', 'transport'),
             seed=seed,
-            **{k: kwargs.pop(k) for k in list(kwargs.keys()) if k in _REG_EXTRA_KEYS},
+            **{k: kwargs.pop(k) for k in list(kwargs.keys()) if k in REGULARIZER_EXTRA_KEYS and k != 'alpha'},
         ).to(device_str)
 
         # Single Interpolation Invariant: absorb initial transform into T_init

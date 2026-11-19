@@ -615,8 +615,11 @@ def resolved_parameters(manifest: Dict[str, Any], function_prefix: str = "syntx.
     return {}
 
 
-# fit() keywords that carry per-image data rather than parameters (initial affine / grid / warp)
-_IMAGE_DEPENDENT_FIT_KEYS = ("initial_grid", "initial_warp", "initial_inverse_warp", "theta")
+# fit() keywords that carry per-image data rather than parameters (initial affine / grid / warp / geometry)
+_IMAGE_DEPENDENT_FIT_KEYS = (
+    "initial_grid", "initial_warp", "initial_inverse_warp", "theta",
+    "spacing", "origin", "direction", "grid_shape", "image_shape",
+)
 
 
 def cohort_provenance(manifests: List[Dict[str, Any]]) -> Dict[str, Any]:

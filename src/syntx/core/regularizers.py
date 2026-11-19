@@ -1263,6 +1263,26 @@ def apply_hyperelastic_regularizer(
 # -----------------------------------------------------------------------------
 # Unified Regularizer Registry & Factory
 # -----------------------------------------------------------------------------
+REGULARIZER_EXTRA_KEYS = frozenset({
+    'beta', 'gamma', 'poisson_ratio', 'darcy_permeability', 'bulk_modulus',
+    'num_iters', 'dilatation_weight', 'mask', 'fixed_mask',
+    'alpha', 'h3_envelope', 'envelope_power', 's',
+})
+
+COUPLED_CONTINUUM_REGULARIZERS = frozenset({
+    'solenoidal', 'leray', 'leray_pure', 'incompressible', 'solenoidal_sobolev',
+    'div_curl', 'helmholtz',
+    'navier', 'stokes', 'elastic',
+    'masked_incompressible',
+    'beltrami', 'quasiconformal', 'conformal',
+    'poroelastic', 'darcy_stokes', 'biot',
+    'hyperelastic', 'simo_pister', 'log_jacobian',
+})
+
+SPECTRAL_REGULARIZERS = COUPLED_CONTINUUM_REGULARIZERS | frozenset({
+    'sobolev', 'dsti', 'dsti1', 'dst_i', 'dst1', 'dirichlet',
+})
+
 _REGISTRY: Dict[str, Callable[..., Callable[[torch.Tensor], torch.Tensor]]] = {}
 
 
@@ -1620,6 +1640,8 @@ for _k, _fn in [
     ('erf', _build_compact_gaussian),
     ('dsti', _build_dsti),
     ('dsti1', _build_dsti),
+    ('dst_i', _build_dsti),
+    ('dst1', _build_dsti),
     ('dirichlet', _build_dsti),
     ('bspline', _build_bspline),
     ('solenoidal', _build_solenoidal),
@@ -1689,3 +1711,173 @@ def get_regularizer(
         return base_reg(v)
 
     return adapter
+
+
+def build_level_regularizer(
+    name: Union[str, Callable[[torch.Tensor], torch.Tensor]],
+    *,
+    spacing: Sequence[float],
+    origin: Optional[Sequence[float]] = None,
+    direction: Optional[Any] = None,
+    alpha: Optional[float] = None,
+    sobolev_alpha: Optional[float] = None,
+    fluid_sigma: float = 3.0,
+    param_domain: str = "physical_mm",
+    grid_shape: Optional[Sequence[int]] = None,
+    mask: Optional[Any] = None,
+    fixed_mask: Optional[Any] = None,
+    extra_reg_kwargs: Optional[Dict[str, Any]] = None,
+    input_role: str = "gradient",
+    output_units: str = "voxel",
+    **kwargs: Any,
+) -> Callable[[torch.Tensor], torch.Tensor]:
+    """Build a level-aware regularizer callable bridging coordinate conventions.
+
+    Parameters
+    ----------
+    name : str or callable
+        Registered regularizer name (or custom callable).
+    spacing : sequence of float
+        Level physical voxel spacing in ANTs ``(x, y, z)`` order.
+    origin, direction : optional
+        ITK physical origin and direction cosine matrix.
+    alpha, sobolev_alpha : float, optional
+        Spectral / continuum operator strength. ``None`` delegates to each operator's
+        natural default derived from ``fluid_sigma``.
+    fluid_sigma : float, default 3.0
+    param_domain : {'physical_mm', 'normalized_grid'}, default 'physical_mm'
+        - ``'physical_mm'``: field has spatial and component order ``(z, y, x)`` in mm
+          (used by ``syn``, ``tvf``, ``syngs``), applying exact ``O(d)`` ``D_zyx``
+          conjugation via ``vector_frame='physical'``.
+        - ``'normalized_grid'``: field has spatial order ``(z, y, x)`` and component
+          order ``(x, y, z)`` in normalised ``[-1, 1]`` coordinates (used by ``greedy``,
+          ``scattered``). Converts gradients via the exact chain rule
+          ``f_mm,d = (2 / ((N_d - 1) * s_d)) * g_norm,d`` (or displacements via
+          ``((N_d - 1) * s_d / 2) * v_norm,d`` when ``input_role='velocity'``), flips
+          ``(x, y, z) <-> (z, y, x)`` around the voxel-frame Green's operator on
+          ``spacing``, and returns velocity in ``output_units`` (``'voxel'``,
+          ``'normalized'``, or ``'mm'``).
+    grid_shape : sequence of int, optional
+        Spatial shape in tensor ``(z, y, x)`` order (used for ``normalized_grid``;
+        inferred from the input field if omitted).
+    mask, fixed_mask : optional
+        Anatomical mask forwarded to mask-aware regularizers.
+    extra_reg_kwargs : dict, optional
+        Extra continuum operator parameters (``poisson_ratio``, ``beta``, ``gamma``, etc.).
+    input_role : {'gradient', 'velocity'}, default 'gradient'
+        In ``normalized_grid`` domain, whether the input field is a covariant gradient
+        ``dL/du_norm`` or a contravariant normalized displacement/velocity ``du_norm``.
+    output_units : {'voxel', 'normalized', 'mm'}, default 'voxel'
+        Output units for ``param_domain='normalized_grid'``.
+    """
+    domain = str(param_domain).lower()
+    if domain not in ("physical_mm", "normalized_grid"):
+        raise ValueError(
+            f"build_level_regularizer: param_domain must be 'physical_mm' or 'normalized_grid', "
+            f"got {param_domain!r}"
+        )
+    role = str(input_role).lower()
+    if role not in ("gradient", "velocity"):
+        raise ValueError(
+            f"build_level_regularizer: input_role must be 'gradient' or 'velocity', got {input_role!r}"
+        )
+    out_u = str(output_units).lower()
+    if out_u not in ("voxel", "normalized", "mm"):
+        raise ValueError(
+            f"build_level_regularizer: output_units must be 'voxel', 'normalized', or 'mm', "
+            f"got {output_units!r}"
+        )
+
+    merged_extra: Dict[str, Any] = dict(extra_reg_kwargs or {})
+    merged_extra.update(kwargs)
+    if sobolev_alpha is not None:
+        alpha_resolved = sobolev_alpha
+    elif alpha is not None:
+        alpha_resolved = alpha
+    elif 'alpha' in merged_extra:
+        alpha_resolved = merged_extra['alpha']
+    else:
+        alpha_resolved = None
+    merged_extra.pop('alpha', None)
+    merged_extra.pop('sobolev_alpha', None)
+    eff_mask = mask if mask is not None else merged_extra.pop('mask', None)
+    eff_fixed_mask = fixed_mask if fixed_mask is not None else merged_extra.pop('fixed_mask', None)
+    merged_extra.pop('mask', None)
+    merged_extra.pop('fixed_mask', None)
+
+    sp_xyz = _validate_spacing_sequence(spacing, "build_level_regularizer")
+
+    if domain == "physical_mm":
+        return get_regularizer(
+            name,
+            alpha=alpha_resolved,
+            sobolev_alpha=alpha_resolved,
+            spacing=sp_xyz,
+            origin=origin,
+            direction=direction,
+            vector_frame="physical",
+            fluid_sigma=fluid_sigma,
+            mask=eff_mask,
+            fixed_mask=eff_fixed_mask,
+            **merged_extra,
+        )
+
+    reg_fn = get_regularizer(
+        name,
+        alpha=alpha_resolved,
+        sobolev_alpha=alpha_resolved,
+        spacing=sp_xyz,
+        origin=origin,
+        direction=direction,
+        vector_frame="voxel",
+        fluid_sigma=fluid_sigma,
+        mask=eff_mask,
+        fixed_mask=eff_fixed_mask,
+        **merged_extra,
+    )
+
+    dim = len(sp_xyz)
+    fixed_grid_shape = tuple(int(n) for n in grid_shape) if grid_shape is not None else None
+    scale_cache: Dict[Tuple[Tuple[int, ...], str, str], Tuple[torch.Tensor, Optional[torch.Tensor]]] = {}
+
+    def _get_scales(spatial_zyx: Tuple[int, ...], device: torch.device, dtype: torch.dtype):
+        key = (spatial_zyx, str(device), str(dtype))
+        cached = scale_cache.get(key)
+        if cached is not None:
+            return cached
+        size_xyz = tuple(reversed(spatial_zyx))
+        phys_ext_xyz = [max(1, n - 1) * float(s) for n, s in zip(size_xyz, sp_xyz)]
+        if role == "gradient":
+            min_ext = min(phys_ext_xyz)
+            in_vals = [min_ext / e for e in phys_ext_xyz]
+            out_scale_factor = 2.0 / min_ext
+        else:
+            max_ext = max(phys_ext_xyz)
+            in_vals = [e / max_ext for e in phys_ext_xyz]
+            out_scale_factor = max_ext / 2.0
+        in_t = torch.tensor(in_vals, device=device, dtype=dtype).view(1, *([1] * dim), dim)
+        if out_u == "mm":
+            out_t = torch.full((1, *([1] * dim), dim), out_scale_factor, device=device, dtype=dtype)
+        elif out_u == "voxel":
+            out_vals = [out_scale_factor / float(s) for s in sp_xyz]
+            out_t = torch.tensor(out_vals, device=device, dtype=dtype).view(1, *([1] * dim), dim)
+        else:  # 'normalized'
+            out_vals = [
+                0.0 if n <= 1 else (out_scale_factor * 2.0 / ((n - 1) * float(s)))
+                for n, s in zip(size_xyz, sp_xyz)
+            ]
+            out_t = torch.tensor(out_vals, device=device, dtype=dtype).view(1, *([1] * dim), dim)
+        scale_cache[key] = (in_t, out_t)
+        return in_t, out_t
+
+    def _wrapped(field: torch.Tensor) -> torch.Tensor:
+        unbatched = (field.ndim == dim + 1)
+        f_b = field.unsqueeze(0) if unbatched else field
+        spatial_zyx = fixed_grid_shape if fixed_grid_shape is not None else tuple(int(x) for x in f_b.shape[1:-1])
+        in_t, out_t = _get_scales(spatial_zyx, f_b.device, f_b.dtype)
+        f_mm = f_b * in_t
+        v_mm = reg_fn(f_mm.flip(-1)).flip(-1)
+        v_out = v_mm * out_t
+        return v_out[0] if unbatched else v_out
+
+    return _wrapped

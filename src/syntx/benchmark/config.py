@@ -133,11 +133,14 @@ DEFAULT_BENCHMARK_CONFIG: Dict[str, Any] = {
     },
     # Must equal syntx.greedy()'s defaults (tests/test_canonical_parameters.py).
     "greedy_config": {
-        "grad_step": 0.5625,
-        "flow_sigma": 1.8,
+        "grad_step": 1.5,
+        "flow_sigma": 1.62,
         "total_sigma": 0.28,
-        "optimizer": "adam",
+        "optimizer": 'cfl',
         "regadam_sigma": 0.8,
+        "cfl_momentum": 0.1875,
+        "regularizer": 'div_curl',
+        "sobolev_alpha": None,
         "similarity_metric": "cc2",
         "reg_iterations": [100, 100, 20],
     },

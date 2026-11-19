@@ -388,5 +388,66 @@ def test_greedy_mattes_bin_aliases(sample_2d_images):
     assert r4['model'].similarity_metric == 'mattes'
 
 
+def test_greedy_navier_out_of_the_box_convergence_and_zero_folding(sample_3d_images):
+    """Verify syntx.greedy(..., regularizer='navier') converges cleanly with 0% folding."""
+    fi, mi = sample_3d_images
+    initial_corr = float(np.corrcoef(fi.numpy().flatten(), mi.numpy().flatten())[0, 1])
+
+    res = syntx.greedy(
+        fixed=fi,
+        moving=mi,
+        regularizer='navier',
+        poisson_ratio=0.35,
+        s=2.0,
+        reg_iterations=[20, 15],
+        scales=[2, 1],
+        initial_transform=False,
+        device="cpu",
+        verbose=False,
+    )
+
+    assert res['provenance']['optimizer'] == 'cfl'
+    assert res['model'].sobolev_alpha is None
+    warped = res['warpedmovout']
+    final_corr = float(np.corrcoef(fi.numpy().flatten(), warped.numpy().flatten())[0, 1])
+    assert final_corr > initial_corr + 0.05, (
+        f"Expected strong navier convergence, got initial={initial_corr:.4f}, final={final_corr:.4f}"
+    )
+    from syntx.deformation_metrics import compute_jacobian_metrics
+    jac = compute_jacobian_metrics(fi, res['fwdtransforms'][0])
+    assert jac['folding_pct'] == 0.0
+
+
+def test_greedy_cfl_momentum_anisotropic_noncubic():
+    """Verify optimizer='cfl' with cfl_momentum converges on non-cubic anisotropic 3D grids."""
+    shape = (24, 20, 14)
+    z, y, x = np.ogrid[:shape[2], :shape[1], :shape[0]]
+    fi_np = (((x - 12) ** 2 + (y - 10) ** 2 + ((z - 7) * 2.0) ** 2) <= 6.0 ** 2).T.astype(np.float32)
+    mi_np = (((x - 10) ** 2 + (y - 12) ** 2 + ((z - 6.5) * 2.0) ** 2) <= 6.0 ** 2).T.astype(np.float32)
+    fi = ants.from_numpy(fi_np, spacing=(1.0, 1.0, 2.0), origin=(0.0, 0.0, 0.0))
+    mi = ants.from_numpy(mi_np, spacing=(1.0, 1.0, 2.0), origin=(0.0, 0.0, 0.0))
+
+    init_corr = float(np.corrcoef(fi.numpy().flatten(), mi.numpy().flatten())[0, 1])
+    res = syntx.greedy(
+        fixed=fi,
+        moving=mi,
+        optimizer='cfl',
+        cfl_momentum=0.85,
+        regularizer='div_curl',
+        reg_iterations=[15, 10],
+        scales=[2, 1],
+        initial_transform=False,
+        device="cpu",
+        verbose=False,
+    )
+    assert res['provenance']['optimizer'] == 'cfl'
+    assert res['provenance']['cfl_momentum'] == 0.85
+    final_corr = float(np.corrcoef(fi.numpy().flatten(), res['warpedmovout'].numpy().flatten())[0, 1])
+    assert final_corr > init_corr + 0.05
+    from syntx.deformation_metrics import compute_jacobian_metrics
+    jac = compute_jacobian_metrics(fi, res['fwdtransforms'][0])
+    assert jac['folding_pct'] == 0.0
+
+
 
 

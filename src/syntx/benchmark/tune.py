@@ -246,24 +246,26 @@ METHODS: Dict[str, MethodSpec] = {
         defaults=_signature_defaults(
             "syntx.greedy.greedy_registration",
             ["learning_rate", "flow_sigma", "total_sigma", "optimizer", "regadam_sigma",
-             "lncc_radius", "reg_iterations"],
+             "cfl_momentum", "regularizer", "sobolev_alpha", "lncc_radius", "reg_iterations"],
             hidden={"reg_iterations": [100, 100, 20]}),
         space=[
-            Param("learning_rate", lo=0.05, hi=1.0),
+            Param("learning_rate", lo=0.05, hi=1.5),
             Param("flow_sigma", lo=0.5, hi=6.0),
             Param("total_sigma", values=(0.0, 0.14, 0.42, 0.56, 0.8)),
-            Param("optimizer", kind="categorical", values=("adam", "regadam")),
+            Param("optimizer", kind="categorical", values=("adam", "regadam", "cfl")),
             Param("regadam_sigma", lo=0.2, hi=3.0, requires={"optimizer": ("regadam", "reg_adam")}),
+            Param("cfl_momentum", values=(0.0, 0.75, 0.85, 0.92), requires={"optimizer": ("cfl",)}),
             Param("lncc_radius", kind="int", values=(1, 3)),
             Param("regularizer", kind="categorical", values=("gaussian", "solenoidal", "navier", "div_curl", "beltrami", "hyperelastic", "poroelastic")),
-            Param("sobolev_alpha", lo=0.5, hi=4.0, requires={"regularizer": ("solenoidal", "navier", "div_curl", "beltrami", "hyperelastic", "poroelastic")}),
-            Param("poisson_ratio", lo=0.10, hi=0.499, requires={"regularizer": ("navier", "stokes", "elastic")}),
+            Param("sobolev_alpha", values=(0.4, 0.8, 1.2, 1.8, 2.5), requires={"regularizer": ("solenoidal", "navier", "div_curl", "beltrami", "hyperelastic", "poroelastic")}),
+            Param("poisson_ratio", values=(0.15, 0.25, 0.35, 0.45), requires={"regularizer": ("navier", "stokes", "elastic")}),
             Param("beta", values=(1.0, 2.5, 5.0, 10.0, 20.0), requires={"regularizer": ("div_curl", "helmholtz")}),
             Param("gamma", values=(0.5, 1.0, 2.0), requires={"regularizer": ("div_curl", "helmholtz")}),
             Param("bulk_modulus", values=(2.0, 5.0, 10.0, 20.0, 50.0), requires={"regularizer": ("hyperelastic", "simo_pister")}),
             Param("darcy_permeability", values=(0.05, 0.1, 0.2, 0.4), requires={"regularizer": ("poroelastic", "biot")}),
             Param("dilatation_weight", values=(0.1, 0.25, 0.5), requires={"regularizer": ("beltrami", "quasiconformal")}),
             Param("h3_envelope", kind="categorical", values=(True, False), requires={"regularizer": ("div_curl", "hyperelastic")}),
+            Param("s", kind="categorical", values=(1.0, 2.0), requires={"regularizer": ("navier", "stokes", "elastic", "beltrami", "hyperelastic")}),
             # fixed by default (DEFAULT_FIXED_PARAMETERS); searched only if unfixed
             Param("reg_iterations", kind="list", values=([100, 100, 50], [100, 50, 10], [200, 100, 20])),
         ],
@@ -273,16 +275,18 @@ METHODS: Dict[str, MethodSpec] = {
         name="syngs", model="syngs", function="syntx.syngs",
         defaults=_signature_defaults(
             "syntx.syngs.syngs_registration",
-            ["alpha", "max_step_norm", "optimizer", "optimizer_lr", "n_steps", "bootstrap_mode"],
+            ["grad_step", "alpha", "max_step_norm", "optimizer", "optimizer_lr", "n_steps", "bootstrap_mode"],
             hidden={"regularizer": "sobolev", "reg_iterations": [100, 100, 20],
                     # the effective 3-D default (SYNGS_DEFAULT_ALPHA[3]): benchmarks are 3-D
                     "alpha": lambda: __import__("importlib").import_module("syntx.syngs").default_alpha(3)}),
         space=[
-            Param("max_step_norm", lo=0.05, hi=1.2),
+            Param("optimizer", kind="categorical", values=("reg_adam", "cfl")),
+            Param("grad_step", lo=0.05, hi=1.5, requires={"optimizer": ("cfl",)}),
+            Param("max_step_norm", lo=0.05, hi=1.2, requires={"optimizer": ("reg_adam", "regadam")}),
             Param("alpha", lo=0.02, hi=3.0, requires={"regularizer": ("sobolev", "dsti", "dsti1", "solenoidal", "navier", "div_curl", "beltrami", "hyperelastic", "poroelastic")}),
             # flow_sigma is not searched: syngs accepts it only with regularizer='gaussian' (the
             # spectral regularisers searched here use alpha); fast_smooth does not exist.
-            Param("optimizer_lr", lo=0.2, hi=3.5),
+            Param("optimizer_lr", lo=0.2, hi=3.5, requires={"optimizer": ("reg_adam", "regadam")}),
             Param("n_steps", kind="int", values=(6, 8, 10, 12)),
             Param("regularizer", kind="categorical", values=("sobolev", "dsti1", "solenoidal", "navier", "div_curl", "beltrami", "hyperelastic")),
             Param("poisson_ratio", lo=0.10, hi=0.499, requires={"regularizer": ("navier", "stokes", "elastic")}),
@@ -376,13 +380,18 @@ _CANONICAL = {
         config_block="greedy_config", run_config_block="greedy_config",
         config_keys={"grad_step": "learning_rate", "flow_sigma": "flow_sigma",
                      "total_sigma": "total_sigma", "optimizer": "optimizer",
-                     "regadam_sigma": "regadam_sigma", "similarity_metric": "similarity_metric",
+                     "regadam_sigma": "regadam_sigma", "cfl_momentum": "cfl_momentum",
+                     "regularizer": "regularizer", "sobolev_alpha": "sobolev_alpha",
+                     "similarity_metric": "similarity_metric",
                      "lncc_radius": "lncc_radius", "reg_iterations": "reg_iterations"},
         resolved={"learning_rate": ("attr", "learning_rate", None),
                   "flow_sigma": ("attr", "flow_sigma", None),
                   "total_sigma": ("attr", "total_sigma", None),
                   "optimizer": ("attr", "optimizer", None),
                   "regadam_sigma": ("attr", "regadam_sigma", None),
+                  "cfl_momentum": ("attr", "cfl_momentum", None),
+                  "regularizer": ("attr", "regularizer", None),
+                  "sobolev_alpha": ("attr", "sobolev_alpha", None),
                   "lncc_radius": ("attr", "lncc_radius", None),
                   "similarity_metric": ("attr", "similarity_metric", None)},
         probe_kwargs={"initial_transform": False},
@@ -1330,7 +1339,7 @@ class Tuner:
                     cands = [p._clip(cur * f) for f in (0.8, 1.25)]
                     cands = [v for v in cands if v != cur]
                 elif neighbours_only:
-                    cands = []
+                    cands = [] if p.name in tried else p.candidates(cur)
                 else:
                     cands = p.candidates(cur)
                 for v in cands:

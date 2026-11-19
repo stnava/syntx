@@ -1,12 +1,27 @@
 # Tracking Summary
-current phase: v6.42.0 (`syntx.greedy` autotuned `learning_rate = 0.5625` winner `+0.70 pp` 3-pair Dice, `mbhard` `1.73x–2.57x` speedup vs. `antstorch.greedy`, and strict physical-space `(spacing, origin, direction)` + $O(d)$ continuum regularizer enforcement)
-next WP: per-run synthetic calibration of slice-set clock thresholds
+current phase: v6.43.0 (Centralized `FieldStepOptimizer` + `build_level_regularizer` continuum refactor across `greedy`/`syn`/`tvf`/`syngs`, autotuned `syntx.greedy` `div_curl + cfl` default at `0.6041` 3-pair Dice `+1.95 pp`, and concerted multi-solver autotuning + disjoint held-out benchmark orchestrator)
+next WP: execute concerted `syn`/`tvf`/`syngs` continuum autotuning + subject-disjoint `[28, 55, 84]` held-out & external benchmark campaign when GPU is free (`scripts/concerted_tune_and_benchmark.py`)
 blockers: none
-active work: none (`v6.42.0` released; `2,683 passed, 398 skipped, 0 failed`, `0` `antsxqc.lint` findings)
+active work: none (`v6.43.0` released; `0` `antsxqc.lint` findings, concerted pipeline `--smoke` verified on CPU)
 device: Apple Silicon MPS / CPU (macOS arm64)
 last updated: 2026-11-19
 
 ---
+
+## R47 (Centralized `FieldStepOptimizer` & Continuum Regularizer Plumbing, Autotuned `syntx.greedy` `div_curl + cfl` Default `0.6041`, and Concerted Tune + Disjoint Held-Out Benchmark Suite; v6.43.0, 2026-11-19)
+- **Centralized Continuum Regularizer & Field-Step Optimizer Architecture (`src/syntx/core/{regularizers,optimizers,__init__}.py`, `src/syntx/{greedy,syn,tvf,syngs}.py`, `tests/test_field_step_guard.py`)**:
+  - **Root Causes Eliminated Centrally**:
+    1. Removed `sobolev_alpha = 0.035` signature/fallback leakage outside `RegAdam`'s legacy `'sobolev'`/`'dsti'` branch so continuum regularizers (`navier`, `div_curl`, `hyperelastic`, `solenoidal`, `poroelastic`, `beltrami`) derive their physical $\alpha$ cleanly from `flow_sigma` when `sobolev_alpha=None`.
+    2. Added `REGULARIZER_EXTRA_KEYS`, `COUPLED_CONTINUUM_REGULARIZERS`, `SPECTRAL_REGULARIZERS`, and `build_level_regularizer` in `src/syntx/core/regularizers.py`, handling `param_domain in ('normalized_grid', 'physical_mm')` physical chain-rule force scaling (`min(ext_xyz) / ext_xyz`) and voxel conversion (`1 / spacing_xyz`) in one canonical place across `greedy`, `syn`, `tvf`, and `syngs`.
+    3. Added stateful, allocation-free, zero-host-sync `FieldStepOptimizer` (`mode in ('cfl', 'adam', 'reg_adam')`) and `validate_regularizer_optimizer_pair` in `src/syntx/core/optimizers.py`: auto-selects `'cfl'` when `optimizer=None` for `SPECTRAL_REGULARIZERS` (`'adam'` for `'gaussian'`/`'none'`) and raises `ValueError` if an explicit componentwise optimizer (`'adam'`, `'adamw'`, `'rmsprop'`, `'rprop'`) is paired with a `COUPLED_CONTINUUM_REGULARIZERS` PDE operator.
+    4. Removed $H^4$ pre- and post-Adam double-smoothing in `SyNTo.fit` (`syn.py`) and `GreedyRegistrationModel.fit` (`greedy.py`) so `reg_adam` smooths the Adam quotient once, and replaced `RegAdam`'s `min(spacing)` step-bound shortcut with exact per-axis anisotropic voxel norms (`_scaled_sq_sum`) plus `origin`/`direction`/`extra_reg_kwargs` forwarding.
+  - Added static + behavioral guard suite `tests/test_field_step_guard.py` enforcing zero local `_*_EXTRA_REG_KEYS`/`_*_CONTINUUM*` sets, zero `sobolev_alpha=0.035` defaults, zero inline `exp_avg_sq` loops in `greedy.py`, and zero `min(spacing)` shortcuts in `core/optimizers.py`.
+- **Autotuned `syntx.greedy` Continuum Winner (`src/syntx/{greedy,provenance}.py`, `src/syntx/benchmark/{config,evaluate,tune}.py`, `docs/provenance/{best_parameters,canonical,run_config}.json`, `docs/provenance/tuning/greedy_2026-11-19.md`)**:
+  - Executed 3-pair Mindboggle-101 `[77, 44, 0]` autotune (`reg_iterations = [100, 100, 20]`, `noise = 0.00000` across rep 0 / rep 1): confirmed 2-rep feasible winner **`{'regularizer': 'div_curl', 'optimizer': 'cfl', 'learning_rate': 1.5, 'cfl_momentum': 0.1875, 'flow_sigma': 1.62}`** (**`+0.0235` gain over screening baseline**).
+  - **3-Pair Mean DKT31 NN Dice (`[77, 44, 0]`)**: **`0.6041`** (`Pair 77: 0.5859`, `Pair 44 mbhard: 0.5948`, `Pair 0: 0.6315`; **`0.0000%` folding** and `minJ > 0` on all 3 pairs) — **`+1.95 pp` over `v6.42.0` `syntx.greedy` (`0.5846`)** and **`+1.47 pp` over `FireANTs` `[100, 100, 50]` (`0.5894`)**.
+- **Concerted Multi-Solver Autotuning & Subject-Disjoint Benchmark Orchestrator (`scripts/concerted_tune_and_benchmark.py`, `src/syntx/benchmark/tune.py`, `docs/CONCERTED_TUNE_AND_BENCHMARK_PLAN.md`)**:
+  - Added `scripts/concerted_tune_and_benchmark.py` and `docs/CONCERTED_TUNE_AND_BENCHMARK_PLAN.md` coupling Stage 1 (`syn`, `tvf`, `syngs` continuum tuning on `[77, 44, 0]` + expanded `syngs` `cfl`/`grad_step` search space) with Stage 2A (`[28, 55, 84]` 100% subject-disjoint Mindboggle held-out promotion gate vs. `v6.43.0` defaults and `ANTs C++`), Stage 2B (6-pair multi-paradigm `syntx` + `ANTs` + `FireANTs` + `VoxelMorph` benchmark), and optional Stage 2C (10-task `N = 50` MSD gate), verified end-to-end on CPU via `--smoke` (`exit 0`) and `--dry-run` without touching MPS.
+- **Gates**: `python3 -m antsxqc.lint src/syntx` (`0 finding(s)`, no `.antsxqc-allow`), CPU-only `scripts/concerted_tune_and_benchmark.py --smoke` (`exit 0`), targeted guard/canonical/greedy/tune suites on CPU, and full fast suite (`2,697 passed, 8 skipped, 0 failed`).
 
 ## R46 (`syntx.greedy` Autotuned Default `learning_rate = 0.5625`, `mbhard` Benchmark vs. `antstorch.greedy` & Strict Physical-Space Geometry Enforcement; v6.42.0, 2026-11-19)
 - **Autotuned `syntx.greedy` Winner (`src/syntx/greedy.py`, `src/syntx/benchmark/config.py`, `docs/provenance/{best_parameters,canonical,run_config}.json`, `docs/provenance/tuning/greedy_2026-11-19.md`)**:

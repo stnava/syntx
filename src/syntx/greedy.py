@@ -216,11 +216,19 @@ class GreedyRegistrationModel(nn.Module):
         Gaussian sigma (voxels) smoothing the similarity gradient.
     total_sigma : float, default 0.28
         Gaussian sigma (voxels) smoothing the whole field after each update (0 = off).
-    optimizer : {'adam', 'regadam' / 'reg_adam'}, default 'adam'
-        'regadam' additionally smooths the Adam step (``regadam_sigma``, Gaussian voxels).
+    optimizer : {'adam', 'regadam', 'reg_adam', 'cfl'}, optional
+        If None, defaults to 'adam' for Gaussian/identity regularizers and 'cfl' for
+        continuum/spectral regularizers. 'regadam' additionally smooths the Adam step
+        (``regadam_sigma``, Gaussian voxels). 'cfl' uses global scalar velocity-norm CFL
+        step normalization with single-buffer momentum (``cfl_momentum``), preserving exact
+        continuum PDE coupling across vector components and anisotropic grids.
     regadam_sigma : float, default 0.8
-    sobolev_alpha : float, default 0.035
-        Sobolev strength used for the RegAdam step when ``regadam_sigma`` is 0.
+    sobolev_alpha : float, optional
+        Sobolev / continuum operator strength. When None (default), continuum regularizers
+        derive their natural alpha from ``flow_sigma``; the legacy ``regadam`` fallback when
+        ``regadam_sigma == 0`` uses a small default Sobolev width.
+    cfl_momentum : float, default 0.85
+        Momentum decay factor for ``optimizer='cfl'`` (0 disables momentum).
     lncc_radius : int, default 2
     similarity_metric : str, default 'cc2'
         'cc2' / 'lncc' / 'cc' / 'ncc': local correlation (``squared=True``: squared, as
@@ -239,10 +247,11 @@ class GreedyRegistrationModel(nn.Module):
         learning_rate: float = 0.5625,
         flow_sigma: float = 1.8,
         total_sigma: float = 0.28,
-        optimizer: str = 'adam',
+        optimizer: Optional[str] = None,
         regularizer: str = 'gaussian',
         regadam_sigma: float = 0.8,
-        sobolev_alpha: float = 0.035,
+        sobolev_alpha: Optional[float] = None,
+        cfl_momentum: float = 0.85,
         lncc_radius: int = 2,
         similarity_metric: str = 'cc2',
         squared: bool = True,
@@ -287,14 +296,22 @@ class GreedyRegistrationModel(nn.Module):
             self.restrict_transformation = tuple(rt)
         else:
             self.restrict_transformation = None
+        from .core.optimizers import validate_regularizer_optimizer_pair
         self.learning_rate = learning_rate
         self.flow_sigma = flow_sigma
         self.total_sigma = total_sigma
-        self.optimizer = optimizer.lower()
         self.regularizer = regularizer.lower()
+        self.optimizer = validate_regularizer_optimizer_pair(
+            self.regularizer, optimizer, caller="GreedyRegistrationModel"
+        )
+        if self.optimizer not in ('adam', 'regadam', 'reg_adam', 'cfl'):
+            raise ValueError(
+                f"Unknown greedy optimizer {optimizer!r}; expected 'adam', 'regadam', or 'cfl'"
+            )
         self.extra_reg_kwargs = extra_reg_kwargs or {}
         self.regadam_sigma = regadam_sigma
-        self.sobolev_alpha = sobolev_alpha
+        self.sobolev_alpha = None if sobolev_alpha is None else float(sobolev_alpha)
+        self.cfl_momentum = float(cfl_momentum)
         self.lncc_radius = lncc_radius
         self.window_size = 2 * lncc_radius + 1
 
@@ -430,8 +447,18 @@ class GreedyRegistrationModel(nn.Module):
                 warp = warp * restr_init
         else:
             warp = torch.zeros((1, *init_size, dim), dtype=torch.float32, device=self.device)
-        exp_avg = torch.zeros_like(warp)
-        exp_avg_sq = torch.zeros_like(warp)
+        from .core.optimizers import FieldStepOptimizer
+        from .core.regularizers import build_level_regularizer
+        step_opt = FieldStepOptimizer(
+            mode=self.optimizer,
+            param_domain='normalized_grid',
+            beta1=self.beta1,
+            beta2=self.beta2,
+            eps=self.eps,
+            cfl_momentum=self.cfl_momentum,
+            sobolev_alpha=self.sobolev_alpha,
+        )
+        step_opt.init_state(warp)
 
         self.loss_history = []
         self.stop.records.clear()
@@ -446,11 +473,10 @@ class GreedyRegistrationModel(nn.Module):
             mi_down = moving_lv[level_idx].tensor
             mask_down = mask_lv[level_idx].tensor if mask_lv is not None else None
 
-            # Interpolate warp and Adam moments to current scale via centralized resize_field
+            # Interpolate warp and optimizer state to current scale via centralized resize_field
             if list(warp.shape[1:-1]) != size_down:
-                warp      = resize_field(warp,      size_down, mode=mode)
-                exp_avg   = resize_field(exp_avg,   size_down, mode=mode)
-                exp_avg_sq = resize_field(exp_avg_sq, size_down, mode=mode)
+                warp = resize_field(warp, size_down, mode=mode)
+                step_opt.on_level_change(size_down, interp_mode=mode)
 
             grid_shape = [1, 1, *size_down]
             id_grid = F.affine_grid(torch.eye(dim, dim + 1, device=self.device)[None], grid_shape, align_corners=True)
@@ -463,8 +489,6 @@ class GreedyRegistrationModel(nn.Module):
                     atol=1e-7,
                 )
             )
-            half_resolution = 1.0 / (max(size_down) - 1)
-            step = 0  # Reset Adam warm-up step at each scale level
             restr_mask = (
                 torch.tensor(self.restrict_transformation, device=self.device, dtype=warp.dtype).view(1, *([1] * dim), dim)
                 if self.restrict_transformation is not None
@@ -497,22 +521,65 @@ class GreedyRegistrationModel(nn.Module):
             warp_gaussians = [gaussian_1d_compact(self.total_sigma, truncated=2.0, device=self.device) for _ in range(dim)] if self.total_sigma > 0 else None
 
             if self.regularizer not in ('gaussian', 'gauss', 'none', 'identity'):
-                from .core.regularizers import get_regularizer
-                grad_reg_fn = get_regularizer(
+                grad_reg_fn = build_level_regularizer(
                     self.regularizer,
                     alpha=self.sobolev_alpha,
                     sobolev_alpha=self.sobolev_alpha,
                     spacing=fixed_lv[level_idx].spacing,
                     origin=fixed_lv[level_idx].origin,
                     direction=fixed_lv[level_idx].direction,
-                    vector_frame="voxel",
                     fluid_sigma=self.flow_sigma,
+                    param_domain="normalized_grid",
+                    grid_shape=size_down,
                     mask=mask_down,
                     fixed_mask=mask_down,
-                    **self.extra_reg_kwargs,
+                    extra_reg_kwargs=self.extra_reg_kwargs,
+                    input_role="gradient",
+                    output_units="voxel",
+                )
+                post_reg_fn = (
+                    build_level_regularizer(
+                        self.regularizer,
+                        alpha=self.sobolev_alpha,
+                        sobolev_alpha=self.sobolev_alpha,
+                        spacing=fixed_lv[level_idx].spacing,
+                        origin=fixed_lv[level_idx].origin,
+                        direction=fixed_lv[level_idx].direction,
+                        fluid_sigma=self.flow_sigma,
+                        param_domain="normalized_grid",
+                        grid_shape=size_down,
+                        mask=mask_down,
+                        fixed_mask=mask_down,
+                        extra_reg_kwargs=self.extra_reg_kwargs,
+                        input_role="velocity",
+                        output_units="voxel",
+                    )
+                    if self.optimizer in ('regadam', 'reg_adam')
+                    else None
                 )
             else:
                 grad_reg_fn = None
+                post_reg_fn = None
+
+            grad_smooth_fn = (
+                (lambda f, _g=grad_gaussians: smooth_field(f, _g))
+                if (self.flow_sigma > 0 and grad_gaussians is not None)
+                else None
+            )
+            reg_smooth_fn = (
+                (lambda f, _g=reg_gaussians: smooth_field(f, _g))
+                if reg_gaussians is not None
+                else None
+            )
+
+            def _sobolev_fallback_fn(raw_u, ra_alpha, _sp=fixed_lv[level_idx].spacing):
+                from .core.smoothing import apply_sobolev_green_operator
+                return apply_sobolev_green_operator(
+                    raw_u.squeeze(0),
+                    fluid_sigma=ra_alpha,
+                    alpha=ra_alpha,
+                    spacing=_sp,
+                ).unsqueeze(0)
 
             _stop_pending: List[Tuple[int, torch.Tensor]] = []
             for it in range(n_iters):
@@ -558,48 +625,18 @@ class GreedyRegistrationModel(nn.Module):
                 del loss, moved, sample_grid, warp_param
 
                 with torch.no_grad():
-                    if grad_reg_fn is not None:
-                        grad = grad_reg_fn(grad.flip(-1)).flip(-1)
-                    elif self.flow_sigma > 0 and grad_gaussians is not None:
-                        grad = smooth_field(grad, grad_gaussians)
-
-                    step += 1
-                    exp_avg.mul_(self.beta1).add_(grad, alpha=1.0 - self.beta1)
-                    exp_avg_sq.mul_(self.beta2).addcmul_(grad, grad, value=1.0 - self.beta2)
+                    update = step_opt.step(
+                        grad,
+                        self.learning_rate,
+                        grid_shape=size_down,
+                        spacing=fixed_lv[level_idx].spacing,
+                        reg_fn=grad_reg_fn,
+                        post_reg_fn=post_reg_fn,
+                        grad_smooth_fn=grad_smooth_fn,
+                        reg_smooth_fn=reg_smooth_fn,
+                        sobolev_fallback_fn=_sobolev_fallback_fn,
+                    )
                     del grad
-
-                    b1_corr = 1.0 - self.beta1 ** step
-                    b2_corr = 1.0 - self.beta2 ** step
-                    b2_sqrt = math.sqrt(b2_corr)
-                    step_size = b2_sqrt / b1_corr
-                    eps_scaled = self.eps * b2_sqrt
-                    raw_update = (exp_avg * step_size).div_(exp_avg_sq.sqrt().add_(eps_scaled))
-
-                    # Apply RegAdam quotient smoothing if elected
-                    if self.optimizer in ('regadam', 'reg_adam'):
-                        if grad_reg_fn is not None:
-                            u_reg = grad_reg_fn(raw_update.flip(-1)).flip(-1)
-                        elif reg_gaussians is not None:
-                            u_reg = smooth_field(raw_update, reg_gaussians)
-                        elif self.sobolev_alpha > 0:
-                            from .core.smoothing import apply_sobolev_green_operator
-                            u_reg = apply_sobolev_green_operator(
-                                raw_update.squeeze(0),
-                                fluid_sigma=self.sobolev_alpha,
-                                alpha=self.sobolev_alpha,
-                                spacing=fixed_lv[level_idx].spacing,
-                            ).unsqueeze(0)
-                        else:
-                            u_reg = raw_update
-                    else:
-                        u_reg = raw_update
-                    del raw_update
-
-                    # Bound max velocity step
-                    gradmax = self.eps + u_reg.norm(p=2, dim=-1, keepdim=True).flatten(1).max(1).values
-                    gradmax = gradmax.reshape(-1, *([1]) * (dim + 1)).clamp(min=1.0)
-                    update = -self.learning_rate * half_resolution * (u_reg / gradmax)
-                    del u_reg, gradmax
                     if restr_mask is not None:
                         update = update * restr_mask
 
@@ -684,10 +721,10 @@ def greedy_registration(
     reg_iterations: Optional[Union[List[int], Tuple[int, ...]]] = None,
     iterations: Optional[Union[List[int], Tuple[int, ...]]] = None,
     scales: Optional[Union[List[int], Tuple[int, ...]]] = None,
-    learning_rate: float = 0.5625,
-    flow_sigma: float = 1.8,
+    learning_rate: float = 1.5,
+    flow_sigma: float = 1.62,
     total_sigma: float = 0.28,
-    optimizer: str = 'adam',
+    optimizer: Optional[str] = 'cfl',
     regadam_sigma: float = 0.8,
     similarity_metric: str = 'cc2',
     lncc_radius: int = 2,
@@ -707,6 +744,9 @@ def greedy_registration(
     levels: Optional[Union[List[int], Tuple[int, ...]]] = None,
     initial_warp: Optional[Union[torch.Tensor, ants.ANTsImage, str, os.PathLike]] = None,
     initial_inverse_warp: Optional[Union[torch.Tensor, ants.ANTsImage, str, os.PathLike]] = None,
+    cfl_momentum: float = 0.1875,
+    regularizer: str = 'div_curl',
+    sobolev_alpha: Optional[float] = None,
     **kwargs: Any
 ) -> Dict[str, Any]:
     """
@@ -718,8 +758,9 @@ def greedy_registration(
         reg = syntx.greedy(fixed, moving)
         reg['warpedmovout'], reg['fwdtransforms']        # [warp, affine] standard ANTs list
 
-    Defaults were tuned on Mindboggle pairs 77 / 44 / 0 (learning_rate 0.375 -> 0.5625,
-    docs/provenance/best_parameters.json "syntx.greedy/canonical_2026_11_19").
+    Defaults were tuned on Mindboggle pairs 77 / 44 / 0 (`div_curl` + `cfl` with
+    ``learning_rate=1.5``, ``flow_sigma=1.62``, ``cfl_momentum=0.1875``,
+    docs/provenance/best_parameters.json and docs/provenance/canonical.json).
 
     Parameters
     ----------
@@ -730,17 +771,28 @@ def greedy_registration(
         Both names are accepted interchangeably.
     scales : int or list of int, default None
         Shrink factor per level. None: [2**(L-1), ..., 1] for L = len(reg_iterations).
-    learning_rate : float, default 0.5625
+    learning_rate : float, default 1.5
         Step size (``grad_step=`` is an alias); see ``GreedyRegistrationModel``.
-    flow_sigma : float, default 1.8
+    flow_sigma : float, default 1.62
         Gaussian sigma in voxels for smoothing the gradient (not the ITK variance convention
-        of ``syntx.syn``).
+        of ``syntx.syn``), and natural scale for continuum regularizers when ``sobolev_alpha`` is None.
     total_sigma : float, default 0.28
         Gaussian sigma in voxels for smoothing the whole field after each update.
-    optimizer : {'adam', 'regadam', 'reg_adam'}, default 'adam'
-        (``optimizer_type=`` is an alias.)
+    optimizer : {'adam', 'regadam', 'reg_adam', 'cfl'}, default 'cfl'
+        If None, defaults to 'adam' for Gaussian/identity regularizers and 'cfl' for
+        continuum/spectral regularizers. (``optimizer_type=`` is an alias.)
     regadam_sigma : float, default 0.8
         RegAdam step smoothing (voxels).
+    cfl_momentum : float, default 0.1875
+        Momentum decay factor for ``optimizer='cfl'`` (0 disables momentum).
+    regularizer : str, default 'div_curl'
+        Velocity/gradient regularizer ('gaussian' or any continuum operator from
+        ``syntx.core.regularizers.list_regularizers()``, e.g. 'navier', 'hyperelastic',
+        'div_curl', 'beltrami', 'solenoidal', 'poroelastic', 'sobolev', 'dsti').
+    sobolev_alpha : float, optional
+        Sobolev / continuum operator strength. When None (default), continuum regularizers
+        derive their natural alpha from ``flow_sigma``; the legacy ``regadam`` fallback when
+        ``regadam_sigma == 0`` uses a small default Sobolev width.
     similarity_metric : str, default 'cc2'
         'cc2' / 'lncc' / 'cc' / 'ncc' = local correlation; 'mse' / 'l2' = mean squared error;
         other values raise ValueError.
@@ -773,9 +825,10 @@ def greedy_registration(
         Write the transforms with this file prefix (default: temporary files).
     seed : int, default 42
     **kwargs
-        ``sobolev_alpha`` (0.035), ``padding_mode`` ('border'), ``squared`` (True),
-        ``interpolator`` ('linear', for the warped output), ``regularizer`` (only 'gaussian';
-        anything else raises ValueError, as does a ``dsti_alpha``), and the aliases
+        ``padding_mode`` ('border'), ``squared`` (True), ``interpolator`` ('linear', for
+        the warped output), ``dsti_alpha`` (for DST-I regularizers), continuum parameters
+        (``poisson_ratio``, ``beta``, ``gamma``, ``bulk_modulus``, ``darcy_permeability``,
+        ``dilatation_weight``, ``h3_envelope``, ``s``), and the aliases
         ``grad_step`` / ``optimizer_type`` / ``project_inverse`` / ``anderson_projection``. Any
         other keyword raises TypeError (they were silently ignored).
 
@@ -877,26 +930,25 @@ def greedy_registration(
         learning_rate = float(kwargs.pop('grad_step'))
     if 'optimizer_type' in kwargs:
         optimizer = str(kwargs.pop('optimizer_type'))
-    if 'optimizer' in kwargs:
-        optimizer = str(kwargs.pop('optimizer'))
     regadam_sigma = float(kwargs.pop('regadam_sigma', regadam_sigma))
-    sobolev_alpha = float(kwargs.pop('sobolev_alpha', 0.035))
+    cfl_momentum = float(kwargs.pop('cfl_momentum', cfl_momentum))
+    if 'sobolev_alpha' in kwargs:
+        sobolev_alpha = kwargs.pop('sobolev_alpha')
+    sobolev_alpha = None if sobolev_alpha is None else float(sobolev_alpha)
     padding_mode = str(kwargs.pop('padding_mode', 'border'))
 
-    _GREEDY_EXTRA_REG_KEYS = frozenset({
-        'beta', 'gamma', 'poisson_ratio', 'darcy_permeability', 'bulk_modulus',
-        'num_iters', 'dilatation_weight', 'mask', 'alpha', 'h3_envelope', 's',
-    })
-    extra_reg_kwargs = {k: kwargs.pop(k) for k in list(kwargs.keys()) if k in _GREEDY_EXTRA_REG_KEYS}
+    from .core.optimizers import validate_regularizer_optimizer_pair
+    from .core.regularizers import REGULARIZER_EXTRA_KEYS, list_regularizers
+    extra_reg_kwargs = {k: kwargs.pop(k) for k in list(kwargs.keys()) if k in REGULARIZER_EXTRA_KEYS}
     if 'alpha' in extra_reg_kwargs:
-        sobolev_alpha = float(extra_reg_kwargs['alpha'])
+        sobolev_alpha = float(extra_reg_kwargs.pop('alpha'))
 
     # --- Parameter relevance validation ---
-    reg_mode = str(kwargs.pop('regularizer', 'gaussian')).lower()
-    from .core.regularizers import list_regularizers
+    reg_mode = str(kwargs.pop('regularizer', regularizer)).lower()
     _VALID_GREEDY_REGS = set(list_regularizers()) | {'gaussian', 'gauss', 'sobolev'}
     if reg_mode not in _VALID_GREEDY_REGS:
         raise ValueError(f"syntx.greedy: unknown regularizer {reg_mode!r}; expected one of {sorted(_VALID_GREEDY_REGS)}")
+    optimizer = validate_regularizer_optimizer_pair(reg_mode, optimizer, caller="syntx.greedy")
     _dsti_alpha_val = kwargs.pop('dsti_alpha', None)
     if _dsti_alpha_val is not None:
         if reg_mode not in ('dsti', 'dsti1', 'dst_i', 'dst1'):
@@ -948,6 +1000,7 @@ def greedy_registration(
         extra_reg_kwargs=extra_reg_kwargs,
         regadam_sigma=regadam_sigma,
         sobolev_alpha=sobolev_alpha,
+        cfl_momentum=cfl_momentum,
         lncc_radius=lncc_radius,
         similarity_metric=similarity_metric,
         squared=squared,
@@ -1156,6 +1209,9 @@ def greedy_registration(
         'algorithm': 'syntx.greedy',
         'formulation': 'eulerian_compositive',
         'optimizer': optimizer,
+        'regularizer': reg_mode,
+        'sobolev_alpha': sobolev_alpha,
+        'cfl_momentum': cfl_momentum if optimizer == 'cfl' else None,
         'regadam_sigma': regadam_sigma if optimizer in ('regadam', 'reg_adam') else None,
         'reg_iterations': reg_iterations,
         'scales': scales,

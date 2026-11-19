@@ -55,7 +55,18 @@ from .core.smoothing import (
     apply_dsti1_green_operator,
     get_boundary_mask,
 )
-from .core.optimizers import LARS, RegAdam, SobolevAdam
+from .core.optimizers import (
+    LARS,
+    RegAdam,
+    SobolevAdam,
+    validate_regularizer_optimizer_pair,
+)
+from .core.regularizers import (
+    COUPLED_CONTINUUM_REGULARIZERS,
+    REGULARIZER_EXTRA_KEYS,
+    SPECTRAL_REGULARIZERS,
+    build_level_regularizer,
+)
 from .core.grid import compose_grids, sample_field_cf, resize_field
 from .core.utils import check_loss_collapse, require_finite_images
 
@@ -121,22 +132,6 @@ class TVFConjugateGradient(torch.optim.Optimizer):
                 p.data.add_(d_k, alpha=lr)
 
 
-_TVF_CONTINUUM = (
-    'solenoidal', 'leray', 'incompressible', 'solenoidal_sobolev',
-    'div_curl', 'helmholtz',
-    'navier', 'stokes', 'elastic',
-    'masked_incompressible',
-    'hyperelastic', 'simo_pister', 'log_jacobian',
-    'beltrami', 'quasiconformal', 'conformal',
-    'poroelastic', 'darcy_stokes', 'biot',
-)
-
-_TVF_EXTRA_REG_KEYS = frozenset({
-    'beta', 'gamma', 'poisson_ratio', 'darcy_permeability', 'bulk_modulus',
-    'num_iters', 'dilatation_weight', 'mask', 'fixed_mask',
-    's', 'h3_envelope', 'envelope_power',
-})
-
 # keyword options TVFModel.fit / TVFModel() read from **kwargs (others raise TypeError)
 _TVF_FIT_KWARGS = frozenset({
     'adam_eps_rel', 'adjoint', 'alpha', 'amp', 'bootstrap_jitter_scale', 'bootstrap_mode',
@@ -148,7 +143,7 @@ _TVF_FIT_KWARGS = frozenset({
     'optimizer_type', 'regularizer', 'smooth_every_n', 'smooth_pyramid', 'smoothing_sigmas',
     'solver', 'spline_distance', 'spline_order', 'temporal_weight', 'total_alpha', 'trust',
     'trust_coefficient', 'use_analytical_gradients',
-}) | _TVF_EXTRA_REG_KEYS
+}) | REGULARIZER_EXTRA_KEYS
 _TVF_INIT_KWARGS = frozenset({'adjoint', 'mattes_bins', 'num_bins', 'similarity_metric', 'solver', 'use_analytical_gradients'})
 
 
@@ -1370,7 +1365,8 @@ class TVFModel(nn.Module):
         # "Fluid" smoothing is applied exactly once per step: inside RegAdam (after the Adam
         # normalisation) for optimizer='reg_adam', otherwise to the raw gradient.
         reg_mode = str(kwargs.get('regularizer', 'sobolev')).lower()
-        spectral = reg_mode in ('sobolev', 'dsti', 'dsti1') or reg_mode in _TVF_CONTINUUM
+        opt_type = validate_regularizer_optimizer_pair(reg_mode, opt_type, caller="TVFModel.fit")
+        spectral = reg_mode in SPECTRAL_REGULARIZERS
         fluid_alpha = (float(kwargs['alpha']) if kwargs.get('alpha') is not None
                        else (default_tvf_alpha(self.dim) if spectral else 0.0))
         total_alpha = float(kwargs.get('total_alpha') or 0.0)
@@ -1473,15 +1469,15 @@ class TVFModel(nn.Module):
                     ra_alpha, ra_sigma = 0.0, float(self.fluid_sigma or 0.0)
                 max_step_norm = float(kwargs['max_step_norm'])
                 ra_cont_fn = None
-                if ra_reg in _TVF_CONTINUUM:
-                    from .core.regularizers import get_regularizer
-                    ra_cont_fn = get_regularizer(
+                if ra_reg in COUPLED_CONTINUUM_REGULARIZERS:
+                    ra_cont_fn = build_level_regularizer(
                         ra_reg,
                         alpha=ra_alpha,
                         spacing=vel_spacing,
                         origin=self.origin,
                         direction=self.direction,
-                        **{k: kwargs[k] for k in _TVF_EXTRA_REG_KEYS if k in kwargs},
+                        param_domain="physical_mm",
+                        extra_reg_kwargs={k: kwargs[k] for k in REGULARIZER_EXTRA_KEYS if k in kwargs and k != 'alpha'},
                     )
                 optimizer = RegAdam(
                     [self.velocity],
@@ -1492,6 +1488,8 @@ class TVFModel(nn.Module):
                     gaussian_sigma=ra_sigma,
                     max_step_norm=max_step_norm,
                     spacing=vel_spacing,
+                    origin=self.origin,
+                    direction=self.direction,
                     **({"eps_rel": float(kwargs["adam_eps_rel"])} if kwargs.get("adam_eps_rel") is not None else {})
                 )
             else:
@@ -1768,21 +1766,21 @@ class TVFModel(nn.Module):
                                 order=kwargs.get('spline_order', 3),
                                 coord_convention='xyz',
                             )
-                        elif regularizer_mode in _TVF_CONTINUUM:
-                            from .core.regularizers import get_regularizer
+                        elif regularizer_mode in COUPLED_CONTINUUM_REGULARIZERS:
                             g_process.mul_(self._bmask_pre_cache)
-                            _extra_tvf = {k: kwargs[k] for k in _TVF_EXTRA_REG_KEYS if k in kwargs}
+                            _extra_tvf = {k: kwargs[k] for k in REGULARIZER_EXTRA_KEYS if k in kwargs and k != 'alpha'}
                             _dir_key = tuple(float(x) for x in np.asarray(self.direction).ravel().tolist())
                             _reg_key = (regularizer_mode, float(fluid_alpha) if fluid_alpha is not None else None, tuple(float(x) for x in adj_spacing), _dir_key, float(sigma_val or 3.0))
                             if getattr(self, '_tvf_reg_cache_key', None) != _reg_key or not _extra_tvf == getattr(self, '_tvf_reg_extra', None):
-                                self._tvf_reg_fn = get_regularizer(
+                                self._tvf_reg_fn = build_level_regularizer(
                                     regularizer_mode,
                                     alpha=fluid_alpha,
                                     spacing=adj_spacing,
                                     origin=self.origin,
                                     direction=self.direction,
                                     fluid_sigma=sigma_val or 3.0,
-                                    **_extra_tvf,
+                                    param_domain="physical_mm",
+                                    extra_reg_kwargs=_extra_tvf,
                                 )
                                 self._tvf_reg_cache_key = _reg_key
                                 self._tvf_reg_extra = _extra_tvf
@@ -1878,8 +1876,7 @@ class TVFModel(nn.Module):
                                 sl_last[d + 1] = -1
                                 vel_tapered[tuple(sl_last)] = 0.0
                             vel_smoothed = self._apply_sobolev_green_operator(vel_tapered, fluid_sigma=1.0, alpha=total_alpha, spacing=vel_spacing)
-                        elif regularizer_mode in _TVF_CONTINUUM:
-                            from .core.regularizers import get_regularizer
+                        elif regularizer_mode in COUPLED_CONTINUUM_REGULARIZERS:
                             vel_tapered = vel_batch.clone()
                             for d in range(self.dim):
                                 sl_first = [slice(None)] * (self.dim + 2)
@@ -1888,14 +1885,15 @@ class TVFModel(nn.Module):
                                 sl_last = [slice(None)] * (self.dim + 2)
                                 sl_last[d + 1] = -1
                                 vel_tapered[tuple(sl_last)] = 0.0
-                            reg_total_fn = get_regularizer(
+                            reg_total_fn = build_level_regularizer(
                                 regularizer_mode,
                                 alpha=total_alpha,
                                 spacing=vel_spacing,
                                 origin=self.origin,
                                 direction=self.direction,
                                 fluid_sigma=elastic_sigma_val or 3.0,
-                                **{k: kwargs[k] for k in _TVF_EXTRA_REG_KEYS if k in kwargs},
+                                param_domain="physical_mm",
+                                extra_reg_kwargs={k: kwargs[k] for k in REGULARIZER_EXTRA_KEYS if k in kwargs and k != 'alpha'},
                             )
                             vel_smoothed = reg_total_fn(vel_tapered)
                         elif regularizer_mode in ['bspline', 'bsplinesyn']:
@@ -2044,7 +2042,7 @@ class TVFModel(nn.Module):
 TVF_DEFAULT_ALPHA = {2: 2.0, 3: 2.5}
 TVF_DEFAULT_CFL = {"grad_step": 1.25, "cfl_momentum": 0.9}
 
-_TVF_SPECTRAL = ('sobolev', 'dsti', 'dsti1') + _TVF_CONTINUUM
+_TVF_SPECTRAL = tuple(sorted(SPECTRAL_REGULARIZERS))
 _TVF_SIGMA = ('gaussian', 'bspline')
 _TVF_OPTIMIZERS = ('reg_adam', 'adam', 'adamw', 'sgd', 'rmsprop', 'lars', 'cg', 'cfl')
 
@@ -2330,9 +2328,9 @@ def tvf_registration(
         raise ValueError(f"unknown regularizer {regularizer!r}; expected one of {_TVF_SPECTRAL + _TVF_SIGMA}")
 
     # ---- optimiser: family-specific parameters ------------------------------------------------
-    optimizer = str(optimizer).lower()
-    if optimizer not in _TVF_OPTIMIZERS:
+    if optimizer is not None and str(optimizer).lower() not in _TVF_OPTIMIZERS:
         raise ValueError(f"unknown optimizer {optimizer!r}; expected one of {_TVF_OPTIMIZERS}")
+    optimizer = validate_regularizer_optimizer_pair(regularizer, optimizer, caller="syntx.tvf")
     if optimizer == 'cfl':
         for name, val in (('optimizer_lr', optimizer_lr), ('max_step_norm', max_step_norm)):
             if val is not None:

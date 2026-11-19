@@ -93,6 +93,7 @@ from .core.optimizers import (
     LARS,
     get_cfl_max_norm,
     compute_cfl_step,
+    validate_regularizer_optimizer_pair,
 )
 from .core.pipeline import (
     auto_detect_device,
@@ -103,17 +104,13 @@ from .core.utils import (
     normalize_tensor,
 )
 from .core.utils import check_loss_collapse, require_finite_images
-from .core.regularizers import get_regularizer
-
-_CONTINUUM_REGS = frozenset({
-    'solenoidal', 'leray', 'incompressible', 'solenoidal_sobolev',
-    'div_curl', 'helmholtz',
-    'navier', 'stokes', 'elastic',
-    'masked_incompressible',
-    'hyperelastic', 'simo_pister', 'log_jacobian',
-    'beltrami', 'quasiconformal', 'conformal',
-    'poroelastic', 'darcy_stokes', 'biot',
-})
+from .core.regularizers import (
+    COUPLED_CONTINUUM_REGULARIZERS,
+    REGULARIZER_EXTRA_KEYS,
+    SPECTRAL_REGULARIZERS,
+    build_level_regularizer,
+    get_regularizer,
+)
 
 
 def _backward_similarity_terms_per_term(
@@ -688,9 +685,14 @@ class SyNTo(nn.Module):
         verbose = kwargs.get('verbose', False)
         self.stop = stop = LossSlopeStop(slope_threshold=kwargs.get('convergence_slope', DEFAULT_SLOPE_THRESHOLD))   # shared deformable stop rule
         optimizer_type = kwargs.get('optimizer_type', 'cfl')
-        if optimizer_type not in SYN_OPTIMIZERS_PYTORCH:
+        if optimizer_type is not None and str(optimizer_type).lower() not in SYN_OPTIMIZERS_PYTORCH:
             raise ValueError(f"unknown optimizer {optimizer_type!r} for the PyTorch SyN; use one of "
                              f"{sorted(SYN_OPTIMIZERS_PYTORCH)}")
+        optimizer_type = validate_regularizer_optimizer_pair(
+            kwargs.get('regularizer', kwargs.get('kernel_type', 'sobolev')),
+            optimizer_type,
+            caller="SyNTo.fit",
+        )
         optimizer_lr = resolve_optimizer_lr(optimizer_type, kwargs.get('optimizer_lr'))
         from .core.regularizers import resolve_required_image_geometry
         fixed_spacing = kwargs.get('fixed_spacing', None)
@@ -1787,20 +1789,27 @@ class SyNTo(nn.Module):
                     
                 kernel_type = kwargs.get('kernel_type', getattr(self, 'kernel_type', 'bessel'))
                 regularizer = kwargs.get('regularizer', kwargs.get('kernel_type', 'gaussian'))
+                is_regadam_opt = optimizer_type in (
+                    'reg_adam', 'regadam', 'sobolev_adam', 'gaussian_adam', 'dsti_adam'
+                )
                 with torch.no_grad():
                     raw_alpha = kwargs.get('sobolev_alpha')
                     if raw_alpha is None:
                         raw_alpha = kwargs.get('alpha')
-                    if raw_alpha is None:
-                        raw_alpha = curr_fluid_sig / 2.0
-                    alpha_sobolev = float(raw_alpha)
+                    alpha_sobolev = float(raw_alpha) if raw_alpha is not None else float(curr_fluid_sig / 2.0)
 
                     _fs_raw = kwargs.get('fast_smooth', False)
                     fast_smooth = bool(_fs_raw) if _fs_raw is not None else False
 
                     warp_l2r.grad.mul_(b_mask)
                     warp_r2l.grad.mul_(b_mask)
-                    if regularizer in ('compact', 'compact_gaussian', 'erf') or kernel_type in ('compact', 'compact_gaussian', 'erf'):
+                    if is_regadam_opt:
+                        # RegAdam smooths its Adam quotient ONCE after moment division (avoid H^4 double-filtering)
+                        grad_l = warp_l2r.grad
+                        warp_l2r.grad = None
+                        grad_r = warp_r2l.grad
+                        warp_r2l.grad = None
+                    elif regularizer in ('compact', 'compact_gaussian', 'erf') or kernel_type in ('compact', 'compact_gaussian', 'erf'):
                         # Compact erf-based Gaussian kernel: always uses compact spatial erf filter (bypassing FFT spectral smoothing)
                         grad_l = separable_gaussian_filter(warp_l2r.grad, curr_fluid_sig, kernel_type='compact')
                         warp_l2r.grad = None
@@ -1862,7 +1871,7 @@ class SyNTo(nn.Module):
                             **kwargs,
                         )
                         warp_r2l.grad = None
-                    elif regularizer in _CONTINUUM_REGS:
+                    elif regularizer in COUPLED_CONTINUUM_REGULARIZERS:
                         f_mask = kwargs.get('fixed_mask', kwargs.get('mask', None))
                         if f_mask is not None and not isinstance(f_mask, torch.Tensor):
                             if hasattr(f_mask, 'numpy'):
@@ -1870,20 +1879,21 @@ class SyNTo(nn.Module):
                             else:
                                 f_mask = torch.as_tensor(f_mask, dtype=dtype, device=device)
                         _dir_key_syn = tuple(float(x) for x in np.asarray(fixed_direction).ravel().tolist())
-                        _reg_key_syn = (regularizer, float(alpha_sobolev), tuple(float(x) for x in curr_spacing_fixed), _dir_key_syn, float(curr_fluid_sig), id(f_mask))
+                        _reg_key_syn = (regularizer, None if raw_alpha is None else float(raw_alpha), tuple(float(x) for x in curr_spacing_fixed), _dir_key_syn, float(curr_fluid_sig), id(f_mask))
                         if getattr(self, '_syn_reg_cache_key', None) != _reg_key_syn:
-                            extra_kwargs = {k: v for k, v in kwargs.items() if k not in ('fixed_mask', 'mask', 'regularizer', 'alpha', 'sobolev_alpha', 'spacing', 'fluid_sigma', 'origin', 'direction')}
-                            self._syn_reg_fn = get_regularizer(
+                            extra_kwargs = {k: kwargs[k] for k in REGULARIZER_EXTRA_KEYS if k in kwargs and k not in ('fixed_mask', 'mask', 'alpha')}
+                            self._syn_reg_fn = build_level_regularizer(
                                 regularizer,
-                                alpha=alpha_sobolev,
-                                sobolev_alpha=alpha_sobolev,
+                                alpha=raw_alpha,
+                                sobolev_alpha=raw_alpha,
                                 spacing=curr_spacing_fixed,
                                 origin=fixed_origin,
                                 direction=fixed_direction,
                                 fluid_sigma=curr_fluid_sig,
+                                param_domain="physical_mm",
                                 fixed_mask=f_mask,
                                 mask=f_mask,
-                                **extra_kwargs,
+                                extra_reg_kwargs=extra_kwargs,
                             )
                             self._syn_reg_cache_key = _reg_key_syn
                         grad_l = self._syn_reg_fn(warp_l2r.grad)
@@ -2150,28 +2160,33 @@ class SyNTo(nn.Module):
                                     fluid_sigma=curr_fluid_sig,
                                     **kwargs,
                                 )
-                            elif regularizer in _CONTINUUM_REGS:
+                            elif regularizer in COUPLED_CONTINUUM_REGULARIZERS:
                                 f_mask = kwargs.get('fixed_mask', kwargs.get('mask', None))
                                 if f_mask is not None and not isinstance(f_mask, torch.Tensor):
                                     if hasattr(f_mask, 'numpy'):
                                         f_mask = torch.from_numpy(f_mask.numpy().astype(np.float32)).to(device)
                                     else:
                                         f_mask = torch.as_tensor(f_mask, dtype=dtype, device=device)
-                                extra_kwargs = {k: v for k, v in kwargs.items() if k not in ('fixed_mask', 'mask', 'regularizer', 'alpha', 'sobolev_alpha', 'spacing', 'fluid_sigma', 'origin', 'direction')}
-                                reg_fn = get_regularizer(
-                                    regularizer,
-                                    alpha=alpha_sobolev,
-                                    sobolev_alpha=alpha_sobolev,
-                                    spacing=curr_spacing_fixed,
-                                    origin=fixed_origin,
-                                    direction=fixed_direction,
-                                    fluid_sigma=curr_fluid_sig,
-                                    fixed_mask=f_mask,
-                                    mask=f_mask,
-                                    **extra_kwargs,
-                                )
-                                u_reg_l = reg_fn(u_raw_l)
-                                u_reg_r = reg_fn(u_raw_r)
+                                _dir_key_syn = tuple(float(x) for x in np.asarray(fixed_direction).ravel().tolist())
+                                _reg_key_syn = (regularizer, None if raw_alpha is None else float(raw_alpha), tuple(float(x) for x in curr_spacing_fixed), _dir_key_syn, float(curr_fluid_sig), id(f_mask))
+                                if getattr(self, '_syn_reg_cache_key', None) != _reg_key_syn:
+                                    extra_kwargs = {k: kwargs[k] for k in REGULARIZER_EXTRA_KEYS if k in kwargs and k not in ('fixed_mask', 'mask', 'alpha')}
+                                    self._syn_reg_fn = build_level_regularizer(
+                                        regularizer,
+                                        alpha=raw_alpha,
+                                        sobolev_alpha=raw_alpha,
+                                        spacing=curr_spacing_fixed,
+                                        origin=fixed_origin,
+                                        direction=fixed_direction,
+                                        fluid_sigma=curr_fluid_sig,
+                                        param_domain="physical_mm",
+                                        fixed_mask=f_mask,
+                                        mask=f_mask,
+                                        extra_reg_kwargs=extra_kwargs,
+                                    )
+                                    self._syn_reg_cache_key = _reg_key_syn
+                                u_reg_l = self._syn_reg_fn(u_raw_l)
+                                u_reg_r = self._syn_reg_fn(u_raw_r)
                             else:
                                 g_sig = kwargs.get('gaussian_sigma', 1.5)
                                 u_reg_l = separable_gaussian_filter(u_raw_l, g_sig)
@@ -3607,10 +3622,11 @@ def registration(
 
     # --- Parameter relevance validation ---
     reg_mode = str(kwargs.get('regularizer', kwargs.get('kernel_type', 'sobolev'))).lower()
+    optimizer = validate_regularizer_optimizer_pair(reg_mode, optimizer, caller="syntx.syn")
     if kwargs.get('alpha') is not None:  # legacy alias of sobolev_alpha
         sobolev_alpha = kwargs.pop('alpha')
     kwargs.pop('alpha', None)
-    _SPECTRAL_REGS = {'sobolev', 'dsti', 'dsti1'} | _CONTINUUM_REGS
+    _SPECTRAL_REGS = SPECTRAL_REGULARIZERS
     if reg_mode in _SPECTRAL_REGS and sobolev_alpha is not None:
         kwargs['sobolev_alpha'] = sobolev_alpha  # None -> fit()'s legacy sqrt(flow_sigma)/2
     # RegAdam / Adam family default 0.5 (was a 1e-3 sentinel meaning grad_step, i.e. a max
