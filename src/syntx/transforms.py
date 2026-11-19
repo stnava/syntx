@@ -462,22 +462,39 @@ def _write_ants_images_fast(
 
     lvl = max(1, min(9, int(compresslevel)))
 
-    def _compress_one(job: tuple[str, str]) -> None:
+    def _gz_chunk(chunk: bytes) -> bytes:
+        comp = zlib.compressobj(lvl, zlib.DEFLATED, 16 + zlib.MAX_WBITS)
+        return comp.compress(chunk) + comp.flush()
+
+    def _compress_one(job: tuple[str, str], max_chunk_workers: int = 1) -> None:
         src_nii, dst_gz = job
         tmp_gz = f"{dst_gz}.tmp_{os.getpid()}"
         try:
-            comp = zlib.compressobj(lvl, zlib.DEFLATED, 16 + zlib.MAX_WBITS)
-            with open(src_nii, "rb") as fin, open(tmp_gz, "wb") as fout:
-                while True:
-                    chunk = fin.read(8 * 1024 * 1024)
-                    if not chunk:
-                        break
-                    data = comp.compress(chunk)
-                    if data:
-                        fout.write(data)
-                tail = comp.flush()
-                if tail:
-                    fout.write(tail)
+            file_sz = os.path.getsize(src_nii)
+            if max_chunk_workers > 1 and file_sz >= 8 * 1024 * 1024:
+                n_chunks = min(max_chunk_workers, max(1, file_sz // (4 * 1024 * 1024)))
+                chunk_sz = (file_sz + n_chunks - 1) // n_chunks
+                with open(src_nii, "rb") as fin:
+                    raw_chunks = [fin.read(chunk_sz) for _ in range(n_chunks)]
+                raw_chunks = [c for c in raw_chunks if c]
+                with ThreadPoolExecutor(max_workers=len(raw_chunks)) as ex:
+                    parts = list(ex.map(_gz_chunk, raw_chunks))
+                with open(tmp_gz, "wb") as fout:
+                    for part in parts:
+                        fout.write(part)
+            else:
+                comp = zlib.compressobj(lvl, zlib.DEFLATED, 16 + zlib.MAX_WBITS)
+                with open(src_nii, "rb") as fin, open(tmp_gz, "wb") as fout:
+                    while True:
+                        chunk = fin.read(8 * 1024 * 1024)
+                        if not chunk:
+                            break
+                        data = comp.compress(chunk)
+                        if data:
+                            fout.write(data)
+                    tail = comp.flush()
+                    if tail:
+                        fout.write(tail)
             os.replace(tmp_gz, dst_gz)
         finally:
             for stale in (src_nii, tmp_gz):
@@ -487,11 +504,13 @@ def _write_ants_images_fast(
                     except OSError:
                         pass
 
+    n_cpus = min(os.cpu_count() or 4, 8)
     if len(gz_jobs) == 1:
-        _compress_one(gz_jobs[0])
+        _compress_one(gz_jobs[0], max_chunk_workers=n_cpus)
     else:
+        per_job_workers = max(1, n_cpus // len(gz_jobs))
         with ThreadPoolExecutor(max_workers=min(len(gz_jobs), 4)) as ex:
-            list(ex.map(_compress_one, gz_jobs))
+            list(ex.map(lambda j: _compress_one(j, max_chunk_workers=per_job_workers), gz_jobs))
 
 
 def _cache_disp_image_and_field(path: str, disp_img: Any, device: Any | None = None) -> None:

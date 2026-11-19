@@ -275,6 +275,8 @@ _ENTRY_POINTS = [
     ("syntx", "auto_reg"), ("ants", "registration"),
     ("syntx.benchmark.external", "run_voxelmorph_pretrained"),
     ("syntx.benchmark.external", "run_voxelmorph_multiscale"),
+    ("syntx.benchmark.external", "run_voxelmorph_hybrid_greedy"),
+    ("syntx.benchmark.external", "run_voxelmorph_hybrid_syn"),
     ("syntx.benchmark.external", "run_fireants_greedy"),
 ]
 # (module, class) whose fit() receives the fully resolved parameters.
@@ -613,8 +615,8 @@ def resolved_parameters(manifest: Dict[str, Any], function_prefix: str = "syntx.
     return {}
 
 
-# fit() keywords that carry per-image data rather than parameters (initial affine / grid)
-_IMAGE_DEPENDENT_FIT_KEYS = ("initial_grid", "theta")
+# fit() keywords that carry per-image data rather than parameters (initial affine / grid / warp)
+_IMAGE_DEPENDENT_FIT_KEYS = ("initial_grid", "initial_warp", "initial_inverse_warp", "theta")
 
 
 def cohort_provenance(manifests: List[Dict[str, Any]]) -> Dict[str, Any]:
@@ -679,7 +681,7 @@ def cohort_provenance(manifests: List[Dict[str, Any]]) -> Dict[str, Any]:
                and not (isinstance(v, str) and v.startswith(("<tensor", "<ndarray", "{'ANTsImage'")))
                and not (isinstance(v, dict) and "ANTsImage" in v)}
         exp = {k: v for k, v in p.get("explicit", {}).items()
-               if k not in ("fixed", "moving", "initial_transform")}
+               if k not in ("fixed", "moving", "initial_transform", "initial_warp", "initial_inverse_warp")}
         return {"function": p.get("function"), "explicit": exp, "fit_kwargs": fit,
                 "model_attributes": attrs}
 

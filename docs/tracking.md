@@ -1,12 +1,30 @@
 # Tracking Summary
-current phase: v6.40.0 (VoxelMorph + repaired FireANTs standard benchmark integration, unidirectional comparison report, and ANTsTorch PR #96–#99 + `syntx.greedy` speed/memory/MPS optimization pass)
+current phase: v6.41.0 (Universal cross-solver `initial_warp` / `[warp, affine]` support across `greedy`, `syn`, `tvf`, `syngs`, `auto_reg` + PyTorch/JAX, `5.29x` multi-member parallel `.nii.gz` export, and 3-pair Mindboggle `VoxelMorph` hybrid warm-start evaluation)
 next WP: per-run synthetic calibration of slice-set clock thresholds
 blockers: none
-active work: none (`v6.40.0` released; `antsxdata v0.11.0` synced; `2,629 passed, 398 skipped, 0 failed`, `0` `antsxqc.lint` findings)
+active work: none (`v6.41.0` released; `2,641 passed, 398 skipped, 0 failed`, `0` `antsxqc.lint` findings)
 device: Apple Silicon MPS / CPU (macOS arm64)
 last updated: 2026-11-18
 
 ---
+
+## R45 (Universal Cross-Solver `initial_warp` / `[warp, affine]` Contract, Multi-Member Parallel `.nii.gz` Export & 3-Pair Hybrid VoxelMorph Warm-Start Study; v6.41.0, 2026-11-18)
+- **Universal `initial_warp` / `initial_inverse_warp` / `initial_transform=[warp, affine]` Architecture (`src/syntx/core/initial_warp.py`, `src/syntx/{greedy,syn,syn_jax,tvf,tvf_jax,syngs,syngs_jax,spatial,provenance}.py`, `tests/test_hybrid_voxelmorph.py`)**:
+  - Added centralized physical-space `resolve_initial_warp_and_affine` and `compose_initial_and_residual_warps` across all 8 deformable solver/backend paths (`greedy-pytorch`, `syn-pytorch`, `syn-jax`, `tvf-pytorch`, `tvf-jax`, `syngs-pytorch`, `syngs-jax`, and `auto_reg`), accepting normalized `[-1, 1]` tensors, ITK LPS vector `ANTsImage`s, `.nii.gz` warp files, or `initial_transform=[warp, affine, ...]` and exporting strictly as single-interpolation `[1Warp.nii.gz, 0GenericAffine.mat]` / `[0GenericAffine.mat, 1InverseWarp.nii.gz]` (`whichtoinvert_inv=[True, False]`) with uniform `has_initial_warp` / `initial_warp_kind` provenance.
+  - Fixed a cross-orientation bug in `SyN.fit` and `SyNJAX.fit` where `M_phys, t_phys` previously re-applied `moving` metadata on top of `self.initial_grid` (`cc2 = 0.0` on `RPI -> LAI`; now active from epoch 0, `0.4737 -> 0.5571` NN on Pair 44).
+- **Multi-Member RFC-1952 Parallel `.nii.gz` Export & `enforce_digital_diffeomorphism_nd` Fast-Path (`src/syntx/transforms.py`, `src/syntx/core/digital_diffeomorphism.py`)**:
+  - Parallelized `_write_ants_images_fast` across up to 8 `ThreadPoolExecutor` workers for payloads `>= 8 MB` via concatenated RFC-1952 gzip members (`3.51 s -> 0.66 s`, **`5.29x` faster** on `192x256x256x3`, bitwise-identical `ants.image_read`), plus a lazy `det_f0 >= jac_floor` pre-check in `enforce_digital_diffeomorphism_nd`: cold `syntx.greedy [100, 100, 20]` end-to-end runtime dropped to **`4.41 s` 3-pair mean (`2.17 s` opt; `3.71 s` E2E on Pair 0, `5.47 s` on Pair 44)**.
+- **Hybrid `VoxelMorph -> Greedy / SyN` Adapters & 3-Pair Mindboggle-101 (`[44, 77, 0]`) Evaluation (`src/syntx/benchmark/{external,evaluate}.py`, `benchmarks/fast_syn_ants_benchmark.py`, `scripts/benchmark_hybrid_voxelmorph.py`, `docs/{HYBRID_VOXELMORPH_WARMSTART_REPORT,EXTERNAL_BENCHMARK_BASELINES}.md`, `docs/provenance/hybrid_voxelmorph_benchmark.json`)**:
+  - Added `run_voxelmorph_hybrid_greedy` and `run_voxelmorph_hybrid_syn` (cached `antsxdata` weights, GPU `_Conv1x1AffineGrid` alignment, `vel_smooth_sigma=1.5` SVF de-spiking, and `< 1 ms` GPU voxel-to-normalized conversion).
+  - **3-Pair Mean Results (Isolated Apple MPS, `NN` / `GL` DKT Dice, `opt_s` / `E2E_s`, Folding)**:
+    - `voxelmorph_pretrained`: `0.4874 / 0.4967` (`0.34 s / 2.04 s`, `0.0470%` fold, `minJ = -8.55`, `antsxqc = fail` 3/3)
+    - `voxelmorph_polished` (`30` L1 SVF): `0.5375 / 0.5490` (`6.43 s / 8.06 s`, `0.0000%` fold)
+    - `voxelmorph_hybrid_greedy_turbo` (`[2, 1] (25, 10)`): `0.5461 / 0.5583` (`1.74 s / 4.36 s`, `0.0000%` fold, `minJ >= +0.0534`)
+    - `voxelmorph_hybrid_greedy` (`[2, 1] (35, 15)`): `0.5543 / 0.5670` (`2.34 s / 5.08 s`, `0.0000%` fold, **`+6.69 pp` NN over zero-shot VoxelMorph** and **`+1.68 pp` NN at `2.75x` faster opt than `voxelmorph_polished`**; `0.5922 / 0.6048` on intra-site Pair 0)
+    - `syntx_greedy_default` (`[4, 2, 1] (100, 100, 20)` cold): **`0.5767 / 0.5901`** (`2.17 s / 4.41 s`, `0.0000%` fold — falsifying `[2, 1]` warm-start superiority on cross-site `RPI -> LAI` / `PIR -> LAI` pairs where omitting `L4` locks `5^3` LNCC into `VxmPairwise`'s domain-shifted basins)
+    - `syntx_greedy_matched` (`[4, 2, 1] (100, 100, 50)` cold): `0.5865 / 0.6005` (`6.52 s / 8.76 s`, **`2.98x` faster E2E than `fireants_greedy`** at `26.12 s`)
+    - `voxelmorph_hybrid_syn` (`[2, 1] (30, 15)`): `0.5674 / 0.5814` (`SymNN = 0.5632`, `ICE = 0.016 mm`, `0.0000%` fold, `33.03 s`) vs. cold `syntx_syn_beltrami` **`0.6217 / 0.6387`** (`SymNN = 0.6216`, `ICE = 0.012 mm`, `0.0000%` fold, `39.60 s`).
+- **Gates**: `python3 -m antsxqc.lint src/syntx` (`0 finding(s)`, no `.antsxqc-allow`), `benchmarks/fast_syn_ants_benchmark.py --smoke --include-external` (`exit 0`), and full `pytest tests/ -q` suite (`2,641 passed, 398 skipped, 0 failed`).
 
 ## R44 (VoxelMorph & FireANTs Benchmark Adapters, Unidirectional Comparison Report, and ANTsTorch PR #96–#99 + `syntx.greedy` Optimizations; v6.40.0, 2026-11-18)
 - **ANTsTorch PR #96–#99 & `syntx.greedy` Speed, Peak-VRAM & MPS Safety Pass (`src/syntx/{syn,tvf,syngs,greedy,features}.py`, `src/syntx/core/{smoothing,losses/cross_correlation,losses/registry}.py`, `src/syntx/landmarks/blob.py`, `scripts/benchmark_pr96_98_port.py`, `docs/{PR96_99_AND_GREEDY_BENCHMARK.md,provenance/pr96_98_port_benchmark.json}`, `tests/test_pr96_98_port.py`)**:

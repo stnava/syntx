@@ -145,6 +145,9 @@ ARM_LABELS: Dict[str, str] = {
     "voxelmorph_pretrained": "VoxelMorph 0.3.3 pretrained (zero-shot, PIR canonical)",
     "voxelmorph_polished": "VoxelMorph 0.3.3 pretrained + 30-step SVF polish",
     "voxelmorph_svf": "VoxelMorph 0.3.3 [4, 2, 1] multi-scale SVF (5^3 LNCC)",
+    "voxelmorph_hybrid_greedy_turbo": "VoxelMorph SVF warm-start -> syntx.greedy [2, 1] (25, 10)",
+    "voxelmorph_hybrid_greedy": "VoxelMorph SVF warm-start -> syntx.greedy [2, 1] (35, 15)",
+    "voxelmorph_hybrid_syn": "VoxelMorph SVF warm-start -> symmetric syntx.syn [2, 1] (30, 15) beltrami",
     "syntx_e2e_syn": "syntx.syn ('SyN' end-to-end: robust_affine + sobolev)",
     "ants_e2e_syn": "ants.registration ('SyN' end-to-end: Affine + SyN)",
 }
@@ -155,6 +158,9 @@ EXTERNAL_ARM_CHOICES: Tuple[str, ...] = (
     "voxelmorph_pretrained",
     "voxelmorph_polished",
     "voxelmorph_svf",
+    "voxelmorph_hybrid_greedy_turbo",
+    "voxelmorph_hybrid_greedy",
+    "voxelmorph_hybrid_syn",
 )
 
 DKT31_NAMES: Dict[int, str] = {
@@ -629,6 +635,37 @@ def _execute_single_registration(
                 scales=scales,
                 reg_iterations=reg_iters_list,
                 return_inverse=False,
+                device=device,
+                seed=pairs_seed,
+            )
+            return res, device
+        if arm in ("voxelmorph_hybrid_greedy_turbo", "voxelmorph_hybrid_greedy"):
+            from syntx.benchmark.external import run_voxelmorph_hybrid_greedy
+
+            is_smoke_iters = max(reg_iters_list) <= 5
+            hg_iters = (2, 2) if is_smoke_iters else ((25, 10) if arm == "voxelmorph_hybrid_greedy_turbo" else (35, 15))
+            res = run_voxelmorph_hybrid_greedy(
+                fixed=fi,
+                moving=mi,
+                initial_transform=shared_affine_path,
+                scales=(2, 1),
+                reg_iterations=hg_iters,
+                return_inverse=False,
+                device=device,
+                seed=pairs_seed,
+            )
+            return res, device
+        if arm == "voxelmorph_hybrid_syn":
+            from syntx.benchmark.external import run_voxelmorph_hybrid_syn
+
+            is_smoke_iters = max(reg_iters_list) <= 5
+            hs_iters = (2, 2) if is_smoke_iters else (30, 15)
+            res = run_voxelmorph_hybrid_syn(
+                fixed=fi,
+                moving=mi,
+                initial_transform=shared_affine_path,
+                levels=(2, 1),
+                reg_iterations=hs_iters,
                 device=device,
                 seed=pairs_seed,
             )
@@ -2563,7 +2600,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument(
         "--include-external",
         action="store_true",
-        help="Opt-in: include unidirectional comparison & external baseline arms (syntx_greedy, fireants_greedy, voxelmorph_pretrained, voxelmorph_polished, voxelmorph_svf).",
+        help="Opt-in: include unidirectional comparison & external baseline arms (syntx_greedy, fireants_greedy, voxelmorph_pretrained, voxelmorph_polished, voxelmorph_svf, voxelmorph_hybrid_greedy_turbo, voxelmorph_hybrid_greedy, voxelmorph_hybrid_syn).",
     )
     p.add_argument(
         "--external-arms",

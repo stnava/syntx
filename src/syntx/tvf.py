@@ -143,7 +143,7 @@ _TVF_FIT_KWARGS = frozenset({
     'bootstrap_orig_weight', 'cfl_momentum', 'cfl_step', 'constant_speed',
     'constant_speed_relaxation', 'convergence_threshold', 'convergence_window',
     'elastic_mesh_size', 'elastic_spline_distance', 'energy_weight', 'enforce_stationary_boundary',
-    'fast_smooth', 'grad_step', 'mattes_bins', 'max_step_norm', 'max_velocity_downsample',
+    'fast_smooth', 'grad_step', 'initial_grid', 'mattes_bins', 'max_step_norm', 'max_velocity_downsample',
     'mesh_size', 'multipoint_loss', 'multipoint_schedule', 'num_bins', 'optimizer',
     'optimizer_type', 'regularizer', 'smooth_every_n', 'smooth_pyramid', 'smoothing_sigmas',
     'solver', 'spline_distance', 'spline_order', 'temporal_weight', 'total_alpha', 'trust',
@@ -1012,9 +1012,16 @@ class TVFModel(nn.Module):
         phi_f_id_norm = physical_to_normalized_fast(phys_grid, *norm_f)
         fixed_id_w = grid_sample_nd(fixed_image, phi_f_id_norm, mode='bilinear', padding_mode='zeros')
 
-        phys_m_pre = phys_grid @ M_phys_zyx.t() + t_phys_zyx
-        phi_m_pre_norm = physical_to_normalized_fast(phys_m_pre, *norm_m)
-        prealigned_moving = grid_sample_nd(moving_image, phi_m_pre_norm, mode='bilinear', padding_mode='zeros')
+        ig_attr = getattr(self, 'initial_grid', None)
+        ig_lvl = None
+        if ig_attr is not None:
+            ig_dev = ig_attr.to(device=device, dtype=dtype)
+            ig_lvl = ig_dev if tuple(ig_dev.shape[1:-1]) == target_shape else resize_field(ig_dev, list(target_shape))
+            prealigned_moving = grid_sample_nd(moving_image, ig_lvl, mode='bilinear', padding_mode='zeros')
+        else:
+            phys_m_pre = phys_grid @ M_phys_zyx.t() + t_phys_zyx
+            phi_m_pre_norm = physical_to_normalized_fast(phys_m_pre, *norm_m)
+            prealigned_moving = grid_sample_nd(moving_image, phi_m_pre_norm, mode='bilinear', padding_mode='zeros')
 
         spacing_tensor = torch.tensor(curr_spacing, device=device, dtype=dtype).view(*([1] * (self.dim + 1) + [self.dim]))
 
@@ -1029,6 +1036,7 @@ class TVFModel(nn.Module):
             'fixed_id_w': fixed_id_w,
             'prealigned_moving': prealigned_moving,
             'spacing_tensor': spacing_tensor,
+            'initial_grid_level': ig_lvl,
         }
 
     def forward(
@@ -1094,6 +1102,7 @@ class TVFModel(nn.Module):
             fixed_id_w = _level_ctx['fixed_id_w']
             prealigned_moving = _level_ctx['prealigned_moving']
             spacing_tensor_cached = _level_ctx['spacing_tensor']
+            ig_lvl = _level_ctx.get('initial_grid_level', None)
         else:
             curr_spacing = [
                 sp * (float(orig_s - 1) / float(curr_s - 1)) if curr_s > 1 else sp
@@ -1149,6 +1158,12 @@ class TVFModel(nn.Module):
             fixed_id_w = None
             prealigned_moving = None
             spacing_tensor_cached = None
+            ig_attr = getattr(self, 'initial_grid', None)
+            if ig_attr is not None:
+                ig_dev = ig_attr.to(device=device, dtype=dtype)
+                ig_lvl = ig_dev if tuple(ig_dev.shape[1:-1]) == target_shape else resize_field(ig_dev, list(target_shape))
+            else:
+                ig_lvl = None
 
         norm_f_pair = (M_f_norm, b_f_norm)
         compute_id_loss = (0.0 in eval_points) and (1.0 in eval_points)
@@ -1202,11 +1217,14 @@ class TVFModel(nn.Module):
 
             # Base coordinates (integrated ODE trajectory)
             phys_fixed_base = phys_grid if is_t0 else (phys_grid + phi_tk_to_fixed)
-            phys_moving_base = (
-                (phys_grid @ M_phys_zyx.t() + t_phys_zyx)
-                if is_t1
-                else ((phys_grid + phi_tk_to_moving) @ M_phys_zyx.t() + t_phys_zyx)
-            )
+            if ig_lvl is not None:
+                phys_moving_base = phys_grid if is_t1 else (phys_grid + phi_tk_to_moving)
+            else:
+                phys_moving_base = (
+                    (phys_grid @ M_phys_zyx.t() + t_phys_zyx)
+                    if is_t1
+                    else ((phys_grid + phi_tk_to_moving) @ M_phys_zyx.t() + t_phys_zyx)
+                )
 
             def _sample_sim_loss(phys_f, phys_m, use_cached_f=False, use_cached_m=False):
                 if use_cached_f and fixed_id_w is not None:
@@ -1217,6 +1235,10 @@ class TVFModel(nn.Module):
 
                 if use_cached_m and prealigned_moving is not None:
                     moving_w = prealigned_moving
+                elif ig_lvl is not None:
+                    phi_m_fixed_norm = physical_to_normalized_fast(phys_m, M_f_norm, b_f_norm)
+                    phi_m_norm = compose_grids(ig_lvl, phi_m_fixed_norm)
+                    moving_w = grid_sample_nd(moving_image, phi_m_norm, mode='bilinear', padding_mode='zeros')
                 else:
                     phi_m_norm = physical_to_normalized_fast(phys_m, M_m_norm, b_m_norm)
                     moving_w = grid_sample_nd(moving_image, phi_m_norm, mode='bilinear', padding_mode='zeros')
@@ -1229,7 +1251,7 @@ class TVFModel(nn.Module):
                 for offset in offsets:
                     # Perturb sampling coordinates at lookup boundary to cancel interpolation noise
                     phys_f_offset = phys_fixed_base + offset
-                    phys_m_offset = phys_moving_base + offset @ M_phys_zyx.t()
+                    phys_m_offset = phys_moving_base + (offset if ig_lvl is not None else offset @ M_phys_zyx.t())
                     loss_perturbed = loss_perturbed + boot_weight * _sample_sim_loss(phys_f_offset, phys_m_offset)
                 loss_timepoint = orig_w * loss_base + loss_perturbed
             else:
@@ -1311,6 +1333,8 @@ class TVFModel(nn.Module):
             raise TypeError(f"TVFModel.fit() got unexpected keyword(s) {_unknown}")
         device = fixed_image.device
         dtype = fixed_image.dtype
+        ig_in = kwargs.pop('initial_grid', None)
+        self.initial_grid = ig_in.to(device=device, dtype=dtype) if ig_in is not None else None
         
         self.similarity_metric = similarity_metric
         self.mattes_bins = int(kwargs.get('mattes_bins', kwargs.get('num_bins', getattr(self, 'mattes_bins', 32))))
@@ -1505,7 +1529,7 @@ class TVFModel(nn.Module):
                     multipoint_loss = list(mp_schedule[level_idx])
 
             level_ctx = None
-            if not getattr(self, 'use_analytical_gradients', False):
+            if not getattr(self, 'use_analytical_gradients', False) or getattr(self, 'initial_grid', None) is not None:
                 level_ctx = self._build_level_ctx(curr_fixed, curr_moving)
 
             dev_type = 'cuda' if 'cuda' in str(device) else ('mps' if 'mps' in str(device) else 'cpu')
@@ -1524,7 +1548,7 @@ class TVFModel(nn.Module):
             for epoch in range(epochs):
                 optimizer.zero_grad(set_to_none=True)
                 
-                if getattr(self, 'use_analytical_gradients', False):
+                if getattr(self, 'use_analytical_gradients', False) and getattr(self, 'initial_grid', None) is None:
                     # === Analytical gradient mode ===
                     # Step 1: Forward pass under no_grad to get warped images
                     with torch.no_grad():
@@ -2092,6 +2116,8 @@ def tvf_registration(
     backend='pytorch',
     device=None,
     verbose=False,
+    initial_warp=None,
+    initial_inverse_warp=None,
     **advanced,
 ):
     """
@@ -2321,22 +2347,36 @@ def tvf_registration(
     if len(levels) != len(reg_iterations):
         raise ValueError(f"levels {levels} and reg_iterations {reg_iterations} differ in length")
 
-    # --- Extract native space moving image (Single Interpolation Policy: NO pre-warping) ---
-    init_tx_list = []
-    init_M_phys, init_t_phys = None, None
-    from .syn import parse_ants_affine
-    if initial_transform is False or (
-        isinstance(initial_transform, str) and initial_transform.lower() == "identity"
-    ):
-        init_tx_list = []  # explicit opt-out of initial alignment (matching syntx.syn / syngs)
-    elif initial_transform is not None:
-        init_tx_list = initial_transform if isinstance(initial_transform, list) else [initial_transform]
-        init_M_phys, init_t_phys = parse_ants_affine(init_tx_list, dim)
-    else:
+    # --- Extract native space moving image & optional initial warp (Single Interpolation Policy) ---
+    from .core.initial_warp import (
+        compose_initial_and_residual_warps,
+        resolve_initial_transform_and_warp,
+    )
+
+    raw_init_tx = initial_transform
+    if initial_transform is None and initial_warp is None:
         from .robust_affine import robust_affine
         reg_aff = robust_affine(fixed_primary, moving_primary, dof=affine_dof, mode=affine_mode, seed=affine_seed, verbose=verbose)
-        init_tx_list = reg_aff['fwdtransforms']
-        init_M_phys, init_t_phys = parse_ants_affine(init_tx_list, dim)
+        raw_init_tx = reg_aff['fwdtransforms']
+
+    _init_dev_tvf = device if backend.lower() == 'pytorch' else None
+    resolved_init = resolve_initial_transform_and_warp(
+        fixed_primary,
+        moving_primary,
+        initial_transform=raw_init_tx,
+        initial_warp=initial_warp,
+        initial_inverse_warp=initial_inverse_warp,
+        need_inverse=True,
+        device=_init_dev_tvf,
+    )
+    init_tx_list = resolved_init.aff_tx or []
+    init_M_phys = None
+    init_t_phys = None
+    if not resolved_init.has_initial_warp and (
+        resolved_init.has_linear_affine or (isinstance(raw_init_tx, str) and raw_init_tx.lower() == "identity")
+    ):
+        init_M_phys = torch.from_numpy(resolved_init.M_phys).to(torch.float32)
+        init_t_phys = torch.from_numpy(resolved_init.t_phys).to(torch.float32)
 
     from .core.pipeline import normalize_and_tensorize, auto_detect_device, cleanup_gpu
 
@@ -2427,6 +2467,9 @@ def tvf_registration(
             if verbose:
                 print("[TVF] Initialized affine from initial_transform (T_init absorbed)")
 
+        model.has_initial_warp = resolved_init.has_initial_warp
+        model.initial_warp_kind = resolved_init.initial_warp_kind
+
         # --- Fit ---
         model.fit(
             I_tensor, J_tensor,
@@ -2441,6 +2484,7 @@ def tvf_registration(
             fixed_origin=origin,
             fixed_direction=direction,
             lncc_radius=syn_sampling,
+            initial_grid=resolved_init.initial_grid_zyx.to(device=device, dtype=torch.float32) if resolved_init.has_initial_warp else None,
             **fit_kwargs
         )
 
@@ -2448,14 +2492,30 @@ def tvf_registration(
         with torch.no_grad():
             fwd_disp_gpu = model.get_forward_warp(image_shape=grid_shape_zyx)
             inv_disp_gpu = model.get_inverse_warp(image_shape=grid_shape_zyx)
+            if resolved_init.has_initial_warp:
+                if sum(reg_iterations) > 0:
+                    fwd_disp_gpu, inv_disp_gpu = compose_initial_and_residual_warps(
+                        fwd_disp_gpu,
+                        inv_disp_gpu,
+                        resolved_init.u0_phys,
+                        resolved_init.u0_inv_phys,
+                        spacing,
+                        origin,
+                        direction,
+                        device=device,
+                    )
+                else:
+                    fwd_disp_gpu = resolved_init.u0_phys.to(device=device, dtype=torch.float32)
+                    inv_disp_gpu = resolved_init.u0_inv_phys.to(device=device, dtype=torch.float32)
             from .core.inverse import (
                 calculate_inverse_identity_error,
                 update_inverse_field_nd_hybrid_lm,
             )
             if (
-                sum(reg_iterations) > 0
+                (sum(reg_iterations) > 0 or resolved_init.has_initial_warp)
                 and compose_polish_tol is not None
                 and float(compose_polish_tol) > 0.0
+                and sum(reg_iterations) > 0
             ):
                 _cp_tol = float(compose_polish_tol)
                 inv_disp_gpu = update_inverse_field_nd_hybrid_lm(
@@ -2469,7 +2529,7 @@ def tvf_registration(
                     direction=direction,
                     stationary_boundary=True,
                 )
-            if _dd_on and sum(reg_iterations) > 0:
+            if _dd_on and (sum(reg_iterations) > 0 or resolved_init.has_initial_warp):
                 from .core.digital_diffeomorphism import enforce_digital_diffeomorphism_nd
                 _dd_ice_tol = (
                     float(compose_polish_tol)
@@ -2571,6 +2631,9 @@ def tvf_registration(
             if verbose:
                 print("[TVF-JAX] Initialized affine from initial_transform (T_init absorbed)")
 
+        model.has_initial_warp = resolved_init.has_initial_warp
+        model.initial_warp_kind = resolved_init.initial_warp_kind
+
         # TVFModelJAX smooths with a voxel variance per level (sigma_voxel = sqrt(value)); convert
         # syntx.tvf's mm sigmas on each level's velocity grid (spacing x level), as PyTorch does.
         sp_min = float(min(spacing))
@@ -2590,6 +2653,7 @@ def tvf_registration(
             fixed_origin=origin,
             fixed_direction=direction,
             lncc_radius=syn_sampling,
+            initial_grid=resolved_init.initial_grid_zyx.detach().cpu().numpy() if resolved_init.has_initial_warp else None,
             **fit_kwargs
         )
 
@@ -2600,8 +2664,26 @@ def tvf_registration(
                 calculate_inverse_identity_error,
                 update_inverse_field_nd_hybrid_lm,
             )
-            fwd_t = torch.from_numpy(fwd_disp).float()
-            inv_t = torch.from_numpy(inv_disp).float()
+            if resolved_init.has_initial_warp:
+                if sum(reg_iterations) > 0:
+                    fwd_t, inv_t = compose_initial_and_residual_warps(
+                        fwd_disp,
+                        inv_disp,
+                        resolved_init.u0_phys,
+                        resolved_init.u0_inv_phys,
+                        spacing,
+                        origin,
+                        direction,
+                        device=resolved_init.u0_phys.device,
+                    )
+                else:
+                    fwd_t = resolved_init.u0_phys
+                    inv_t = resolved_init.u0_inv_phys
+                fwd_disp = fwd_t.detach().cpu().numpy()
+                inv_disp = inv_t.detach().cpu().numpy()
+            else:
+                fwd_t = torch.from_numpy(fwd_disp).float()
+                inv_t = torch.from_numpy(inv_disp).float()
             if (
                 sum(reg_iterations) > 0
                 and compose_polish_tol is not None
@@ -2619,8 +2701,8 @@ def tvf_registration(
                     direction=direction,
                     stationary_boundary=True,
                 )
-                inv_disp = inv_t.numpy()
-            if _dd_on and sum(reg_iterations) > 0:
+                inv_disp = inv_t.detach().cpu().numpy()
+            if _dd_on and (sum(reg_iterations) > 0 or resolved_init.has_initial_warp):
                 from .core.digital_diffeomorphism import enforce_digital_diffeomorphism_nd
                 _dd_ice_tol = (
                     float(compose_polish_tol)
@@ -2638,11 +2720,13 @@ def tvf_registration(
                     steps=_dd_steps,
                     stationary_boundary=True,
                 )
-                fwd_disp = fwd_t.numpy()
-                inv_disp = inv_t.numpy()
+                fwd_disp = fwd_t.detach().cpu().numpy()
+                inv_disp = inv_t.detach().cpu().numpy()
             inv_err_dict = calculate_inverse_identity_error(
                 fwd_t, inv_t, spacing=spacing, origin=origin, direction=direction
             )
+            if isinstance(inv_err_dict.get('error_map'), torch.Tensor):
+                inv_err_dict['error_map'] = inv_err_dict['error_map'].cpu()
         fwd_np = fwd_disp.squeeze(0)
         inv_np = inv_disp.squeeze(0)
 
@@ -2664,21 +2748,37 @@ def tvf_registration(
     _cache_disp_image_and_field(inv_file, inv_img, _apply_dev)
 
     # Export physical affine transform using standardized ITK layout
-    M_phys, t_phys = grid_to_physical_affine(T_grid, fixed_primary, moving_primary)
-    affine_file = tempfile.NamedTemporaryFile(suffix='.mat', delete=False).name
-
-    tx_fwd, tx_inv = export_ants_affine_transform(M_phys, t_phys, dim=dim, filename=affine_file)
-
-    # Build transform lists (same order as registration())
     # Note: affine_file already incorporates initial_transform (absorbed during initialization)
-    if sum(reg_iterations) > 0:
-        fwd_transforms = [fwd_file, affine_file]
-        inv_transforms = [affine_file, inv_file]
-        whichtoinvert_inv = [True, False]
+    if resolved_init.has_initial_warp:
+        if resolved_init.has_linear_affine:
+            affine_file = tempfile.NamedTemporaryFile(suffix='.mat', delete=False).name
+            export_ants_affine_transform(resolved_init.M_phys, resolved_init.t_phys, dim=dim, filename=affine_file)
+            if sum(reg_iterations) > 0 or resolved_init.has_initial_warp:
+                fwd_transforms = [fwd_file, affine_file]
+                inv_transforms = [affine_file, inv_file]
+                whichtoinvert_inv = [True, False]
+            else:
+                fwd_transforms = [affine_file]
+                inv_transforms = [affine_file]
+                whichtoinvert_inv = [True]
+        else:
+            fwd_transforms = [fwd_file]
+            inv_transforms = [inv_file]
+            whichtoinvert_inv = [False]
     else:
-        fwd_transforms = [affine_file]
-        inv_transforms = [affine_file]
-        whichtoinvert_inv = [True]
+        M_phys, t_phys = grid_to_physical_affine(T_grid, fixed_primary, moving_primary)
+        affine_file = tempfile.NamedTemporaryFile(suffix='.mat', delete=False).name
+
+        tx_fwd, tx_inv = export_ants_affine_transform(M_phys, t_phys, dim=dim, filename=affine_file)
+
+        if sum(reg_iterations) > 0:
+            fwd_transforms = [fwd_file, affine_file]
+            inv_transforms = [affine_file, inv_file]
+            whichtoinvert_inv = [True, False]
+        else:
+            fwd_transforms = [affine_file]
+            inv_transforms = [affine_file]
+            whichtoinvert_inv = [True]
 
     # Generate warped output images (same as registration())
     warpedmovout = _apply_transforms(fixed=fixed_primary, moving=moving_primary, transformlist=fwd_transforms)
@@ -2738,6 +2838,8 @@ def tvf_registration(
             moving_shape=tuple(moving_primary.shape),
             moving_spacing=tuple(moving_primary.spacing),
             moving_orientation=str(moving_primary.orientation) if hasattr(moving_primary, 'orientation') else None,
+            has_initial_warp=resolved_init.has_initial_warp,
+            initial_warp_kind=resolved_init.initial_warp_kind,
         )
         ret_dict['provenance'] = provenance
     except Exception:

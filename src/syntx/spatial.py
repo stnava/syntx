@@ -461,6 +461,69 @@ def normalized_to_physical_disp(
     return flat_phys.reshape(orig_shape)
 
 
+def physical_to_normalized_disp(
+    disp,
+    shape,
+    spacing,
+    direction,
+    origin=None,
+    device=None,
+    dtype=torch.float32 if torch is not None else None,
+):
+    """Inverse of :func:`normalized_to_physical_disp`: convert a tensor-layout physical (mm)
+    displacement field into a normalised ``[-1, 1]`` displacement tensor.
+
+    Input components in ``(dz, dy, dx)`` mm order are un-rotated by ``direction``, divided by
+    ``(n - 1) / 2 * spacing`` per axis, and flipped back to normalised ``(x, y, z)`` order.
+
+    Parameters
+    ----------
+    disp : torch.Tensor or np.ndarray
+        Physical displacement of shape ``(1, *shape, dim)`` or ``(*shape, dim)`` in tensor
+        ``(z, y, x)`` spatial order and ``(dz, dy, dx)`` mm component order.
+    shape : tuple of int
+        Tensor spatial shape ``(Nz, Ny, Nx)`` or ``(Ny, Nx)``.
+    spacing : tuple of float
+        Physical voxel spacing in ITK ``(sx, sy[, sz])`` order.
+    direction : np.ndarray or array-like
+        Direction cosine matrix in ITK order.
+    origin : tuple or list, optional
+        Ignored (a displacement does not depend on the origin).
+    device : str or torch.device, optional
+        None: the input's device.
+    dtype : torch.dtype, default torch.float32
+        None: the input dtype (float32 for integer input).
+
+    Returns
+    -------
+    torch.Tensor
+        Same shape as ``disp``; components in normalised ``(dx, dy, dz)`` order.
+    """
+    if torch is None:
+        raise ImportError("PyTorch is required for physical_to_normalized_disp.")
+    if not isinstance(disp, torch.Tensor):
+        disp = torch.from_numpy(np.asarray(disp))
+    if device is None:
+        device = disp.device
+    if dtype is None:
+        dtype = disp.dtype if disp.is_floating_point() else torch.float32
+    disp = disp.to(device=device, dtype=dtype)
+    dim = len(shape)
+
+    shape_t = torch.tensor(list(shape), device=device, dtype=dtype)
+    dummy_origin = (0.0,) * dim if origin is None else origin
+    spacing_rev, _, direction_rev = reverse_metadata(spacing, dummy_origin, direction)
+    spacing_t = torch.tensor(list(spacing_rev), device=device, dtype=dtype)
+    dir_inv_t = np.linalg.inv(np.asarray(direction_rev, dtype=np.float64)).T
+    dir_inv_t_t = torch.tensor(dir_inv_t.copy(), device=device, dtype=dtype)
+
+    scale_t = ((shape_t - 1.0).clamp(min=1.0) / 2.0) * spacing_t
+    orig_shape = disp.shape
+    flat_scaled = disp.reshape(-1, dim) @ dir_inv_t_t
+    disp_tensor = flat_scaled.reshape(orig_shape) / scale_t
+    return torch.flip(disp_tensor, dims=[-1])
+
+
 # ═══════════════════════════════════════════════════════════════════════════════
 # Affine Parameter Conversions & Exports
 # ═══════════════════════════════════════════════════════════════════════════════

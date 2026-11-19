@@ -589,8 +589,47 @@ def _evaluate_mindboggle_pair_impl(
             grad_step=0.25,
             verbose=verbose
         )
+    elif model_lower in ("voxelmorph_hybrid_greedy", "voxelmorph_hybrid_greedy_turbo"):
+        from .external import run_voxelmorph_hybrid_greedy
+
+        if user_reg_iters is not None:
+            hg_iters = user_reg_iters
+            hg_scales = kwargs.pop("scales", [2**i for i in range(len(hg_iters) - 1, -1, -1)])
+        elif model_lower == "voxelmorph_hybrid_greedy_turbo":
+            hg_iters = (25, 10)
+            hg_scales = kwargs.pop("scales", (2, 1))
+        else:
+            hg_iters = (35, 15)
+            hg_scales = kwargs.pop("scales", (2, 1))
+        res_reg = run_voxelmorph_hybrid_greedy(
+            fixed=fi,
+            moving=mi,
+            initial_transform=aff_0,
+            scales=hg_scales,
+            reg_iterations=hg_iters,
+            device=device,
+            seed=seed + pair_idx,
+            verbose=verbose,
+            **kwargs,
+        )
+    elif model_lower == "voxelmorph_hybrid_syn":
+        from .external import run_voxelmorph_hybrid_syn
+
+        hs_iters = user_reg_iters if user_reg_iters is not None else (30, 15)
+        hs_levels = kwargs.pop("levels", [2**i for i in range(len(hs_iters) - 1, -1, -1)])
+        res_reg = run_voxelmorph_hybrid_syn(
+            fixed=fi,
+            moving=mi,
+            initial_transform=aff_0,
+            levels=hs_levels,
+            reg_iterations=hs_iters,
+            device=device,
+            seed=seed + pair_idx,
+            verbose=verbose,
+            **kwargs,
+        )
     else:
-        raise ValueError(f"Unknown registration model: '{model}'. Supported: 'affine', 'affine_fast', 'affine_accurate', 'ants', 'sobolev', 'gaussian', 'syn', 'syn_navier', 'syn_solenoidal', 'syn_divcurl', 'syn_hyperelastic', 'syn_regadam', 'tvf', 'tvf_navier', 'syngs', 'greedy', 'greedy_regadam', 'fireants', 'voxelmorph_pretrained', 'voxelmorph_polished', 'voxelmorph_svf'")
+        raise ValueError(f"Unknown registration model: '{model}'. Supported: 'affine', 'affine_fast', 'affine_accurate', 'ants', 'sobolev', 'gaussian', 'syn', 'syn_navier', 'syn_solenoidal', 'syn_divcurl', 'syn_hyperelastic', 'syn_regadam', 'tvf', 'tvf_navier', 'syngs', 'greedy', 'greedy_regadam', 'fireants', 'voxelmorph_pretrained', 'voxelmorph_polished', 'voxelmorph_svf', 'voxelmorph_hybrid_greedy_turbo', 'voxelmorph_hybrid_greedy', 'voxelmorph_hybrid_syn'")
 
     t_reg = (t_aff if model_lower in ("affine", "affine_default") else (res_reg.get("runtime_seconds", time.time() - t0_reg) if "affine" in model_lower else (time.time() - t0_reg + t_aff)))
 
@@ -599,7 +638,11 @@ def _evaluate_mindboggle_pair_impl(
     inv_tx = res_reg["invtransforms"]
     which_inv = res_reg.get("whichtoinvert_inv", [True, False])
 
-    if (inv_tx is None or len(inv_tx) == 0) or ("greedy" in model_lower or "fireants" in model_lower or "voxelmorph" in model_lower):
+    if (inv_tx is None or len(inv_tx) == 0) or (
+        "greedy" in model_lower
+        or "fireants" in model_lower
+        or model_lower in ("voxelmorph_pretrained", "voxelmorph_polished", "voxelmorph_pretrained_polished", "voxelmorph_svf", "voxelmorph_multiscale")
+    ):
         df_fixed, _, _ = compute_bidirectional_dice(
             fl, ml, fi, mi, fwd_tx, [], []
         )

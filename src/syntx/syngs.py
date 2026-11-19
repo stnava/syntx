@@ -598,13 +598,23 @@ class GeodesicShootingModel(nn.Module):
         b_m_norm = ctx["b_m_norm"]
         M_phys_zyx = ctx["M_phys_zyx"]
         t_phys_zyx = ctx["t_phys_zyx"]
+        ig_lvl = ctx.get("ig_lvl", None)
+        if ig_lvl is None:
+            ig_attr = getattr(self, 'initial_grid', None)
+            if ig_attr is not None:
+                ig_dev = ig_attr.to(device=device, dtype=dtype)
+                ig_lvl = ig_dev if tuple(ig_dev.shape[1:-1]) == target_shape_f else resize_field(ig_dev, list(target_shape_f))
 
         # 1. Forward shooting (+v0_fwd) -> warp moving to fixed space
         disp_fwd = self.shoot(
             self.velocity_0_fwd, target_shape_f, spacing_rev_f, phys_grid_f, meta_f, _norm_cache=norm_cache_f
         )
-        phi_moving = (phys_grid_f + disp_fwd) @ M_phys_zyx.t() + t_phys_zyx
-        phi_norm_fwd = physical_to_normalized_fast(phi_moving, M_m_norm, b_m_norm)
+        if ig_lvl is not None:
+            phi_m_fixed_norm = physical_to_normalized_fast(phys_grid_f + disp_fwd, M_f_norm, b_f_norm)
+            phi_norm_fwd = compose_grids(ig_lvl, phi_m_fixed_norm)
+        else:
+            phi_moving = (phys_grid_f + disp_fwd) @ M_phys_zyx.t() + t_phys_zyx
+            phi_norm_fwd = physical_to_normalized_fast(phi_moving, M_m_norm, b_m_norm)
         moving_warped = grid_sample_nd(moving_image, phi_norm_fwd, mode='bilinear', padding_mode='zeros')
 
         # 2. Inverse shooting (+v0_inv)
@@ -616,6 +626,8 @@ class GeodesicShootingModel(nn.Module):
         # Prealigned moving on reference grid (reuse level-cached tensor when affine is frozen)
         if _prealigned_moving is not None:
             moving_aff = _prealigned_moving
+        elif ig_lvl is not None:
+            moving_aff = grid_sample_nd(moving_image, ig_lvl, mode='bilinear', padding_mode='zeros')
         else:
             phi_m_aff = phys_grid_f @ M_phys_zyx.t() + t_phys_zyx
             phi_m_aff_norm = physical_to_normalized_fast(phi_m_aff, M_m_norm, b_m_norm)
@@ -647,8 +659,11 @@ class GeodesicShootingModel(nn.Module):
             loss_inv_0 = self._eval_similarity(moving_aff, fixed_warped, metric_to_use, lncc_window_size=lncc_window_size)
 
             # Plus jitter
-            phi_mov_p = (phys_grid_f + disp_fwd + jitter_phys) @ M_phys_zyx.t() + t_phys_zyx
-            norm_mov_p = physical_to_normalized_fast(phi_mov_p, M_m_norm, b_m_norm)
+            if ig_lvl is not None:
+                norm_mov_p = compose_grids(ig_lvl, physical_to_normalized_fast(phys_grid_f + disp_fwd + jitter_phys, M_f_norm, b_f_norm))
+            else:
+                phi_mov_p = (phys_grid_f + disp_fwd + jitter_phys) @ M_phys_zyx.t() + t_phys_zyx
+                norm_mov_p = physical_to_normalized_fast(phi_mov_p, M_m_norm, b_m_norm)
             w_mov_p = grid_sample_nd(moving_image, norm_mov_p, mode='bilinear', padding_mode='zeros')
             loss_fwd_p = self._eval_similarity(fixed_image, w_mov_p, metric_to_use, lncc_window_size=lncc_window_size)
 
@@ -658,8 +673,11 @@ class GeodesicShootingModel(nn.Module):
             loss_inv_p = self._eval_similarity(moving_aff, w_fix_p, metric_to_use, lncc_window_size=lncc_window_size)
 
             # Minus jitter
-            phi_mov_m = (phys_grid_f + disp_fwd - jitter_phys) @ M_phys_zyx.t() + t_phys_zyx
-            norm_mov_m = physical_to_normalized_fast(phi_mov_m, M_m_norm, b_m_norm)
+            if ig_lvl is not None:
+                norm_mov_m = compose_grids(ig_lvl, physical_to_normalized_fast(phys_grid_f + disp_fwd - jitter_phys, M_f_norm, b_f_norm))
+            else:
+                phi_mov_m = (phys_grid_f + disp_fwd - jitter_phys) @ M_phys_zyx.t() + t_phys_zyx
+                norm_mov_m = physical_to_normalized_fast(phi_mov_m, M_m_norm, b_m_norm)
             w_mov_m = grid_sample_nd(moving_image, norm_mov_m, mode='bilinear', padding_mode='zeros')
             loss_fwd_m = self._eval_similarity(fixed_image, w_mov_m, metric_to_use, lncc_window_size=lncc_window_size)
 
@@ -738,12 +756,15 @@ class GeodesicShootingModel(nn.Module):
         After each level the best-loss velocity is kept.
         """
         unknown = sorted(set(kwargs) - {'max_step_norm', 'adam_eps_rel', 'weight_decay', 'momentum',
-                                        'smoothing_sigmas', 'seed', 'mattes_bins', 'convergence_slope'})
+                                        'smoothing_sigmas', 'seed', 'mattes_bins', 'convergence_slope',
+                                        'initial_grid'})
         if unknown:
             raise TypeError(f"GeodesicShootingModel.fit() got unexpected keyword(s) {unknown}")
         self.stop = stop = LossSlopeStop(slope_threshold=kwargs.get('convergence_slope', DEFAULT_SLOPE_THRESHOLD))   # shared stop rule
         device = fixed_image.device
         dtype = fixed_image.dtype
+        ig_arg = kwargs.pop('initial_grid', None)
+        self.initial_grid = ig_arg.to(device=device, dtype=dtype) if ig_arg is not None else None
 
         if 'seed' in kwargs:
             seed_arg = kwargs.pop('seed')
@@ -791,15 +812,26 @@ class GeodesicShootingModel(nn.Module):
             with torch.no_grad():
                 curr_moving_shape = tuple(curr_moving.shape[2:])
                 level_ctx = self._build_level_ctx(curr_vel_shape, curr_moving_shape, device, dtype)
-                phi_m_aff_lvl = (
-                    level_ctx["phys_grid_f"] @ level_ctx["M_phys_zyx"].t() + level_ctx["t_phys_zyx"]
-                )
-                phi_m_aff_norm_lvl = physical_to_normalized_fast(
-                    phi_m_aff_lvl, level_ctx["M_m_norm"], level_ctx["b_m_norm"]
-                )
-                curr_moving_aff = grid_sample_nd(
-                    curr_moving, phi_m_aff_norm_lvl, mode='bilinear', padding_mode='zeros'
-                )
+                if self.initial_grid is not None:
+                    ig_lvl = (
+                        self.initial_grid
+                        if tuple(self.initial_grid.shape[1:-1]) == curr_vel_shape
+                        else resize_field(self.initial_grid, list(curr_vel_shape))
+                    )
+                    level_ctx["ig_lvl"] = ig_lvl
+                    curr_moving_aff = grid_sample_nd(
+                        curr_moving, ig_lvl, mode='bilinear', padding_mode='zeros'
+                    )
+                else:
+                    phi_m_aff_lvl = (
+                        level_ctx["phys_grid_f"] @ level_ctx["M_phys_zyx"].t() + level_ctx["t_phys_zyx"]
+                    )
+                    phi_m_aff_norm_lvl = physical_to_normalized_fast(
+                        phi_m_aff_lvl, level_ctx["M_m_norm"], level_ctx["b_m_norm"]
+                    )
+                    curr_moving_aff = grid_sample_nd(
+                        curr_moving, phi_m_aff_norm_lvl, mode='bilinear', padding_mode='zeros'
+                    )
 
             active_params = [self.velocity_0_fwd]
             if self.symmetric and self.velocity_0_inv is not None:
@@ -976,6 +1008,8 @@ def syngs_registration(
     bootstrap_mode='none',
     seed=42,
     convergence_slope=DEFAULT_SLOPE_THRESHOLD,
+    initial_warp=None,
+    initial_inverse_warp=None,
     **kwargs
 ):
     """
@@ -1158,21 +1192,33 @@ def syngs_registration(
                          f"{sorted(_SPECTRAL_REGS | _SIGMA_REGS)}")
 
 
-    # Extract initial transform (Single Interpolation Policy)
-    init_tx_list = []
-    init_M_phys, init_t_phys = None, None
-    if initial_transform is False or (isinstance(initial_transform, str)
-                                      and initial_transform.lower() == "identity"):
-        init_tx_list = []  # explicit opt-out of initial alignment (as syntx.syn / greedy)
-    elif initial_transform is not None:
-        init_tx_list = initial_transform if isinstance(initial_transform, list) else [initial_transform]
-    else:
+    # Extract initial transform & optional dense initial warp (Single Interpolation Policy)
+    from .core.initial_warp import compose_initial_and_residual_warps, resolve_initial_transform_and_warp
+    raw_init_tx = initial_transform
+    if initial_transform is None and initial_warp is None:
         from .robust_affine import robust_affine
         aff_res = robust_affine(
             fixed, moving, dof=affine_dof, mode=affine_mode, seed=affine_seed, verbose=verbose
         )
-        init_tx_list = aff_res['fwdtransforms']
-    init_M_phys, init_t_phys = parse_ants_affine(init_tx_list, dim)
+        raw_init_tx = aff_res['fwdtransforms']
+
+    resolved_init = resolve_initial_transform_and_warp(
+        fixed,
+        moving,
+        initial_transform=raw_init_tx,
+        initial_warp=initial_warp,
+        initial_inverse_warp=initial_inverse_warp,
+        need_inverse=True,
+        device=None,
+    )
+    init_tx_list = resolved_init.aff_tx or []
+    init_M_phys = None
+    init_t_phys = None
+    if not resolved_init.has_initial_warp and (
+        resolved_init.has_linear_affine or (isinstance(raw_init_tx, str) and raw_init_tx.lower() == "identity")
+    ):
+        init_M_phys = torch.from_numpy(resolved_init.M_phys).to(torch.float32)
+        init_t_phys = torch.from_numpy(resolved_init.t_phys).to(torch.float32)
 
     # Normalize images
     fi_np = fixed.numpy()
@@ -1258,6 +1304,9 @@ def syngs_registration(
             if verbose:
                 print("[SyNGS] Initialized affine from initial_transform (T_init absorbed)")
 
+        model.has_initial_warp = resolved_init.has_initial_warp
+        model.initial_warp_kind = resolved_init.initial_warp_kind
+
         model.fit(
             I_tensor, J_tensor,
             levels=levels,
@@ -1277,6 +1326,7 @@ def syngs_registration(
             cfl_step=grad_step,
             seed=seed,
             convergence_slope=convergence_slope,
+            initial_grid=resolved_init.initial_grid_zyx.to(device=device_str, dtype=torch.float32) if resolved_init.has_initial_warp else None,
             **kwargs
         )
 
@@ -1284,6 +1334,21 @@ def syngs_registration(
         with torch.no_grad():
             fwd_disp = model.get_forward_warp(image_shape=grid_shape_zyx)
             inv_disp = model.get_inverse_warp(image_shape=grid_shape_zyx)
+            if resolved_init.has_initial_warp:
+                if sum(reg_iterations) > 0:
+                    fwd_disp, inv_disp = compose_initial_and_residual_warps(
+                        fwd_disp,
+                        inv_disp,
+                        resolved_init.u0_phys,
+                        resolved_init.u0_inv_phys,
+                        spacing,
+                        origin,
+                        direction,
+                        device=device_str,
+                    )
+                else:
+                    fwd_disp = resolved_init.u0_phys.to(device=device_str, dtype=torch.float32)
+                    inv_disp = resolved_init.u0_inv_phys.to(device=device_str, dtype=torch.float32)
             from .core.inverse import (
                 calculate_inverse_identity_error,
                 update_inverse_field_nd_hybrid_lm,
@@ -1305,7 +1370,7 @@ def syngs_registration(
                     direction=direction,
                     stationary_boundary=True,
                 )
-            if _dd_on and sum(reg_iterations) > 0:
+            if _dd_on and (sum(reg_iterations) > 0 or resolved_init.has_initial_warp):
                 from .core.digital_diffeomorphism import enforce_digital_diffeomorphism_nd
                 _dd_ice_tol = (
                     float(compose_polish_tol)
@@ -1414,6 +1479,9 @@ def syngs_registration(
             if verbose:
                 print("[SyNGS-JAX] Initialized affine from initial_transform (T_init absorbed)")
 
+        model.has_initial_warp = resolved_init.has_initial_warp
+        model.initial_warp_kind = resolved_init.initial_warp_kind
+
         model.fit(
             I_tensor, J_tensor,
             levels=levels,
@@ -1429,6 +1497,7 @@ def syngs_registration(
             optimizer_type=optimizer,
             cfl_step=grad_step,
             convergence_slope=convergence_slope,
+            initial_grid=resolved_init.initial_grid_zyx.detach().cpu().numpy() if resolved_init.has_initial_warp else None,
             **kwargs
         )
 
@@ -1439,8 +1508,26 @@ def syngs_registration(
                 calculate_inverse_identity_error,
                 update_inverse_field_nd_hybrid_lm,
             )
-            fwd_t = torch.from_numpy(fwd_disp).float()
-            inv_t = torch.from_numpy(inv_disp).float()
+            if resolved_init.has_initial_warp:
+                if sum(reg_iterations) > 0:
+                    fwd_t, inv_t = compose_initial_and_residual_warps(
+                        fwd_disp,
+                        inv_disp,
+                        resolved_init.u0_phys,
+                        resolved_init.u0_inv_phys,
+                        spacing,
+                        origin,
+                        direction,
+                        device=resolved_init.u0_phys.device,
+                    )
+                else:
+                    fwd_t = resolved_init.u0_phys
+                    inv_t = resolved_init.u0_inv_phys
+                fwd_disp = fwd_t.detach().cpu().numpy()
+                inv_disp = inv_t.detach().cpu().numpy()
+            else:
+                fwd_t = torch.from_numpy(fwd_disp).float()
+                inv_t = torch.from_numpy(inv_disp).float()
             if (
                 sum(reg_iterations) > 0
                 and compose_polish_tol is not None
@@ -1458,8 +1545,8 @@ def syngs_registration(
                     direction=direction,
                     stationary_boundary=True,
                 )
-                inv_disp = inv_t.numpy()
-            if _dd_on and sum(reg_iterations) > 0:
+                inv_disp = inv_t.detach().cpu().numpy()
+            if _dd_on and (sum(reg_iterations) > 0 or resolved_init.has_initial_warp):
                 from .core.digital_diffeomorphism import enforce_digital_diffeomorphism_nd
                 _dd_ice_tol = (
                     float(compose_polish_tol)
@@ -1477,8 +1564,8 @@ def syngs_registration(
                     steps=_dd_steps,
                     stationary_boundary=True,
                 )
-                fwd_disp = fwd_t.numpy()
-                inv_disp = inv_t.numpy()
+                fwd_disp = fwd_t.detach().cpu().numpy()
+                inv_disp = inv_t.detach().cpu().numpy()
             inv_err_calc = calculate_inverse_identity_error(
                 fwd_t, inv_t, spacing=spacing, origin=origin, direction=direction
             )
@@ -1530,20 +1617,31 @@ def syngs_registration(
     _cache_disp_image_and_field(fwd_file, fwd_img, _apply_dev)
     _cache_disp_image_and_field(inv_file, inv_img, _apply_dev)
 
-    # Export affine transform using standardized reference matrix conversion
-    M_phys, t_phys = grid_to_physical_affine(T_grid, fixed, moving)
-    affine_file = tempfile.NamedTemporaryFile(suffix='.mat', delete=False).name
-    tx_fwd, tx_inv = export_ants_affine_transform(M_phys, t_phys, dim=dim, filename=affine_file)
-
-    # Build transform lists (Single Interpolation Invariant)
-    if sum(reg_iterations) > 0:
-        fwd_transforms = [fwd_file, affine_file] + init_tx_list
-        inv_transforms = init_tx_list + [affine_file, inv_file]
-        whichtoinvert_inv = [True] * len(init_tx_list) + [True, False]
+    # Export affine transform & build single-interpolation transform lists
+    if resolved_init.has_initial_warp:
+        if resolved_init.has_linear_affine:
+            affine_file = tempfile.NamedTemporaryFile(suffix='.mat', delete=False).name
+            export_ants_affine_transform(resolved_init.M_phys, resolved_init.t_phys, dim=dim, filename=affine_file)
+            fwd_transforms = [fwd_file, affine_file]
+            inv_transforms = [affine_file, inv_file]
+            whichtoinvert_inv = [True, False]
+        else:
+            fwd_transforms = [fwd_file]
+            inv_transforms = [inv_file]
+            whichtoinvert_inv = [False]
     else:
-        fwd_transforms = [affine_file] + init_tx_list
-        inv_transforms = init_tx_list + [affine_file]
-        whichtoinvert_inv = [True] * (len(init_tx_list) + 1)
+        M_phys, t_phys = grid_to_physical_affine(T_grid, fixed, moving)
+        affine_file = tempfile.NamedTemporaryFile(suffix='.mat', delete=False).name
+        tx_fwd, tx_inv = export_ants_affine_transform(M_phys, t_phys, dim=dim, filename=affine_file)
+
+        if sum(reg_iterations) > 0:
+            fwd_transforms = [fwd_file, affine_file] + init_tx_list
+            inv_transforms = init_tx_list + [affine_file, inv_file]
+            whichtoinvert_inv = [True] * len(init_tx_list) + [True, False]
+        else:
+            fwd_transforms = [affine_file] + init_tx_list
+            inv_transforms = init_tx_list + [affine_file]
+            whichtoinvert_inv = [True] * (len(init_tx_list) + 1)
 
     # Apply single-interpolation composite transforms
     from .transforms import apply_transforms as _apply_transforms
@@ -1602,7 +1700,9 @@ def syngs_registration(
             moving_shape=tuple(moving.shape),
             moving_spacing=tuple(moving.spacing),
             moving_orientation=str(moving.orientation) if hasattr(moving, 'orientation') else None,
-            n_steps=n_steps
+            n_steps=n_steps,
+            has_initial_warp=resolved_init.has_initial_warp,
+            initial_warp_kind=resolved_init.initial_warp_kind,
         )
         ret_dict['provenance'] = provenance
     except Exception:

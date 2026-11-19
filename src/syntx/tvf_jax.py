@@ -28,6 +28,8 @@ from .syn_jax import (
     jax_grid_sample_image,
     interpolate_jax,
     pyramid_level_jax,
+    compose_grids_jax,
+    upscale_initial_grid,
 )
 
 
@@ -110,7 +112,7 @@ _TVF_JAX_FIT_KWARGS = frozenset({
     'aa_sigma', 'aff_metric', 'affine_lr', 'alpha', 'antisymmetric', 'antisymmetry', 'cfl_max',
     'cfl_momentum', 'cfl_step', 'constant_speed', 'constant_speed_relaxation',
     'convergence_threshold', 'convergence_window', 'elastic_sigma', 'elastic_sigmas',
-    'fast_smooth', 'fluid_sigma', 'fluid_sigmas', 'grad_step', 'initial_transform', 'mattes_bins',
+    'fast_smooth', 'fluid_sigma', 'fluid_sigmas', 'grad_step', 'initial_grid', 'initial_transform', 'mattes_bins',
     'multipoint_loss', 'num_bins', 'optimizer', 'optimizer_type', 'regularizer',
     'regularizer_mode', 'sampling_percentage', 'smooth_pyramid', 'sobolev_alpha', 'total_sigma',
 })
@@ -628,6 +630,12 @@ class TVFModelJAX:
         M_phys_zyx = M_phys
         t_phys_zyx = t_phys
 
+        ig_attr = getattr(self, 'initial_grid', None)
+        if ig_attr is not None:
+            ig_lvl = ig_attr if tuple(ig_attr.shape[1:-1]) == target_shape else upscale_initial_grid(ig_attr, target_shape)
+        else:
+            ig_lvl = None
+
         losses = []
         compute_id_loss = (0.0 in eval_points) and (1.0 in eval_points)
         phi_0_to_1 = None
@@ -649,11 +657,17 @@ class TVFModelJAX:
             )
             fixed_warped_tk = jax_grid_sample_image(fixed_image, phi_fixed_norm_tk, mode='bilinear', padding_mode='zeros')
 
-            shape_m, spacing_m, origin_m, direction_m = self._get_moving_metadata_tensors()
-            phi_moving_affine_tk = (phys_grid + phi_tk_to_moving) @ M_phys_zyx.T + t_phys_zyx
-            phi_moving_norm_tk = physical_to_normalized_jax_cached(
-                phi_moving_affine_tk, shape_m, spacing_m, origin_m, direction_m
-            )
+            if ig_lvl is not None:
+                phi_m_fixed_norm_tk = physical_to_normalized_jax_cached(
+                    phys_grid + phi_tk_to_moving, shape_t, spacing_t, origin_t, direction_t
+                )
+                phi_moving_norm_tk = compose_grids_jax(ig_lvl, phi_m_fixed_norm_tk)
+            else:
+                shape_m, spacing_m, origin_m, direction_m = self._get_moving_metadata_tensors()
+                phi_moving_affine_tk = (phys_grid + phi_tk_to_moving) @ M_phys_zyx.T + t_phys_zyx
+                phi_moving_norm_tk = physical_to_normalized_jax_cached(
+                    phi_moving_affine_tk, shape_m, spacing_m, origin_m, direction_m
+                )
             moving_warped_tk = jax_grid_sample_image(moving_image, phi_moving_norm_tk, mode='bilinear', padding_mode='zeros')
             losses.append(eval_similarity_jax(fixed_warped_tk, moving_warped_tk, self.similarity_metric,
                                               lncc_window_size, self.mattes_bins))
@@ -793,6 +807,9 @@ class TVFModelJAX:
             self.velocity = jnp.zeros_like(self.velocity)
             return
 
+        initial_grid_arg = kwargs.get('initial_grid', None)
+        self.initial_grid = jnp.array(initial_grid_arg, dtype=jnp.float32) if initial_grid_arg is not None else None
+
         initial_transform = kwargs.get('initial_transform', None)
         if initial_transform is not None:
             from .syn import parse_ants_affine
@@ -811,7 +828,7 @@ class TVFModelJAX:
         if isinstance(affine_epochs, (list, tuple)):
             affine_epochs = sum(affine_epochs)
         # 1. Optimize affine pre-alignment first
-        if affine_epochs > 0:
+        if affine_epochs > 0 and self.initial_grid is None:
             if verbose: print("Optimizing affine pre-alignment in JAX...")
             m_aff = {k: jnp.zeros_like(v) for k, v in self.affine_params.items()}
             v_aff = {k: jnp.zeros_like(v) for k, v in self.affine_params.items()}

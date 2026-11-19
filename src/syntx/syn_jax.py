@@ -3634,10 +3634,14 @@ class SyNJAX:
             spacing_arg = curr_spacing_fixed
             
             # Compute physical affine translation matrix and translation vector
-            M_phys, t_phys = grid_to_physical_affine_jax(
-                A_grid, spatial_shape, fixed_spacing, fixed_origin, fixed_direction,
-                J_jax.shape[2:], moving_spacing, moving_origin, moving_direction
-            )
+            if self.initial_grid is not None:
+                M_phys = jnp.eye(self.dim, dtype=jnp.float32)
+                t_phys = jnp.zeros(self.dim, dtype=jnp.float32)
+            else:
+                M_phys, t_phys = grid_to_physical_affine_jax(
+                    A_grid, spatial_shape, fixed_spacing, fixed_origin, fixed_direction,
+                    J_jax.shape[2:], moving_spacing, moving_origin, moving_direction
+                )
             # M_phys and t_phys are returned directly in ZYX order
 
             
@@ -4441,19 +4445,20 @@ class SyNJAX:
         warp_resampled = upscale_field_jax(jnp.array(self.warp_l2r), spatial_shape)
         phi_l2r_phys = X_phys + warp_resampled
         
-        T_grid = get_affine_matrix_jax(self.affine_params, dim, self.transform_type)
-        M_phys, t_phys = grid_to_physical_affine_jax(
-            T_grid, spatial_shape, spacing, origin, direction,
-            moving_image_jax.shape[2:], moving_spacing, moving_origin, moving_direction
-        )
-        
-        # grid_to_physical_affine_jax already returns tensor (z, y, x) order, like phi_l2r_phys
-        y_phys = phi_l2r_phys @ M_phys.T + t_phys
-        composed_grid = physical_to_normalized_jax(y_phys, moving_image_jax.shape[2:], moving_spacing, moving_origin, moving_direction)
-        
         if hasattr(self, 'initial_grid') and self.initial_grid is not None:
+            composed_grid = physical_to_normalized_jax(phi_l2r_phys, spatial_shape, spacing, origin, direction)
             initial_grid_resampled = upscale_initial_grid(self.initial_grid, spatial_shape)
             composed_grid = compose_grids_jax(initial_grid_resampled, composed_grid)
+        else:
+            T_grid = get_affine_matrix_jax(self.affine_params, dim, self.transform_type)
+            M_phys, t_phys = grid_to_physical_affine_jax(
+                T_grid, spatial_shape, spacing, origin, direction,
+                moving_image_jax.shape[2:], moving_spacing, moving_origin, moving_direction
+            )
+            
+            # grid_to_physical_affine_jax already returns tensor (z, y, x) order, like phi_l2r_phys
+            y_phys = phi_l2r_phys @ M_phys.T + t_phys
+            composed_grid = physical_to_normalized_jax(y_phys, moving_image_jax.shape[2:], moving_spacing, moving_origin, moving_direction)
             
         warped_jax = jax_grid_sample(moving_image_jax, composed_grid, padding_mode='zeros', interpolator=self.interpolator)
         warped_xyz = jnp.transpose(warped_jax, perm)

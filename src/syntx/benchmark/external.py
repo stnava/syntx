@@ -7,6 +7,14 @@ Provides standardized ``syntx`` registration-dictionary wrappers for:
   (``syntx_features/voxelmorph_pairwise_3d_brain``), with lossless signed axis
   permutation into the pretrained canonical anatomical frame and optional
   full-resolution SVF velocity refinement (``polish_steps > 0``).
+- ``run_voxelmorph_hybrid_greedy``: Hybrid deep-learning + variational
+  registration warm-starting ``syntx.greedy`` (``[2, 1]`` fine-scale
+  ``regadam`` refinement) directly on GPU from ``VxmPairwise``'s ``<0.5 s``
+  SVF deformation with single-interpolation ``[1Warp.nii.gz, affine]`` export.
+- ``run_voxelmorph_hybrid_syn``: Symmetric bidirectional ``syntx.syn``
+  warm-started from ``VxmPairwise``'s SVF forward/inverse warps with
+  single-interpolation endpoint composition and ``0%`` digital diffeomorphism
+  projection.
 - ``run_voxelmorph_multiscale``: ``[4, 2, 1]`` multi-scale ``VxmPairwise`` SVF
   registration built on ``syntx.pyramid.build_pyramid(..., policy="deformable")``
   and sync-free ``5^3`` LNCC (``syntx.core.losses.cross_correlation.local_ncc_loss_nd``).
@@ -29,14 +37,24 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 import ants
 import numpy as np
 import torch
+import torch.nn.functional as F
 
+from ..core.affine import parse_ants_affine
 from ..core.grid import resize_field
 from ..core.losses.cross_correlation import local_ncc_loss_nd
 from ..core.pipeline import cleanup_gpu
 from ..core.smoothing import separable_gaussian_filter
+from ..core.utils import normalize_image
 from ..device import resolve_device
+from ..greedy import _Conv1x1AffineGrid, _build_torch_affine_matrix, greedy_registration
 from ..pyramid import build_pyramid
-from ..transforms import apply_transforms as syntx_apply_transforms
+from ..robust_affine import robust_affine
+from ..spatial import disp_tensor_to_itk
+from ..transforms import (
+    _cache_disp_image_and_field,
+    _write_ants_images_fast,
+    apply_transforms as syntx_apply_transforms,
+)
 
 
 _I3 = np.eye(3, dtype=np.float64)
@@ -317,6 +335,167 @@ def _build_return_dict(
     }
 
 
+_VXM_CKPT_CACHE: Dict[str, Tuple[str, Dict[str, Any]]] = {}
+
+
+def _load_voxelmorph_weights(asset_ref: str) -> Tuple[str, Dict[str, Any], Dict[str, Any]]:
+    """Fetch ``asset_ref`` via ``antsxdata`` and cache ``(weights_path, state_dict)`` in memory."""
+    import antsxdata
+
+    asset_prov = antsxdata.provenance(asset_ref)
+    cached = _VXM_CKPT_CACHE.get(asset_ref)
+    if cached is not None and os.path.exists(cached[0]):
+        return cached[0], asset_prov, cached[1]
+    weights_path = str(antsxdata.fetch(asset_ref))
+    ckpt = torch.load(weights_path, map_location="cpu", weights_only=False)
+    _VXM_CKPT_CACHE[asset_ref] = (weights_path, ckpt)
+    return weights_path, asset_prov, ckpt
+
+
+def _align_moving_on_device(
+    fixed: ants.ANTsImage,
+    moving: ants.ANTsImage,
+    initial_transform: Optional[Any],
+    dev_t: torch.device,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Upload ``fixed`` and affine-aligned ``moving`` onto ``dev_t`` in ZYX ``(1, 1, nz, ny, nx)``
+    layout without a CPU/disk resampling round-trip, returning ``(fi_zyx, mi_aff_zyx, theta)``."""
+    fi_zyx = torch.from_numpy(fixed.numpy().T).float().unsqueeze(0).unsqueeze(0).to(dev_t)
+    same_grid = (
+        tuple(fixed.shape) == tuple(moving.shape)
+        and np.allclose(fixed.spacing, moving.spacing, atol=1e-4)
+        and np.allclose(fixed.origin, moving.origin, atol=1e-4)
+        and np.allclose(fixed.direction, moving.direction, atol=1e-4)
+    )
+    if initial_transform is None:
+        M_phys = np.eye(3, dtype=np.float64)
+        t_phys = np.zeros(3, dtype=np.float64)
+        theta, _, _ = _build_torch_affine_matrix(fixed, moving, M_phys, t_phys, dev_t)
+        if same_grid:
+            mi_zyx = torch.from_numpy(moving.numpy().T).float().unsqueeze(0).unsqueeze(0).to(dev_t)
+            return fi_zyx, mi_zyx, theta
+    else:
+        M_phys, t_phys = parse_ants_affine(initial_transform, 3, allow_nonlinear=True)
+        if M_phys is None:
+            mi_aff = _prepare_moving_aligned(fixed, moving, initial_transform)
+            mi_aff_zyx = torch.from_numpy(mi_aff.numpy().T).float().unsqueeze(0).unsqueeze(0).to(dev_t)
+            theta = torch.eye(3, 4, device=dev_t, dtype=torch.float32).unsqueeze(0)
+            return fi_zyx, mi_aff_zyx, theta
+        theta, _, _ = _build_torch_affine_matrix(fixed, moving, M_phys, t_phys, dev_t)
+
+    mi_zyx = torch.from_numpy(moving.numpy().T).float().unsqueeze(0).unsqueeze(0).to(dev_t)
+    id_grid = F.affine_grid(
+        torch.eye(3, 4, device=dev_t, dtype=torch.float32).unsqueeze(0),
+        [1, 1, *fi_zyx.shape[2:]],
+        align_corners=True,
+    )
+    sample_grid = _Conv1x1AffineGrid.apply(
+        id_grid, theta[0, :, :3].contiguous(), theta[0, :, 3].contiguous()
+    )
+    mi_aff_zyx = F.grid_sample(
+        mi_zyx, sample_grid, mode="bilinear", padding_mode="zeros", align_corners=True
+    )
+    del mi_zyx, id_grid, sample_grid
+    return fi_zyx, mi_aff_zyx, theta
+
+
+def _voxelmorph_predict_svf(
+    fi_norm: ants.ANTsImage,
+    mi_norm: ants.ANTsImage,
+    initial_transform: Optional[Any],
+    canonical_orientation: Optional[str],
+    int_steps: int,
+    return_inverse: bool,
+    dev: str,
+    asset_ref: str,
+    vel_smooth_sigma: float = 0.0,
+) -> Tuple[torch.Tensor, Optional[torch.Tensor], torch.Tensor, Dict[str, Any]]:
+    """Run zero-shot ``VxmPairwise`` SVF inference on ``dev`` with GPU affine alignment and
+    lossless canonical orientation permutation. Returns ``(disp_fwd_nat, disp_inv_nat, theta, meta)``."""
+    vxm, _ = _import_voxelmorph()
+    _, asset_prov, ckpt = _load_voxelmorph_weights(asset_ref)
+    dev_t = torch.device(dev)
+
+    t0 = time.perf_counter()
+    fi_zyx, mi_aff_zyx, theta = _align_moving_on_device(fi_norm, mi_norm, initial_transform, dev_t)
+    src_nat = mi_aff_zyx.permute(0, 1, 4, 3, 2).contiguous()
+    tgt_nat = fi_zyx.permute(0, 1, 4, 3, 2).contiguous()
+    del fi_zyx, mi_aff_zyx
+
+    if canonical_orientation is not None:
+        perm, flips = canonical_orientation_transform(
+            np.asarray(fi_norm.direction, dtype=np.float64), canonical_orientation
+        )
+        src_can = apply_axis_permutation(src_nat, perm, flips)
+        tgt_can = apply_axis_permutation(tgt_nat, perm, flips)
+    else:
+        perm, flips = (0, 1, 2), (1, 1, 1)
+        src_can, tgt_can = src_nat, tgt_nat
+    del src_nat, tgt_nat
+
+    nb_features = (16, 16, 16, 16, 16)
+    pad_mult = 2 ** len(nb_features)
+    model = vxm.nn.models.VxmPairwise(
+        ndim=3,
+        source_channels=1,
+        target_channels=1,
+        nb_features=nb_features,
+        integration_steps=int(int_steps),
+        device=dev,
+    ).to(dev)
+    model.load_state_dict(ckpt)
+    model.eval()
+
+    src_pad, pads = _pad_to_multiple(src_can, pad_mult)
+    tgt_pad, _ = _pad_to_multiple(tgt_can, pad_mult)
+    del src_can, tgt_can
+
+    with torch.no_grad():
+        vel_can = _crop_from_pads(
+            model(src_pad, tgt_pad, return_field_type="velocity"), pads
+        )
+        del src_pad, tgt_pad
+        if float(vel_smooth_sigma) > 0.0:
+            vel_can = _smooth_cf(vel_can, float(vel_smooth_sigma))
+        disp_fwd_can = model.velocity_field_integrator(vel_can)
+        disp_fwd_nat = invert_displacement_permutation(disp_fwd_can, perm, flips)
+        del disp_fwd_can
+        disp_inv_nat = None
+        if return_inverse:
+            disp_inv_can = model.velocity_field_integrator(-vel_can)
+            disp_inv_nat = invert_displacement_permutation(disp_inv_can, perm, flips)
+            del disp_inv_can
+        del vel_can
+
+    _sync_device(dev)
+    vxm_s = time.perf_counter() - t0
+    del model
+
+    meta = {
+        "voxelmorph_version": importlib.metadata.version("voxelmorph"),
+        "asset_ref": asset_prov.get("ref", asset_ref),
+        "asset_sha256": asset_prov.get("sha256"),
+        "canonical_orientation": canonical_orientation,
+        "axis_perm": list(perm),
+        "axis_flips": list(flips),
+        "int_steps": int(int_steps),
+        "vxm_seconds": float(vxm_s),
+    }
+    return disp_fwd_nat, disp_inv_nat, theta, meta
+
+
+def _voxel_disp_nat_to_norm_zyx(disp_vox_nat: torch.Tensor) -> torch.Tensor:
+    """Convert VoxelMorph ``(1, 3, nx, ny, nz)`` voxel displacement directly on GPU to
+    ``GreedyRegistrationModel`` normalised ``(1, nz, ny, nx, 3)`` ``(dx, dy, dz)`` tensor."""
+    nx, ny, nz = disp_vox_nat.shape[2:]
+    scale_xyz = torch.tensor(
+        [2.0 / max(nx - 1, 1), 2.0 / max(ny - 1, 1), 2.0 / max(nz - 1, 1)],
+        device=disp_vox_nat.device,
+        dtype=torch.float32,
+    ).view(1, 1, 1, 1, 3)
+    return disp_vox_nat.permute(0, 4, 3, 2, 1).contiguous() * scale_xyz
+
+
 def run_voxelmorph_pretrained(
     fixed: ants.ANTsImage,
     moving: ants.ANTsImage,
@@ -352,7 +531,6 @@ def run_voxelmorph_pretrained(
         raise ValueError(
             f"run_voxelmorph_pretrained supports 3-D images only, got {fixed.dimension}-D / {moving.dimension}-D"
         )
-    import antsxdata
 
     vxm, ne = _import_voxelmorph()
     dev = resolve_device(device, task="reg")
@@ -360,15 +538,13 @@ def run_voxelmorph_pretrained(
     torch.manual_seed(int(seed))
     np.random.seed(int(seed))
 
-    weights_path = str(antsxdata.fetch(asset_ref))
-    asset_prov = antsxdata.provenance(asset_ref)
-    ckpt = torch.load(weights_path, map_location="cpu", weights_only=False)
+    _, asset_prov, ckpt = _load_voxelmorph_weights(asset_ref)
 
     t0 = time.perf_counter()
-    mi_aff = _prepare_moving_aligned(fixed, moving, initial_transform)
-
-    src_nat = torch.from_numpy(mi_aff.numpy()).float()[None, None].to(dev)
-    tgt_nat = torch.from_numpy(fixed.numpy()).float()[None, None].to(dev)
+    fi_zyx, mi_aff_zyx, _ = _align_moving_on_device(fixed, moving, initial_transform, torch.device(dev))
+    src_nat = mi_aff_zyx.permute(0, 1, 4, 3, 2).contiguous()
+    tgt_nat = fi_zyx.permute(0, 1, 4, 3, 2).contiguous()
+    del fi_zyx, mi_aff_zyx
 
     if canonical_orientation is not None:
         perm, flips = canonical_orientation_transform(
@@ -441,12 +617,19 @@ def run_voxelmorph_pretrained(
 
     save_dir = _resolve_output_dir(out_dir, "syntx_vxm_pretrained_")
     fwd_warp_path = os.path.join(save_dir, "1Warp.nii.gz")
-    ants.image_write(voxel_disp_to_itk_lps(disp_fwd_nat, fixed), fwd_warp_path)
+    fwd_img = voxel_disp_to_itk_lps(disp_fwd_nat, fixed)
 
     inv_warp_path: Optional[str] = None
+    inv_img = None
     if disp_inv_nat is not None:
         inv_warp_path = os.path.join(save_dir, "1InverseWarp.nii.gz")
-        ants.image_write(voxel_disp_to_itk_lps(disp_inv_nat, fixed), inv_warp_path)
+        inv_img = voxel_disp_to_itk_lps(disp_inv_nat, fixed)
+        _write_ants_images_fast([(fwd_img, fwd_warp_path), (inv_img, inv_warp_path)], compresslevel=1)
+        _cache_disp_image_and_field(fwd_warp_path, fwd_img, dev)
+        _cache_disp_image_and_field(inv_warp_path, inv_img, dev)
+    else:
+        _write_ants_images_fast([(fwd_img, fwd_warp_path)], compresslevel=1)
+        _cache_disp_image_and_field(fwd_warp_path, fwd_img, dev)
 
     del model, src_nat, tgt_nat, src_can, tgt_can, src_pad, tgt_pad, vel_can, disp_fwd_nat
     _release_device_cache(dev)
@@ -472,6 +655,290 @@ def run_voxelmorph_pretrained(
     return _build_return_dict(
         fixed, moving, fwd_warp_path, inv_warp_path, initial_transform, provenance
     )
+
+
+def run_voxelmorph_hybrid_greedy(
+    fixed: ants.ANTsImage,
+    moving: ants.ANTsImage,
+    initial_transform: Optional[str] = None,
+    run_affine_if_none: bool = False,
+    scales: Sequence[int] = (2, 1),
+    reg_iterations: Sequence[int] = (35, 15),
+    optimizer: str = "regadam",
+    learning_rate: float = 0.50,
+    flow_sigma: float = 1.5,
+    total_sigma: float = 0.25,
+    regadam_sigma: float = 0.8,
+    similarity_metric: str = "cc2",
+    lncc_radius: int = 2,
+    convergence_slope: Optional[float] = 0.0,
+    canonical_orientation: Optional[str] = "PIR",
+    int_steps: int = 7,
+    vel_smooth_sigma: float = 1.5,
+    return_inverse: bool = False,
+    digital_diffeomorphism: bool = True,
+    digital_diffeomorphism_floor: float = 0.05,
+    digital_diffeomorphism_steps: int = 25,
+    device: Optional[str] = None,
+    seed: int = 42,
+    asset_ref: str = "syntx_features/voxelmorph_pairwise_3d_brain",
+    out_dir: Optional[str] = None,
+    outprefix: Optional[str] = None,
+    verbose: bool = False,
+) -> Dict[str, Any]:
+    """Hybrid deep-learning + variational greedy registration (``VxmPairwise`` SVF
+    warm-start -> fine-scale ``syntx.greedy`` refinement).
+
+    Runs zero-shot ``VxmPairwise`` inference in canonical ``PIR`` orientation on
+    ``dev`` (``<0.5 s``), converts the voxel displacement field directly on GPU to
+    ``GreedyRegistrationModel``'s normalised ``[-1, 1]`` displacement tensor, and
+    seeds ``syntx.greedy(..., initial_warp=...)`` to refine at fine scales
+    ``scales`` with single-interpolation ``[1Warp.nii.gz, initial_transform]``
+    export and ``0%`` digital diffeomorphism folding.
+    """
+    if fixed.dimension != 3 or moving.dimension != 3:
+        raise ValueError(
+            f"run_voxelmorph_hybrid_greedy supports 3-D images only, got {fixed.dimension}-D / {moving.dimension}-D"
+        )
+
+    dev = resolve_device(device, task="reg")
+    _release_device_cache(dev)
+    torch.manual_seed(int(seed))
+    np.random.seed(int(seed))
+
+    t0_e2e = time.perf_counter()
+    fi_norm = normalize_image(fixed, method="auto")
+    mi_norm = normalize_image(moving, method="auto")
+
+    t_aff = 0.0
+    if initial_transform is None and run_affine_if_none:
+        t0_aff = time.perf_counter()
+        reg_aff = robust_affine(fi_norm, mi_norm, mode="auto", verbose=verbose, device=dev)
+        initial_transform = reg_aff["fwdtransforms"][0]
+        t_aff = time.perf_counter() - t0_aff
+
+    disp_fwd_nat, _, _, vxm_meta = _voxelmorph_predict_svf(
+        fi_norm,
+        mi_norm,
+        initial_transform=initial_transform,
+        canonical_orientation=canonical_orientation,
+        int_steps=int_steps,
+        return_inverse=False,
+        dev=dev,
+        asset_ref=asset_ref,
+        vel_smooth_sigma=vel_smooth_sigma,
+    )
+    init_warp_norm = _voxel_disp_nat_to_norm_zyx(disp_fwd_nat)
+    del disp_fwd_nat
+
+    resolved_outprefix = outprefix
+    if resolved_outprefix is None and out_dir is not None:
+        os.makedirs(out_dir, exist_ok=True)
+        resolved_outprefix = os.path.join(out_dir, "")
+
+    res = greedy_registration(
+        fixed=fi_norm,
+        moving=mi_norm,
+        reg_iterations=list(int(k) for k in reg_iterations),
+        scales=list(int(s) for s in scales),
+        learning_rate=float(learning_rate),
+        flow_sigma=float(flow_sigma),
+        total_sigma=float(total_sigma),
+        optimizer=str(optimizer),
+        regadam_sigma=float(regadam_sigma),
+        similarity_metric=str(similarity_metric),
+        lncc_radius=int(lncc_radius),
+        return_inverse=bool(return_inverse),
+        initial_transform=(initial_transform if initial_transform is not None else False),
+        device=dev,
+        verbose=verbose,
+        outprefix=resolved_outprefix,
+        seed=int(seed),
+        initial_warp=init_warp_norm,
+        convergence_slope=convergence_slope,
+        digital_diffeomorphism=bool(digital_diffeomorphism),
+        digital_diffeomorphism_floor=float(digital_diffeomorphism_floor),
+        digital_diffeomorphism_steps=int(digital_diffeomorphism_steps),
+    )
+    del init_warp_norm
+    _sync_device(dev)
+    total_e2e_s = time.perf_counter() - t0_e2e
+
+    prov = dict(res.get("provenance", {}))
+    prov.update(
+        {
+            "method": "voxelmorph_hybrid_greedy",
+            "asset_ref": vxm_meta["asset_ref"],
+            "asset_sha256": vxm_meta["asset_sha256"],
+            "voxelmorph_version": vxm_meta["voxelmorph_version"],
+            "canonical_orientation": canonical_orientation,
+            "axis_perm": vxm_meta["axis_perm"],
+            "axis_flips": vxm_meta["axis_flips"],
+            "int_steps": int(int_steps),
+            "vel_smooth_sigma": float(vel_smooth_sigma),
+            "vxm_seconds": float(vxm_meta["vxm_seconds"]),
+            "greedy_deformable_seconds": float(prov.get("runtime_deformable_sec", 0.0)),
+            "opt_seconds": float(vxm_meta["vxm_seconds"] + prov.get("runtime_deformable_sec", 0.0)),
+            "runtime_affine_sec": float(t_aff),
+            "runtime_seconds": float(total_e2e_s),
+            "convergence_slope": convergence_slope,
+        }
+    )
+    res["provenance"] = prov
+    return res
+
+
+def run_voxelmorph_hybrid_syn(
+    fixed: ants.ANTsImage,
+    moving: ants.ANTsImage,
+    initial_transform: Optional[str] = None,
+    run_affine_if_none: bool = False,
+    levels: Sequence[int] = (2, 1),
+    reg_iterations: Sequence[int] = (30, 15),
+    regularizer: str = "beltrami",
+    grad_step: float = 0.7,
+    flow_sigma: float = 3.0,
+    total_sigma: float = 0.0,
+    dilatation_weight: float = 0.1,
+    similarity_metric: str = "cc2",
+    syn_sampling: int = 2,
+    convergence_slope: Optional[float] = 0.0,
+    canonical_orientation: Optional[str] = "PIR",
+    int_steps: int = 7,
+    vel_smooth_sigma: float = 1.5,
+    digital_diffeomorphism: bool = True,
+    digital_diffeomorphism_floor: float = 0.05,
+    digital_diffeomorphism_steps: int = 25,
+    device: Optional[str] = None,
+    seed: int = 42,
+    asset_ref: str = "syntx_features/voxelmorph_pairwise_3d_brain",
+    out_dir: Optional[str] = None,
+    outprefix: Optional[str] = None,
+    verbose: bool = False,
+    **syn_kwargs: Any,
+) -> Dict[str, Any]:
+    """Symmetric bidirectional hybrid registration (``VxmPairwise`` SVF warm-start
+    -> fine-scale ``syntx.syn`` with single-interpolation composed endpoint export).
+
+    Predicts forward/inverse SVF displacements with ``VxmPairwise`` in canonical
+    ``PIR`` orientation on ``dev`` and seeds ``syntx.syn(..., initial_warp=...,
+    initial_inverse_warp=...)``, which handles composition, digital
+    diffeomorphism projection, ICE evaluation, and single-interpolation
+    ``[1Warp.nii.gz, 0GenericAffine.mat]`` / ``[0GenericAffine.mat, 1InverseWarp.nii.gz]``
+    export.
+    """
+    if fixed.dimension != 3 or moving.dimension != 3:
+        raise ValueError(
+            f"run_voxelmorph_hybrid_syn supports 3-D images only, got {fixed.dimension}-D / {moving.dimension}-D"
+        )
+    from ..syn import syn as syntx_syn
+
+    dev = resolve_device(device, task="reg")
+    _release_device_cache(dev)
+    torch.manual_seed(int(seed))
+    np.random.seed(int(seed))
+
+    t0_e2e = time.perf_counter()
+    fi_norm = normalize_image(fixed, method="auto")
+    mi_norm = normalize_image(moving, method="auto")
+
+    t_aff = 0.0
+    if initial_transform is None and run_affine_if_none:
+        t0_aff = time.perf_counter()
+        reg_aff = robust_affine(fi_norm, mi_norm, mode="auto", verbose=verbose, device=dev)
+        initial_transform = reg_aff["fwdtransforms"][0]
+        t_aff = time.perf_counter() - t0_aff
+
+    disp_fwd_nat, disp_inv_nat, _, vxm_meta = _voxelmorph_predict_svf(
+        fi_norm,
+        mi_norm,
+        initial_transform=initial_transform,
+        canonical_orientation=canonical_orientation,
+        int_steps=int_steps,
+        return_inverse=True,
+        dev=dev,
+        asset_ref=asset_ref,
+        vel_smooth_sigma=vel_smooth_sigma,
+    )
+
+    with torch.no_grad():
+        vxm_fwd_norm = _voxel_disp_nat_to_norm_zyx(disp_fwd_nat)
+        vxm_inv_norm = _voxel_disp_nat_to_norm_zyx(disp_inv_nat)
+        del disp_fwd_nat, disp_inv_nat
+
+    resolved_outprefix = outprefix
+    if resolved_outprefix is None and out_dir is not None:
+        os.makedirs(out_dir, exist_ok=True)
+        resolved_outprefix = os.path.join(out_dir, "")
+
+    t0_syn = time.perf_counter()
+    syn_extra = dict(syn_kwargs)
+    if regularizer.lower() == "beltrami" and "dilatation_weight" not in syn_extra:
+        syn_extra["dilatation_weight"] = float(dilatation_weight)
+    res_syn = syntx_syn(
+        fixed=fi_norm,
+        moving=mi_norm,
+        initial_transform=(initial_transform if initial_transform is not None else "identity"),
+        initial_warp=vxm_fwd_norm,
+        initial_inverse_warp=vxm_inv_norm,
+        backend="pytorch",
+        device=dev,
+        levels=[int(x) for x in levels],
+        reg_iterations=[int(k) for k in reg_iterations],
+        regularizer=str(regularizer),
+        grad_step=float(grad_step),
+        flow_sigma=float(flow_sigma),
+        total_sigma=float(total_sigma),
+        similarity_metric=str(similarity_metric),
+        syn_sampling=int(syn_sampling),
+        convergence_slope=convergence_slope,
+        digital_diffeomorphism=bool(digital_diffeomorphism),
+        digital_diffeomorphism_floor=float(digital_diffeomorphism_floor),
+        digital_diffeomorphism_steps=int(digital_diffeomorphism_steps),
+        outprefix=resolved_outprefix,
+        seed=int(seed),
+        verbose=verbose,
+        **syn_extra,
+    )
+    del vxm_fwd_norm, vxm_inv_norm
+    _sync_device(dev)
+    syn_s = time.perf_counter() - t0_syn
+    total_e2e_s = time.perf_counter() - t0_e2e
+    _release_device_cache(dev)
+
+    provenance = dict(res_syn.get("provenance", {}))
+    provenance.update(
+        {
+            "method": "voxelmorph_hybrid_syn",
+            "device": dev,
+            "voxelmorph_version": vxm_meta["voxelmorph_version"],
+            "asset_ref": vxm_meta["asset_ref"],
+            "asset_sha256": vxm_meta["asset_sha256"],
+            "canonical_orientation": canonical_orientation,
+            "axis_perm": vxm_meta["axis_perm"],
+            "axis_flips": vxm_meta["axis_flips"],
+            "int_steps": int(int_steps),
+            "vel_smooth_sigma": float(vel_smooth_sigma),
+            "levels": [int(x) for x in levels],
+            "reg_iterations": [int(k) for k in reg_iterations],
+            "regularizer": str(regularizer),
+            "grad_step": float(grad_step),
+            "flow_sigma": float(flow_sigma),
+            "total_sigma": float(total_sigma),
+            "dilatation_weight": float(dilatation_weight),
+            "similarity_metric": str(similarity_metric),
+            "syn_sampling": int(syn_sampling),
+            "convergence_slope": convergence_slope,
+            "digital_diffeomorphism": bool(digital_diffeomorphism),
+            "vxm_seconds": float(vxm_meta["vxm_seconds"]),
+            "syn_seconds": float(syn_s),
+            "opt_seconds": float(vxm_meta["vxm_seconds"] + syn_s),
+            "runtime_affine_sec": float(t_aff),
+            "runtime_seconds": float(total_e2e_s),
+        }
+    )
+    res_syn["provenance"] = provenance
+    return res_syn
 
 
 def run_voxelmorph_multiscale(

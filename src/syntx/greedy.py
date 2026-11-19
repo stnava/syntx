@@ -27,12 +27,12 @@ import torch.nn.functional as F
 import ants
 
 from .spatial import (
-    disp_itk_to_tensor,
     disp_tensor_to_itk,
     itk_shape_to_tensor_shape,
     export_ants_affine_transform,
     normalized_to_physical_disp,
 )
+from .core.initial_warp import resolve_initial_transform_and_warp
 from .core.affine import parse_ants_affine
 from .core.grid import compose_grids, resize_field, sample_field_cf
 from .core.losses import (
@@ -352,6 +352,7 @@ class GreedyRegistrationModel(nn.Module):
         verbose: bool = False,
         spacing: Optional[Sequence[float]] = None,
         moving_spacing: Optional[Sequence[float]] = None,
+        initial_warp: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """
         Multi-scale optimisation of the field. ``fixed_tensor`` / ``moving_tensor``:
@@ -359,6 +360,9 @@ class GreedyRegistrationModel(nn.Module):
         (fixed -> moving); ``scales`` / ``iterations``: shrink factor and iterations per level.
         ``spacing`` / ``moving_spacing`` (ITK x, y, z order; default unit spacing, and the fixed spacing for the moving image) feed the
         central ``deformable`` pyramid, so a level is isotropic in millimetres and a thick axis is not shrunk with the thin ones.
+        ``initial_warp``: optional normalised ``[-1, 1]`` displacement field ``(1, *spatial, dim)``
+        in tensor ``(z, y, x)`` spatial order and ``(x, y, z)`` component order to warm-start
+        optimisation at the coarsest scale.
         Returns (and stores as ``self.warp``) the field; ``self.loss_history`` keeps the loss.
         """
         self.theta = theta
@@ -380,7 +384,26 @@ class GreedyRegistrationModel(nn.Module):
 
         # Initialize displacement field u at the coarsest scale
         init_size = list(fixed_lv[0].shape)
-        warp = torch.zeros((1, *init_size, dim), dtype=torch.float32, device=self.device)
+        if initial_warp is not None:
+            iw = initial_warp.to(device=self.device, dtype=torch.float32)
+            if iw.ndim == dim + 1:
+                iw = iw.unsqueeze(0)
+            if iw.ndim != dim + 2 or iw.shape[-1] != dim:
+                raise ValueError(
+                    f"initial_warp must have shape (1, *spatial, {dim}) or (*spatial, {dim}), "
+                    f"got {tuple(initial_warp.shape)}"
+                )
+            if list(iw.shape[1:-1]) != init_size:
+                warp = resize_field(iw, init_size, mode=mode)
+            else:
+                warp = iw.clone()
+            if self.restrict_transformation is not None:
+                restr_init = torch.tensor(
+                    self.restrict_transformation, device=self.device, dtype=warp.dtype
+                ).view(1, *([1] * dim), dim)
+                warp = warp * restr_init
+        else:
+            warp = torch.zeros((1, *init_size, dim), dtype=torch.float32, device=self.device)
         exp_avg = torch.zeros_like(warp)
         exp_avg_sq = torch.zeros_like(warp)
 
@@ -647,6 +670,8 @@ def greedy_registration(
     seed: int = 42,
     restrict_transformation: Optional[Union[Sequence[float], Tuple[float, ...]]] = None,
     levels: Optional[Union[List[int], Tuple[int, ...]]] = None,
+    initial_warp: Optional[Union[torch.Tensor, ants.ANTsImage, str, os.PathLike]] = None,
+    initial_inverse_warp: Optional[Union[torch.Tensor, ants.ANTsImage, str, os.PathLike]] = None,
     **kwargs: Any
 ) -> Dict[str, Any]:
     """
@@ -695,11 +720,15 @@ def greedy_registration(
         are NaN in the benchmarks).
     initial_transform : None, False, 'identity', str, list or ANTsTransform
         None: ``syntx.robust_affine(mode=affine_mode)``; False / 'identity': no affine;
-        otherwise ANTs transform file(s) -- must be linear (affine/rigid/similarity/...); a
-        non-linear transform (e.g. a displacement field) raises ``NotImplementedError`` (no
-        dense-initial-grid support yet, unlike ``core.affine.parse_ants_affine``'s general
-        ``allow_nonlinear`` contract -- nothing in this function's optimisation loop can
-        currently consume a per-voxel starting field).
+        otherwise ANTs transform file(s) -- linear transform(s) or a leading displacement
+        field followed by linear transform(s) (e.g. ``[warp_file, affine_file]``). Other
+        non-linear combinations (e.g. ``[affine_file, warp_file]`` or composite/BSpline
+        transforms) raise ``NotImplementedError``.
+    initial_warp : torch.Tensor, ANTsImage, or str, optional
+        Dense initial displacement field to warm-start optimization: either a normalised
+        ``[-1, 1]`` tensor ``(1, *spatial, dim)`` in tensor ``(z, y, x)`` order and
+        ``(x, y, z)`` components, an ITK LPS vector ``ANTsImage``, or a ``.nii.gz``
+        displacement field path. Exported as a single composed ``1Warp.nii.gz``.
     affine_mode : str, default 'auto'
         ``syntx.robust_affine`` mode for the automatic alignment.
     device : str, optional
@@ -765,43 +794,29 @@ def greedy_registration(
     fi_norm = normalize_intensity(fixed)
     mi_norm = normalize_intensity(moving)
 
-    # 3. Initial Affine Alignment
+    # 3. Initial Affine Alignment & Optional Dense Initial Warp
     t0_aff = time.time()
-    aff_tx = None
-    if initial_transform is None:
+    raw_init_tx = initial_transform
+    if initial_transform is None and initial_warp is None:
         if verbose:
             print("[greedy] Running syntx.robust_affine(mode='auto')...")
         reg_aff = robust_affine(fi_norm, mi_norm, mode=affine_mode, verbose=False, device=torch_device)
-        aff_tx = reg_aff['fwdtransforms'][0]
-    elif initial_transform is False or (isinstance(initial_transform, str) and initial_transform.lower() == 'identity'):
-        aff_tx = None
-    else:
-        aff_tx = initial_transform if isinstance(initial_transform, list) else [initial_transform]
+        raw_init_tx = reg_aff['fwdtransforms'][0]
     t1_aff = time.time() - t0_aff
 
-    # 4. Extract Physical and Normalized Affine Matrices
-    if aff_tx is not None:
-        tx_list = aff_tx if isinstance(aff_tx, list) else [aff_tx]
-        # allow_nonlinear=True so a non-linear initial_transform (e.g. a displacement field)
-        # surfaces here as a clean (None, None) instead of parse_ants_affine's own ValueError
-        # -- this function has NO dense-initial-grid support despite what its docstring says
-        # ("anything else becomes an initial grid"): GreedyRegistrationModel.fit() only
-        # accepts an affine theta, nothing seeds a per-voxel starting field. Since tx_list is
-        # guaranteed non-empty here (aff_tx is not None), a (None, None) result can only mean
-        # a non-linear item was passed -- raise clearly rather than silently discarding it and
-        # starting from identity, which would be a much worse, silent version of this gap.
-        M_phys, t_phys = parse_ants_affine(tx_list, dim, allow_nonlinear=True)
-        if M_phys is None:
-            raise NotImplementedError(
-                "greedy_registration: initial_transform contains a non-linear transform (e.g. "
-                "a displacement field), which this function does not yet support as a dense "
-                "initial grid -- GreedyRegistrationModel.fit() only accepts an affine starting "
-                "point. Pass a linear transform (affine/rigid/similarity/...), None (runs "
-                "syntx.robust_affine), False, or 'identity' instead."
-            )
-    else:
-        M_phys = np.eye(dim, dtype=np.float64)
-        t_phys = np.zeros(dim, dtype=np.float64)
+    resolved_init = resolve_initial_transform_and_warp(
+        fi_norm,
+        mi_norm,
+        initial_transform=raw_init_tx,
+        initial_warp=initial_warp,
+        initial_inverse_warp=initial_inverse_warp,
+        need_inverse=False,
+        device=torch_device,
+    )
+    aff_tx = resolved_init.aff_tx
+    M_phys = resolved_init.M_phys
+    t_phys = resolved_init.t_phys
+    init_warp_t = resolved_init.u0_norm
 
     theta, P_F, P_M = _build_torch_affine_matrix(fi_norm, mi_norm, M_phys, t_phys, torch_device)
 
@@ -916,6 +931,9 @@ def greedy_registration(
         digital_diffeomorphism_steps=digital_diffeomorphism_steps,
     )
 
+    model.has_initial_warp = resolved_init.has_initial_warp
+    model.initial_warp_kind = resolved_init.initial_warp_kind
+
     t0_opt = time.time()
     warp = model.fit(
         fixed_tensor=fi_t,
@@ -927,6 +945,7 @@ def greedy_registration(
         verbose=verbose,
         spacing=tuple(float(x) for x in fixed.spacing),
         moving_spacing=tuple(float(x) for x in moving.spacing),
+        initial_warp=init_warp_t,
     )
     t1_opt = time.time() - t0_opt
 
@@ -958,16 +977,19 @@ def greedy_registration(
         if verbose:
             print("[greedy] Computing physical inverse displacement field with Anderson acceleration...")
         inv_steps = max(anderson_steps, 15)
-        inv_disp_t = update_inverse_field_nd_anderson(
-            W_disp=disp_t,
-            W_inv_disp=None,
-            steps=inv_steps,
-            m=anderson_m,
-            spacing=fixed.spacing,
-            origin=fixed.origin,
-            direction=fixed.direction,
-        )
-        if digital_diffeomorphism and sum(reg_iterations) > 0:
+        if sum(reg_iterations) == 0 and resolved_init.u0_inv_phys is not None:
+            inv_disp_t = resolved_init.u0_inv_phys
+        else:
+            inv_disp_t = update_inverse_field_nd_anderson(
+                W_disp=disp_t,
+                W_inv_disp=resolved_init.u0_inv_phys,
+                steps=inv_steps,
+                m=anderson_m,
+                spacing=fixed.spacing,
+                origin=fixed.origin,
+                direction=fixed.direction,
+            )
+        if digital_diffeomorphism and (sum(reg_iterations) > 0 or init_warp_t is not None):
             from .core.digital_diffeomorphism import enforce_digital_diffeomorphism_nd
             disp_t, inv_disp_t = enforce_digital_diffeomorphism_nd(
                 disp_t,
@@ -988,7 +1010,7 @@ def greedy_registration(
         inv_disp_img = disp_tensor_to_itk(inv_disp_t, fixed)
         t1_inv = time.time() - t0_inv
     else:
-        if digital_diffeomorphism and sum(reg_iterations) > 0:
+        if digital_diffeomorphism and (sum(reg_iterations) > 0 or init_warp_t is not None):
             from .core.digital_diffeomorphism import enforce_digital_diffeomorphism_nd
             disp_t = enforce_digital_diffeomorphism_nd(
                 disp_t,
@@ -1108,6 +1130,8 @@ def greedy_registration(
         'anderson_freq': anderson_freq if anderson else 'none',
         'return_inverse': return_inverse,
         'digital_diffeomorphism': digital_diffeomorphism,
+        'has_initial_warp': resolved_init.has_initial_warp,
+        'initial_warp_kind': resolved_init.initial_warp_kind,
         'runtime_total_sec': round(total_runtime, 2),
         'runtime_affine_sec': round(t1_aff, 2),
         'runtime_deformable_sec': round(t1_opt, 2),

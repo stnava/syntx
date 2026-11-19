@@ -34,7 +34,8 @@ from .syn_jax import (
     get_affine_matrix_jax, get_physical_grid_jax,
     physical_to_normalized_jax_cached, jax_grid_sample,
     local_ncc_loss_nd_jax, mattes_mi_loss_nd_jax, grid_to_physical_affine_jax,
-    separable_gaussian_filter_jax, interpolate_jax, pyramid_level_jax
+    separable_gaussian_filter_jax, interpolate_jax, pyramid_level_jax,
+    compose_grids_jax, upscale_initial_grid,
 )
 from .tvf_jax import clamp_affine_params_jax, adam_step_dict
 
@@ -601,23 +602,43 @@ class GeodesicShootingModelJAX:
         M_phys_inv_zyx = jnp.linalg.inv(M_phys_zyx)
         t_phys_inv_zyx = -(M_phys_inv_zyx @ t_phys_zyx)
 
+        ig_attr = getattr(self, 'initial_grid', None)
+        if ig_attr is not None:
+            ig_lvl = ig_attr if tuple(ig_attr.shape[1:-1]) == target_shape else upscale_initial_grid(ig_attr, target_shape)
+        else:
+            ig_lvl = None
+
         # 1. Forward shooting -> warp moving to fixed
         disp_fwd = self.shoot(velocity_0_fwd, n_steps=self.n_steps, image_shape=target_shape)
-        phi_moving_affine = (phys_grid + disp_fwd) @ M_phys_zyx.T + t_phys_zyx
-        phi_norm_fwd = physical_to_normalized_jax_cached(
-            phi_moving_affine, shape_t, spacing_t, origin_t, direction_t
-        )
+        if ig_lvl is not None:
+            phi_m_fixed_norm = physical_to_normalized_jax_cached(
+                phys_grid + disp_fwd, shape_t, spacing_t, origin_t, direction_t
+            )
+            phi_norm_fwd = compose_grids_jax(ig_lvl, phi_m_fixed_norm)
+        else:
+            phi_moving_affine = (phys_grid + disp_fwd) @ M_phys_zyx.T + t_phys_zyx
+            phi_norm_fwd = physical_to_normalized_jax_cached(
+                phi_moving_affine, shape_t, spacing_t, origin_t, direction_t
+            )
         moving_warped = jax_grid_sample(moving_image, phi_norm_fwd, mode='bilinear', padding_mode='zeros')
         loss_fwd = self._eval_similarity(fixed_image, moving_warped, lncc_window_size)
 
         # 2. Inverse shooting -> warp fixed to moving
         disp_inv = self.shoot(velocity_0_inv, n_steps=self.n_steps, image_shape=target_shape)
-        phi_fixed_affine = (phys_grid + disp_inv) @ M_phys_inv_zyx.T + t_phys_inv_zyx
-        phi_norm_inv = physical_to_normalized_jax_cached(
-            phi_fixed_affine, shape_t, spacing_t, origin_t, direction_t
-        )
-        fixed_warped = jax_grid_sample(fixed_image, phi_norm_inv, mode='bilinear', padding_mode='zeros')
-        loss_inv = self._eval_similarity(moving_image, fixed_warped, lncc_window_size)
+        if ig_lvl is not None:
+            phi_norm_inv = physical_to_normalized_jax_cached(
+                phys_grid + disp_inv, shape_t, spacing_t, origin_t, direction_t
+            )
+            fixed_warped = jax_grid_sample(fixed_image, phi_norm_inv, mode='bilinear', padding_mode='zeros')
+            moving_init = jax_grid_sample(moving_image, ig_lvl, mode='bilinear', padding_mode='zeros')
+            loss_inv = self._eval_similarity(moving_init, fixed_warped, lncc_window_size)
+        else:
+            phi_fixed_affine = (phys_grid + disp_inv) @ M_phys_inv_zyx.T + t_phys_inv_zyx
+            phi_norm_inv = physical_to_normalized_jax_cached(
+                phi_fixed_affine, shape_t, spacing_t, origin_t, direction_t
+            )
+            fixed_warped = jax_grid_sample(fixed_image, phi_norm_inv, mode='bilinear', padding_mode='zeros')
+            loss_inv = self._eval_similarity(moving_image, fixed_warped, lncc_window_size)
 
         sim_loss = 0.5 * (loss_fwd + loss_inv)
 
@@ -720,7 +741,7 @@ class GeodesicShootingModelJAX:
         None. Read results with ``get_forward_warp`` / ``get_inverse_warp``. The moving image
         must share the fixed geometry (``syntx.syngs`` checks this for the JAX backend).
         """
-        _GS_JAX_FIT_KWARGS = {'initial_transform', 'fluid_sigmas', 'fluid_sigma', 'optimizer_type',
+        _GS_JAX_FIT_KWARGS = {'initial_grid', 'initial_transform', 'fluid_sigmas', 'fluid_sigma', 'optimizer_type',
                               'optimizer', 'cfl_step', 'grad_step', 'cfl_momentum', 'vel_spacing',
                               'smooth_pyramid', 'pre_smooth', 'aa_sigma', 'convergence_slope'}
         _unknown = sorted(set(kwargs) - _GS_JAX_FIT_KWARGS)
@@ -739,6 +760,9 @@ class GeodesicShootingModelJAX:
         if moving_image.ndim == self.dim:
             moving_image = moving_image[None, None]
 
+        initial_grid_arg = kwargs.get('initial_grid', None)
+        self.initial_grid = jnp.array(initial_grid_arg, dtype=jnp.float32) if initial_grid_arg is not None else None
+
         initial_transform = kwargs.get('initial_transform', None)
         if initial_transform is not None:
             from .syn import parse_ants_affine
@@ -755,7 +779,7 @@ class GeodesicShootingModelJAX:
 
         if isinstance(affine_epochs, (list, tuple)):
             affine_epochs = sum(affine_epochs)
-        if affine_epochs > 0:
+        if affine_epochs > 0 and self.initial_grid is None:
             if verbose: print("Optimizing affine pre-alignment in JAX...")
             m_aff = {k: jnp.zeros_like(v) for k, v in self.affine_params.items()}
             v_aff = {k: jnp.zeros_like(v) for k, v in self.affine_params.items()}

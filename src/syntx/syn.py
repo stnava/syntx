@@ -1062,7 +1062,12 @@ class SyNTo(nn.Module):
             curr_spacing_moving = tuple(J_lv[level_idx].spacing)
             
             with torch.no_grad():
-                if hasattr(self, 'affine'):
+                if self.initial_grid is not None:
+                    M_phys = torch.eye(dim, device=device, dtype=dtype)
+                    t_phys = torch.zeros(dim, device=device, dtype=dtype)
+                    self.init_M_phys = None
+                    self.init_t_phys = None
+                elif hasattr(self, 'affine'):
                     T_grid = self.affine.get_matrix()
                     M_phys, t_phys = grid_to_physical_affine_torch(
                         T_grid,
@@ -2826,17 +2831,8 @@ class SyNTo(nn.Module):
         
         phi_l2r_phys = X_phys + warp_resampled
         
-        T_grid = self.affine.get_matrix()
-        # Shapes are tensor (Z, Y, X) order, matching fit().
-        M_phys, t_phys = grid_to_physical_affine_torch(
-            T_grid, spatial_shape, spacing, origin, direction,
-            tuple(moving_image_zyx.shape[2:]), moving_spacing, moving_origin, moving_direction
-        )
-        
-        y_phys = phi_l2r_phys @ M_phys.t() + t_phys
-        composed_grid = physical_to_normalized_torch(y_phys, moving_image_zyx.shape[2:], moving_spacing, moving_origin, moving_direction)
-        
         if hasattr(self, 'initial_grid') and self.initial_grid is not None:
+            composed_grid = physical_to_normalized_torch(phi_l2r_phys, spatial_shape, spacing, origin, direction)
             initial_grid_resampled = F.interpolate(
                 torch.movedim(self.initial_grid.to(device=device, dtype=dtype), -1, 1),
                 size=spatial_shape,
@@ -2845,6 +2841,15 @@ class SyNTo(nn.Module):
             )
             initial_grid_resampled = torch.movedim(initial_grid_resampled, 1, -1)
             composed_grid = compose_grids(initial_grid_resampled, composed_grid)
+        else:
+            T_grid = self.affine.get_matrix()
+            # Shapes are tensor (Z, Y, X) order, matching fit().
+            M_phys, t_phys = grid_to_physical_affine_torch(
+                T_grid, spatial_shape, spacing, origin, direction,
+                tuple(moving_image_zyx.shape[2:]), moving_spacing, moving_origin, moving_direction
+            )
+            y_phys = phi_l2r_phys @ M_phys.t() + t_phys
+            composed_grid = physical_to_normalized_torch(y_phys, moving_image_zyx.shape[2:], moving_spacing, moving_origin, moving_direction)
             
         warped_zyx = grid_sample_nd(moving_image_zyx, composed_grid, padding_mode='itk', align_corners=True, interpolator=self.interpolator)
         warped_xyz = warped_zyx.permute(perm)
@@ -3100,6 +3105,8 @@ def registration(
     midpoint_only=False,
     export_midpoint=True,
     return_warped=True,
+    initial_warp=None,
+    initial_inverse_warp=None,
     **kwargs
 ):
     """
@@ -3436,45 +3443,33 @@ def registration(
     if inv_tolerance is None:
         inv_tolerance = 0.1 * min(spacing)
     
-    # Apply initial transform if provided
+    # Apply initial transform / dense initial warp if provided
+    from .core.initial_warp import (
+        compose_initial_and_residual_warps,
+        resolve_initial_transform_and_warp,
+    )
+
     tx_list = []
     initial_grid = kwargs.pop('initial_grid', None)
-    
+
     init_M_phys, init_t_phys = None, None
-    
+    resolved_init = None
+
+    _tot_lower_early = type_of_transform.lower()
+    _skip_align_early = (
+        _tot_lower_early in ('synonly', 'syn_only') or
+        _tot_lower_early in ('greedy', 'greedy_compositive') or
+        str(kwargs.get('formulation', '')).lower() == 'greedy'
+    )
+
     if initial_grid is not None:
         perm_grid = (0, 2, 1, 3) if dim == 2 else (0, 3, 2, 1, 4)
         initial_grid = initial_grid.transpose(perm_grid)
-    elif isinstance(initial_transform, str) and initial_transform.lower() == 'identity':
-        # ANTs keyword: start from the identity transform in physical (scanner header) space,
-        # bypassing the automatic center-of-mass initialization below -- mandatory for
-        # opposite-contrast pairs (e.g. T1 structural -> BOLD/EPI) where intensity-centroid
-        # alignment fails. `tx_list` stays empty: there is no real transform file to compose,
-        # and passing the literal string "Identity" to ants.read_transform/apply_transforms
-        # raises ("Transform Identity does not exist").
-        import torch
-        init_M_phys = torch.eye(dim, dtype=torch.float32)
-        init_t_phys = torch.zeros(dim, dtype=torch.float32)
-    elif initial_transform is not None:
-        tx_list = initial_transform if isinstance(initial_transform, list) else [initial_transform]
-        # a list containing a warp is not one linear map: use the dense initial grid instead
-        init_M_phys, init_t_phys = parse_ants_affine(tx_list, dim, allow_nonlinear=True)
-        if init_M_phys is None:
-            initial_grid = compute_initial_grid(fixed_primary, moving_primary, tx_list)
-            perm_grid = (0, 2, 1, 3) if dim == 2 else (0, 3, 2, 1, 4)
-            initial_grid = initial_grid.transpose(perm_grid)
+    elif _tot_lower_early in ('greedy', 'greedy_compositive') or str(kwargs.get('formulation', '')).lower() == 'greedy':
+        pass  # greedy_registration handles initial_transform / initial_warp directly below
     else:
-        # No caller-supplied initial transform/grid, and not the identity keyword: resolve the
-        # initial affine/rigid alignment automatically via the single, validated robust_affine
-        # solver -- unless the transform type explicitly means "skip affine alignment entirely"
-        # (SyNOnly / greedy dispatch, mirrored from the tot_lower checks below).
-        _tot_lower_early = type_of_transform.lower()
-        _skip_align_early = (
-            _tot_lower_early in ('synonly', 'syn_only') or
-            _tot_lower_early in ('greedy', 'greedy_compositive') or
-            str(kwargs.get('formulation', '')).lower() == 'greedy'
-        )
-        if not _skip_align_early:
+        raw_init_tx = initial_transform
+        if initial_transform is None and initial_warp is None and not _skip_align_early:
             from .robust_affine import robust_affine
             _affine_dof_resolved = affine_dof
             if _affine_dof_resolved is None:
@@ -3494,8 +3489,29 @@ def registration(
                 dof=_affine_dof_resolved, mode=affine_mode, seed=affine_seed, verbose=verbose,
                 **_aff_kwargs
             )
-            tx_list = aff_res['fwdtransforms']
-            init_M_phys, init_t_phys = parse_ants_affine(tx_list, dim)
+            raw_init_tx = aff_res['fwdtransforms']
+
+        _init_dev = kwargs.get('device', None) if backend == 'pytorch' else None
+        resolved_init = resolve_initial_transform_and_warp(
+            fixed_primary,
+            moving_primary,
+            initial_transform=raw_init_tx,
+            initial_warp=initial_warp,
+            initial_inverse_warp=initial_inverse_warp,
+            need_inverse=True,
+            device=_init_dev,
+        )
+        if resolved_init.has_initial_warp:
+            initial_grid = resolved_init.initial_grid_zyx.detach().cpu().numpy()
+            tx_list = resolved_init.aff_tx or []
+            # init_M_phys / init_t_phys stay None during fit so affine is not double-applied
+        elif resolved_init.has_linear_affine or (
+            isinstance(raw_init_tx, str) and raw_init_tx.lower() == 'identity'
+        ):
+            import torch
+            init_M_phys = torch.from_numpy(resolved_init.M_phys).to(torch.float32)
+            init_t_phys = torch.from_numpy(resolved_init.t_phys).to(torch.float32)
+            tx_list = resolved_init.aff_tx or []
     moving_reg = moving
     
     from .core.pipeline import normalize_and_tensorize, auto_detect_device, cleanup_gpu
@@ -3538,6 +3554,8 @@ def registration(
             similarity_metric=syn_metric,
             lncc_radius=syn_sampling,
             initial_transform=initial_transform,
+            initial_warp=initial_warp,
+            initial_inverse_warp=initial_inverse_warp,
             verbose=verbose,
             device=kwargs.pop('device', None),
             restrict_transformation=restrict_transformation,
@@ -3823,6 +3841,11 @@ def registration(
             **fit_kwargs
         )
     
+    _has_init_warp = bool(resolved_init is not None and resolved_init.has_initial_warp)
+    _init_warp_kind = resolved_init.initial_warp_kind if resolved_init is not None else "none"
+    model.has_initial_warp = _has_init_warp
+    model.initial_warp_kind = _init_warp_kind
+
     # 4. Save displacement fields to temp files to match ANTs file-based transforms
     from .transforms import _cache_disp_image_and_field, _write_ants_images_fast, apply_transforms as _apply_transforms
     _apply_dev = str(device) if backend == 'pytorch' else None
@@ -3836,7 +3859,7 @@ def registration(
 
     fwd_file = None
     inv_file = None
-    if sum(reg_iterations) > 0 and not _skip_full_warps:
+    if (sum(reg_iterations) > 0 or _has_init_warp) and not _skip_full_warps:
         if outprefix is not None:
             os.makedirs(os.path.dirname(outprefix) or '.', exist_ok=True)
             fwd_file = f"{outprefix}1Warp.nii.gz"
@@ -3859,7 +3882,18 @@ def registration(
                 total_fwd_deformable = model.warp_l2r.data
                 total_inv_deformable = model.warp_r2l.data
 
-            if hasattr(model, 'affine'):
+            if _has_init_warp:
+                if resolved_init.has_linear_affine:
+                    M_phys, t_phys = resolved_init.M_phys, resolved_init.t_phys
+                    if outprefix is not None:
+                        affine_file = f"{outprefix}0GenericAffine.mat"
+                        affine_inv_file = f"{outprefix}0GenericAffine_inv.mat"
+                    else:
+                        affine_file = tempfile.NamedTemporaryFile(suffix='.mat', delete=False).name
+                        affine_inv_file = tempfile.NamedTemporaryFile(suffix='.mat', delete=False).name
+                    tx_fwd, tx_inv = export_ants_affine_transform(M_phys, t_phys, dim=dim, filename=affine_file)
+                    ants.write_transform(tx_inv, affine_inv_file)
+            elif hasattr(model, 'affine'):
                 # Convert internal grid affine to physical ITK AffineTransform
                 T_grid = model.affine.get_matrix().detach().cpu().numpy()
                 if verbose >= 2:
@@ -3886,7 +3920,18 @@ def registration(
             total_fwd_deformable = model.warp_l2r
             total_inv_deformable = model.warp_r2l
         
-        if hasattr(model, 'affine_params'):
+        if _has_init_warp:
+            if resolved_init.has_linear_affine:
+                M_phys, t_phys = resolved_init.M_phys, resolved_init.t_phys
+                if outprefix is not None:
+                    affine_file = f"{outprefix}0GenericAffine.mat"
+                    affine_inv_file = f"{outprefix}0GenericAffine_inv.mat"
+                else:
+                    affine_file = tempfile.NamedTemporaryFile(suffix='.mat', delete=False).name
+                    affine_inv_file = tempfile.NamedTemporaryFile(suffix='.mat', delete=False).name
+                tx_fwd, tx_inv = export_ants_affine_transform(M_phys, t_phys, dim=dim, filename=affine_file)
+                ants.write_transform(tx_inv, affine_inv_file)
+        elif hasattr(model, 'affine_params'):
             T_grid = get_affine_matrix_jax(model.affine_params, dim, model.transform_type)
             T_grid = np.array(T_grid)
             if verbose >= 2:
@@ -3906,8 +3951,37 @@ def registration(
 
     fwd_warp_image = None
     inv_warp_image = None
-    if sum(reg_iterations) > 0 and not _skip_full_warps:
-        if total_fwd_deformable is None:
+    if (sum(reg_iterations) > 0 or _has_init_warp) and not _skip_full_warps:
+        if _has_init_warp:
+            if sum(reg_iterations) > 0 and total_fwd_deformable is not None:
+                comp_dev = device if backend == 'pytorch' else resolved_init.u0_phys.device
+                total_fwd_deformable, total_inv_deformable = compose_initial_and_residual_warps(
+                    total_fwd_deformable,
+                    total_inv_deformable,
+                    resolved_init.u0_phys,
+                    resolved_init.u0_inv_phys,
+                    fixed_primary.spacing,
+                    fixed_primary.origin,
+                    fixed_primary.direction,
+                    device=comp_dev,
+                )
+                if bool(kwargs.get('digital_diffeomorphism', True)):
+                    from .core.digital_diffeomorphism import enforce_digital_diffeomorphism_nd
+                    total_fwd_deformable, total_inv_deformable = enforce_digital_diffeomorphism_nd(
+                        total_fwd_deformable,
+                        total_inv_deformable,
+                        spacing=fixed_primary.spacing,
+                        origin=fixed_primary.origin,
+                        direction=fixed_primary.direction,
+                        ice_tol=0.30,
+                        jac_floor=float(kwargs.get('digital_diffeomorphism_floor', 0.05)),
+                        steps=int(kwargs.get('digital_diffeomorphism_steps', 25)),
+                        stationary_boundary=True,
+                    )
+            else:
+                total_fwd_deformable = resolved_init.u0_phys
+                total_inv_deformable = resolved_init.u0_inv_phys
+        elif total_fwd_deformable is None:
             tensor_shape = itk_shape_to_tensor_shape(fixed_primary.shape)
             total_fwd_deformable = np.zeros((1, *tensor_shape, dim), dtype=np.float32)
             total_inv_deformable = np.zeros((1, *tensor_shape, dim), dtype=np.float32)
@@ -3924,11 +3998,11 @@ def registration(
         fwd_warp_image = fwd_img
         inv_warp_image = inv_img
         
-        if affine_file is not None and (initial_transform is None or init_M_phys is not None):
+        if affine_file is not None and (initial_transform is None or init_M_phys is not None or _has_init_warp):
             fwd_transforms = [fwd_file, affine_file]
             inv_transforms = [affine_file, inv_file]
             whichtoinvert_inv = [True, False]
-        elif initial_transform is not None:
+        elif initial_transform is not None and not _has_init_warp:
             fwd_transforms = [fwd_file] + tx_list
             inv_transforms = tx_list + [inv_file]
             whichtoinvert_inv = [True] * len(tx_list) + [False]
@@ -3951,7 +4025,16 @@ def registration(
             whichtoinvert_inv = []
     
     inverse_identity_errors = {}
-    if not midpoint_only and sum(reg_iterations) > 0 and hasattr(model, 'warp_l2r') and hasattr(model, 'warp_r2l'):
+    if not midpoint_only and _has_init_warp and total_fwd_deformable is not None and total_inv_deformable is not None:
+        import torch
+        with torch.no_grad():
+            tf = total_fwd_deformable if isinstance(total_fwd_deformable, torch.Tensor) else torch.from_numpy(np.asarray(total_fwd_deformable))
+            ti = total_inv_deformable if isinstance(total_inv_deformable, torch.Tensor) else torch.from_numpy(np.asarray(total_inv_deformable))
+            err_1 = calculate_inverse_identity_error(tf, ti, fixed_primary.spacing, fixed_primary.origin, fixed_primary.direction)
+            if isinstance(err_1.get('error_map'), torch.Tensor):
+                err_1['error_map'] = err_1['error_map'].cpu()
+            inverse_identity_errors['phi_1'] = err_1
+    elif not midpoint_only and sum(reg_iterations) > 0 and hasattr(model, 'warp_l2r') and hasattr(model, 'warp_r2l'):
         import torch
         with torch.no_grad():
             if backend == 'pytorch':
@@ -4092,6 +4175,8 @@ def registration(
             antisymmetric=antisymmetric,
             use_analytical_gradients=use_analytical,
             metric_chunks=int(_raw_mc),
+            has_initial_warp=_has_init_warp,
+            initial_warp_kind=_init_warp_kind,
         )
         ret_dict['provenance'] = provenance
     except Exception:
@@ -4338,6 +4423,7 @@ def auto_reg(
 
     # 5. Deterministic Robust Affine Initialization (run BEFORE narrow CT windowing so global affine sees full HU attenuation)
     initial_transform = kwargs.pop('initial_transform', None)
+    initial_warp_arg = kwargs.get('initial_warp', None)
     aff_mode = robust_affine if isinstance(robust_affine, str) and robust_affine in ('translation_only', 'com_only', 'pytorch', 'ants_fast') else 'auto'
     need_pre_window_affine = bool(
         apply_ct_window and dim == 3 and hasattr(fixed_primary, 'dimension')
@@ -4347,7 +4433,7 @@ def auto_reg(
         (robust_affine is True) or
         (isinstance(robust_affine, str) and robust_affine in ('auto', 'translation_only', 'com_only', 'pytorch', 'ants_fast')) or
         (robust_affine == 'auto' and dim == 3 and hasattr(fixed_primary, 'dimension'))
-    ) and initial_transform is None and not is_affine_only and (not is_self_resolving_backend or need_pre_window_affine)
+    ) and initial_transform is None and initial_warp_arg is None and not is_affine_only and (not is_self_resolving_backend or need_pre_window_affine)
 
     if should_run_affine:
         from .robust_affine import robust_affine as run_robust_affine

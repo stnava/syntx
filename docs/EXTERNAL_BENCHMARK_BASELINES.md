@@ -126,3 +126,38 @@ Measured sequentially on isolated Apple Silicon MPS (`Pair 44`: `NKI-TRT-20-2` `
 | `syntx_syn_beltrami` | Symmetric Bidirectional | `[100, 100, 20]`, `beltrami` (`dil=0.1`) | **`0.6165`** | **`0.6338`** | **`0.0000%`** | **`+0.0592`** | `49.14 s` |
 
 *(For `syntx_syn_beltrami`: Moving `NN` Dice = `0.6076`, Symmetric `NN` Dice = `0.6121`, Inverse Consistency Error mean / p95 = `0.0108 / 0.0726 mm`.)*
+
+---
+
+## 6. Hybrid VoxelMorph Warm-Start Adapters & 3-Pair Mindboggle-101 MPS Summary
+
+`src/syntx/core/initial_warp.py` adds centralized physical-space `initial_warp`, `initial_inverse_warp`, and `[warp, affine]` support across `syntx.greedy`, `syntx.syn` (PyTorch & JAX), `syntx.tvf` (PyTorch & JAX), `syntx.syngs` (PyTorch & JAX), and `syntx.auto_reg` with single-interpolation `[1Warp.nii.gz, 0GenericAffine.mat]` export.
+
+On top of this substrate, `src/syntx/benchmark/external.py` provides:
+- `run_voxelmorph_hybrid_greedy` (and `turbo` `[2, 1] (25, 10)` / balanced `[2, 1] (35, 15)` schedules, `vel_smooth_sigma=1.5`)
+- `run_voxelmorph_hybrid_syn` (symmetric `[2, 1] (30, 15)` `beltrami` warm-start)
+
+Both adapters are wired into `src/syntx/provenance.py`, `src/syntx/benchmark/evaluate.py`, and `benchmarks/fast_syn_ants_benchmark.py` (`--external-arms voxelmorph_hybrid_greedy_turbo voxelmorph_hybrid_greedy voxelmorph_hybrid_syn`). For full profiling, methodology, and per-pair numbers, see [`docs/HYBRID_VOXELMORPH_WARMSTART_REPORT.md`](HYBRID_VOXELMORPH_WARMSTART_REPORT.md) and [`docs/provenance/hybrid_voxelmorph_benchmark.json`](provenance/hybrid_voxelmorph_benchmark.json).
+
+### Replay Command (3-Pair Mindboggle `[44, 77, 0]` on Apple MPS)
+
+```bash
+PYTHONPATH=src /Users/stnava/miniconda3/bin/python3 scripts/benchmark_hybrid_voxelmorph.py --smoke
+PYTHONPATH=src /Users/stnava/miniconda3/bin/python3 scripts/benchmark_hybrid_voxelmorph.py --device mps
+```
+
+### 3-Pair Mean Results (`pairs = [44, 77, 0]`, Apple MPS)
+
+| Arm | Mean Opt (s) | Mean E2E (s) | Mean Fixed NN | Mean Fixed GL | Mean Sym NN | Mean Fold % | Worst Min $\|J\|$ |
+| :--- | :---: | :---: | :---: | :---: | :---: | :---: | :---: |
+| `syntx_robust_affine` | `0.00` | `0.12` | `0.3342` | `0.3373` | — | `0.0000%` | `+1.0000` |
+| `voxelmorph_pretrained` | `0.34` | `2.04` | `0.4874` | `0.4967` | — | `0.0470%` | `-8.5536` |
+| `voxelmorph_polished` | `6.43` | `8.06` | `0.5375` | `0.5490` | — | `0.0000%` | `+0.0340` |
+| `voxelmorph_hybrid_greedy_turbo` | `1.74` | `4.36` | `0.5461` | `0.5583` | — | `0.0000%` | `+0.0534` |
+| `voxelmorph_hybrid_greedy` | `2.34` | `5.08` | `0.5543` | `0.5670` | — | `0.0000%` | `+0.0521` |
+| `syntx_greedy_default` | `2.17` | `4.41` | `0.5767` | `0.5901` | — | `0.0000%` | `+0.0050` |
+| `syntx_greedy_matched` | `6.52` | `8.76` | `0.5865` | `0.6005` | — | `0.0003%` | `-0.0517` |
+| `fireants_greedy` | `24.90` | `26.12` | `0.5894` | `0.6038` | — | `0.0015%` | `-0.0262` |
+| `voxelmorph_hybrid_syn` | `33.03` | `33.43` | `0.5674` | `0.5814` | `0.5632` | `0.0000%` | `+0.1111` (`FD +0.0580`) |
+| `syntx_syn_beltrami` | `39.60` | `39.89` | **`0.6217`** | **`0.6387`** | **`0.6216`** | `0.0000%` | `+0.0559` (`FD +0.0529`) |
+
