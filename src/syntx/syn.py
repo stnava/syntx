@@ -3066,10 +3066,10 @@ def registration(
     syn_sampling=2,
     reg_iterations=None,
     iterations=None,
-    grad_step=0.4,
+    grad_step=0.6,
     flow_sigma=2.4,
     total_sigma=0.0,
-    sobolev_alpha=2.25,
+    sobolev_alpha=1.5,
     verbose=False,
     backend='pytorch',
     initial_transform=None,
@@ -3189,12 +3189,12 @@ def registration(
     total_sigma : float, default 0.0
         Elastic smoothing of the displacement itself after each update, also a variance;
         0 = off.
-    sobolev_alpha : float or None, default 2.25
-        Strength of the spectral regulariser ('sobolev', 'dsti', 'dsti1'); larger is
-        smoother. ``alpha=`` is an alias. None: sqrt(flow_sigma) / 2 (legacy).
+    sobolev_alpha : float or None, default 1.5
+        Strength of the spectral / continuum regulariser ('navier', 'sobolev', 'dsti', 'dsti1');
+        larger is smoother. ``alpha=`` is an alias. None: sqrt(flow_sigma) / 2 (legacy).
     fast_smooth : bool or None, default None
         Spectral regularisers: True = spectral operator only; False / None = spectral
-        operator followed by the Gaussian post-filter (the canonical setting).
+        operator followed by the Gaussian post-filter (for 'sobolev' / 'dsti').
     restrict_transformation : sequence of float, optional
         Per-axis deformation weights in [0, 1], physical (x, y, z) order like
         ``ants.registration``: 1 free, 0 suppressed, e.g. (0, 1, 0) for EPI distortion along
@@ -3204,7 +3204,7 @@ def registration(
 
     Optimiser
     ---------
-    grad_step : float, default 0.4
+    grad_step : float, default 0.6
         Largest displacement per iteration (voxels) -- the CFL step of ``optimizer='cfl'``.
     optimizer : str, default 'cfl'
         'cfl' (update scaled so its largest displacement is grad_step); Adam family
@@ -3247,7 +3247,8 @@ def registration(
     interpolator : {'linear', 'nearestNeighbor'}, default 'linear'
         For the warped output images.
     backend : {'pytorch', 'jax'}, default 'pytorch'
-        Note: the default regulariser is 'sobolev' with PyTorch but 'gaussian' with JAX.
+        Note: the default regulariser is 'navier' with PyTorch (or 'sobolev' for componentwise
+        Adam/Rprop optimisers) and 'sobolev' with JAX.
     seed : int, default 42
     midpoint_only : bool, default False
         When True (and ``outprefix`` is None), skip exporting full end-to-end ``fwdtransforms`` /
@@ -3265,7 +3266,7 @@ def registration(
         Deep-feature metric settings (layers [4], 'lncc_3d', 32, 8, 9).
 
     **kwargs
-        Advanced: ``regularizer`` ('sobolev' default, 'dsti', 'dsti1', 'gaussian',
+        Advanced: ``regularizer`` ('navier' default, 'sobolev', 'dsti', 'dsti1', 'gaussian',
         'bspline'), ``kernel_type``, ``formulation`` ('eulerian' default, 'lagrangian',
         'greedy'), ``stationary_boundary`` (True: zero displacement at the image border),
         ``dof`` ('rigid' / 'affine'), ``device``, ``smoothing_sigmas`` (pyramid),
@@ -3621,7 +3622,12 @@ def registration(
 
 
     # --- Parameter relevance validation ---
-    reg_mode = str(kwargs.get('regularizer', kwargs.get('kernel_type', 'sobolev'))).lower()
+    _syn_default_reg = (
+        'sobolev'
+        if (str(backend).lower() == 'jax' or str(optimizer).lower() in ('adam', 'adamw', 'rmsprop', 'rprop'))
+        else 'navier'
+    )
+    reg_mode = str(kwargs.get('regularizer', kwargs.get('kernel_type', _syn_default_reg))).lower()
     optimizer = validate_regularizer_optimizer_pair(reg_mode, optimizer, caller="syntx.syn")
     if kwargs.get('alpha') is not None:  # legacy alias of sobolev_alpha
         sobolev_alpha = kwargs.pop('alpha')
@@ -3706,7 +3712,7 @@ def registration(
         ).to(device)
         model.formulation = kwargs.get('formulation', 'eulerian')
         model.smooth_in_deformed_space = kwargs.get('smooth_in_deformed_space', False)
-        model.kernel_type = kwargs.get('kernel_type', 'bessel')
+        model.kernel_type = kwargs.get('kernel_type', kwargs.get('regularizer', reg_mode))
     elif backend == 'jax':
         if restrict_transformation is not None:
             raise NotImplementedError(
@@ -3777,7 +3783,7 @@ def registration(
             moving_origin=moving_primary.origin,
             moving_direction=moving_primary.direction,
             smoothing_sigmas=smoothing_sigmas,
-            regularizer=kwargs.get('regularizer', kwargs.get('kernel_type', 'sobolev')),
+            regularizer=reg_mode,
             sobolev_alpha=kwargs.get('sobolev_alpha', kwargs.get('alpha', None)),
             fast_smooth=fast_smooth,
             verbose=verbose,

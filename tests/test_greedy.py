@@ -407,7 +407,7 @@ def test_greedy_navier_out_of_the_box_convergence_and_zero_folding(sample_3d_ima
     )
 
     assert res['provenance']['optimizer'] == 'cfl'
-    assert res['model'].sobolev_alpha is None
+    assert res['model'].sobolev_alpha == 2.625
     warped = res['warpedmovout']
     final_corr = float(np.corrcoef(fi.numpy().flatten(), warped.numpy().flatten())[0, 1])
     assert final_corr > initial_corr + 0.05, (

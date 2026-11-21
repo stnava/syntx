@@ -274,17 +274,20 @@ class RegAdam(torch.optim.Optimizer):
                     else:
                         smooth_step = raw_step
                 elif reg_mode not in ('none', 'identity'):
-                    reg_builder = get_regularizer(
-                        reg_mode,
-                        alpha=alpha,
-                        sobolev_alpha=alpha,
-                        fluid_sigma=gauss_sig if gauss_sig is not None else 3.0,
-                        spacing=spacing,
-                        origin=origin,
-                        direction=direction,
-                        **extra_reg_kwargs,
-                    )
-                    smooth_step = reg_builder(raw_step)
+                    if alpha is not None and float(alpha) <= 0.0:
+                        smooth_step = raw_step
+                    else:
+                        reg_builder = get_regularizer(
+                            reg_mode,
+                            alpha=alpha,
+                            sobolev_alpha=alpha,
+                            fluid_sigma=gauss_sig if gauss_sig is not None else 3.0,
+                            spacing=spacing,
+                            origin=origin,
+                            direction=direction,
+                            **extra_reg_kwargs,
+                        )
+                        smooth_step = reg_builder(raw_step)
                 else:
                     smooth_step = raw_step
 

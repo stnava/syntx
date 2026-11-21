@@ -723,7 +723,7 @@ def greedy_registration(
     scales: Optional[Union[List[int], Tuple[int, ...]]] = None,
     learning_rate: float = 1.5,
     flow_sigma: float = 1.62,
-    total_sigma: float = 0.28,
+    total_sigma: float = 0.0,
     optimizer: Optional[str] = 'cfl',
     regadam_sigma: float = 0.8,
     similarity_metric: str = 'cc2',
@@ -745,8 +745,8 @@ def greedy_registration(
     initial_warp: Optional[Union[torch.Tensor, ants.ANTsImage, str, os.PathLike]] = None,
     initial_inverse_warp: Optional[Union[torch.Tensor, ants.ANTsImage, str, os.PathLike]] = None,
     cfl_momentum: float = 0.1875,
-    regularizer: str = 'div_curl',
-    sobolev_alpha: Optional[float] = None,
+    regularizer: str = 'navier',
+    sobolev_alpha: Optional[float] = 2.625,
     **kwargs: Any
 ) -> Dict[str, Any]:
     """
@@ -758,8 +758,10 @@ def greedy_registration(
         reg = syntx.greedy(fixed, moving)
         reg['warpedmovout'], reg['fwdtransforms']        # [warp, affine] standard ANTs list
 
-    Defaults were tuned on Mindboggle pairs 77 / 44 / 0 (`div_curl` + `cfl` with
-    ``learning_rate=1.5``, ``flow_sigma=1.62``, ``cfl_momentum=0.1875``,
+    Defaults use the unified cross-model Navier-Cauchy regularizer (``regularizer='navier'``,
+    ``poisson_ratio=0.20``, ``s=2.0``) with ``sobolev_alpha=2.625``, ``total_sigma=0.0``,
+    ``learning_rate=1.5``, ``cfl_momentum=0.1875`` (tuned on Mindboggle pairs 77 / 44 / 0 and
+    validated out-of-sample on subject-disjoint pairs 28 / 55 / 84;
     docs/provenance/best_parameters.json and docs/provenance/canonical.json).
 
     Parameters
@@ -776,7 +778,7 @@ def greedy_registration(
     flow_sigma : float, default 1.62
         Gaussian sigma in voxels for smoothing the gradient (not the ITK variance convention
         of ``syntx.syn``), and natural scale for continuum regularizers when ``sobolev_alpha`` is None.
-    total_sigma : float, default 0.28
+    total_sigma : float, default 0.0
         Gaussian sigma in voxels for smoothing the whole field after each update.
     optimizer : {'adam', 'regadam', 'reg_adam', 'cfl'}, default 'cfl'
         If None, defaults to 'adam' for Gaussian/identity regularizers and 'cfl' for
@@ -785,12 +787,12 @@ def greedy_registration(
         RegAdam step smoothing (voxels).
     cfl_momentum : float, default 0.1875
         Momentum decay factor for ``optimizer='cfl'`` (0 disables momentum).
-    regularizer : str, default 'div_curl'
+    regularizer : str, default 'navier'
         Velocity/gradient regularizer ('gaussian' or any continuum operator from
         ``syntx.core.regularizers.list_regularizers()``, e.g. 'navier', 'hyperelastic',
         'div_curl', 'beltrami', 'solenoidal', 'poroelastic', 'sobolev', 'dsti').
-    sobolev_alpha : float, optional
-        Sobolev / continuum operator strength. When None (default), continuum regularizers
+    sobolev_alpha : float, optional, default 2.625
+        Sobolev / continuum operator strength. When None, continuum regularizers
         derive their natural alpha from ``flow_sigma``; the legacy ``regadam`` fallback when
         ``regadam_sigma == 0`` uses a small default Sobolev width.
     similarity_metric : str, default 'cc2'

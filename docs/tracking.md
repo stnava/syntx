@@ -1,12 +1,26 @@
 # Tracking Summary
-current phase: v6.43.0 (Centralized `FieldStepOptimizer` + `build_level_regularizer` continuum refactor across `greedy`/`syn`/`tvf`/`syngs`, autotuned `syntx.greedy` `div_curl + cfl` default at `0.6041` 3-pair Dice `+1.95 pp`, and concerted multi-solver autotuning + disjoint held-out benchmark orchestrator)
-next WP: execute concerted `syn`/`tvf`/`syngs` continuum autotuning + subject-disjoint `[28, 55, 84]` held-out & external benchmark campaign when GPU is free (`scripts/concerted_tune_and_benchmark.py`)
+current phase: v6.44.0 (Unified cross-solver Navier-Cauchy default `regularizer='navier', s=2.0, poisson_ratio=0.20` across `greedy`/`syn`/`syngs`/`tvf`, validated on subject-disjoint Held-Out `[28, 55, 84]` `+1.15 pp` 4-solver mean, and verified on full 90-pair Mindboggle-101 benchmark: `greedy 0.6302`, `syngs 0.6389`, `syn 0.6423`, `tvf 0.6529` `90/90` wins, `360/360` `0.0000%` folding)
+next WP: optional 10-task (`N = 50`) Medical Segmentation Decathlon cross-organ evaluation under unified Navier defaults
 blockers: none
-active work: none (`v6.43.0` released; `0` `antsxqc.lint` findings, concerted pipeline `--smoke` verified on CPU)
+active work: none (`v6.44.0` released; `0` `antsxqc.lint` findings, `19/19` canonical tests green, full test suite green)
 device: Apple Silicon MPS / CPU (macOS arm64)
-last updated: 2026-11-19
+last updated: 2026-11-21
 
 ---
+
+## R48 (Unified Cross-Model Navier-Cauchy Default `s=2.0, poisson_ratio=0.20`, Subject-Disjoint Held-Out Validation, and 360-Run 90-Pair Mindboggle-101 4-Model Benchmark; v6.44.0, 2026-11-21)
+- **Per-Model Navier Autotuning (`[77, 44, 0]`) & Principled Common Navier Selection (`[28, 55, 84]`) (`src/syntx/core/{regularizers,optimizers}.py`, `src/syntx/{greedy,syn,tvf,syngs,provenance}.py`, `src/syntx/benchmark/{config,evaluate,tune}.py`, `docs/provenance/tuning/{greedy,syn,tvf,syngs}_navier_2026-11-20.md`)**:
+  - Completed 2-rep confirmed Mindboggle-101 `[77, 44, 0]` (`[100, 100, 20]`, MPS) Navier autotuning across all 4 solvers: `greedy` `0.6093 -> 0.6181` (`+0.88 pp`), `syn` `0.6044 -> 0.6346` (`+3.02 pp`), `tvf` `0.6343 -> 0.6440` (`+0.97 pp`), and `syngs` `0.6180 -> 0.6287` (`+1.08 pp`), all with `0.0000%` Liouville folding.
+  - Selected **one unified Navier operator (`regularizer='navier'`, `s=2.0`, `poisson_ratio=0.20`, $\kappa=0.625$, $\lambda_{\parallel}=0.375$)** across all 4 models via 3-D Sobolev $C^1$ embedding ($2s > 2.5$), operator multiplicity $(1-\kappa)^m$ ($m=1$ for `greedy`/`syn`/`tvf` vs. $m=2$ $(0.375)^2 = 0.141$ for `syngs` momentum shooting), and out-of-sample minimax-regret validation on the **100% subject-disjoint Held-Out set `[28, 55, 84]`** (`results/common_navier_heldout_20261120/`): lifted 4-solver Held-Out mean Dice **`0.6158 -> 0.6273` (`+1.15 pp`, winning `12/12` solver $\times$ pair comparisons, `0.0000%` folding)**: `greedy` `0.6060 -> 0.6169` (`+1.09 pp`), `syn` `0.6110 -> 0.6304` (`+1.94 pp`), `syngs` `0.6168 -> 0.6251` (`+0.83 pp`), `tvf` `0.6292 -> 0.6367` (`+0.75 pp`, `inv_int` `1.14 -> 0.90 mm`).
+  - Wired canonical defaults across `_build_navier`/`apply_navier_green_operator` (`poisson_ratio=0.20, s=2.0`), `greedy` (`sobolev_alpha=2.625, total_sigma=0.0`), `syn` (`sobolev_alpha=1.5, grad_step=0.6`), `syngs` (`SYNGS_DEFAULT_ALPHA={2: 0.25, 3: 0.25}, max_step_norm=0.95`, plus `alpha<=0` bypass in `RegAdam`/`syngs` and `0.03 * min_ext` small-grid step guard), and `tvf` (`TVF_DEFAULT_ALPHA[3]=3.5, grad_step=1.8, cfl_momentum=0.8, energy_weight=0.0004`), synchronized across `config.py`, `run_config.json`, `best_parameters.json`, and `canonical.json`.
+- **Full 90-Pair Mindboggle-101 4-Model Population Benchmark (`results/navier_90pair_20261120/`, `docs/reports/mindboggle_90pair_common_navier_report.html`, `docs/provenance/mindboggle_90pair_common_navier_2026-11-20.md`, `src/syntx/viz/reports.py`)**:
+  - Executed all `90 x 4 = 360` isolated MPS runs (`seed=42`, shared cached `pt7` affines `0.3448` vs. `ANTs C++ SyN` `0.6216 ± 0.0229`, `139.37 s`; `360/360` `SUCCESS` and `check_canonical_call` verified, `0.000000%` Liouville and 1-mm FD folding on all `360/360` runs):
+    - **`syntx.greedy`**: **`0.6302 ± 0.0220`** (`+0.86 pp` vs `ANTs`, **`67/90` wins = `74.4%`**, $p = 2.26 \times 10^{-8}$, `min|J| = 0.0505`, **`11.74 s` = `11.87x` faster**)
+    - **`syntx.syngs`**: **`0.6389 ± 0.0217`** (`+1.73 pp` vs `ANTs`, **`84/90` wins = `93.3%`**, $p = 3.06 \times 10^{-15}$, `min|J| = 0.1409`, **`63.73 s` = `2.19x` faster**)
+    - **`syntx.syn`**: **`0.6423 ± 0.0212`** (`+2.07 pp` vs `ANTs`, **`+0.81 pp` vs 90-pair Sobolev `0.6342`**, **`87/90` wins = `96.7%`**, $p = 5.07 \times 10^{-16}$, `90/90` interior ICE `<= 0.9386 mm`, **`46.20 s` = `3.02x` faster**)
+    - **`syntx.tvf`**: **`0.6529 ± 0.0204`** (`+3.13 pp` vs `ANTs`, **`90/90` wins = `100.0%`**, $p = 1.74 \times 10^{-16}$, min pair Dice `0.6021`, `197.43 s`)
+  - Upgraded `syntx.viz.create_population_benchmark_report` to light theme (`#ffffff` / `#1e293b`) with full 4-solver (`TVF`, `SyN`, `SyNGS`, `Greedy`) + `ANTs C++` support and fixed single-arm `greedy`/`syngs` summary parsing.
+- **Gates**: `python3 -m antsxqc.lint src/syntx` (`0 finding(s)`, no `.antsxqc-allow`), `pytest --runslow tests/test_canonical_parameters.py` (`19/19 passed`), and full `pytest tests/ -q` suite (`2,698 passed, 399 skipped, 0 failed`).
 
 ## R47 (Centralized `FieldStepOptimizer` & Continuum Regularizer Plumbing, Autotuned `syntx.greedy` `div_curl + cfl` Default `0.6041`, and Concerted Tune + Disjoint Held-Out Benchmark Suite; v6.43.0, 2026-11-19)
 - **Centralized Continuum Regularizer & Field-Step Optimizer Architecture (`src/syntx/core/{regularizers,optimizers,__init__}.py`, `src/syntx/{greedy,syn,tvf,syngs}.py`, `tests/test_field_step_guard.py`)**:

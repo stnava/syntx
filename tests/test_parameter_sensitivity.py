@@ -124,13 +124,22 @@ class TestSyNParameterSensitivity:
         self.fi, self.mi, self.fl, self.ml = _get_r16_images()
 
     def test_flow_sigma_changes_performance(self):
-        """Different flow_sigma values must produce different Dice scores."""
-        reg_a = _quick_syn(self.fi, self.mi, flow_sigma=0.5)
-        reg_b = _quick_syn(self.fi, self.mi, flow_sigma=5.0)
+        """Different flow_sigma values must produce different Dice scores (gaussian kernel)."""
+        reg_a = _quick_syn(self.fi, self.mi, regularizer="gaussian", flow_sigma=0.5)
+        reg_b = _quick_syn(self.fi, self.mi, regularizer="gaussian", flow_sigma=5.0)
         _assert_different_field(_get_warp(reg_a), _get_warp(reg_b), "flow_sigma", 0.5, 5.0, "syn")
         dice_a = _compute_dice(reg_a, self.fl, self.ml, self.fi, self.mi)
         dice_b = _compute_dice(reg_b, self.fl, self.ml, self.fi, self.mi)
         _assert_different_dice(dice_a, dice_b, "flow_sigma", 0.5, 5.0, "syn")
+
+    def test_sobolev_alpha_changes_performance(self):
+        """Different sobolev_alpha values must produce different Dice scores on default Navier regularizer."""
+        reg_a = _quick_syn(self.fi, self.mi, sobolev_alpha=0.2)
+        reg_b = _quick_syn(self.fi, self.mi, sobolev_alpha=4.0)
+        _assert_different_field(_get_warp(reg_a), _get_warp(reg_b), "sobolev_alpha", 0.2, 4.0, "syn")
+        dice_a = _compute_dice(reg_a, self.fl, self.ml, self.fi, self.mi)
+        dice_b = _compute_dice(reg_b, self.fl, self.ml, self.fi, self.mi)
+        _assert_different_dice(dice_a, dice_b, "sobolev_alpha", 0.2, 4.0, "syn")
 
     def test_grad_step_changes_performance(self):
         """Different grad_step values must produce different Dice scores."""

@@ -165,6 +165,8 @@ def test_greedy_navier_autoselects_cfl_and_converges_anisotropic_noncubic():
         fi,
         mi,
         regularizer="navier",
+        optimizer=None,
+        learning_rate=0.5,
         reg_iterations=[15, 10],
         scales=[2, 1],
         initial_transform=False,
@@ -173,7 +175,7 @@ def test_greedy_navier_autoselects_cfl_and_converges_anisotropic_noncubic():
     )
     assert res["provenance"]["optimizer"] == "cfl"
     assert res["model"].optimizer == "cfl"
-    assert res["model"].sobolev_alpha is None
+    assert res["model"].sobolev_alpha == 2.625
     final_mse = float(np.mean((fi.numpy() - res["warpedmovout"].numpy()) ** 2))
     assert final_mse < init_mse
     from syntx.deformation_metrics import compute_jacobian_metrics

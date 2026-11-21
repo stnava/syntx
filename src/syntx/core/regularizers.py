@@ -797,11 +797,11 @@ def apply_navier_green_operator(
     m: torch.Tensor,
     alpha: Optional[float] = None,
     fluid_sigma: float = 3.0,
-    poisson_ratio: float = 0.49,
+    poisson_ratio: float = 0.20,
     total_sigma: Optional[float] = None,
     elastic_sigma: Optional[float] = None,
     spacing: Optional[Sequence[float]] = None,
-    s: float = 1.0,
+    s: float = 2.0,
     direction: Optional[Any] = None,
     origin: Optional[Any] = None,
     vector_frame: str = 'physical',
@@ -810,6 +810,7 @@ def apply_navier_green_operator(
     Navier-Cauchy continuum elastic Green's operator:
     G(k) = (1 + alpha |k|^2)^-s * [ I - kappa * (k k^T / |k|^2) ], where kappa = 1 / (2 (1 - nu)).
 
+    - nu = 0.20: canonical cross-solver 3-D registration default (kappa = 0.625, s = 2.0).
     - nu = 0.30: standard compressible engineering solid (kappa = 0.714).
     - nu = 0.49: nearly incompressible brain parenchyma (kappa = 0.980).
     - nu = 0.50: strictly incompressible Stokes fluid (kappa = 1.000).
@@ -819,12 +820,12 @@ def apply_navier_green_operator(
     m : Tensor (B, *spatial, dim) or (*spatial, dim)
     alpha : float, optional
     fluid_sigma : float, default 3.0
-    poisson_ratio : float, default 0.49
+    poisson_ratio : float, default 0.20
         Poisson's ratio in [0.0, 0.50].
     total_sigma, elastic_sigma : float, optional
     spacing : sequence of float
         Required voxel spacing in ANTs (x, y, z) order.
-    s : float, default 1.0
+    s : float, default 2.0
     direction : array-like, optional
     origin : sequence of float, optional
     vector_frame : {'physical', 'voxel'}, default 'physical'
@@ -1508,12 +1509,12 @@ def _build_div_curl(
 def _build_navier(
     alpha: Optional[float] = None,
     sobolev_alpha: Optional[float] = None,
-    poisson_ratio: float = 0.49,
+    poisson_ratio: float = 0.20,
     fluid_sigma: float = 3.0,
     total_sigma: Optional[float] = None,
     elastic_sigma: Optional[float] = None,
     spacing: Optional[Sequence[float]] = None,
-    s: float = 1.0,
+    s: float = 2.0,
     direction: Optional[Any] = None,
     origin: Optional[Any] = None,
     vector_frame: str = 'physical',

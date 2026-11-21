@@ -154,7 +154,7 @@ def test_apply_to_tree_places_each_default_where_it_lives(tmp_path):
     changed = apply_to_tree(str(tmp_path), "syngs", {"alpha": 0.6, "max_step_norm": 0.25},
                             {"alpha": 0.45, "max_step_norm": 0.19})
     g = (tmp_path / "src/syntx/syngs.py").read_text()
-    assert "SYNGS_DEFAULT_ALPHA = {2: 0.060, 3: 0.6}" in g and "max_step_norm=0.25," in g
+    assert "SYNGS_DEFAULT_ALPHA = {2: 0.25, 3: 0.6}" in g and "max_step_norm=0.25," in g
     c = (tmp_path / "src/syntx/benchmark/config.py").read_text()
     assert '"alpha": 0.6' in c and '"max_step_norm": 0.25' in c
     import json

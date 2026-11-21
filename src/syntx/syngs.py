@@ -67,11 +67,11 @@ from .core.utils import check_loss_collapse, require_finite_images
 # Default spectral (Sobolev) strength per dimension. 3-D: the benchmark configuration (3-D
 # sweep 2026-09-19); 2-D: the calibrated legacy value. Shared by syngs_registration(), the model
 # and integrate_momentum() so a saved momentum field reconstructs exactly.
-SYNGS_DEFAULT_ALPHA = {2: 0.060, 3: 0.448}
+SYNGS_DEFAULT_ALPHA = {2: 0.25, 3: 0.25}
 
 
 def default_alpha(dim: int) -> float:
-    """Default Sobolev strength ``alpha`` for ``dim``-D images (``SYNGS_DEFAULT_ALPHA``; 3-D if missing)."""
+    """Default spectral strength ``alpha`` for ``dim``-D images (``SYNGS_DEFAULT_ALPHA``; 3-D if missing)."""
     return SYNGS_DEFAULT_ALPHA.get(int(dim), SYNGS_DEFAULT_ALPHA[3])
 
 
@@ -180,7 +180,7 @@ class GeodesicShootingModel(nn.Module):
         self.bootstrap_mode = kwargs.get('bootstrap_mode', 'none')
         self.bootstrap_orig_weight = float(kwargs.get('bootstrap_orig_weight', 0.50))
         self.bootstrap_jitter_scale = float(kwargs.get('bootstrap_jitter_scale', 0.25))
-        self.regularizer = str(kwargs.get('regularizer', 'sobolev')).lower()
+        self.regularizer = str(kwargs.get('regularizer', 'navier')).lower()
         if self.regularizer in ('gauss', 'gaussian'):
             self.regularizer = 'gaussian'
         elif self.regularizer in ('dsti', 'dsti1', 'dst_i', 'dirichlet'):
@@ -325,7 +325,7 @@ class GeodesicShootingModel(nn.Module):
             bkey = (tuple(int(s) for s in shape), str(device), str(dtype))
             bmask = bmask_cache.get(bkey)
             if bmask is None:
-                bmask = self._create_boundary_mask(shape, device, dtype, border_width=4)
+                bmask = self._create_boundary_mask(shape, device, dtype, border_width=min(4, max(1, min(shape) // 4)))
                 if len(bmask_cache) > 32:
                     bmask_cache.clear()
                 bmask_cache[bkey] = bmask
@@ -840,14 +840,16 @@ class GeodesicShootingModel(nn.Module):
                 active_params.append(self.velocity_0_inv)
 
             level_lr = lr * math.sqrt(1.0 / level)
-            max_step = float(kwargs.get('max_step_norm', cfl_step))
+            _min_lvl_ext = min(int(s) for s in self.velocity_0_fwd.shape[1:-1])
+            max_step = min(float(kwargs.get('max_step_norm', cfl_step)), 0.03 * _min_lvl_ext)
 
             if opt_name in ('reg_adam', 'regadam', 'sobolev_adam', 'sobolevadam'):
                 cont_reg_fn = None
-                if self.regularizer in COUPLED_CONTINUUM_REGULARIZERS:
+                if self.regularizer in COUPLED_CONTINUUM_REGULARIZERS and self.alpha is not None and self.alpha > 0:
                     _lvl_shape = tuple(int(s) for s in self.velocity_0_fwd.shape[1:-1])
                     _bmask_lvl = self._create_boundary_mask(
-                        _lvl_shape, self.velocity_0_fwd.device, self.velocity_0_fwd.dtype, border_width=4
+                        _lvl_shape, self.velocity_0_fwd.device, self.velocity_0_fwd.dtype,
+                        border_width=min(4, max(1, min(_lvl_shape) // 4)),
                     )
                     _raw_cont_fn = build_level_regularizer(
                         self.regularizer,
@@ -1004,7 +1006,7 @@ def syngs_registration(
     grad_step=0.25,
     flow_sigma=None,
     alpha=None,
-    max_step_norm=0.6,
+    max_step_norm=0.95,
     n_steps=8,
     verbose=False,
     backend='pytorch',
@@ -1055,7 +1057,7 @@ def syngs_registration(
         [4, 2, 1] (3-D) / [8, 4, 2, 1] (2-D).
     alpha : float or None, default None
         Spectral strength (larger = smoother; 0 = no smoothing). None:
-        ``SYNGS_DEFAULT_ALPHA[dim]`` (3-D 0.448, 2-D 0.06). Spectral regularisers only
+        ``SYNGS_DEFAULT_ALPHA[dim]`` (3-D 0.25, 2-D 0.06). Spectral regularisers only
         (raises with 'gaussian' / 'bspline'); no aliases: ``sobolev_alpha`` / ``dsti_alpha`` raise TypeError.
         ``integrate_momentum`` uses the same default.
     flow_sigma : float or None, default None
@@ -1068,7 +1070,7 @@ def syngs_registration(
         other values use LARS.
     optimizer_lr : float or None, default 2.246094
         Learning rate (None: 0.6).
-    max_step_norm : float or None, default 0.6
+    max_step_norm : float or None, default 0.95
         Largest per-iteration update (voxels). None: ``grad_step``.
     grad_step : float, default 0.25
         Used only as ``max_step_norm`` when that is None.
@@ -1078,8 +1080,9 @@ def syngs_registration(
     backend : {'pytorch', 'jax'}, default 'pytorch'
     verbose : bool, default False
     **kwargs
-        ``regularizer`` ('sobolev' default, 'dsti', 'dsti1', 'gaussian', 'bspline'; others
-        raise), ``transport_mode`` ('transport', 'scaled', 'recursive'), ``solver``,
+        ``regularizer`` ('navier' default on PyTorch, 'sobolev' on JAX; 'dsti', 'dsti1',
+        'gaussian', 'bspline', and continuum operators; others raise), ``transport_mode``
+        ('transport', 'scaled', 'recursive'), ``solver``,
         ``symmetric`` (default True: a second, inverse velocity field), ``inverse_identity_weight``
         (default 0.5), ``bootstrap_orig_weight``, ``bootstrap_jitter_scale``,
         ``spline_distance``, ``mesh_size``, ``device``, ``winsorize_quantiles``,
@@ -1166,7 +1169,8 @@ def syngs_registration(
     # Each regulariser has exactly one strength parameter; the other one is rejected rather
     # than silently ignored:  gaussian / bspline -> flow_sigma (Gaussian sigma, 0 = off);
     # sobolev / dsti / dsti1 -> alpha (0 = off).
-    reg_mode = str(kwargs.get('regularizer', 'sobolev')).lower()
+    _default_syngs_reg = 'sobolev' if str(backend).lower() == 'jax' else 'navier'
+    reg_mode = str(kwargs.get('regularizer', _default_syngs_reg)).lower()
     optimizer = validate_regularizer_optimizer_pair(reg_mode, optimizer, caller="syntx.syngs")
     _SPECTRAL_REGS = SPECTRAL_REGULARIZERS
     _SIGMA_REGS = {'gaussian', 'gauss', 'bspline', 'bsplinesyn'}
@@ -1282,7 +1286,7 @@ def syngs_registration(
             alpha=alpha,
             symmetric=bool(kwargs.pop('symmetric', True)),
             inverse_identity_weight=float(kwargs.pop('inverse_identity_weight', 0.50)),
-            regularizer=kwargs.pop('regularizer', 'sobolev'),
+            regularizer=kwargs.pop('regularizer', 'navier'),
             spline_distance=kwargs.pop('spline_distance', None),
             mesh_size=kwargs.pop('mesh_size', None),
             bootstrap_mode=kwargs.pop('bootstrap_mode', bootstrap_mode),

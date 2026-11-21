@@ -1467,64 +1467,54 @@ def create_population_benchmark_report(
     records = {}
     gaussian_records = {}
     tvf_records = {}
+    syngs_records = {}
+    greedy_records = {}
+
+    def _load_dir_glob(pattern, dst):
+        import glob
+        for f in sorted(glob.glob(pattern)):
+            try:
+                with open(f, "r") as fp:
+                    d = json.load(fp)
+                if d.get("status") == "SUCCESS" or "syntx_dice_sym" in d or "dice_sym" in d:
+                    p_idx = d.get("pair_idx", len(dst))
+                    dst[int(p_idx)] = d
+            except Exception:
+                pass
 
     # 1. Parse results_source
     if isinstance(results_source, str):
         if os.path.isdir(results_source):
-            import glob
-            # Check for tvf files
-            tvf_files = sorted(glob.glob(os.path.join(results_source, "pair_*_tvf.json")))
-            for f in tvf_files:
-                try:
-                    with open(f, "r") as fp:
-                        d = json.load(fp)
-                    if d.get("status") == "SUCCESS" or "syntx_dice_sym" in d or "dice_sym" in d:
-                        p_idx = d.get("pair_idx", len(tvf_records))
-                        tvf_records[p_idx] = d
-                except Exception:
-                    pass
-            # Check for sobolev files
-            sob_files = sorted(glob.glob(os.path.join(results_source, "pair_*_sobolev.json")))
-            if not sob_files:
-                sob_files = sorted(glob.glob(os.path.join(results_source, "pair_*_syn.json")))
-            for f in sob_files:
-                try:
-                    with open(f, "r") as fp:
-                        d = json.load(fp)
-                    if d.get("status") == "SUCCESS" or "syntx_dice_sym" in d or "dice_sym" in d:
-                        p_idx = d.get("pair_idx", len(records))
-                        records[p_idx] = d
-                except Exception:
-                    pass
-            # Check for gaussian probe files
-            gauss_files = sorted(glob.glob(os.path.join(results_source, "pair_*_gaussian.json")))
-            for f in gauss_files:
-                try:
-                    with open(f, "r") as fp:
-                        d = json.load(fp)
-                    if d.get("status") == "SUCCESS" or "syntx_dice_sym" in d or "dice_sym" in d:
-                        p_idx = d.get("pair_idx", len(gaussian_records))
-                        gaussian_records[p_idx] = d
-                except Exception:
-                    pass
+            _load_dir_glob(os.path.join(results_source, "pair_*_tvf.json"), tvf_records)
+            _load_dir_glob(os.path.join(results_source, "pair_*_sobolev.json"), records)
+            if not records:
+                _load_dir_glob(os.path.join(results_source, "pair_*_syn.json"), records)
+            _load_dir_glob(os.path.join(results_source, "pair_*_syngs.json"), syngs_records)
+            _load_dir_glob(os.path.join(results_source, "pair_*_greedy.json"), greedy_records)
+            _load_dir_glob(os.path.join(results_source, "pair_*_gaussian.json"), gaussian_records)
         elif os.path.isfile(results_source):
             with open(results_source, "r") as fp:
                 d = json.load(fp)
-            if "tvf_results" in d:
-                tvf_records = {int(k): v for k, v in d["tvf_results"].items()}
-            if "sobolev_results" in d:
-                records = {int(k): v for k, v in d["sobolev_results"].items()}
-            if "gaussian_results" in d:
-                gaussian_records = {int(k): v for k, v in d["gaussian_results"].items()}
-            if not tvf_records and not records and not gaussian_records:
+            if isinstance(d, dict):
+                if "tvf_results" in d and isinstance(d["tvf_results"], dict):
+                    tvf_records = {int(k): v for k, v in d["tvf_results"].items() if str(k).isdigit()}
+                if "sobolev_results" in d and isinstance(d["sobolev_results"], dict):
+                    records = {int(k): v for k, v in d["sobolev_results"].items() if str(k).isdigit()}
+                if "syngs_results" in d and isinstance(d["syngs_results"], dict):
+                    syngs_records = {int(k): v for k, v in d["syngs_results"].items() if str(k).isdigit()}
+                if "greedy_results" in d and isinstance(d["greedy_results"], dict):
+                    greedy_records = {int(k): v for k, v in d["greedy_results"].items() if str(k).isdigit()}
+                if "gaussian_results" in d and isinstance(d["gaussian_results"], dict):
+                    gaussian_records = {int(k): v for k, v in d["gaussian_results"].items() if str(k).isdigit()}
+            if not (tvf_records or records or syngs_records or greedy_records or gaussian_records):
                 if isinstance(d, list):
                     records = {r.get("pair_idx", i): r for i, r in enumerate(d)}
                 elif isinstance(d, dict):
-                    records = {int(k): v for k, v in d.items()}
+                    records = {int(k): v for k, v in d.items() if str(k).isdigit()}
     elif isinstance(results_source, list):
         records = {r.get("pair_idx", i): r for i, r in enumerate(results_source)}
     elif isinstance(results_source, dict):
-        records = {int(k): v for k, v in results_source.items()}
+        records = {int(k): v for k, v in results_source.items() if str(k).isdigit() or isinstance(k, int)}
 
     # 2. Parse baseline_source if provided
     baseline_records = {}
@@ -1543,21 +1533,33 @@ def create_population_benchmark_report(
         baseline_records = {int(k): v for k, v in baseline_source.items()}
 
     has_tvf = len(tvf_records) > 0
-    all_indices = sorted(list(set(records.keys()) | set(gaussian_records.keys()) | set(tvf_records.keys())))
+    has_syngs = len(syngs_records) > 0
+    has_greedy = len(greedy_records) > 0
+    all_indices = sorted(list(
+        set(records.keys())
+        | set(gaussian_records.keys())
+        | set(tvf_records.keys())
+        | set(syngs_records.keys())
+        | set(greedy_records.keys())
+    ))
 
     # 3. Format per-pair comparison rows
     matched_pairs = []
     for idx in all_indices:
         t_rec = tvf_records.get(idx, {})
         s_rec = records.get(idx, {})
+        gs_rec = syngs_records.get(idx, {})
+        gr_rec = greedy_records.get(idx, {})
         g_rec = gaussian_records.get(idx, {})
-        primary_rec = t_rec if t_rec else (s_rec if s_rec else g_rec)
+        primary_rec = t_rec or s_rec or gs_rec or gr_rec or g_rec
         a_rec = primary_rec.get("ants_baseline", s_rec.get("ants_baseline", baseline_records.get(idx, {})))
 
         t_dice = t_rec.get("syntx_dice_sym", t_rec.get("dice_sym", float("nan"))) if t_rec else float("nan")
         s_dice = s_rec.get("syntx_dice_sym", s_rec.get("dice_sym", float("nan"))) if s_rec else float("nan")
+        gs_dice = gs_rec.get("syntx_dice_sym", gs_rec.get("dice_sym", float("nan"))) if gs_rec else float("nan")
+        gr_dice = gr_rec.get("syntx_dice_sym", gr_rec.get("dice_sym", float("nan"))) if gr_rec else float("nan")
         g_dice = g_rec.get("syntx_dice_sym", g_rec.get("dice_sym", float("nan"))) if g_rec else float("nan")
-        
+
         if isinstance(a_rec, dict) and "dice_sym" in a_rec:
             a_dice = a_rec.get("dice_sym", float("nan"))
             a_time = a_rec.get("runtime_seconds", float("nan"))
@@ -1569,17 +1571,29 @@ def create_population_benchmark_report(
 
         t_time = t_rec.get("syntx_time", t_rec.get("runtime_seconds", float("nan"))) if t_rec else float("nan")
         s_time = s_rec.get("syntx_time", s_rec.get("runtime_seconds", float("nan"))) if s_rec else float("nan")
+        gs_time = gs_rec.get("syntx_time", gs_rec.get("runtime_seconds", float("nan"))) if gs_rec else float("nan")
+        gr_time = gr_rec.get("syntx_time", gr_rec.get("runtime_seconds", float("nan"))) if gr_rec else float("nan")
         g_time = g_rec.get("syntx_time", g_rec.get("runtime_seconds", float("nan"))) if g_rec else float("nan")
 
         t_fold = t_rec.get("syntx_fold", t_rec.get("folding_pct", float("nan"))) if t_rec else float("nan")
         s_fold = s_rec.get("syntx_fold", s_rec.get("folding_pct", float("nan"))) if s_rec else float("nan")
+        gs_fold = gs_rec.get("syntx_fold", gs_rec.get("folding_pct", float("nan"))) if gs_rec else float("nan")
+        gr_fold = gr_rec.get("syntx_fold", gr_rec.get("folding_pct", float("nan"))) if gr_rec else float("nan")
         g_fold = g_rec.get("syntx_fold", g_rec.get("folding_pct", float("nan"))) if g_rec else float("nan")
 
         aff_dice = primary_rec.get("syntx_affine_dice_sym", primary_rec.get("affine_dice_sym", float("nan")))
         c_type = primary_rec.get("cohort_type", "intra" if idx < 40 else "inter")
 
         # Primary metric calculation
-        focus_dice = t_dice if has_tvf else s_dice
+        focus_dice = (
+            t_dice if has_tvf else (
+                s_dice if records else (
+                    gs_dice if has_syngs else (
+                        gr_dice if has_greedy else g_dice
+                    )
+                )
+            )
+        )
         diff_vs_ants = float((focus_dice - a_dice) * 100.0) if np.isfinite(focus_dice) and np.isfinite(a_dice) else float("nan")
         win = bool(focus_dice >= a_dice) if np.isfinite(focus_dice) and np.isfinite(a_dice) else False
 
@@ -1591,15 +1605,21 @@ def create_population_benchmark_report(
             "aff_dice": float(aff_dice),
             "t_dice": float(t_dice),
             "s_dice": float(s_dice),
+            "gs_dice": float(gs_dice),
+            "gr_dice": float(gr_dice),
             "g_dice": float(g_dice),
             "a_dice": float(a_dice),
             "focus_dice": float(focus_dice),
             "t_time": float(t_time),
             "s_time": float(s_time),
+            "gs_time": float(gs_time),
+            "gr_time": float(gr_time),
             "g_time": float(g_time),
             "a_time": float(a_time),
             "t_fold": float(t_fold),
             "s_fold": float(s_fold),
+            "gs_fold": float(gs_fold),
+            "gr_fold": float(gr_fold),
             "g_fold": float(g_fold),
             "a_fold": float(a_fold),
             "diff_vs_ants": diff_vs_ants,
@@ -1618,7 +1638,13 @@ def create_population_benchmark_report(
                 return r["config"]
         return None
 
-    _cfg_cols = [("TVF", tvf_records), ("Sobolev SyN", records), ("Gaussian SyN", gaussian_records)]
+    _cfg_cols = [
+        ("TVF", tvf_records),
+        ("SyN", records),
+        ("SyNGS", syngs_records),
+        ("Greedy", greedy_records),
+        ("Gaussian SyN", gaussian_records),
+    ]
     _cfgs = [(name, _first_config(recs)) for name, recs in _cfg_cols if recs]
     _keys = sorted({k for _, c in _cfgs if c for k in c})
     if _cfgs:
@@ -1634,17 +1660,25 @@ def create_population_benchmark_report(
         config_table_html = "<p>not recorded</p>"
 
     # 4. Aggregated stats
+    def _safe_mean(vals, default=0.0):
+        clean = [float(x) for x in vals if np.isfinite(x)]
+        return float(np.mean(clean)) if clean else default
+
     valid_dices_t = [p["t_dice"] for p in matched_pairs if np.isfinite(p["t_dice"])]
     valid_dices_s = [p["s_dice"] for p in matched_pairs if np.isfinite(p["s_dice"])]
+    valid_dices_gs = [p["gs_dice"] for p in matched_pairs if np.isfinite(p["gs_dice"])]
+    valid_dices_gr = [p["gr_dice"] for p in matched_pairs if np.isfinite(p["gr_dice"])]
     valid_dices_g = [p["g_dice"] for p in matched_pairs if np.isfinite(p["g_dice"])]
     valid_dices_a = [p["a_dice"] for p in matched_pairs if np.isfinite(p["a_dice"])]
 
-    mean_t_dice = float(np.mean(valid_dices_t)) if valid_dices_t else 0.0
-    mean_s_dice = float(np.mean(valid_dices_s)) if valid_dices_s else 0.0
-    mean_g_dice = float(np.mean(valid_dices_g)) if valid_dices_g else 0.0
-    mean_a_dice = float(np.mean(valid_dices_a)) if valid_dices_a else 0.0
+    mean_t_dice = _safe_mean(valid_dices_t, 0.0)
+    mean_s_dice = _safe_mean(valid_dices_s, 0.0)
+    mean_gs_dice = _safe_mean(valid_dices_gs, 0.0)
+    mean_gr_dice = _safe_mean(valid_dices_gr, 0.0)
+    mean_g_dice = _safe_mean(valid_dices_g, 0.0)
+    mean_a_dice = _safe_mean(valid_dices_a, 0.0)
 
-    primary_mean_dice = mean_t_dice if has_tvf else mean_s_dice
+    primary_mean_dice = _safe_mean([p["focus_dice"] for p in matched_pairs], 0.0)
     dice_diff = primary_mean_dice - mean_a_dice
 
     wins = sum(1 for p in matched_pairs if p["win"])
@@ -1654,54 +1688,122 @@ def create_population_benchmark_report(
     tvf_sob_pct = (100.0 * tvf_sob_wins / n_tvf_sob) if n_tvf_sob else float("nan")
     win_rate = (wins / n_completed * 100.0) if n_completed > 0 else 0.0
 
-    mean_t_fold = float(np.mean([p["t_fold"] for p in matched_pairs if np.isfinite(p["t_fold"])])) if valid_dices_t else 0.0
-    mean_s_fold = float(np.mean([p["s_fold"] for p in matched_pairs if np.isfinite(p["s_fold"])])) if valid_dices_s else 0.0
-    mean_a_fold = float(np.mean([p["a_fold"] for p in matched_pairs if np.isfinite(p["a_fold"])])) if matched_pairs else 0.0
-    primary_fold = mean_t_fold if has_tvf else mean_s_fold
+    mean_t_fold = _safe_mean([p["t_fold"] for p in matched_pairs], 0.0) if valid_dices_t else 0.0
+    mean_s_fold = _safe_mean([p["s_fold"] for p in matched_pairs], 0.0) if valid_dices_s else 0.0
+    mean_gs_fold = _safe_mean([p["gs_fold"] for p in matched_pairs], 0.0) if valid_dices_gs else 0.0
+    mean_gr_fold = _safe_mean([p["gr_fold"] for p in matched_pairs], 0.0) if valid_dices_gr else 0.0
+    mean_a_fold = _safe_mean([p["a_fold"] for p in matched_pairs], 0.0)
+    primary_fold = (
+        mean_t_fold if has_tvf else (
+            mean_s_fold if valid_dices_s else (
+                mean_gs_fold if valid_dices_gs else mean_gr_fold
+            )
+        )
+    )
 
-    valid_times_t = [p["t_time"] for p in matched_pairs if np.isfinite(p["t_time"])]
-    valid_times_s = [p["s_time"] for p in matched_pairs if np.isfinite(p["s_time"])]
-    valid_times_a = [p["a_time"] for p in matched_pairs if np.isfinite(p["a_time"])]
-    mean_t_time = float(np.mean(valid_times_t)) if valid_times_t else 0.0
-    mean_s_time = float(np.mean(valid_times_s)) if valid_times_s else 0.0
-    mean_a_time = float(np.mean(valid_times_a)) if valid_times_a else 0.0
-    primary_time = mean_t_time if has_tvf else mean_s_time
-    speedup = (mean_a_time / mean_s_time) if mean_s_time > 0 else 1.0
+    mean_t_time = _safe_mean([p["t_time"] for p in matched_pairs], 0.0)
+    mean_s_time = _safe_mean([p["s_time"] for p in matched_pairs], 0.0)
+    mean_gs_time = _safe_mean([p["gs_time"] for p in matched_pairs], 0.0)
+    mean_gr_time = _safe_mean([p["gr_time"] for p in matched_pairs], 0.0)
+    mean_a_time = _safe_mean([p["a_time"] for p in matched_pairs], 0.0)
+    primary_time = (
+        mean_t_time if has_tvf else (
+            mean_s_time if mean_s_time > 0 else (
+                mean_gs_time if mean_gs_time > 0 else mean_gr_time
+            )
+        )
+    )
+    ref_fast_time = mean_s_time if mean_s_time > 0 else primary_time
+    speedup = (mean_a_time / ref_fast_time) if ref_fast_time > 0 else 1.0
 
     # Subgroups
     intra_pairs = [p for p in matched_pairs if p["cohort"] == "intra"]
     inter_pairs = [p for p in matched_pairs if p["cohort"] == "inter"]
 
-    intra_t_dice = float(np.mean([p["t_dice"] for p in intra_pairs if np.isfinite(p["t_dice"])])) if intra_pairs and valid_dices_t else float("nan")
-    intra_s_dice = float(np.mean([p["s_dice"] for p in intra_pairs if np.isfinite(p["s_dice"])])) if intra_pairs else float("nan")
-    intra_g_dice = float(np.mean([p["g_dice"] for p in intra_pairs if np.isfinite(p["g_dice"])])) if intra_pairs and valid_dices_g else float("nan")
-    intra_a_dice = float(np.mean([p["a_dice"] for p in intra_pairs if np.isfinite(p["a_dice"])])) if intra_pairs else float("nan")
+    intra_t_dice = _safe_mean([p["t_dice"] for p in intra_pairs], float("nan"))
+    intra_s_dice = _safe_mean([p["s_dice"] for p in intra_pairs], float("nan"))
+    intra_gs_dice = _safe_mean([p["gs_dice"] for p in intra_pairs], float("nan"))
+    intra_gr_dice = _safe_mean([p["gr_dice"] for p in intra_pairs], float("nan"))
+    intra_g_dice = _safe_mean([p["g_dice"] for p in intra_pairs], float("nan"))
+    intra_a_dice = _safe_mean([p["a_dice"] for p in intra_pairs], float("nan"))
+    intra_focus_dice = _safe_mean([p["focus_dice"] for p in intra_pairs], float("nan"))
     intra_win = (sum(1 for p in intra_pairs if p["win"]) / len(intra_pairs) * 100.0) if intra_pairs else 0.0
 
-    inter_t_dice = float(np.mean([p["t_dice"] for p in inter_pairs if np.isfinite(p["t_dice"])])) if inter_pairs and valid_dices_t else float("nan")
-    inter_s_dice = float(np.mean([p["s_dice"] for p in inter_pairs if np.isfinite(p["s_dice"])])) if inter_pairs else float("nan")
-    inter_g_dice = float(np.mean([p["g_dice"] for p in inter_pairs if np.isfinite(p["g_dice"])])) if inter_pairs and valid_dices_g else float("nan")
-    inter_a_dice = float(np.mean([p["a_dice"] for p in inter_pairs if np.isfinite(p["a_dice"])])) if inter_pairs else float("nan")
+    inter_t_dice = _safe_mean([p["t_dice"] for p in inter_pairs], float("nan"))
+    inter_s_dice = _safe_mean([p["s_dice"] for p in inter_pairs], float("nan"))
+    inter_gs_dice = _safe_mean([p["gs_dice"] for p in inter_pairs], float("nan"))
+    inter_gr_dice = _safe_mean([p["gr_dice"] for p in inter_pairs], float("nan"))
+    inter_g_dice = _safe_mean([p["g_dice"] for p in inter_pairs], float("nan"))
+    inter_a_dice = _safe_mean([p["a_dice"] for p in inter_pairs], float("nan"))
+    inter_focus_dice = _safe_mean([p["focus_dice"] for p in inter_pairs], float("nan"))
     inter_win = (sum(1 for p in inter_pairs if p["win"]) / len(inter_pairs) * 100.0) if inter_pairs else 0.0
 
     probe_pairs = [p for p in matched_pairs if np.isfinite(p["g_dice"])]
-    probe_sob_mean = float(np.mean([p["s_dice"] for p in probe_pairs])) if probe_pairs else float("nan")
-    probe_gauss_mean = float(np.mean([p["g_dice"] for p in probe_pairs])) if probe_pairs else float("nan")
-    probe_ants_mean = float(np.mean([p["a_dice"] for p in probe_pairs if np.isfinite(p["a_dice"])])) if probe_pairs else float("nan")
+    probe_sob_mean = _safe_mean([p["s_dice"] for p in probe_pairs], float("nan"))
+    probe_gauss_mean = _safe_mean([p["g_dice"] for p in probe_pairs], float("nan"))
+    probe_ants_mean = _safe_mean([p["a_dice"] for p in probe_pairs], float("nan"))
     probe_gain_vs_gauss = (probe_sob_mean - probe_gauss_mean) * 100.0 if np.isfinite(probe_sob_mean) and np.isfinite(probe_gauss_mean) else float("nan")
     probe_gain_vs_ants = (probe_sob_mean - probe_ants_mean) * 100.0 if np.isfinite(probe_sob_mean) and np.isfinite(probe_ants_mean) else float("nan")
+
+    # Derive dynamic regularizer label from recorded config
+    first_primary_cfg = (_first_config(tvf_records) or _first_config(records)
+                         or _first_config(syngs_records) or _first_config(greedy_records) or {})
+    reg_label = str(first_primary_cfg.get("regularizer") or first_primary_cfg.get("syn_regularizer") or "navier").upper()
+    badge_text = f"Unified {reg_label} Diffeomorphic Standard" if (has_syngs or has_greedy or reg_label == "NAVIER") else ("TVF Standard" if has_tvf else "SyN Standard")
+    focus_name = "TVF" if has_tvf else ("SyN" if valid_dices_s else ("SyNGS" if has_syngs else "Greedy"))
+
+    arch_parts = []
+    if valid_dices_t:
+        arch_parts.append(f"TVF: {mean_t_dice:.4f} ({mean_t_time:.1f}s)")
+    if valid_dices_s:
+        arch_parts.append(f"SyN: {mean_s_dice:.4f} ({mean_s_time:.1f}s)")
+    if valid_dices_gs:
+        arch_parts.append(f"SyNGS: {mean_gs_dice:.4f} ({mean_gs_time:.1f}s)")
+    if valid_dices_gr:
+        arch_parts.append(f"Greedy: {mean_gr_dice:.4f} ({mean_gr_time:.1f}s)")
+    if valid_dices_g:
+        arch_parts.append(f"Gauss: {mean_g_dice:.4f}")
+    arch_summary_line = " | ".join(arch_parts)
 
     # 5. Data arrays for Plotly
     plotly_labels = [f"Pair {p['idx']:02d} ({p['cohort'].upper()})" for p in matched_pairs]
     plotly_focus_dice = [round(p["focus_dice"], 4) if np.isfinite(p["focus_dice"]) else None for p in matched_pairs]
     plotly_t_dice = [round(p["t_dice"], 4) if np.isfinite(p["t_dice"]) else None for p in matched_pairs]
     plotly_s_dice = [round(p["s_dice"], 4) if np.isfinite(p["s_dice"]) else None for p in matched_pairs]
+    plotly_gs_dice = [round(p["gs_dice"], 4) if np.isfinite(p["gs_dice"]) else None for p in matched_pairs]
+    plotly_gr_dice = [round(p["gr_dice"], 4) if np.isfinite(p["gr_dice"]) else None for p in matched_pairs]
     plotly_g_dice = [round(p["g_dice"], 4) if np.isfinite(p["g_dice"]) else None for p in matched_pairs]
     plotly_a_dice = [round(p["a_dice"], 4) if np.isfinite(p["a_dice"]) else None for p in matched_pairs]
-    plotly_s_time = [round(p["s_time"], 1) if np.isfinite(p["s_time"]) else None for p in matched_pairs]
-    plotly_t_time = [round(p["t_time"], 1) if np.isfinite(p["t_time"]) else None for p in matched_pairs]
-    plotly_a_time = [round(p["a_time"], 1) if np.isfinite(p["a_time"]) else None for p in matched_pairs]
     plotly_cohort = [p["cohort"] for p in matched_pairs]
+
+    def _fmt_cell(v):
+        return f"{v:.4f}" if np.isfinite(v) else "&mdash;"
+
+    sub_headers = []
+    if valid_dices_t:
+        sub_headers.append("<th>TVF Dice</th>")
+    if valid_dices_s:
+        sub_headers.append("<th>SyN Dice</th>")
+    if valid_dices_gs:
+        sub_headers.append("<th>SyNGS Dice</th>")
+    if valid_dices_gr:
+        sub_headers.append("<th>Greedy Dice</th>")
+    if valid_dices_g:
+        sub_headers.append("<th>Gaussian SyN Dice</th>")
+
+    def _sub_row_cells(t_v, s_v, gs_v, gr_v, g_v):
+        cells = []
+        if valid_dices_t:
+            cells.append(f'<td><strong style="color: var(--win-green);">{_fmt_cell(t_v)}</strong></td>')
+        if valid_dices_s:
+            cells.append(f"<td><strong>{_fmt_cell(s_v)}</strong></td>")
+        if valid_dices_gs:
+            cells.append(f"<td>{_fmt_cell(gs_v)}</td>")
+        if valid_dices_gr:
+            cells.append(f"<td>{_fmt_cell(gr_v)}</td>")
+        if valid_dices_g:
+            cells.append(f"<td>{_fmt_cell(g_v)}</td>")
+        return "".join(cells)
 
     html = f"""<!DOCTYPE html>
 <html lang="en">
@@ -1712,15 +1814,16 @@ def create_population_benchmark_report(
     <script src="https://cdn.plot.ly/plotly-2.27.0.min.js"></script>
     <style>
         :root {{
-            --bg: #0d1117;
-            --surface: #161b22;
-            --border: #30363d;
-            --text-main: #e6edf3;
-            --text-muted: #8b949e;
-            --accent: #58a6ff;
-            --win-green: #3fb950;
-            --loss-red: #f85149;
-            --card-bg: #21262d;
+            --bg: #ffffff;
+            --surface: #f8fafc;
+            --border: #e2e8f0;
+            --text-main: #1e293b;
+            --text-muted: #64748b;
+            --accent: #0284c7;
+            --win-green: #059669;
+            --loss-red: #dc2626;
+            --amber: #d97706;
+            --card-bg: #f1f5f9;
             --font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
         }}
         body {{
@@ -1732,7 +1835,7 @@ def create_population_benchmark_report(
             line-height: 1.5;
         }}
         .container {{
-            max-width: 1400px;
+            max-width: 1440px;
             margin: 0 auto;
         }}
         header {{
@@ -1741,25 +1844,26 @@ def create_population_benchmark_report(
             margin-bottom: 30px;
         }}
         h1 {{
-            color: #ffffff;
-            font-size: 26px;
+            color: var(--text-main);
+            font-size: 25px;
             margin: 0 0 10px 0;
             display: flex;
             align-items: center;
+            flex-wrap: wrap;
             gap: 12px;
         }}
         .badge {{
-            font-size: 13px;
+            font-size: 12px;
             font-weight: 600;
             padding: 4px 10px;
             border-radius: 20px;
-            background: rgba(88, 166, 255, 0.15);
+            background: rgba(2, 132, 199, 0.10);
             color: var(--accent);
-            border: 1px solid rgba(88, 166, 255, 0.3);
+            border: 1px solid rgba(2, 132, 199, 0.28);
         }}
         .stats-grid {{
             display: grid;
-            grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
+            grid-template-columns: repeat(auto-fit, minmax(250px, 1fr));
             gap: 16px;
             margin-bottom: 30px;
         }}
@@ -1777,9 +1881,9 @@ def create_population_benchmark_report(
             margin-bottom: 6px;
         }}
         .stat-value {{
-            font-size: 28px;
+            font-size: 26px;
             font-weight: 700;
-            color: #ffffff;
+            color: var(--text-main);
         }}
         .stat-sub {{
             font-size: 12px;
@@ -1794,7 +1898,7 @@ def create_population_benchmark_report(
             margin-bottom: 25px;
         }}
         h2 {{
-            color: #ffffff;
+            color: var(--text-main);
             font-size: 18px;
             margin-top: 0;
             margin-bottom: 16px;
@@ -1811,7 +1915,7 @@ def create_population_benchmark_report(
             }}
         }}
         .plot-box {{
-            background: var(--surface);
+            background: #ffffff;
             border: 1px solid var(--border);
             border-radius: 8px;
             padding: 16px;
@@ -1822,10 +1926,11 @@ def create_population_benchmark_report(
             border-collapse: collapse;
             font-size: 13px;
             text-align: left;
+            background: #ffffff;
         }}
         th {{
             background: var(--card-bg);
-            color: #ffffff;
+            color: var(--text-main);
             font-weight: 600;
             padding: 10px 12px;
             border-bottom: 1px solid var(--border);
@@ -1835,7 +1940,7 @@ def create_population_benchmark_report(
             border-bottom: 1px solid var(--border);
         }}
         tr:hover td {{
-            background: rgba(255, 255, 255, 0.02);
+            background: #f8fafc;
         }}
         .pill {{
             padding: 2px 8px;
@@ -1844,12 +1949,12 @@ def create_population_benchmark_report(
             font-weight: 600;
         }}
         .pill-intra {{
-            background: rgba(88, 166, 255, 0.15);
-            color: #58a6ff;
+            background: rgba(2, 132, 199, 0.12);
+            color: var(--accent);
         }}
         .pill-inter {{
-            background: rgba(210, 153, 34, 0.15);
-            color: #d29922;
+            background: rgba(217, 119, 6, 0.12);
+            color: var(--amber);
         }}
         .gain-pos {{
             color: var(--win-green);
@@ -1859,50 +1964,40 @@ def create_population_benchmark_report(
             color: var(--loss-red);
             font-weight: 600;
         }}
-        .config-box {{
-            background: #090d13;
-            border: 1px solid var(--border);
-            border-radius: 6px;
-            padding: 14px;
-            font-family: monospace;
-            font-size: 12px;
-            color: #79c0ff;
-            overflow-x: auto;
-        }}
     </style>
 </head>
 <body>
     <div class="container">
         <header>
-            <h1>{title} <span class="badge">{'Dirichlet-Shield TVF Standard' if has_tvf else 'Sobolev SyN Standard'}</span></h1>
+            <h1>{title} <span class="badge">{badge_text}</span></h1>
             <div style="color: var(--text-muted); font-size: 13px;">
-                Syntx: <code>{'syntx.tvf (DST-I Dirichlet Shield + RegAdam) & syntx.syn on GPU' if has_tvf else 'syntx.syn (Eulerian + Sobolev) on GPU'}</code> &bull; Baseline: <code>ANTs C++ SyN on CPU</code> &bull; Updated: {time.strftime('%Y-%m-%d %H:%M:%S UTC', time.gmtime())}
+                Syntx Solvers: <code>{arch_summary_line or focus_name}</code> &bull; Baseline: <code>ANTs C++ SyN ({mean_a_dice:.4f})</code> &bull; Updated: {time.strftime('%Y-%m-%d %H:%M:%S UTC', time.gmtime())}
             </div>
-            <div style="background: rgba(210, 153, 34, 0.1); border: 1px solid rgba(210, 153, 34, 0.4); border-radius: 6px; padding: 10px 14px; margin-top: 12px; font-size: 12px; color: #e3b341; line-height: 1.5;">
-                <strong>Hardware &amp; Reproducibility Notice:</strong> Benchmark runs were executed on Apple Silicon GPU (<code>device='mps'</code>). Apple MPS uses non-deterministic atomic operations and floating-point accumulation nuances that may cause minor metric jitter across serial runs (&plusmn;0.0005&ndash;0.001 DICE). NVIDIA CUDA or CPU execution is recommended for bitwise-exact determinism.
+            <div style="background: rgba(217, 119, 6, 0.08); border: 1px solid rgba(217, 119, 6, 0.30); border-radius: 6px; padding: 10px 14px; margin-top: 12px; font-size: 12px; color: #92400e; line-height: 1.5;">
+                <strong>Hardware &amp; Reproducibility Notice:</strong> Isolated single-process Apple Silicon GPU (<code>device='mps'</code>) runs sharing identical canonical <code>syntx.robust_affine</code> initializations and deterministic seeded pair order (<code>seed=42</code>).
             </div>
         </header>
 
         <div class="stats-grid">
             <div class="stat-card">
-                <div class="stat-label">{'Dirichlet-Shield TVF vs. ANTs' if has_tvf else 'Syntx vs. ANTs Mean Dice'}</div>
+                <div class="stat-label">{focus_name} vs. ANTs Mean Dice</div>
                 <div class="stat-value" style="color: var(--win-green);">{primary_mean_dice:.4f} <span style="font-size: 16px; color: var(--text-muted);">vs {mean_a_dice:.4f}</span></div>
                 <div class="stat-sub">Advantage: <strong class="gain-pos">{dice_diff*100:+.2f}%</strong> ({wins}/{n_completed} Wins, {win_rate:.1f}%)</div>
             </div>
             <div class="stat-card">
-                <div class="stat-label">Grid Folding Regularity</div>
+                <div class="stat-label">Liouville Folding Regularity</div>
                 <div class="stat-value" style="color: var(--win-green);">{primary_fold:.4f}%</div>
-                <div class="stat-sub">{'Strict DST-I Shield Boundary Control' if has_tvf else f'ANTs C++ Baseline: {mean_a_fold:.4f}%'}</div>
+                <div class="stat-sub">ANTs C++ Baseline: {mean_a_fold:.4f}%</div>
             </div>
             <div class="stat-card">
                 <div class="stat-label">Cohort Architecture Comparison</div>
-                <div class="stat-value" style="color: #bc8cff; font-size: 20px;">{f'TVF {mean_t_dice:.4f}' if has_tvf else f'{primary_time:.1f}s'} <span style="font-size: 14px; color: var(--text-muted);">| G: {mean_g_dice:.4f} | S: {mean_s_dice:.4f}</span></div>
-                <div class="stat-sub">{f'TVF beats Sobolev in {tvf_sob_wins}/{n_tvf_sob} ({tvf_sob_pct:.1f}%) pairs' if has_tvf else f'{speedup:.2f}x Faster on GPU'}</div>
+                <div class="stat-value" style="color: var(--accent); font-size: 16px; line-height: 1.4;">{arch_summary_line}</div>
+                <div class="stat-sub">{f'TVF beats Sobolev in {tvf_sob_wins}/{n_tvf_sob} ({tvf_sob_pct:.1f}%) pairs' if n_tvf_sob else f'{speedup:.2f}x Faster on GPU'}</div>
             </div>
             <div class="stat-card">
-                <div class="stat-label">Progress Throughput</div>
+                <div class="stat-label">Completed Cohort Pairs</div>
                 <div class="stat-value" style="color: var(--accent);">{n_completed}</div>
-                <div class="stat-sub">Completed pairs</div>
+                <div class="stat-sub">Intra: {len(intra_pairs)} | Inter: {len(inter_pairs)}</div>
             </div>
         </div>
 
@@ -1918,7 +2013,7 @@ def create_population_benchmark_report(
                     <tr>
                         <th>Cohort Subgroup</th>
                         <th>Completed</th>
-                        {f'<th>Dirichlet TVF Dice</th><th>Sobolev SyN Dice</th><th>Gaussian SyN Dice</th>' if has_tvf else '<th>Syntx Sobolev Mean Dice</th>'}
+                        {"".join(sub_headers)}
                         <th>ANTs Baseline Dice</th>
                         <th>Primary Advantage</th>
                         <th>Win Rate</th>
@@ -1927,18 +2022,18 @@ def create_population_benchmark_report(
                 <tbody>
                     <tr>
                         <td><strong>Intra-Cohort Pairs</strong></td>
-                        <td>{len(intra_pairs)} / 40</td>
-                        {f'<td><strong style="color: var(--win-green);">{intra_t_dice:.4f}</strong></td><td>{intra_s_dice:.4f}</td><td>{intra_g_dice:.4f}</td>' if has_tvf else f'<td><strong>{intra_s_dice:.4f}</strong></td>'}
-                        <td>{intra_a_dice:.4f}</td>
-                        <td class="{'gain-pos' if (intra_t_dice if has_tvf else intra_s_dice) >= intra_a_dice else 'gain-neg'}">{(((intra_t_dice if has_tvf else intra_s_dice) - intra_a_dice)*100.0):+.2f}%</td>
+                        <td>{len(intra_pairs)}</td>
+                        {_sub_row_cells(intra_t_dice, intra_s_dice, intra_gs_dice, intra_gr_dice, intra_g_dice)}
+                        <td>{_fmt_cell(intra_a_dice)}</td>
+                        <td class="{'gain-pos' if intra_focus_dice >= intra_a_dice else 'gain-neg'}">{((intra_focus_dice - intra_a_dice)*100.0):+.2f}%</td>
                         <td><strong>{intra_win:.1f}%</strong></td>
                     </tr>
                     <tr>
                         <td><strong>Inter-Cohort Pairs</strong></td>
-                        <td>{len(inter_pairs)} / 50</td>
-                        {f'<td><strong style="color: var(--win-green);">{inter_t_dice:.4f}</strong></td><td>{inter_s_dice:.4f}</td><td>{inter_g_dice:.4f}</td>' if has_tvf else f'<td><strong>{inter_s_dice:.4f}</strong></td>'}
-                        <td>{inter_a_dice:.4f}</td>
-                        <td class="{'gain-pos' if (inter_t_dice if has_tvf else inter_s_dice) >= inter_a_dice else 'gain-neg'}">{(((inter_t_dice if has_tvf else inter_s_dice) - inter_a_dice)*100.0):+.2f}%</td>
+                        <td>{len(inter_pairs)}</td>
+                        {_sub_row_cells(inter_t_dice, inter_s_dice, inter_gs_dice, inter_gr_dice, inter_g_dice)}
+                        <td>{_fmt_cell(inter_a_dice)}</td>
+                        <td class="{'gain-pos' if inter_focus_dice >= inter_a_dice else 'gain-neg'}">{((inter_focus_dice - inter_a_dice)*100.0):+.2f}%</td>
                         <td><strong>{inter_win:.1f}%</strong></td>
                     </tr>
                 </tbody>
@@ -1954,11 +2049,11 @@ def create_population_benchmark_report(
                 <div class="stat-card" style="background: var(--card-bg);">
                     <div class="stat-label">Sobolev Probe Mean Dice</div>
                     <div class="stat-value" style="color: var(--accent);">{probe_sob_mean:.4f}</div>
-                    <div class="stat-sub">Syntx Sobolev (k=5, &sigma;=1.5, &gamma;=0.10)</div>
+                    <div class="stat-sub">Syntx Spectral / Continuum</div>
                 </div>
                 <div class="stat-card" style="background: var(--card-bg);">
                     <div class="stat-label">Gaussian Probe Mean Dice</div>
-                    <div class="stat-value" style="color: #d29922;">{probe_gauss_mean:.4f}</div>
+                    <div class="stat-value" style="color: var(--amber);">{probe_gauss_mean:.4f}</div>
                     <div class="stat-sub">Syntx Gaussian (&sigma;=3.0)</div>
                 </div>
                 <div class="stat-card" style="background: var(--card-bg);">
@@ -1975,6 +2070,19 @@ def create_population_benchmark_report(
         </div>
 """
 
+    tbl_headers = ["<th>Pair</th>", "<th>Type</th>", "<th>Affine</th>", "<th>ANTs C++</th>"]
+    if valid_dices_gr:
+        tbl_headers.append("<th>Greedy</th>")
+    if valid_dices_gs:
+        tbl_headers.append("<th>SyNGS</th>")
+    if valid_dices_s:
+        tbl_headers.append("<th>SyN</th>")
+    if valid_dices_g:
+        tbl_headers.append("<th>Gaussian SyN</th>")
+    if valid_dices_t:
+        tbl_headers.append('<th style="color: var(--win-green);">TVF</th>')
+    tbl_headers.extend([f"<th>&Delta; {focus_name} vs ANTs</th>", f"<th>{focus_name} Fold%</th>", f"<th>{focus_name} Time</th>"])
+
     html += f"""
         <div class="card">
             <h2>Recorded Configuration per Method</h2>
@@ -1989,17 +2097,7 @@ def create_population_benchmark_report(
             <table>
                 <thead>
                     <tr>
-                        <th>Pair</th>
-                        <th>Type</th>
-                        <th>Affine</th>
-                        <th>ANTs Baseline</th>
-                        <th>Sobolev SyN</th>
-                        <th>Gaussian SyN</th>
-                        <th style="color: var(--win-green);">Dirichlet TVF</th>
-                        <th>&Delta; TVF vs ANTs</th>
-                        <th>&Delta; TVF vs Sobolev</th>
-                        <th>TVF Fold%</th>
-                        <th>TVF Time</th>
+                        {"".join(tbl_headers)}
                     </tr>
                 </thead>
                 <tbody>
@@ -2008,36 +2106,38 @@ def create_population_benchmark_report(
     for p in matched_pairs:
         p_type = p["cohort"]
         pill_cls = "pill-intra" if p_type == "intra" else "pill-inter"
+        aff_dice_str = _fmt_cell(p.get("aff_dice", float("nan")))
+        a_dice_str = _fmt_cell(p["a_dice"])
 
-        a_dice_str = f"{p['a_dice']:.4f}" if np.isfinite(p["a_dice"]) else "&mdash;"
-        g_dice_str = f"{p['g_dice']:.4f}" if np.isfinite(p["g_dice"]) else "&mdash;"
-        s_dice_str = f"{p['s_dice']:.4f}" if np.isfinite(p["s_dice"]) else "&mdash;"
-        t_dice_str = f"{p['t_dice']:.4f}" if np.isfinite(p["t_dice"]) else "&mdash;"
-        aff_dice_str = f"{p['aff_dice']:.4f}" if np.isfinite(p.get("aff_dice", float("nan"))) else "&mdash;"
+        row_Dynamic = []
+        if valid_dices_gr:
+            row_Dynamic.append(f"<td>{_fmt_cell(p['gr_dice'])}</td>")
+        if valid_dices_gs:
+            row_Dynamic.append(f"<td>{_fmt_cell(p['gs_dice'])}</td>")
+        if valid_dices_s:
+            row_Dynamic.append(f'<td><span style="color: var(--accent); font-weight: 600;">{_fmt_cell(p["s_dice"])}</span></td>')
+        if valid_dices_g:
+            row_Dynamic.append(f'<td><span style="color: var(--amber);">{_fmt_cell(p["g_dice"])}</span></td>')
+        if valid_dices_t:
+            row_Dynamic.append(f'<td><strong style="color: var(--win-green);">{_fmt_cell(p["t_dice"])}</strong></td>')
 
-        t_diff_ants = (p["t_dice"] - p["a_dice"]) * 100.0 if np.isfinite(p["t_dice"]) and np.isfinite(p["a_dice"]) else float("nan")
-        t_diff_sob = (p["t_dice"] - p["s_dice"]) * 100.0 if np.isfinite(p["t_dice"]) and np.isfinite(p["s_dice"]) else float("nan")
-
-        t_diff_ants_str = f"{t_diff_ants:+.2f}%" if np.isfinite(t_diff_ants) else "&mdash;"
-        t_diff_sob_str = f"{t_diff_sob:+.2f}%" if np.isfinite(t_diff_sob) else "&mdash;"
-        t_diff_ants_cls = "gain-pos" if t_diff_ants >= 0 else "gain-neg"
-        t_diff_sob_cls = "gain-pos" if t_diff_sob >= 0 else "gain-neg"
-
-        t_fold_str = f"{p['t_fold']:.4f}%" if np.isfinite(p['t_fold']) else "&mdash;"
-        t_time_str = f"{p['t_time']:.1f}s" if np.isfinite(p['t_time']) else "&mdash;"
+        f_diff_ants = p["diff_vs_ants"]
+        f_diff_ants_str = f"{f_diff_ants:+.2f}%" if np.isfinite(f_diff_ants) else "&mdash;"
+        f_diff_ants_cls = "gain-pos" if f_diff_ants >= 0 else "gain-neg"
+        f_fold_val = p["t_fold"] if has_tvf else (p["s_fold"] if valid_dices_s else (p["gs_fold"] if valid_dices_gs else p["gr_fold"]))
+        f_time_val = p["t_time"] if has_tvf else (p["s_time"] if valid_dices_s else (p["gs_time"] if valid_dices_gs else p["gr_time"]))
+        f_fold_str = f"{f_fold_val:.4f}%" if np.isfinite(f_fold_val) else "&mdash;"
+        f_time_str = f"{f_time_val:.1f}s" if np.isfinite(f_time_val) else "&mdash;"
 
         html += f"""                    <tr>
                         <td><strong>#{p['idx']:02d}</strong></td>
                         <td><span class="pill {pill_cls}">{p_type.upper()}</span></td>
-                        <td><span style="color: #79c0ff;">{aff_dice_str}</span></td>
+                        <td><span style="color: var(--text-muted);">{aff_dice_str}</span></td>
                         <td>{a_dice_str}</td>
-                        <td><span style="color: var(--accent);">{s_dice_str}</span></td>
-                        <td><span style="color: #d29922;">{g_dice_str}</span></td>
-                        <td><strong style="color: var(--win-green);">{t_dice_str}</strong></td>
-                        <td><strong class="{t_diff_ants_cls}">{t_diff_ants_str}</strong></td>
-                        <td><span class="{t_diff_sob_cls}">{t_diff_sob_str}</span></td>
-                        <td>{t_fold_str}</td>
-                        <td>{t_time_str}</td>
+                        {"".join(row_Dynamic)}
+                        <td><strong class="{f_diff_ants_cls}">{f_diff_ants_str}</strong></td>
+                        <td>{f_fold_str}</td>
+                        <td>{f_time_str}</td>
                     </tr>
 """
 
@@ -2051,123 +2151,83 @@ def create_population_benchmark_report(
         const focusDice = {json.dumps(plotly_focus_dice)};
         const tvfDice = {json.dumps(plotly_t_dice)};
         const sobDice = {json.dumps(plotly_s_dice)};
+        const syngsDice = {json.dumps(plotly_gs_dice)};
+        const greedyDice = {json.dumps(plotly_gr_dice)};
         const antsDice = {json.dumps(plotly_a_dice)};
-        const tvfTime = {json.dumps(plotly_t_time)};
-        const antsTime = {json.dumps(plotly_a_time)};
         const cohorts = {json.dumps(plotly_cohort)};
+        const focusLabel = {json.dumps(focus_name)};
 
-        // 1. X-Y Scatter: Dirichlet TVF Dice vs ANTs Dice
-        const pairedAntsDiceIntra = [], pairedTvfDiceIntra = [], pairedLabelsIntra = [];
-        const pairedAntsDiceInter = [], pairedTvfDiceInter = [], pairedLabelsInter = [];
-
-        for (let i = 0; i < pairLabels.length; i++) {{
-            if (antsDice[i] !== null && focusDice[i] !== null) {{
-                const diff = (focusDice[i] - antsDice[i]) * 100;
-                const txt = pairLabels[i] + '<br>Dirichlet TVF: ' + focusDice[i] + '<br>ANTs: ' + antsDice[i] + '<br>&Delta;: ' + (diff >= 0 ? '+' : '') + diff.toFixed(2) + '%';
-                if (cohorts[i] === 'intra') {{
-                    pairedAntsDiceIntra.push(antsDice[i]);
-                    pairedTvfDiceIntra.push(focusDice[i]);
-                    pairedLabelsIntra.push(txt);
-                }} else {{
-                    pairedAntsDiceInter.push(antsDice[i]);
-                    pairedTvfDiceInter.push(focusDice[i]);
-                    pairedLabelsInter.push(txt);
+        // 1. X-Y Scatter: Syntx Models vs ANTs C++ Dice
+        function buildPairedTrace(arrY, labelName, colorHex, symbolName) {{
+            const xs = [], ys = [], txts = [];
+            for (let i = 0; i < pairLabels.length; i++) {{
+                if (antsDice[i] !== null && arrY[i] !== null) {{
+                    const diff = (arrY[i] - antsDice[i]) * 100;
+                    xs.push(antsDice[i]);
+                    ys.push(arrY[i]);
+                    txts.push(pairLabels[i] + '<br>' + labelName + ': ' + arrY[i] + '<br>ANTs C++: ' + antsDice[i] + '<br>&Delta;: ' + (diff >= 0 ? '+' : '') + diff.toFixed(2) + '%');
                 }}
             }}
+            return {{
+                x: xs, y: ys, text: txts, hoverinfo: 'text', mode: 'markers', type: 'scatter',
+                name: labelName,
+                marker: {{ size: 8, symbol: symbolName, color: colorHex, opacity: 0.85, line: {{ color: '#ffffff', width: 1 }} }}
+            }};
         }}
 
-        const allDices = [...pairedAntsDiceIntra, ...pairedTvfDiceIntra, ...pairedAntsDiceInter, ...pairedTvfDiceInter];
-        const minDice = allDices.length > 0 ? Math.min(...allDices, 0.45) : 0.45;
-        const maxDice = allDices.length > 0 ? Math.max(...allDices, 0.75) : 0.75;
+        const scatterTraces = [];
+        if (tvfDice.some(x => x !== null)) scatterTraces.push(buildPairedTrace(tvfDice, 'syntx.tvf', '#059669', 'circle'));
+        if (sobDice.some(x => x !== null)) scatterTraces.push(buildPairedTrace(sobDice, 'syntx.syn', '#0284c7', 'diamond'));
+        if (syngsDice.some(x => x !== null)) scatterTraces.push(buildPairedTrace(syngsDice, 'syntx.syngs', '#d97706', 'square'));
+        if (greedyDice.some(x => x !== null)) scatterTraces.push(buildPairedTrace(greedyDice, 'syntx.greedy', '#64748b', 'triangle-up'));
+        if (scatterTraces.length === 0) scatterTraces.push(buildPairedTrace(focusDice, focusLabel, '#0284c7', 'circle'));
 
-        const scatterDiceIntra = {{
-            x: pairedAntsDiceIntra,
-            y: pairedTvfDiceIntra,
-            text: pairedLabelsIntra,
-            hoverinfo: 'text',
-            mode: 'markers',
-            type: 'scatter',
-            name: 'Intra-Cohort Pairs (40)',
-            marker: {{ size: 10, color: '#58a6ff', opacity: 0.9, line: {{ color: '#ffffff', width: 1.5 }} }}
-        }};
+        const allVals = [];
+        scatterTraces.forEach(tr => {{ allVals.push(...tr.x, ...tr.y); }});
+        const minDice = allVals.length > 0 ? Math.min(...allVals, 0.55) : 0.45;
+        const maxDice = allVals.length > 0 ? Math.max(...allVals, 0.72) : 0.75;
 
-        const scatterDiceInter = {{
-            x: pairedAntsDiceInter,
-            y: pairedTvfDiceInter,
-            text: pairedLabelsInter,
-            hoverinfo: 'text',
-            mode: 'markers',
-            type: 'scatter',
-            name: 'Inter-Cohort Pairs (50)',
-            marker: {{ size: 10, color: '#d29922', opacity: 0.9, line: {{ color: '#ffffff', width: 1.5 }} }}
-        }};
-
-        const lineDiceParity = {{
-            x: [minDice - 0.05, maxDice + 0.05],
-            y: [minDice - 0.05, maxDice + 0.05],
+        scatterTraces.push({{
+            x: [minDice - 0.03, maxDice + 0.03],
+            y: [minDice - 0.03, maxDice + 0.03],
             mode: 'lines',
             type: 'scatter',
             name: 'Parity (y = x)',
-            line: {{ dash: 'dash', color: '#8b949e', width: 2 }}
-        }};
+            line: {{ dash: 'dash', color: '#94a3b8', width: 2 }}
+        }});
 
-        Plotly.newPlot('diceScatterPlot', [scatterDiceIntra, scatterDiceInter, lineDiceParity], {{
-            title: {{ text: '<b>Cortical Accuracy: Dirichlet-Shield TVF vs ANTs C++</b>', font: {{ color: '#ffffff', size: 15 }} }},
-            xaxis: {{ title: 'ANTs C++ Symmetric Mean Dice', range: [minDice - 0.02, maxDice + 0.02], color: '#8b949e', gridcolor: '#21262d' }},
-            yaxis: {{ title: 'Dirichlet-Shield TVF Symmetric Mean Dice', range: [minDice - 0.02, maxDice + 0.02], color: '#8b949e', gridcolor: '#21262d' }},
-            paper_bgcolor: 'rgba(0,0,0,0)',
-            plot_bgcolor: 'rgba(0,0,0,0)',
-            font: {{ family: '-apple-system, BlinkMacSystemFont, Segoe UI, sans-serif', color: '#e6edf3' }},
+        Plotly.newPlot('diceScatterPlot', scatterTraces, {{
+            title: {{ text: '<b>Cortical Accuracy vs. ANTs C++ Baseline (n=' + pairLabels.length + ')</b>', font: {{ color: '#1e293b', size: 15 }} }},
+            xaxis: {{ title: 'ANTs C++ Symmetric Mean Dice', range: [minDice - 0.015, maxDice + 0.015], color: '#475569', gridcolor: '#e2e8f0' }},
+            yaxis: {{ title: 'Syntx Symmetric Mean Dice', range: [minDice - 0.015, maxDice + 0.015], color: '#475569', gridcolor: '#e2e8f0' }},
+            paper_bgcolor: '#ffffff',
+            plot_bgcolor: '#ffffff',
+            font: {{ family: '-apple-system, BlinkMacSystemFont, Segoe UI, sans-serif', color: '#1e293b' }},
             margin: {{ t: 50, b: 50, l: 60, r: 20 }},
-            legend: {{ x: 0.05, y: 0.95, font: {{ color: '#e6edf3' }} }}
+            legend: {{ x: 0.03, y: 0.97, bgcolor: 'rgba(255,255,255,0.85)', font: {{ color: '#1e293b' }} }}
         }}, {{ responsive: true }});
 
-        // 2. X-Y Scatter: TVF vs Sobolev Direct Head-to-Head
-        const pairedSobDice = [], pairedTvfForSob = [], pairedSobLabels = [];
-        for (let i = 0; i < pairLabels.length; i++) {{
-            if (sobDice[i] !== null && tvfDice[i] !== null) {{
-                pairedSobDice.push(sobDice[i]);
-                pairedTvfForSob.push(tvfDice[i]);
-                const diff = (tvfDice[i] - sobDice[i]) * 100;
-                pairedSobLabels.push(pairLabels[i] + '<br>Dirichlet TVF: ' + tvfDice[i] + '<br>Sobolev SyN: ' + sobDice[i] + '<br>&Delta;: ' + (diff >= 0 ? '+' : '') + diff.toFixed(2) + '%');
-            }}
-        }}
+        // 2. Distribution Box Plot across All Active Methods
+        const boxTraces = [];
+        if (antsDice.some(x => x !== null)) boxTraces.push({{ y: antsDice.filter(x => x !== null), type: 'box', name: 'ANTs C++', boxpoints: 'outliers', marker: {{ color: '#94a3b8' }} }});
+        if (greedyDice.some(x => x !== null)) boxTraces.push({{ y: greedyDice.filter(x => x !== null), type: 'box', name: 'syntx.greedy', boxpoints: 'outliers', marker: {{ color: '#64748b' }} }});
+        if (syngsDice.some(x => x !== null)) boxTraces.push({{ y: syngsDice.filter(x => x !== null), type: 'box', name: 'syntx.syngs', boxpoints: 'outliers', marker: {{ color: '#d97706' }} }});
+        if (sobDice.some(x => x !== null)) boxTraces.push({{ y: sobDice.filter(x => x !== null), type: 'box', name: 'syntx.syn', boxpoints: 'outliers', marker: {{ color: '#0284c7' }} }});
+        if (tvfDice.some(x => x !== null)) boxTraces.push({{ y: tvfDice.filter(x => x !== null), type: 'box', name: 'syntx.tvf', boxpoints: 'outliers', marker: {{ color: '#059669' }} }});
 
-        const scatterTvfVsSob = {{
-            x: pairedSobDice,
-            y: pairedTvfForSob,
-            text: pairedSobLabels,
-            hoverinfo: 'text',
-            mode: 'markers',
-            type: 'scatter',
-            name: 'TVF vs Sobolev Pairs ({tvf_sob_wins}/{n_tvf_sob} Wins)',
-            marker: {{ size: 10, color: '#3fb950', opacity: 0.9, line: {{ color: '#ffffff', width: 1.5 }} }}
-        }};
-
-        const lineSobParity = {{
-            x: [minDice - 0.05, maxDice + 0.05],
-            y: [minDice - 0.05, maxDice + 0.05],
-            mode: 'lines',
-            type: 'scatter',
-            name: 'Parity (y = x)',
-            line: {{ dash: 'dash', color: '#8b949e', width: 2 }}
-        }};
-
-        Plotly.newPlot('timeScatterPlot', [scatterTvfVsSob, lineSobParity], {{
-            title: {{ text: '<b>Head-to-Head: Dirichlet-Shield TVF vs Sobolev SyN</b>', font: {{ color: '#ffffff', size: 15 }} }},
-            xaxis: {{ title: 'Sobolev SyN Symmetric Mean Dice', range: [minDice - 0.02, maxDice + 0.02], color: '#8b949e', gridcolor: '#21262d' }},
-            yaxis: {{ title: 'Dirichlet-Shield TVF Symmetric Mean Dice', range: [minDice - 0.02, maxDice + 0.02], color: '#8b949e', gridcolor: '#21262d' }},
-            paper_bgcolor: 'rgba(0,0,0,0)',
-            plot_bgcolor: 'rgba(0,0,0,0)',
-            font: {{ family: '-apple-system, BlinkMacSystemFont, Segoe UI, sans-serif', color: '#e6edf3' }},
+        Plotly.newPlot('timeScatterPlot', boxTraces, {{
+            title: {{ text: '<b>Cohort Cortical Dice Distribution Across Solvers</b>', font: {{ color: '#1e293b', size: 15 }} }},
+            yaxis: {{ title: 'Symmetric DKT31 Cortical Dice', color: '#475569', gridcolor: '#e2e8f0' }},
+            paper_bgcolor: '#ffffff',
+            plot_bgcolor: '#ffffff',
+            font: {{ family: '-apple-system, BlinkMacSystemFont, Segoe UI, sans-serif', color: '#1e293b' }},
             margin: {{ t: 50, b: 50, l: 60, r: 20 }},
-            legend: {{ x: 0.05, y: 0.95, font: {{ color: '#e6edf3' }} }}
+            showlegend: false
         }}, {{ responsive: true }});
 
     </script>
 </body>
 </html>
-
 """
     with open(output_html, "w") as f:
         f.write(html)

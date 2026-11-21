@@ -49,7 +49,7 @@ ALLOWED_REGISTRATION_EXCEPTIONS: dict[str, str] = {
     "template.py:394": (
         "Template builder C++ fallback backend when explicitly requested via backend='ants'"
     ),
-    "viz/reports.py:2589": (
+    "viz/reports.py:2649": (
         "Prose / code snippet inside HTML report template string describing ANTs baseline"
     ),
 }

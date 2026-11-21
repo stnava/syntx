@@ -477,10 +477,10 @@ def _evaluate_mindboggle_pair_impl(
         tvf_kwargs = {}
         if config is not None or model_lower != "tvf":
             _keys = ("regularizer", "alpha", "total_alpha", "flow_sigma", "total_sigma", "optimizer",
-                     "optimizer_lr", "max_step_norm", "grad_step", "cfl_momentum", "cfl_max",
-                     "n_time_steps", "multipoint_loss", "fast_smooth", "syn_metric", "syn_sampling",
-                     "reg_iterations", "constant_speed", "constant_speed_relaxation",
-                     "poisson_ratio", "beta", "gamma", "bulk_modulus", "darcy_permeability",
+                     "optimizer_lr", "max_step_norm", "grad_step", "cfl_momentum", "cfl_max", "energy_weight",
+                     "n_time_steps", "multipoint_loss", "fast_smooth", "syn_metric", "syn_sampling", "s",
+                     "reg_iterations", "constant_speed", "constant_speed_relaxation", "poisson_ratio",
+                     "beta", "gamma", "bulk_modulus", "darcy_permeability",
                      "dilatation_weight", "h3_envelope", "envelope_power")
             tvf_kwargs = {k: model_cfg[k] for k in _keys if k in model_cfg}
         for k, v in explicit_syn.items():
@@ -503,7 +503,7 @@ def _evaluate_mindboggle_pair_impl(
                     "transport_mode": "transport_mode",
                     "poisson_ratio": "poisson_ratio", "beta": "beta", "gamma": "gamma",
                     "bulk_modulus": "bulk_modulus", "darcy_permeability": "darcy_permeability",
-                    "dilatation_weight": "dilatation_weight", "h3_envelope": "h3_envelope"}
+                    "dilatation_weight": "dilatation_weight", "h3_envelope": "h3_envelope", "s": "s"}
             gs_kwargs = {_map[k]: v for k, v in model_cfg.items() if k in _map}
         for k, v in explicit_syn.items():
             gs_kwargs[{"similarity_metric": "syn_metric", "learning_rate": "grad_step"}.get(k, k)] = v

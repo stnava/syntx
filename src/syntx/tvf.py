@@ -2037,10 +2037,10 @@ class TVFModel(nn.Module):
 # Default spectral strength alpha (mm^2) and CFL step parameters.
 # 3-D canonical defaults tuned on Mindboggle pairs 77 / 44 / 0 (2026-11-11,
 # docs/provenance/tuning/tvf_2026-11-11.md): regularizer='beltrami', alpha=2.5,
-# grad_step=1.25, energy_weight=0.0008, multipoint_loss=(0.0, 1.0) (+0.0268 mean Dice,
-# 0.6346 mean bidirectional cortical Dice, 0 % Liouville folding).
-TVF_DEFAULT_ALPHA = {2: 2.0, 3: 2.5}
-TVF_DEFAULT_CFL = {"grad_step": 1.25, "cfl_momentum": 0.9}
+# Canonical 3-D defaults: unified Navier-Cauchy regularizer (regularizer='navier', poisson_ratio=0.20,
+# s=2.0) with alpha=3.5, grad_step=1.8, cfl_momentum=0.8, energy_weight=0.0004, multipoint_loss=(0.0, 1.0).
+TVF_DEFAULT_ALPHA = {2: 2.0, 3: 3.5}
+TVF_DEFAULT_CFL = {"grad_step": 1.8, "cfl_momentum": 0.8}
 
 _TVF_SPECTRAL = tuple(sorted(SPECTRAL_REGULARIZERS))
 _TVF_SIGMA = ('gaussian', 'bspline')
@@ -2125,7 +2125,7 @@ def tvf_registration(
     levels=None,
     n_time_steps=3,
     multipoint_loss=(0.0, 1.0),
-    regularizer='beltrami',
+    regularizer='navier',
     alpha=None,
     total_alpha=None,
     flow_sigma=None,
@@ -2136,7 +2136,7 @@ def tvf_registration(
     grad_step=None,
     cfl_momentum=None,
     cfl_max=0.0,
-    energy_weight=0.0008,
+    energy_weight=0.0004,
     temporal_weight=0.0,
     fast_smooth=None,
     solver='euler',
@@ -2190,9 +2190,9 @@ def tvf_registration(
     Regularisation -- one strength parameter per regulariser
     ---------------------------------------------------------
     regularizer : str
-        Spectral / continuum ('beltrami', 'sobolev', 'dsti', 'dsti1', 'poroelastic',
-        'div_curl', 'hyperelastic', 'navier', 'solenoidal') or spatial ('gaussian', 'bspline').
-        Default 'beltrami'.
+        Spectral / continuum ('navier', 'beltrami', 'sobolev', 'dsti', 'dsti1', 'poroelastic',
+        'div_curl', 'hyperelastic', 'solenoidal') or spatial ('gaussian', 'bspline').
+        Default 'navier'.
     alpha : float
         Spectral regularisers only: strength (mm^2, physical units at every pyramid level) of
         the fluid smoothing applied to every update (0 = off). Default ``TVF_DEFAULT_ALPHA[dim]``.
@@ -2220,15 +2220,15 @@ def tvf_registration(
     max_step_norm : float
         'reg_adam' only: largest per-iteration update (voxels). Default 0.5.
     grad_step : float
-        'cfl' only: CFL step (voxels). Default 1.25 (``TVF_DEFAULT_CFL['grad_step']``).
+        'cfl' only: CFL step (voxels). Default 1.8 (``TVF_DEFAULT_CFL['grad_step']``).
     cfl_momentum : float
-        'cfl' only: direction momentum in [0, 1). Default 0.9.
+        'cfl' only: direction momentum in [0, 1). Default 0.8.
     cfl_max : float
         Cap on the velocity magnitude (voxels per unit time) after every step; 0 = no cap.
     energy_weight : float
         Weight of the path energy mean_t <v_t, L v_t> (L = inverse of the regulariser's kernel,
         same alpha): the LDDMM geodesic energy -- symmetric in time, it makes short, smooth
-        paths preferable among those reaching the same map. Default 0.0008;
+        paths preferable among those reaching the same map. Default 0.0004;
         0 = off. With the default constant_speed the keyframe speeds are equalised in the
         same V-norm (geodesics have constant speed).
     temporal_weight : float
@@ -2614,9 +2614,9 @@ def tvf_registration(
                             "(PyTorch-backend options)")
         if resolved_adjoint or str(resolved_solver).lower().startswith('adjoint'):
             raise NotImplementedError("backend='jax' does not support adjoint solvers; use backend='pytorch'")
-        if max_step_norm is not None or temporal_weight != 0.0 or energy_weight != 0.0008:
+        if max_step_norm is not None or temporal_weight != 0.0 or energy_weight != 0.0004:
             raise ValueError("backend='jax' has no path-energy / step-norm options: leave "
-                             "energy_weight (0.0008), temporal_weight (0) and max_step_norm (None) at "
+                             "energy_weight (0.0004), temporal_weight (0) and max_step_norm (None) at "
                              "their defaults (the JAX model uses a plain mean(v^2) penalty instead)")
         if device not in (None, 'cpu'):
             raise ValueError("backend='jax' runs on the JAX default device; device is not used")

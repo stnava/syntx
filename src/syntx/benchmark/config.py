@@ -31,12 +31,12 @@ DEFAULT_BENCHMARK_CONFIG: Dict[str, Any] = {
         "similarity_metric": "cc2",
         "reg_iterations": [100, 100, 20],
     },
-    # Canonical: docs/provenance/best_parameters.json "syntx.syn/canonical_2026_11_11"
-    # (Option A: warm-started (1, 2, 4) inversion cadence + 30-step level polish + 0.30-vox
-    # post-composition Levenberg-Marquardt polish, pairs 77/44/0). Must equal syntx.syn()'s
-    # defaults -- enforced by tests/test_canonical_parameters.py.
+    # Canonical: docs/provenance/best_parameters.json "syntx.syn/canonical_2026_11_20"
+    # (Common Navier s=2.0, poisson_ratio=0.20 + warm-started (1, 2, 4) inversion cadence +
+    # 30-step level polish + 0.30-vox post-composition Levenberg-Marquardt polish). Must equal
+    # syntx.syn()'s defaults -- enforced by tests/test_canonical_parameters.py.
     "syn_config": {
-        "grad_step": 0.4,
+        "grad_step": 0.6,
         "fluid_sigma": 2.4,
         "elastic_sigma": 0.0,
         "lncc_radius": 2,
@@ -46,9 +46,9 @@ DEFAULT_BENCHMARK_CONFIG: Dict[str, Any] = {
         "polish_inv_tol": 0.02,
         "compose_polish_tol": 0.3,
         "syn_metric": "cc2",
-        "syn_regularizer": "sobolev",
-        "kernel_type": "sobolev",
-        "sobolev_alpha": 2.25,
+        "syn_regularizer": "navier",
+        "kernel_type": "navier",
+        "sobolev_alpha": 1.5,
         "syn_fast_smooth": False,
         "syn_use_analytical_gradients": False,
         "syn_inverse_method": "anderson",
@@ -99,16 +99,16 @@ DEFAULT_BENCHMARK_CONFIG: Dict[str, Any] = {
         "syn_formulation": "eulerian",
         "reg_iterations": [100, 100, 20],
     },
-    # Canonical: docs/provenance/best_parameters.json "syntx.tvf/canonical_2026_11_12"
-    # (docs/provenance/tuning/tvf_2026-11-11.md). Must equal syntx.tvf()'s defaults
+    # Canonical: docs/provenance/best_parameters.json "syntx.tvf/canonical_2026_11_20"
+    # (Common Navier s=2.0, poisson_ratio=0.20). Must equal syntx.tvf()'s defaults
     # (tests/test_tvf_interface.py & tests/test_canonical_parameters.py).
     "tvf_config": {
-        "regularizer": "beltrami",
-        "alpha": 2.5,
+        "regularizer": "navier",
+        "alpha": 3.5,
         "optimizer": "cfl",
-        "grad_step": 1.25,
-        "cfl_momentum": 0.9,
-        "energy_weight": 0.0008,
+        "grad_step": 1.8,
+        "cfl_momentum": 0.8,
+        "energy_weight": 0.0004,
         "n_time_steps": 3,
         "multipoint_loss": [0.0, 1.0],
         "fast_smooth": False,
@@ -116,16 +116,16 @@ DEFAULT_BENCHMARK_CONFIG: Dict[str, Any] = {
         "syn_sampling": 2,
         "reg_iterations": [100, 100, 20],
     },
-    # Canonical: docs/provenance/best_parameters.json "syntx.syngs/canonical_2026_11_12"
-    # (docs/provenance/tuning/syngs_2026-11-11.md). Must equal syntx.syngs()'s defaults
+    # Canonical: docs/provenance/best_parameters.json "syntx.syngs/canonical_2026_11_20"
+    # (Common Navier s=2.0, poisson_ratio=0.20). Must equal syntx.syngs()'s defaults
     # (tests/test_canonical_parameters.py).
     "syngs_config": {
         "grad_step": 0.25,
-        "alpha": 0.448,
-        "regularizer": "sobolev",
+        "alpha": 0.25,
+        "regularizer": "navier",
         "optimizer": "reg_adam",
         "optimizer_lr": 2.246094,
-        "max_step_norm": 0.6,
+        "max_step_norm": 0.95,
         "syn_metric": "cc2",
         "n_steps": 8,
         "bootstrap_mode": "none",
@@ -135,12 +135,12 @@ DEFAULT_BENCHMARK_CONFIG: Dict[str, Any] = {
     "greedy_config": {
         "grad_step": 1.5,
         "flow_sigma": 1.62,
-        "total_sigma": 0.28,
+        "total_sigma": 0.0,
         "optimizer": 'cfl',
         "regadam_sigma": 0.8,
         "cfl_momentum": 0.1875,
-        "regularizer": 'div_curl',
-        "sobolev_alpha": None,
+        "regularizer": 'navier',
+        "sobolev_alpha": 2.625,
         "similarity_metric": "cc2",
         "reg_iterations": [100, 100, 20],
     },

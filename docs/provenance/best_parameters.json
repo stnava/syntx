@@ -1470,6 +1470,555 @@
                     }
                 }
             }
+        },
+        "canonical_2026_11_20": {
+            "selection": "unified cross-model Navier-Cauchy canonical default (s=2.0, poisson_ratio=0.20; tuned on [77, 44, 0], minimax-regret & Pareto validated out-of-sample on subject-disjoint [28, 55, 84])",
+            "tune_pairs": [
+                77,
+                44,
+                0
+            ],
+            "heldout_pairs": [
+                28,
+                55,
+                84
+            ],
+            "parameters": {
+                "grad_step": 0.6,
+                "flow_sigma": 2.4,
+                "total_sigma": 0.0,
+                "sobolev_alpha": 1.5,
+                "fast_smooth": false,
+                "in_loop_inv_steps": 10,
+                "inv_refresh_every": [
+                    1,
+                    2,
+                    4
+                ],
+                "polish_inv_steps": 30,
+                "polish_inv_tol": 0.02,
+                "compose_polish_tol": 0.3,
+                "optimizer": "cfl",
+                "regularizer": "navier",
+                "reg_iterations": [
+                    100,
+                    100,
+                    20
+                ],
+                "poisson_ratio": 0.2,
+                "s": 2.0
+            },
+            "previous_defaults": {
+                "grad_step": 0.4,
+                "flow_sigma": 2.4,
+                "total_sigma": 0.0,
+                "sobolev_alpha": 2.25,
+                "fast_smooth": false,
+                "in_loop_inv_steps": 10,
+                "inv_refresh_every": [
+                    1,
+                    2,
+                    4
+                ],
+                "polish_inv_steps": 30,
+                "polish_inv_tol": 0.02,
+                "compose_polish_tol": 0.3,
+                "optimizer": "cfl",
+                "regularizer": "sobolev",
+                "reg_iterations": [
+                    100,
+                    100,
+                    20
+                ]
+            },
+            "mean_dice_gain_vs_previous_defaults_heldout": 0.01941379819046592,
+            "per_pair_heldout": {
+                "28": {
+                    "dice_sym": 0.6470613035879367,
+                    "dice_fixed": 0.6484859982812158,
+                    "dice_moving": 0.6456366088946577,
+                    "folding_pct": 0.0,
+                    "jac_min": 0.09336365014314651,
+                    "jac_max": 8.973901748657227,
+                    "inv_mean_mm": 0.008803625591099262,
+                    "inv_p95_mm": 0.061312485486269,
+                    "inv_max_mm": 0.7705533504486084,
+                    "inv_interior_mean_mm": 0.053127508610486984,
+                    "inv_interior_max_mm": 0.4181388318538666,
+                    "time_s": 57.54219603538513,
+                    "fd_folding_pct": 0.0,
+                    "fd_jac_min": 0.08515594899654388
+                },
+                "55": {
+                    "dice_sym": 0.6442716611677257,
+                    "dice_fixed": 0.6466491364382807,
+                    "dice_moving": 0.6418941858971708,
+                    "folding_pct": 0.0,
+                    "jac_min": 0.09795570373535156,
+                    "jac_max": 16.30580711364746,
+                    "inv_mean_mm": 0.009668689221143723,
+                    "inv_p95_mm": 0.06659893691539764,
+                    "inv_max_mm": 0.6597967147827148,
+                    "inv_interior_mean_mm": 0.05427335202693939,
+                    "inv_interior_max_mm": 0.2994244396686554,
+                    "time_s": 46.59567832946777,
+                    "fd_folding_pct": 0.0,
+                    "fd_jac_min": 0.08060136437416077
+                },
+                "84": {
+                    "dice_sym": 0.5997902055426871,
+                    "dice_fixed": 0.6006099031947778,
+                    "dice_moving": 0.5989705078905964,
+                    "folding_pct": 0.0,
+                    "jac_min": 0.03715106472373009,
+                    "jac_max": 12.032679557800293,
+                    "inv_mean_mm": 0.010327876545488834,
+                    "inv_p95_mm": 0.07149261981248856,
+                    "inv_max_mm": 0.7566918134689331,
+                    "inv_interior_mean_mm": 0.05803893133997917,
+                    "inv_interior_max_mm": 0.36059802770614624,
+                    "time_s": 49.426438093185425,
+                    "fd_folding_pct": 0.0,
+                    "fd_jac_min": 0.08974169194698334
+                }
+            },
+            "baseline_per_pair_heldout": {
+                "28": {
+                    "dice_sym": 0.6289244868562671,
+                    "folding_pct": 0.0,
+                    "jac_min": 0.029477417469024658,
+                    "inv_interior_max_mm": 0.29977771639823914,
+                    "time_s": 48.23586392402649
+                },
+                "55": {
+                    "dice_sym": 0.6135008709100194,
+                    "folding_pct": 0.0,
+                    "jac_min": 0.03290356323122978,
+                    "inv_interior_max_mm": 0.2995297610759735,
+                    "time_s": 49.78144812583923
+                },
+                "84": {
+                    "dice_sym": 0.5904564179606653,
+                    "folding_pct": 0.0,
+                    "jac_min": 0.061630479991436005,
+                    "inv_interior_max_mm": 0.3966420292854309,
+                    "time_s": 45.103331089019775
+                }
+            },
+            "per_model_tune_winner": {
+                "overrides": {
+                    "regularizer": "navier",
+                    "poisson_ratio": 0.25,
+                    "s": 2.0,
+                    "sobolev_alpha": 1.5,
+                    "grad_step": 0.6
+                },
+                "gain": 0.030214941972231846,
+                "parameters": {
+                    "grad_step": 0.6,
+                    "flow_sigma": 2.4,
+                    "total_sigma": 0.0,
+                    "sobolev_alpha": 1.5,
+                    "fast_smooth": false,
+                    "in_loop_inv_steps": 10,
+                    "inv_refresh_every": [
+                        1,
+                        2,
+                        4
+                    ],
+                    "polish_inv_steps": 30,
+                    "polish_inv_tol": 0.02,
+                    "compose_polish_tol": 0.3,
+                    "optimizer": "cfl",
+                    "regularizer": "navier",
+                    "reg_iterations": [
+                        100,
+                        100,
+                        20
+                    ],
+                    "poisson_ratio": 0.25,
+                    "s": 2.0
+                },
+                "per_pair": {
+                    "77": {
+                        "dice_sym": 0.6214491555549413,
+                        "dice_fixed": 0.6166084283829707,
+                        "dice_moving": 0.6262898827269119,
+                        "folding_pct": 0.0,
+                        "jac_min": 0.07093000411987305,
+                        "jac_max": 11.402008533477783,
+                        "inv_mean_mm": 0.01372861722484231,
+                        "inv_p95_mm": 0.08712466061115265,
+                        "inv_max_mm": 1.6569559574127197,
+                        "inv_interior_mean_mm": 0.05563214421272278,
+                        "inv_interior_max_mm": 0.2996593415737152,
+                        "time_s": 45.98501396179199,
+                        "fd_folding_pct": 0.0,
+                        "fd_jac_min": 0.05921657383441925
+                    },
+                    "44": {
+                        "dice_sym": 0.6275113566399211,
+                        "dice_fixed": 0.6324098341483133,
+                        "dice_moving": 0.6226128791315289,
+                        "folding_pct": 0.0,
+                        "jac_min": 0.0859445333480835,
+                        "jac_max": 13.401093482971191,
+                        "inv_mean_mm": 0.011765757575631142,
+                        "inv_p95_mm": 0.08088435605168343,
+                        "inv_max_mm": 1.1945107579231262,
+                        "inv_interior_mean_mm": 0.05820225551724434,
+                        "inv_interior_max_mm": 0.29987382888793945,
+                        "time_s": 48.199026703834534,
+                        "fd_folding_pct": 0.0,
+                        "fd_jac_min": 0.08095443993806839
+                    },
+                    "0": {
+                        "dice_sym": 0.6547709170558991,
+                        "dice_fixed": 0.6553867887200133,
+                        "dice_moving": 0.6541550453917848,
+                        "folding_pct": 0.0,
+                        "jac_min": 0.1480209305882454,
+                        "jac_max": 9.63530158996582,
+                        "inv_mean_mm": 0.01313062896952033,
+                        "inv_p95_mm": 0.08601658418774605,
+                        "inv_max_mm": 0.5975298583507538,
+                        "inv_interior_mean_mm": 0.05070842616260052,
+                        "inv_interior_max_mm": 0.29988908767700195,
+                        "time_s": 41.63621175289154,
+                        "fd_folding_pct": 0.0,
+                        "fd_jac_min": 0.09526608884334564
+                    }
+                }
+            },
+            "tune_baseline_per_pair": {
+                "77": {
+                    "dice_sym": 0.5849602140044136,
+                    "dice_fixed": 0.5812477006383738,
+                    "dice_moving": 0.5886727273704533,
+                    "folding_pct": 0.0,
+                    "jac_min": 0.05203079618513584,
+                    "jac_max": 17.11728572845459,
+                    "inv_mean_mm": 0.01332955714315176,
+                    "inv_p95_mm": 0.08566853776574135,
+                    "inv_max_mm": 0.7634028196334839,
+                    "inv_interior_mean_mm": 0.044108496978878975,
+                    "inv_interior_max_mm": 0.3865617513656616,
+                    "time_s": 46.00911474227905,
+                    "fd_folding_pct": 0.0,
+                    "fd_jac_min": 0.0493589174002409
+                },
+                "44": {
+                    "dice_sym": 0.5973515670634184,
+                    "dice_fixed": 0.6001500724529572,
+                    "dice_moving": 0.5945530616738797,
+                    "folding_pct": 0.0,
+                    "jac_min": 0.02844429388642311,
+                    "jac_max": 28.642563819885254,
+                    "inv_mean_mm": 0.011326223146170378,
+                    "inv_p95_mm": 0.07783287763595581,
+                    "inv_max_mm": 0.8872197866439819,
+                    "inv_interior_mean_mm": 0.049380624666810036,
+                    "inv_interior_max_mm": 0.5054187774658203,
+                    "time_s": 60.25628650188446,
+                    "fd_folding_pct": 0.0,
+                    "fd_jac_min": 0.05608609691262245
+                },
+                "0": {
+                    "dice_sym": 0.6307748222662339,
+                    "dice_fixed": 0.6306607099741892,
+                    "dice_moving": 0.6308889345582785,
+                    "folding_pct": 0.0,
+                    "jac_min": 0.05710623413324356,
+                    "jac_max": 17.86780834197998,
+                    "inv_mean_mm": 0.012274925597012043,
+                    "inv_p95_mm": 0.08047940209507942,
+                    "inv_max_mm": 0.5501650869846344,
+                    "inv_interior_mean_mm": 0.03972025215625763,
+                    "inv_interior_max_mm": 0.2999090850353241,
+                    "time_s": 39.144692182540894,
+                    "fd_folding_pct": 0.0,
+                    "fd_jac_min": 0.05468841642141342
+                }
+            },
+            "criteria": {
+                "folding_abs": 0.0005,
+                "folding_rel": 1.0,
+                "inv_interior_abs": 1.0,
+                "inv_interior_rel": 1.1,
+                "positive_jac_if_baseline": true,
+                "inverse_cap_only_if_baseline_fold_free": true,
+                "max_pair_drop": 0.001,
+                "jac_min_rel": null,
+                "min_gain": 0.0005,
+                "noise_k": 3.0
+            },
+            "margin": 0.0005,
+            "provenance": {
+                "schema_version": 1,
+                "n_runs": 3,
+                "commit": "ddd4b70157e49731225ab3e0ab491e1921586712",
+                "commits": [
+                    "ddd4b70157e49731225ab3e0ab491e1921586712"
+                ],
+                "registration_code": null,
+                "describe": "v6.43.0-dirty",
+                "dirty": true,
+                "diff_sha256": "2f996e7322929546382cf0d16e9534e4d7414d243f6c5d5398b4703d915ffe37",
+                "syntx_version": "6.43.0",
+                "script_sha256": [],
+                "hosts": [
+                    "barncreek.radio.virginia.edu"
+                ],
+                "packages": {
+                    "torch": "2.13.0",
+                    "antspyx": "0.6.4",
+                    "numpy": "2.3.5",
+                    "scipy": "1.18.1",
+                    "jax": "0.10.2",
+                    "antstorch": "0.2.0"
+                },
+                "parameters": {
+                    "function": "syntx.syn",
+                    "explicit": {
+                        "backend": "pytorch",
+                        "device": "mps",
+                        "verbose": false,
+                        "grad_step": 0.6,
+                        "regularizer": "navier",
+                        "s": 2.0,
+                        "poisson_ratio": 0.2,
+                        "sobolev_alpha": 1.5
+                    },
+                    "fit_kwargs": {
+                        "levels": [
+                            4,
+                            2,
+                            1
+                        ],
+                        "epochs_per_level": [
+                            100,
+                            100,
+                            20
+                        ],
+                        "cfl_voxels": 0.6,
+                        "similarity_metric": "cc2",
+                        "syn_metric_weights": null,
+                        "lncc_radius": 2,
+                        "sampling_percentage": null,
+                        "vgg_layers": [
+                            4
+                        ],
+                        "vgg_patch_size": 32,
+                        "vgg_num_patches": 8,
+                        "vgg_mode": "lncc_3d",
+                        "vgg_lncc_window_size": 9,
+                        "smoothing_sigmas": null,
+                        "regularizer": "navier",
+                        "sobolev_alpha": 1.5,
+                        "fast_smooth": null,
+                        "verbose": false,
+                        "optimizer_type": "cfl",
+                        "optimizer_lr": 0.001,
+                        "use_analytical_gradients": false,
+                        "interpolator": "linear",
+                        "inv_refresh_every": [
+                            1,
+                            2,
+                            4
+                        ],
+                        "polish_inv_steps": 30,
+                        "polish_inv_tol": 0.02,
+                        "compose_polish_tol": 0.3,
+                        "seed": 42,
+                        "device": "mps",
+                        "s": 2.0,
+                        "poisson_ratio": 0.2
+                    },
+                    "model_attributes": {
+                        "training": true,
+                        "dim": 3,
+                        "restrict_transformation": null,
+                        "seed": 42,
+                        "inv_tolerance": 0.1,
+                        "fluid_sigma": 1.5491933384829668,
+                        "elastic_sigma": 0.0,
+                        "transform_type": "Affine",
+                        "inverse_method": "anderson",
+                        "inverse_steps": 30,
+                        "in_loop_inv_steps": 10,
+                        "project_inverse": true,
+                        "projection_frequency": 1,
+                        "interpolator": "linear",
+                        "boundary_suppression_thresh": null,
+                        "stationary_boundary": true,
+                        "image_grad_clip": 6.0,
+                        "antisymmetric": true,
+                        "use_ants_pseudo_gradient": false,
+                        "dual_gradient": false,
+                        "dual_gradient_weight": 0.5,
+                        "affine_losses": [],
+                        "syn_losses": [],
+                        "formulation": "eulerian",
+                        "smooth_in_deformed_space": false,
+                        "kernel_type": "bessel"
+                    }
+                }
+            }
+        },
+        "90pair_population_benchmark_common_navier_mps": {
+            "cohort_size": 90,
+            "head_to_head_wins": 87,
+            "head_to_head_losses": 3,
+            "head_to_head_ties": 0,
+            "win_rate_pct": 96.67,
+            "syntx_mean_dice_sym": 0.6423,
+            "syntx_std_dice_sym": 0.0212,
+            "syntx_median_dice_sym": 0.6418,
+            "ants_mean_dice_sym": 0.6216,
+            "ants_std_dice_sym": 0.0229,
+            "mean_dice_gain_pct": 2.07,
+            "mean_folding_pct": 0.0,
+            "max_folding_pct": 0.0,
+            "max_fd_folding_pct": 0.0,
+            "zero_fold_rate_pct": 100.0,
+            "min_jacobian_cohort_worst": 0.0372,
+            "inv_mean_mm": 0.0104,
+            "inv_interior_max_mean_mm": 0.3823,
+            "inv_interior_max_worst_mm": 0.9386,
+            "syntx_mean_runtime_s": 46.2,
+            "ants_mean_runtime_s": 139.37,
+            "average_speedup": 3.02,
+            "hardware": "Apple Silicon GPU (MPS)",
+            "parameters": {
+                "grad_step": 0.6,
+                "flow_sigma": 2.4,
+                "total_sigma": 0.0,
+                "sobolev_alpha": 1.5,
+                "fast_smooth": false,
+                "in_loop_inv_steps": 10,
+                "inv_refresh_every": [
+                    1,
+                    2,
+                    4
+                ],
+                "polish_inv_steps": 30,
+                "polish_inv_tol": 0.02,
+                "compose_polish_tol": 0.3,
+                "optimizer": "cfl",
+                "regularizer": "navier",
+                "poisson_ratio": 0.2,
+                "s": 2.0,
+                "reg_iterations": [
+                    100,
+                    100,
+                    20
+                ]
+            },
+            "provenance": {
+                "schema_version": 1,
+                "n_runs": 90,
+                "commit": "ddd4b70157e49731225ab3e0ab491e1921586712",
+                "commits": [
+                    "ddd4b70157e49731225ab3e0ab491e1921586712"
+                ],
+                "registration_code": null,
+                "describe": "v6.43.0-dirty",
+                "dirty": true,
+                "diff_sha256": "af4eb556ddf9e35964369d12c9388766d0315e9d02f12e9a941d80d2a7764439",
+                "syntx_version": "6.43.0",
+                "script_sha256": [
+                    "6de3b0764a53d5c11506c3ed2f23c6e8c629e8d4d73f6675bf561ea19dc4b45f"
+                ],
+                "hosts": [
+                    "barncreek.radio.virginia.edu"
+                ],
+                "packages": {
+                    "torch": "2.13.0",
+                    "antspyx": "0.6.4",
+                    "numpy": "2.3.5",
+                    "scipy": "1.18.1",
+                    "jax": "0.10.2",
+                    "antstorch": "0.2.0"
+                },
+                "parameters": {
+                    "function": "syntx.syn",
+                    "explicit": {
+                        "backend": "pytorch",
+                        "device": "mps",
+                        "verbose": false
+                    },
+                    "fit_kwargs": {
+                        "levels": [
+                            4,
+                            2,
+                            1
+                        ],
+                        "epochs_per_level": [
+                            100,
+                            100,
+                            20
+                        ],
+                        "cfl_voxels": 0.6,
+                        "similarity_metric": "cc2",
+                        "syn_metric_weights": null,
+                        "lncc_radius": 2,
+                        "sampling_percentage": null,
+                        "vgg_layers": [
+                            4
+                        ],
+                        "vgg_patch_size": 32,
+                        "vgg_num_patches": 8,
+                        "vgg_mode": "lncc_3d",
+                        "vgg_lncc_window_size": 9,
+                        "smoothing_sigmas": null,
+                        "regularizer": "navier",
+                        "sobolev_alpha": 1.5,
+                        "fast_smooth": null,
+                        "verbose": false,
+                        "optimizer_type": "cfl",
+                        "optimizer_lr": 0.001,
+                        "use_analytical_gradients": false,
+                        "interpolator": "linear",
+                        "inv_refresh_every": [
+                            1,
+                            2,
+                            4
+                        ],
+                        "polish_inv_steps": 30,
+                        "polish_inv_tol": 0.02,
+                        "compose_polish_tol": 0.3,
+                        "seed": 42,
+                        "device": "mps"
+                    },
+                    "model_attributes": {
+                        "training": true,
+                        "dim": 3,
+                        "restrict_transformation": null,
+                        "seed": 42,
+                        "fluid_sigma": 1.5491933384829668,
+                        "elastic_sigma": 0.0,
+                        "transform_type": "Affine",
+                        "inverse_method": "anderson",
+                        "inverse_steps": 30,
+                        "in_loop_inv_steps": 10,
+                        "project_inverse": true,
+                        "projection_frequency": 1,
+                        "interpolator": "linear",
+                        "boundary_suppression_thresh": null,
+                        "stationary_boundary": true,
+                        "image_grad_clip": 6.0,
+                        "antisymmetric": true,
+                        "use_ants_pseudo_gradient": false,
+                        "dual_gradient": false,
+                        "dual_gradient_weight": 0.5,
+                        "affine_losses": [],
+                        "syn_losses": [],
+                        "formulation": "eulerian",
+                        "smooth_in_deformed_space": false,
+                        "kernel_type": "navier"
+                    }
+                }
+            }
         }
     },
     "syntx.robust_affine": {
@@ -1949,6 +2498,514 @@
                         "similarity_metric": "cc2",
                         "mattes_bins": 32,
                         "inverse_identity_weight": 0.05
+                    }
+                }
+            }
+        },
+        "canonical_2026_11_20": {
+            "selection": "unified cross-model Navier-Cauchy canonical default (s=2.0, poisson_ratio=0.20; tuned on [77, 44, 0], minimax-regret & Pareto validated out-of-sample on subject-disjoint [28, 55, 84])",
+            "tune_pairs": [
+                77,
+                44,
+                0
+            ],
+            "heldout_pairs": [
+                28,
+                55,
+                84
+            ],
+            "parameters": {
+                "regularizer": "navier",
+                "n_time_steps": 3,
+                "multipoint_loss": [
+                    0.0,
+                    1.0
+                ],
+                "cfl_max": 0.0,
+                "syn_sampling": 2,
+                "energy_weight": 0.0004,
+                "optimizer": "cfl",
+                "reg_iterations": [
+                    100,
+                    100,
+                    20
+                ],
+                "grad_step": 1.8,
+                "cfl_momentum": 0.8,
+                "total_alpha": 0.0,
+                "constant_speed": true,
+                "alpha": 3.5,
+                "poisson_ratio": 0.2,
+                "s": 2.0
+            },
+            "previous_defaults": {
+                "regularizer": "beltrami",
+                "n_time_steps": 3,
+                "multipoint_loss": [
+                    0.0,
+                    1.0
+                ],
+                "cfl_max": 0.0,
+                "syn_sampling": 2,
+                "energy_weight": 0.0008,
+                "optimizer": "cfl",
+                "reg_iterations": [
+                    100,
+                    100,
+                    20
+                ],
+                "grad_step": 1.25,
+                "cfl_momentum": 0.9,
+                "total_alpha": 0.0,
+                "constant_speed": true,
+                "alpha": 2.5
+            },
+            "mean_dice_gain_vs_previous_defaults_heldout": 0.007512148220005417,
+            "per_pair_heldout": {
+                "28": {
+                    "dice_sym": 0.6515387135549444,
+                    "dice_fixed": 0.6507136720091873,
+                    "dice_moving": 0.6523637551007017,
+                    "folding_pct": 0.0,
+                    "jac_min": 0.06034208834171295,
+                    "jac_max": 31.78877067565918,
+                    "inv_mean_mm": 0.012403815053403378,
+                    "inv_p95_mm": 0.09000340849161148,
+                    "inv_max_mm": 1.205641269683838,
+                    "inv_interior_mean_mm": 0.06421729922294617,
+                    "inv_interior_max_mm": 0.8191431760787964,
+                    "time_s": 213.9000289440155,
+                    "fd_folding_pct": 0.0,
+                    "fd_jac_min": 0.06337478011846542
+                },
+                "55": {
+                    "dice_sym": 0.6443886876545757,
+                    "dice_fixed": 0.6468374350682036,
+                    "dice_moving": 0.6419399402409479,
+                    "folding_pct": 0.0,
+                    "jac_min": 0.04119344800710678,
+                    "jac_max": 15.465370178222656,
+                    "inv_mean_mm": 0.013858324848115444,
+                    "inv_p95_mm": 0.1011776477098465,
+                    "inv_max_mm": 1.5372205972671509,
+                    "inv_interior_mean_mm": 0.06586544960737228,
+                    "inv_interior_max_mm": 0.5181451439857483,
+                    "time_s": 215.4266152381897,
+                    "fd_folding_pct": 0.0,
+                    "fd_jac_min": 0.06197168678045273
+                },
+                "84": {
+                    "dice_sym": 0.6141575602365528,
+                    "dice_fixed": 0.6177756426274272,
+                    "dice_moving": 0.6105394778456784,
+                    "folding_pct": 0.0,
+                    "jac_min": 0.053432438522577286,
+                    "jac_max": 17.55673599243164,
+                    "inv_mean_mm": 0.0030168427620083094,
+                    "inv_p95_mm": 0.00660626171156764,
+                    "inv_max_mm": 1.9689544439315796,
+                    "inv_interior_mean_mm": 0.003816370852291584,
+                    "inv_interior_max_mm": 0.9002960920333862,
+                    "time_s": 180.8116638660431,
+                    "fd_folding_pct": 0.0,
+                    "fd_jac_min": 0.0613647922873497
+                }
+            },
+            "baseline_per_pair_heldout": {
+                "28": {
+                    "dice_sym": 0.6479270823936434,
+                    "folding_pct": 0.0,
+                    "jac_min": 0.02212219499051571,
+                    "inv_interior_max_mm": 0.6687244176864624,
+                    "time_s": 181.8625190258026
+                },
+                "55": {
+                    "dice_sym": 0.6295921976513663,
+                    "folding_pct": 0.0,
+                    "jac_min": 0.027934513986110687,
+                    "inv_interior_max_mm": 1.1403224468231201,
+                    "time_s": 202.6306073665619
+                },
+                "84": {
+                    "dice_sym": 0.6100292367410469,
+                    "folding_pct": 0.0,
+                    "jac_min": 0.02306133694946766,
+                    "inv_interior_max_mm": 0.621579110622406,
+                    "time_s": 196.50477695465088
+                }
+            },
+            "per_model_tune_winner": {
+                "overrides": {
+                    "regularizer": "navier",
+                    "poisson_ratio": 0.25,
+                    "s": 2.0,
+                    "alpha": 3.5,
+                    "energy_weight": 0.0004,
+                    "cfl_momentum": 0.8,
+                    "grad_step": 1.8
+                },
+                "gain": 0.00968610454334821,
+                "parameters": {
+                    "regularizer": "navier",
+                    "n_time_steps": 3,
+                    "multipoint_loss": [
+                        0.0,
+                        1.0
+                    ],
+                    "cfl_max": 0.0,
+                    "syn_sampling": 2,
+                    "energy_weight": 0.0004,
+                    "optimizer": "cfl",
+                    "reg_iterations": [
+                        100,
+                        100,
+                        20
+                    ],
+                    "grad_step": 1.8,
+                    "cfl_momentum": 0.8,
+                    "total_alpha": 0.0,
+                    "constant_speed": true,
+                    "alpha": 3.5,
+                    "poisson_ratio": 0.25,
+                    "s": 2.0
+                },
+                "per_pair": {
+                    "77": {
+                        "dice_sym": 0.6301725808098159,
+                        "dice_fixed": 0.6266349449292026,
+                        "dice_moving": 0.633710216690429,
+                        "folding_pct": 0.0,
+                        "jac_min": 0.06246064230799675,
+                        "jac_max": 19.803258895874023,
+                        "inv_mean_mm": 0.0037110450211912394,
+                        "inv_p95_mm": 0.00838376209139824,
+                        "inv_max_mm": 1.834961175918579,
+                        "inv_interior_mean_mm": 0.0027300320798531175,
+                        "inv_interior_max_mm": 0.5248623639345169,
+                        "time_s": 185.09584665298462,
+                        "fd_folding_pct": 0.0,
+                        "fd_jac_min": 0.05606433004140854
+                    },
+                    "44": {
+                        "dice_sym": 0.6363322104331478,
+                        "dice_fixed": 0.6387104293912597,
+                        "dice_moving": 0.633953991475036,
+                        "folding_pct": 0.0,
+                        "jac_min": 0.0821991115808487,
+                        "jac_max": 15.264013290405273,
+                        "inv_mean_mm": 0.003515513031743467,
+                        "inv_p95_mm": 0.007003862876445055,
+                        "inv_max_mm": 2.2117074728012085,
+                        "inv_interior_mean_mm": 0.003584751859307289,
+                        "inv_interior_max_mm": 0.7264381945133209,
+                        "time_s": 244.0057282447815,
+                        "fd_folding_pct": 0.0,
+                        "fd_jac_min": 0.05051305890083313
+                    },
+                    "0": {
+                        "dice_sym": 0.6653736021642903,
+                        "dice_fixed": 0.6667244731801905,
+                        "dice_moving": 0.6640227311483902,
+                        "folding_pct": 0.0,
+                        "jac_min": 0.07859873026609421,
+                        "jac_max": 15.021946907043457,
+                        "inv_mean_mm": 0.0038151040207594633,
+                        "inv_p95_mm": 0.00847915979102254,
+                        "inv_max_mm": 1.5708069801330566,
+                        "inv_interior_mean_mm": 0.0029138163663446903,
+                        "inv_interior_max_mm": 0.7033952474594116,
+                        "time_s": 191.84814524650574,
+                        "fd_folding_pct": 0.0,
+                        "fd_jac_min": 0.06086788699030876
+                    }
+                }
+            },
+            "tune_baseline_per_pair": {
+                "77": {
+                    "dice_sym": 0.6164360027205465,
+                    "dice_fixed": 0.6117881219975296,
+                    "dice_moving": 0.6210838834435636,
+                    "folding_pct": 0.0,
+                    "jac_min": 0.013687442988157272,
+                    "jac_max": 35.137115478515625,
+                    "inv_mean_mm": 0.0034609829308465123,
+                    "inv_p95_mm": 0.006492340704426169,
+                    "inv_max_mm": 2.634090781211853,
+                    "inv_interior_mean_mm": 0.003058580565266311,
+                    "inv_interior_max_mm": 1.3368258476257324,
+                    "time_s": 179.11856174468994,
+                    "fd_folding_pct": 0.0,
+                    "fd_jac_min": 0.05091418698430061
+                },
+                "44": {
+                    "dice_sym": 0.627205223055858,
+                    "dice_fixed": 0.6302503809236933,
+                    "dice_moving": 0.6241600651880228,
+                    "folding_pct": 0.0,
+                    "jac_min": 0.03345823660492897,
+                    "jac_max": 38.43632888793945,
+                    "inv_mean_mm": 0.0037665157578885555,
+                    "inv_p95_mm": 0.00613765511661768,
+                    "inv_max_mm": 2.3383392095565796,
+                    "inv_interior_mean_mm": 0.0037913935957476497,
+                    "inv_interior_max_mm": 0.7962816953659058,
+                    "time_s": 228.96743619441986,
+                    "fd_folding_pct": 0.0,
+                    "fd_jac_min": 0.04927187226712704
+                },
+                "0": {
+                    "dice_sym": 0.6591788540008048,
+                    "dice_fixed": 0.6616393208833183,
+                    "dice_moving": 0.6567183871182911,
+                    "folding_pct": 0.0,
+                    "jac_min": 0.03675263747572899,
+                    "jac_max": 23.43739128112793,
+                    "inv_mean_mm": 0.0036080824211239815,
+                    "inv_p95_mm": 0.006886700401082635,
+                    "inv_max_mm": 1.619203805923462,
+                    "inv_interior_mean_mm": 0.0027735272888094187,
+                    "inv_interior_max_mm": 0.5053031593561172,
+                    "time_s": 174.12698245048523,
+                    "fd_folding_pct": 0.0,
+                    "fd_jac_min": 0.05815093219280243
+                }
+            },
+            "criteria": {
+                "folding_abs": 0.0005,
+                "folding_rel": 1.0,
+                "inv_interior_abs": 1.0,
+                "inv_interior_rel": 1.1,
+                "positive_jac_if_baseline": true,
+                "inverse_cap_only_if_baseline_fold_free": true,
+                "max_pair_drop": 0.001,
+                "jac_min_rel": null,
+                "min_gain": 0.0005,
+                "noise_k": 3.0
+            },
+            "margin": 0.0005,
+            "provenance": {
+                "schema_version": 1,
+                "n_runs": 3,
+                "commit": "ddd4b70157e49731225ab3e0ab491e1921586712",
+                "commits": [
+                    "ddd4b70157e49731225ab3e0ab491e1921586712"
+                ],
+                "registration_code": null,
+                "describe": "v6.43.0-dirty",
+                "dirty": true,
+                "diff_sha256": "2f996e7322929546382cf0d16e9534e4d7414d243f6c5d5398b4703d915ffe37",
+                "syntx_version": "6.43.0",
+                "script_sha256": [],
+                "hosts": [
+                    "barncreek.radio.virginia.edu"
+                ],
+                "packages": {
+                    "torch": "2.13.0",
+                    "antspyx": "0.6.4",
+                    "numpy": "2.3.5",
+                    "scipy": "1.18.1",
+                    "jax": "0.10.2",
+                    "antstorch": "0.2.0"
+                },
+                "parameters": {
+                    "function": "syntx.tvf",
+                    "explicit": {
+                        "backend": "pytorch",
+                        "device": "mps",
+                        "verbose": false,
+                        "grad_step": 1.8,
+                        "regularizer": "navier",
+                        "s": 2.0,
+                        "poisson_ratio": 0.2,
+                        "alpha": 3.5,
+                        "energy_weight": 0.0004,
+                        "cfl_momentum": 0.8
+                    },
+                    "fit_kwargs": {
+                        "levels": [
+                            4,
+                            2,
+                            1
+                        ],
+                        "epochs_per_level": [
+                            100,
+                            100,
+                            20
+                        ],
+                        "similarity_metric": "cc2",
+                        "lr": 1.0,
+                        "energy_weight": 0.0004,
+                        "temporal_weight": 0.0,
+                        "verbose": false,
+                        "lncc_radius": 2,
+                        "s": 2.0,
+                        "poisson_ratio": 0.2,
+                        "regularizer": "navier",
+                        "alpha": 3.5,
+                        "total_alpha": 0.0,
+                        "optimizer_type": "cfl",
+                        "cfl_momentum": 0.8,
+                        "max_step_norm": null,
+                        "multipoint_loss": [
+                            0.0,
+                            1.0
+                        ],
+                        "fast_smooth": false,
+                        "cfl_max": 0.0,
+                        "smooth_pyramid": true,
+                        "cfl_step": 1.8
+                    },
+                    "model_attributes": {
+                        "training": true,
+                        "dim": 3,
+                        "n_time_steps": 3,
+                        "antisymmetric": false,
+                        "use_analytical_gradients": false,
+                        "cfl_max": 0.0,
+                        "adjoint": false,
+                        "solver": "euler",
+                        "fluid_sigma": 0.0,
+                        "elastic_sigma": 0.0,
+                        "integration_steps_per_interval": 1,
+                        "similarity_metric": "cc2",
+                        "mattes_bins": 32,
+                        "inverse_identity_weight": 0.05,
+                        "has_initial_warp": false,
+                        "initial_warp_kind": "none"
+                    }
+                }
+            }
+        },
+        "90pair_population_benchmark_common_navier_mps": {
+            "cohort_size": 90,
+            "head_to_head_wins": 90,
+            "head_to_head_losses": 0,
+            "head_to_head_ties": 0,
+            "win_rate_pct": 100.0,
+            "syntx_mean_dice_sym": 0.6529,
+            "syntx_std_dice_sym": 0.0204,
+            "syntx_median_dice_sym": 0.6516,
+            "ants_mean_dice_sym": 0.6216,
+            "ants_std_dice_sym": 0.0229,
+            "mean_dice_gain_pct": 3.13,
+            "mean_folding_pct": 0.0,
+            "max_folding_pct": 0.0,
+            "max_fd_folding_pct": 0.0,
+            "zero_fold_rate_pct": 100.0,
+            "min_jacobian_cohort_worst": 0.0176,
+            "inv_mean_mm": 0.0077,
+            "inv_interior_max_mean_mm": 0.8042,
+            "inv_interior_max_worst_mm": 1.5548,
+            "syntx_mean_runtime_s": 197.43,
+            "ants_mean_runtime_s": 139.37,
+            "average_speedup": 0.71,
+            "hardware": "Apple Silicon GPU (MPS)",
+            "parameters": {
+                "regularizer": "navier",
+                "n_time_steps": 3,
+                "multipoint_loss": [
+                    0.0,
+                    1.0
+                ],
+                "cfl_max": 0.0,
+                "syn_sampling": 2,
+                "energy_weight": 0.0004,
+                "optimizer": "cfl",
+                "reg_iterations": [
+                    100,
+                    100,
+                    20
+                ],
+                "poisson_ratio": 0.2,
+                "s": 2.0,
+                "grad_step": 1.8,
+                "cfl_momentum": 0.8,
+                "total_alpha": 0.0,
+                "constant_speed": true,
+                "alpha": 3.5
+            },
+            "provenance": {
+                "schema_version": 1,
+                "n_runs": 90,
+                "commit": "ddd4b70157e49731225ab3e0ab491e1921586712",
+                "commits": [
+                    "ddd4b70157e49731225ab3e0ab491e1921586712"
+                ],
+                "registration_code": null,
+                "describe": "v6.43.0-dirty",
+                "dirty": true,
+                "diff_sha256": "af4eb556ddf9e35964369d12c9388766d0315e9d02f12e9a941d80d2a7764439",
+                "syntx_version": "6.43.0",
+                "script_sha256": [
+                    "6de3b0764a53d5c11506c3ed2f23c6e8c629e8d4d73f6675bf561ea19dc4b45f"
+                ],
+                "hosts": [
+                    "barncreek.radio.virginia.edu"
+                ],
+                "packages": {
+                    "torch": "2.13.0",
+                    "antspyx": "0.6.4",
+                    "numpy": "2.3.5",
+                    "scipy": "1.18.1",
+                    "jax": "0.10.2",
+                    "antstorch": "0.2.0"
+                },
+                "parameters": {
+                    "function": "syntx.tvf",
+                    "explicit": {
+                        "backend": "pytorch",
+                        "device": "mps",
+                        "verbose": false
+                    },
+                    "fit_kwargs": {
+                        "levels": [
+                            4,
+                            2,
+                            1
+                        ],
+                        "epochs_per_level": [
+                            100,
+                            100,
+                            20
+                        ],
+                        "similarity_metric": "cc2",
+                        "lr": 1.0,
+                        "energy_weight": 0.0004,
+                        "temporal_weight": 0.0,
+                        "verbose": false,
+                        "lncc_radius": 2,
+                        "regularizer": "navier",
+                        "alpha": 3.5,
+                        "total_alpha": 0.0,
+                        "optimizer_type": "cfl",
+                        "cfl_momentum": 0.8,
+                        "max_step_norm": null,
+                        "multipoint_loss": [
+                            0.0,
+                            1.0
+                        ],
+                        "fast_smooth": false,
+                        "cfl_max": 0.0,
+                        "smooth_pyramid": true,
+                        "cfl_step": 1.8
+                    },
+                    "model_attributes": {
+                        "training": true,
+                        "dim": 3,
+                        "n_time_steps": 3,
+                        "antisymmetric": false,
+                        "use_analytical_gradients": false,
+                        "cfl_max": 0.0,
+                        "adjoint": false,
+                        "solver": "euler",
+                        "fluid_sigma": 0.0,
+                        "elastic_sigma": 0.0,
+                        "integration_steps_per_interval": 1,
+                        "similarity_metric": "cc2",
+                        "mattes_bins": 32,
+                        "inverse_identity_weight": 0.05,
+                        "has_initial_warp": false,
+                        "initial_warp_kind": "none"
                     }
                 }
             }
@@ -3143,6 +4200,462 @@
                     }
                 }
             }
+        },
+        "canonical_2026_11_20": {
+            "selection": "unified cross-model Navier-Cauchy canonical default (s=2.0, poisson_ratio=0.20; tuned on [77, 44, 0], minimax-regret & Pareto validated out-of-sample on subject-disjoint [28, 55, 84])",
+            "tune_pairs": [
+                77,
+                44,
+                0
+            ],
+            "heldout_pairs": [
+                28,
+                55,
+                84
+            ],
+            "parameters": {
+                "alpha": 0.25,
+                "max_step_norm": 0.95,
+                "optimizer": "reg_adam",
+                "optimizer_lr": 2.246094,
+                "n_steps": 8,
+                "bootstrap_mode": "none",
+                "regularizer": "navier",
+                "reg_iterations": [
+                    100,
+                    100,
+                    20
+                ],
+                "poisson_ratio": 0.2,
+                "s": 2.0
+            },
+            "previous_defaults": {
+                "alpha": 0.448,
+                "max_step_norm": 0.6,
+                "optimizer": "reg_adam",
+                "optimizer_lr": 2.246094,
+                "n_steps": 8,
+                "bootstrap_mode": "none",
+                "regularizer": "sobolev",
+                "reg_iterations": [
+                    100,
+                    100,
+                    20
+                ]
+            },
+            "mean_dice_gain_vs_previous_defaults_heldout": 0.008254580455427485,
+            "per_pair_heldout": {
+                "28": {
+                    "dice_sym": 0.6450653696221884,
+                    "dice_fixed": 0.647132742237999,
+                    "dice_moving": 0.6429979970063778,
+                    "folding_pct": 0.0,
+                    "jac_min": 0.2123299092054367,
+                    "jac_max": 5.319657802581787,
+                    "inv_mean_mm": 0.006594229489564896,
+                    "inv_p95_mm": 0.015114041976630688,
+                    "inv_max_mm": 1.5772119760513306,
+                    "inv_interior_mean_mm": 0.003120783716440201,
+                    "inv_interior_max_mm": 0.8075034618377686,
+                    "time_s": 59.26308584213257,
+                    "fd_folding_pct": 0.0,
+                    "fd_jac_min": 0.05028996616601944
+                },
+                "55": {
+                    "dice_sym": 0.6254115245005979,
+                    "dice_fixed": 0.6253683645906976,
+                    "dice_moving": 0.6254546844104982,
+                    "folding_pct": 0.0,
+                    "jac_min": 0.1910669505596161,
+                    "jac_max": 6.421557426452637,
+                    "inv_mean_mm": 0.007743308320641518,
+                    "inv_p95_mm": 0.015411445870995522,
+                    "inv_max_mm": 1.407916784286499,
+                    "inv_interior_mean_mm": 0.005654108710587025,
+                    "inv_interior_max_mm": 0.6546432971954346,
+                    "time_s": 67.9768340587616,
+                    "fd_folding_pct": 0.0,
+                    "fd_jac_min": 0.05211867392063141
+                },
+                "84": {
+                    "dice_sym": 0.604826828324265,
+                    "dice_fixed": 0.606639044475454,
+                    "dice_moving": 0.603014612173076,
+                    "folding_pct": 0.0,
+                    "jac_min": 0.21726302802562714,
+                    "jac_max": 8.059788703918457,
+                    "inv_mean_mm": 0.006340925116091967,
+                    "inv_p95_mm": 0.015922576189041138,
+                    "inv_max_mm": 1.7172393798828125,
+                    "inv_interior_mean_mm": 0.007039356976747513,
+                    "inv_interior_max_mm": 0.9577499032020569,
+                    "time_s": 63.834059953689575,
+                    "fd_folding_pct": 0.0,
+                    "fd_jac_min": 0.050072502344846725
+                }
+            },
+            "baseline_per_pair_heldout": {
+                "28": {
+                    "dice_sym": 0.6377678884139739,
+                    "folding_pct": 0.0,
+                    "jac_min": 0.014059039764106274,
+                    "inv_interior_max_mm": 0.43770650029182434,
+                    "time_s": 47.649094104766846
+                },
+                "55": {
+                    "dice_sym": 0.6160644253596635,
+                    "folding_pct": 0.0,
+                    "jac_min": 0.021263280883431435,
+                    "inv_interior_max_mm": 0.3445865213871002,
+                    "time_s": 47.92074131965637
+                },
+                "84": {
+                    "dice_sym": 0.5967076673071314,
+                    "folding_pct": 0.0,
+                    "jac_min": 0.023252403363585472,
+                    "inv_interior_max_mm": 0.546209990978241,
+                    "time_s": 45.99797081947327
+                }
+            },
+            "per_model_tune_winner": {
+                "overrides": {
+                    "regularizer": "navier",
+                    "poisson_ratio": 0.0,
+                    "s": 2.0,
+                    "alpha": 0.27,
+                    "max_step_norm": 0.8
+                },
+                "gain": 0.010795808412048228,
+                "parameters": {
+                    "alpha": 0.27,
+                    "max_step_norm": 0.8,
+                    "optimizer": "reg_adam",
+                    "optimizer_lr": 2.246094,
+                    "n_steps": 8,
+                    "bootstrap_mode": "none",
+                    "regularizer": "navier",
+                    "reg_iterations": [
+                        100,
+                        100,
+                        20
+                    ],
+                    "poisson_ratio": 0.0,
+                    "s": 2.0
+                },
+                "per_pair": {
+                    "77": {
+                        "dice_sym": 0.6136174880882544,
+                        "dice_fixed": 0.6104542965484803,
+                        "dice_moving": 0.6167806796280286,
+                        "folding_pct": 0.0,
+                        "jac_min": 0.09085045009851456,
+                        "jac_max": 9.05449104309082,
+                        "inv_mean_mm": 0.006999348057433963,
+                        "inv_p95_mm": 0.015292933210730553,
+                        "inv_max_mm": 1.3244765996932983,
+                        "inv_interior_mean_mm": 0.0045116867404431105,
+                        "inv_interior_max_mm": 0.6195363700389862,
+                        "time_s": 60.971157908439636,
+                        "fd_folding_pct": 0.0,
+                        "fd_jac_min": 0.05385247990489006
+                    },
+                    "44": {
+                        "dice_sym": 0.6187398864655287,
+                        "dice_fixed": 0.619092151802062,
+                        "dice_moving": 0.6183876211289956,
+                        "folding_pct": 0.0,
+                        "jac_min": 0.12925198674201965,
+                        "jac_max": 12.801714897155762,
+                        "inv_mean_mm": 0.009288282133638859,
+                        "inv_p95_mm": 0.015530485659837723,
+                        "inv_max_mm": 1.448275864124298,
+                        "inv_interior_mean_mm": 0.00625609653070569,
+                        "inv_interior_max_mm": 0.7711520493030548,
+                        "time_s": 70.90126466751099,
+                        "fd_folding_pct": 0.0,
+                        "fd_jac_min": 0.05579311028122902
+                    },
+                    "0": {
+                        "dice_sym": 0.6539378391062465,
+                        "dice_fixed": 0.6543438524165255,
+                        "dice_moving": 0.6535318257959675,
+                        "folding_pct": 0.0,
+                        "jac_min": 0.11553329974412918,
+                        "jac_max": 11.982194900512695,
+                        "inv_mean_mm": 0.006357492413371801,
+                        "inv_p95_mm": 0.015109986066818237,
+                        "inv_max_mm": 1.6121869683265686,
+                        "inv_interior_mean_mm": 0.0038233394734561443,
+                        "inv_interior_max_mm": 0.7707308828830719,
+                        "time_s": 58.70964741706848,
+                        "fd_folding_pct": 0.0,
+                        "fd_jac_min": 0.05127286911010742
+                    }
+                }
+            },
+            "tune_baseline_per_pair": {
+                "77": {
+                    "dice_sym": 0.5996611168910739,
+                    "dice_fixed": 0.5973530348825994,
+                    "dice_moving": 0.6019691988995486,
+                    "folding_pct": 0.0,
+                    "jac_min": 0.035281095653772354,
+                    "jac_max": 30.7322998046875,
+                    "inv_mean_mm": 0.006659784819930792,
+                    "inv_p95_mm": 0.01436064438894391,
+                    "inv_max_mm": 1.1179665923118591,
+                    "inv_interior_mean_mm": 0.0016263469005934894,
+                    "inv_interior_max_mm": 0.29819919168949127,
+                    "time_s": 46.435657143592834,
+                    "fd_folding_pct": 0.0,
+                    "fd_jac_min": 0.05031543970108032
+                },
+                "44": {
+                    "dice_sym": 0.6093947925628426,
+                    "dice_fixed": 0.6098186441966936,
+                    "dice_moving": 0.6089709409289915,
+                    "folding_pct": 0.0,
+                    "jac_min": 0.03009159117937088,
+                    "jac_max": 45.62409591674805,
+                    "inv_mean_mm": 0.00699068047106266,
+                    "inv_p95_mm": 0.013763210736215115,
+                    "inv_max_mm": 1.1198397874832153,
+                    "inv_interior_mean_mm": 0.0024346591671928763,
+                    "inv_interior_max_mm": 0.7332758903503418,
+                    "time_s": 48.62685668468475,
+                    "fd_folding_pct": 0.0,
+                    "fd_jac_min": 0.056816667318344116
+                },
+                "0": {
+                    "dice_sym": 0.6448518789699684,
+                    "dice_fixed": 0.6478313182306993,
+                    "dice_moving": 0.6418724397092375,
+                    "folding_pct": 0.0,
+                    "jac_min": 0.04718020558357239,
+                    "jac_max": 28.737775802612305,
+                    "inv_mean_mm": 0.0066215109545737505,
+                    "inv_p95_mm": 0.014435813296586275,
+                    "inv_max_mm": 1.2582359910011292,
+                    "inv_interior_mean_mm": 0.0015342550468631089,
+                    "inv_interior_max_mm": 0.3205591142177582,
+                    "time_s": 46.223156809806824,
+                    "fd_folding_pct": 0.0,
+                    "fd_jac_min": 0.05117243714630604
+                }
+            },
+            "criteria": {
+                "folding_abs": 0.0005,
+                "folding_rel": 1.0,
+                "inv_interior_abs": 1.0,
+                "inv_interior_rel": 1.1,
+                "positive_jac_if_baseline": true,
+                "inverse_cap_only_if_baseline_fold_free": true,
+                "max_pair_drop": 0.001,
+                "jac_min_rel": null,
+                "min_gain": 0.0005,
+                "noise_k": 3.0
+            },
+            "margin": 0.0005,
+            "provenance": {
+                "schema_version": 1,
+                "n_runs": 3,
+                "commit": "ddd4b70157e49731225ab3e0ab491e1921586712",
+                "commits": [
+                    "ddd4b70157e49731225ab3e0ab491e1921586712"
+                ],
+                "registration_code": null,
+                "describe": "v6.43.0-dirty",
+                "dirty": true,
+                "diff_sha256": "2f996e7322929546382cf0d16e9534e4d7414d243f6c5d5398b4703d915ffe37",
+                "syntx_version": "6.43.0",
+                "script_sha256": [],
+                "hosts": [
+                    "barncreek.radio.virginia.edu"
+                ],
+                "packages": {
+                    "torch": "2.13.0",
+                    "antspyx": "0.6.4",
+                    "numpy": "2.3.5",
+                    "scipy": "1.18.1",
+                    "jax": "0.10.2",
+                    "antstorch": "0.2.0"
+                },
+                "parameters": {
+                    "function": "syntx.syngs",
+                    "explicit": {
+                        "backend": "pytorch",
+                        "device": "mps",
+                        "verbose": false,
+                        "regularizer": "navier",
+                        "s": 2.0,
+                        "poisson_ratio": 0.2,
+                        "alpha": 0.25,
+                        "max_step_norm": 0.95
+                    },
+                    "fit_kwargs": {
+                        "levels": [
+                            4,
+                            2,
+                            1
+                        ],
+                        "epochs_per_level": [
+                            60,
+                            40,
+                            20
+                        ],
+                        "similarity_metric": "cc2",
+                        "lr": 2.246094,
+                        "max_step_norm": 0.95,
+                        "verbose": false,
+                        "lncc_radius": 2,
+                        "optimizer_type": "reg_adam",
+                        "cfl_step": 0.25,
+                        "seed": 42,
+                        "convergence_slope": 1e-06
+                    },
+                    "model_attributes": {
+                        "training": true,
+                        "dim": 3,
+                        "seed": 42,
+                        "n_steps": 8,
+                        "symmetric": true,
+                        "inverse_identity_weight": 0.5,
+                        "fluid_sigma": null,
+                        "solver": "euler",
+                        "alpha": 0.25,
+                        "similarity_metric": "cc2",
+                        "mattes_bins": 32,
+                        "bootstrap_mode": "none",
+                        "bootstrap_orig_weight": 0.5,
+                        "bootstrap_jitter_scale": 0.25,
+                        "regularizer": "navier",
+                        "spline_distance": null,
+                        "mesh_size": null,
+                        "transport_mode": "transport",
+                        "has_initial_warp": false,
+                        "initial_warp_kind": "none"
+                    }
+                }
+            }
+        },
+        "90pair_population_benchmark_common_navier_mps": {
+            "cohort_size": 90,
+            "head_to_head_wins": 84,
+            "head_to_head_losses": 6,
+            "head_to_head_ties": 0,
+            "win_rate_pct": 93.33,
+            "syntx_mean_dice_sym": 0.6389,
+            "syntx_std_dice_sym": 0.0217,
+            "syntx_median_dice_sym": 0.6387,
+            "ants_mean_dice_sym": 0.6216,
+            "ants_std_dice_sym": 0.0229,
+            "mean_dice_gain_pct": 1.73,
+            "mean_folding_pct": 0.0,
+            "max_folding_pct": 0.0,
+            "max_fd_folding_pct": 0.0,
+            "zero_fold_rate_pct": 100.0,
+            "min_jacobian_cohort_worst": 0.1409,
+            "inv_mean_mm": 0.0073,
+            "inv_interior_max_mean_mm": 0.8199,
+            "inv_interior_max_worst_mm": 1.68,
+            "syntx_mean_runtime_s": 63.73,
+            "ants_mean_runtime_s": 139.37,
+            "average_speedup": 2.19,
+            "hardware": "Apple Silicon GPU (MPS)",
+            "parameters": {
+                "alpha": 0.25,
+                "max_step_norm": 0.95,
+                "optimizer": "reg_adam",
+                "optimizer_lr": 2.246094,
+                "n_steps": 8,
+                "bootstrap_mode": "none",
+                "regularizer": "navier",
+                "poisson_ratio": 0.2,
+                "s": 2.0,
+                "reg_iterations": [
+                    100,
+                    100,
+                    20
+                ]
+            },
+            "provenance": {
+                "schema_version": 1,
+                "n_runs": 90,
+                "commit": "ddd4b70157e49731225ab3e0ab491e1921586712",
+                "commits": [
+                    "ddd4b70157e49731225ab3e0ab491e1921586712"
+                ],
+                "registration_code": null,
+                "describe": "v6.43.0-dirty",
+                "dirty": true,
+                "diff_sha256": "af4eb556ddf9e35964369d12c9388766d0315e9d02f12e9a941d80d2a7764439",
+                "syntx_version": "6.43.0",
+                "script_sha256": [
+                    "6de3b0764a53d5c11506c3ed2f23c6e8c629e8d4d73f6675bf561ea19dc4b45f"
+                ],
+                "hosts": [
+                    "barncreek.radio.virginia.edu"
+                ],
+                "packages": {
+                    "torch": "2.13.0",
+                    "antspyx": "0.6.4",
+                    "numpy": "2.3.5",
+                    "scipy": "1.18.1",
+                    "jax": "0.10.2",
+                    "antstorch": "0.2.0"
+                },
+                "parameters": {
+                    "function": "syntx.syngs",
+                    "explicit": {
+                        "backend": "pytorch",
+                        "device": "mps",
+                        "verbose": false
+                    },
+                    "fit_kwargs": {
+                        "levels": [
+                            4,
+                            2,
+                            1
+                        ],
+                        "epochs_per_level": [
+                            60,
+                            40,
+                            20
+                        ],
+                        "similarity_metric": "cc2",
+                        "lr": 2.246094,
+                        "max_step_norm": 0.95,
+                        "verbose": false,
+                        "lncc_radius": 2,
+                        "optimizer_type": "reg_adam",
+                        "cfl_step": 0.25,
+                        "seed": 42,
+                        "convergence_slope": 1e-06
+                    },
+                    "model_attributes": {
+                        "training": true,
+                        "dim": 3,
+                        "seed": 42,
+                        "n_steps": 8,
+                        "symmetric": true,
+                        "inverse_identity_weight": 0.5,
+                        "fluid_sigma": null,
+                        "solver": "euler",
+                        "alpha": 0.25,
+                        "similarity_metric": "cc2",
+                        "mattes_bins": 32,
+                        "bootstrap_mode": "none",
+                        "bootstrap_orig_weight": 0.5,
+                        "bootstrap_jitter_scale": 0.25,
+                        "regularizer": "navier",
+                        "spline_distance": null,
+                        "mesh_size": null,
+                        "transport_mode": "transport",
+                        "has_initial_warp": false,
+                        "initial_warp_kind": "none"
+                    }
+                }
+            }
         }
     },
     "affine_pt2": {
@@ -3903,6 +5416,482 @@
                         "optimizer": "cfl",
                         "regadam_sigma": 0.8,
                         "sobolev_alpha": null,
+                        "cfl_momentum": 0.1875,
+                        "lncc_radius": 2,
+                        "window_size": 5,
+                        "similarity_metric": "cc2",
+                        "squared": true,
+                        "num_bins": 32,
+                        "sampling_percentage": null,
+                        "anderson": false,
+                        "anderson_steps": 5,
+                        "anderson_m": 5,
+                        "anderson_freq": "per_scale",
+                        "padding_mode": "border",
+                        "beta1": 0.9,
+                        "beta2": 0.99,
+                        "eps": 1e-08,
+                        "device": "mps",
+                        "loss_history": [],
+                        "warp": null,
+                        "theta": null,
+                        "has_initial_warp": false,
+                        "initial_warp_kind": "none"
+                    }
+                }
+            }
+        },
+        "canonical_2026_11_20": {
+            "selection": "unified cross-model Navier-Cauchy canonical default (s=2.0, poisson_ratio=0.20; tuned on [77, 44, 0], minimax-regret & Pareto validated out-of-sample on subject-disjoint [28, 55, 84])",
+            "tune_pairs": [
+                77,
+                44,
+                0
+            ],
+            "heldout_pairs": [
+                28,
+                55,
+                84
+            ],
+            "parameters": {
+                "learning_rate": 1.5,
+                "flow_sigma": 1.62,
+                "total_sigma": 0.0,
+                "optimizer": "cfl",
+                "regadam_sigma": 0.8,
+                "cfl_momentum": 0.1875,
+                "regularizer": "navier",
+                "sobolev_alpha": 2.625,
+                "lncc_radius": 2,
+                "reg_iterations": [
+                    100,
+                    100,
+                    20
+                ],
+                "poisson_ratio": 0.2,
+                "s": 2.0
+            },
+            "previous_defaults": {
+                "learning_rate": 1.5,
+                "flow_sigma": 1.62,
+                "total_sigma": 0.28,
+                "optimizer": "cfl",
+                "regadam_sigma": 0.8,
+                "cfl_momentum": 0.1875,
+                "regularizer": "div_curl",
+                "sobolev_alpha": null,
+                "lncc_radius": 2,
+                "reg_iterations": [
+                    100,
+                    100,
+                    20
+                ]
+            },
+            "mean_dice_gain_vs_previous_defaults_heldout": 0.010847417115957566,
+            "per_pair_heldout": {
+                "28": {
+                    "dice_sym": 0.6393346549885153,
+                    "dice_fixed": 0.6393346549885153,
+                    "dice_moving": "nan",
+                    "folding_pct": 0.0,
+                    "jac_min": 0.05414402484893799,
+                    "jac_max": 8.538000106811523,
+                    "inv_mean_mm": "nan",
+                    "inv_p95_mm": "nan",
+                    "inv_max_mm": "nan",
+                    "inv_interior_mean_mm": "nan",
+                    "inv_interior_max_mm": "nan",
+                    "time_s": 10.75410771369934,
+                    "fd_folding_pct": 0.0,
+                    "fd_jac_min": 0.05414402484893799
+                },
+                "55": {
+                    "dice_sym": 0.614325181449338,
+                    "dice_fixed": 0.614325181449338,
+                    "dice_moving": "nan",
+                    "folding_pct": 0.0,
+                    "jac_min": 0.05857983976602554,
+                    "jac_max": 11.014410018920898,
+                    "inv_mean_mm": "nan",
+                    "inv_p95_mm": "nan",
+                    "inv_max_mm": "nan",
+                    "inv_interior_mean_mm": "nan",
+                    "inv_interior_max_mm": "nan",
+                    "time_s": 11.222837209701538,
+                    "fd_folding_pct": 0.0,
+                    "fd_jac_min": 0.05857983976602554
+                },
+                "84": {
+                    "dice_sym": 0.5969271572381156,
+                    "dice_fixed": 0.5969271572381156,
+                    "dice_moving": "nan",
+                    "folding_pct": 0.0,
+                    "jac_min": 0.05928388237953186,
+                    "jac_max": 10.525396347045898,
+                    "inv_mean_mm": "nan",
+                    "inv_p95_mm": "nan",
+                    "inv_max_mm": "nan",
+                    "inv_interior_mean_mm": "nan",
+                    "inv_interior_max_mm": "nan",
+                    "time_s": 10.307754755020142,
+                    "fd_folding_pct": 0.0,
+                    "fd_jac_min": 0.05928388237953186
+                }
+            },
+            "baseline_per_pair_heldout": {
+                "28": {
+                    "dice_sym": 0.6274646904600549,
+                    "folding_pct": 0.0,
+                    "jac_min": 0.07965069264173508,
+                    "inv_interior_max_mm": "nan",
+                    "time_s": 10.774986982345581
+                },
+                "55": {
+                    "dice_sym": 0.6077563589691728,
+                    "folding_pct": 0.0,
+                    "jac_min": 0.06044063717126846,
+                    "inv_interior_max_mm": "nan",
+                    "time_s": 11.276050090789795
+                },
+                "84": {
+                    "dice_sym": 0.5828236928988685,
+                    "folding_pct": 0.0,
+                    "jac_min": 0.05818726494908333,
+                    "inv_interior_max_mm": "nan",
+                    "time_s": 10.75269103050232
+                }
+            },
+            "per_model_tune_winner": {
+                "overrides": {
+                    "regularizer": "navier",
+                    "poisson_ratio": 0.25,
+                    "s": 2.0,
+                    "sobolev_alpha": 2.625,
+                    "total_sigma": 0.0
+                },
+                "gain": 0.008756302116429268,
+                "parameters": {
+                    "learning_rate": 1.5,
+                    "flow_sigma": 1.62,
+                    "total_sigma": 0.0,
+                    "optimizer": "cfl",
+                    "regadam_sigma": 0.8,
+                    "cfl_momentum": 0.1875,
+                    "regularizer": "navier",
+                    "sobolev_alpha": 2.625,
+                    "lncc_radius": 2,
+                    "reg_iterations": [
+                        100,
+                        100,
+                        20
+                    ],
+                    "poisson_ratio": 0.25,
+                    "s": 2.0
+                },
+                "per_pair": {
+                    "77": {
+                        "dice_sym": 0.5980081193484442,
+                        "dice_fixed": 0.5980081193484442,
+                        "dice_moving": "nan",
+                        "folding_pct": 0.0,
+                        "jac_min": 0.056818678975105286,
+                        "jac_max": 14.602754592895508,
+                        "inv_mean_mm": "nan",
+                        "inv_p95_mm": "nan",
+                        "inv_max_mm": "nan",
+                        "inv_interior_mean_mm": "nan",
+                        "inv_interior_max_mm": "nan",
+                        "time_s": 10.191773176193237,
+                        "fd_folding_pct": 0.0,
+                        "fd_jac_min": 0.056818678975105286
+                    },
+                    "44": {
+                        "dice_sym": 0.6129196395473819,
+                        "dice_fixed": 0.6129196395473819,
+                        "dice_moving": "nan",
+                        "folding_pct": 0.0,
+                        "jac_min": 0.06391096115112305,
+                        "jac_max": 7.769145965576172,
+                        "inv_mean_mm": "nan",
+                        "inv_p95_mm": "nan",
+                        "inv_max_mm": "nan",
+                        "inv_interior_mean_mm": "nan",
+                        "inv_interior_max_mm": "nan",
+                        "time_s": 11.339974999427795,
+                        "fd_folding_pct": 0.0,
+                        "fd_jac_min": 0.06391096115112305
+                    },
+                    "0": {
+                        "dice_sym": 0.6432533232815917,
+                        "dice_fixed": 0.6432533232815917,
+                        "dice_moving": "nan",
+                        "folding_pct": 0.0,
+                        "jac_min": 0.05073145031929016,
+                        "jac_max": 11.299936294555664,
+                        "inv_mean_mm": "nan",
+                        "inv_p95_mm": "nan",
+                        "inv_max_mm": "nan",
+                        "inv_interior_mean_mm": "nan",
+                        "inv_interior_max_mm": "nan",
+                        "time_s": 9.231074213981628,
+                        "fd_folding_pct": 0.0,
+                        "fd_jac_min": 0.05073145031929016
+                    }
+                }
+            },
+            "tune_baseline_per_pair": {
+                "77": {
+                    "dice_sym": 0.592227905312528,
+                    "dice_fixed": 0.592227905312528,
+                    "dice_moving": "nan",
+                    "folding_pct": 0.0,
+                    "jac_min": 0.05590147152543068,
+                    "jac_max": 9.78018569946289,
+                    "inv_mean_mm": "nan",
+                    "inv_p95_mm": "nan",
+                    "inv_max_mm": "nan",
+                    "inv_interior_mean_mm": "nan",
+                    "inv_interior_max_mm": "nan",
+                    "time_s": 9.924262642860413,
+                    "fd_folding_pct": 0.0,
+                    "fd_jac_min": 0.05590147152543068
+                },
+                "44": {
+                    "dice_sym": 0.5973992034513089,
+                    "dice_fixed": 0.5973992034513089,
+                    "dice_moving": "nan",
+                    "folding_pct": 0.0,
+                    "jac_min": 0.05895066261291504,
+                    "jac_max": 7.843438625335693,
+                    "inv_mean_mm": "nan",
+                    "inv_p95_mm": "nan",
+                    "inv_max_mm": "nan",
+                    "inv_interior_mean_mm": "nan",
+                    "inv_interior_max_mm": "nan",
+                    "time_s": 11.150431036949158,
+                    "fd_folding_pct": 0.0,
+                    "fd_jac_min": 0.05895066261291504
+                },
+                "0": {
+                    "dice_sym": 0.6382850670642931,
+                    "dice_fixed": 0.6382850670642931,
+                    "dice_moving": "nan",
+                    "folding_pct": 0.0,
+                    "jac_min": 0.05804631859064102,
+                    "jac_max": 10.978553771972656,
+                    "inv_mean_mm": "nan",
+                    "inv_p95_mm": "nan",
+                    "inv_max_mm": "nan",
+                    "inv_interior_mean_mm": "nan",
+                    "inv_interior_max_mm": "nan",
+                    "time_s": 9.502391695976257,
+                    "fd_folding_pct": 0.0,
+                    "fd_jac_min": 0.05804631859064102
+                }
+            },
+            "criteria": {
+                "folding_abs": 0.0005,
+                "folding_rel": 1.0,
+                "inv_interior_abs": 1.0,
+                "inv_interior_rel": 1.1,
+                "positive_jac_if_baseline": true,
+                "inverse_cap_only_if_baseline_fold_free": true,
+                "max_pair_drop": 0.001,
+                "jac_min_rel": null,
+                "min_gain": 0.0005,
+                "noise_k": 3.0
+            },
+            "margin": 0.0005,
+            "provenance": {
+                "schema_version": 1,
+                "n_runs": 3,
+                "commit": "ddd4b70157e49731225ab3e0ab491e1921586712",
+                "commits": [
+                    "ddd4b70157e49731225ab3e0ab491e1921586712"
+                ],
+                "registration_code": null,
+                "describe": "v6.43.0-dirty",
+                "dirty": true,
+                "diff_sha256": "2f996e7322929546382cf0d16e9534e4d7414d243f6c5d5398b4703d915ffe37",
+                "syntx_version": "6.43.0",
+                "script_sha256": [],
+                "hosts": [
+                    "barncreek.radio.virginia.edu"
+                ],
+                "packages": {
+                    "torch": "2.13.0",
+                    "antspyx": "0.6.4",
+                    "numpy": "2.3.5",
+                    "scipy": "1.18.1",
+                    "jax": "0.10.2",
+                    "antstorch": "0.2.0"
+                },
+                "parameters": {
+                    "function": "syntx.greedy",
+                    "explicit": {
+                        "device": "mps",
+                        "verbose": false,
+                        "total_sigma": 0.0,
+                        "regularizer": "navier",
+                        "s": 2.0,
+                        "poisson_ratio": 0.2,
+                        "sobolev_alpha": 2.625
+                    },
+                    "fit_kwargs": {
+                        "scales": [
+                            4,
+                            2,
+                            1
+                        ],
+                        "iterations": [
+                            100,
+                            100,
+                            20
+                        ],
+                        "verbose": false
+                    },
+                    "model_attributes": {
+                        "training": true,
+                        "digital_diffeomorphism": true,
+                        "digital_diffeomorphism_floor": 0.05,
+                        "digital_diffeomorphism_steps": 25,
+                        "convergence": [],
+                        "dim": 3,
+                        "restrict_transformation": null,
+                        "learning_rate": 1.5,
+                        "flow_sigma": 1.62,
+                        "total_sigma": 0.0,
+                        "regularizer": "navier",
+                        "optimizer": "cfl",
+                        "regadam_sigma": 0.8,
+                        "sobolev_alpha": 2.625,
+                        "cfl_momentum": 0.1875,
+                        "lncc_radius": 2,
+                        "window_size": 5,
+                        "similarity_metric": "cc2",
+                        "squared": true,
+                        "num_bins": 32,
+                        "sampling_percentage": null,
+                        "anderson": false,
+                        "anderson_steps": 5,
+                        "anderson_m": 5,
+                        "anderson_freq": "per_scale",
+                        "padding_mode": "border",
+                        "beta1": 0.9,
+                        "beta2": 0.99,
+                        "eps": 1e-08,
+                        "device": "mps",
+                        "loss_history": [],
+                        "warp": null,
+                        "theta": null,
+                        "has_initial_warp": false,
+                        "initial_warp_kind": "none"
+                    }
+                }
+            }
+        },
+        "90pair_population_benchmark_common_navier_mps": {
+            "cohort_size": 90,
+            "head_to_head_wins": 67,
+            "head_to_head_losses": 23,
+            "head_to_head_ties": 0,
+            "win_rate_pct": 74.44,
+            "syntx_mean_dice_sym": 0.6302,
+            "syntx_std_dice_sym": 0.022,
+            "syntx_median_dice_sym": 0.6316,
+            "ants_mean_dice_sym": 0.6216,
+            "ants_std_dice_sym": 0.0229,
+            "mean_dice_gain_pct": 0.86,
+            "mean_folding_pct": 0.0,
+            "max_folding_pct": 0.0,
+            "max_fd_folding_pct": 0.0,
+            "zero_fold_rate_pct": 100.0,
+            "min_jacobian_cohort_worst": 0.0505,
+            "inv_mean_mm": null,
+            "inv_interior_max_mean_mm": null,
+            "inv_interior_max_worst_mm": null,
+            "syntx_mean_runtime_s": 11.74,
+            "ants_mean_runtime_s": 139.37,
+            "average_speedup": 11.87,
+            "hardware": "Apple Silicon GPU (MPS)",
+            "parameters": {
+                "learning_rate": 1.5,
+                "flow_sigma": 1.62,
+                "total_sigma": 0.0,
+                "optimizer": "cfl",
+                "regadam_sigma": 0.8,
+                "cfl_momentum": 0.1875,
+                "regularizer": "navier",
+                "sobolev_alpha": 2.625,
+                "lncc_radius": 2,
+                "reg_iterations": [
+                    100,
+                    100,
+                    20
+                ],
+                "poisson_ratio": 0.2,
+                "s": 2.0
+            },
+            "provenance": {
+                "schema_version": 1,
+                "n_runs": 90,
+                "commit": "ddd4b70157e49731225ab3e0ab491e1921586712",
+                "commits": [
+                    "ddd4b70157e49731225ab3e0ab491e1921586712"
+                ],
+                "registration_code": null,
+                "describe": "v6.43.0-dirty",
+                "dirty": true,
+                "diff_sha256": "af4eb556ddf9e35964369d12c9388766d0315e9d02f12e9a941d80d2a7764439",
+                "syntx_version": "6.43.0",
+                "script_sha256": [
+                    "6de3b0764a53d5c11506c3ed2f23c6e8c629e8d4d73f6675bf561ea19dc4b45f"
+                ],
+                "hosts": [
+                    "barncreek.radio.virginia.edu"
+                ],
+                "packages": {
+                    "torch": "2.13.0",
+                    "antspyx": "0.6.4",
+                    "numpy": "2.3.5",
+                    "scipy": "1.18.1",
+                    "jax": "0.10.2",
+                    "antstorch": "0.2.0"
+                },
+                "parameters": {
+                    "function": "syntx.greedy",
+                    "explicit": {
+                        "device": "mps",
+                        "verbose": false
+                    },
+                    "fit_kwargs": {
+                        "scales": [
+                            4,
+                            2,
+                            1
+                        ],
+                        "iterations": [
+                            100,
+                            100,
+                            20
+                        ],
+                        "verbose": false
+                    },
+                    "model_attributes": {
+                        "training": true,
+                        "digital_diffeomorphism": true,
+                        "digital_diffeomorphism_floor": 0.05,
+                        "digital_diffeomorphism_steps": 25,
+                        "convergence": [],
+                        "dim": 3,
+                        "restrict_transformation": null,
+                        "learning_rate": 1.5,
+                        "flow_sigma": 1.62,
+                        "total_sigma": 0.0,
+                        "regularizer": "navier",
+                        "optimizer": "cfl",
+                        "regadam_sigma": 0.8,
+                        "sobolev_alpha": 2.625,
                         "cfl_momentum": 0.1875,
                         "lncc_radius": 2,
                         "window_size": 5,
