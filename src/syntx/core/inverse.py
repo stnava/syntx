@@ -805,9 +805,6 @@ def update_inverse_field_nd_anderson(
         )
         W_disp_cf = torch.movedim(W_disp, -1, 1)
 
-    if W_inv_disp is None:
-        W_inv_disp = -W_disp.clone()
-
     bshape = (B,) + (1,) * (W_disp.dim() - 1)
     ones_b = torch.ones(bshape, device=device, dtype=dtype)
 
@@ -861,7 +858,7 @@ def update_inverse_field_nd_anderson(
         v_new.mul_(boundary_mask)
         return v_new
 
-    v_k = W_inv_disp.clone()
+    v_k = -W_disp.clone() if W_inv_disp is None else W_inv_disp.clone()
     R_history: list[torch.Tensor] = []
     G_history: list[torch.Tensor] = []
     done = torch.zeros(B, dtype=torch.bool, device=device)         # element has met the thresholds
@@ -916,7 +913,12 @@ def update_inverse_field_nd_anderson(
         m_k = len(R_history)
 
         if m_k < 2:
-            v_next = g_k
+            # ``g_k`` is stored in ``G_history``; keep ``v_k`` on disjoint storage so later
+            # in-place ``out=v_k`` updates never mutate ``G_history[0]``.
+            if B == 1 and should_check:
+                v_k.copy_(g_k)
+            else:
+                torch.where(done_next.reshape(bshape), v_k, g_k, out=v_k)
         else:
             n_cols = m_k - 1
             r_newest = R_history[-1]
@@ -951,7 +953,8 @@ def update_inverse_field_nd_anderson(
                 v_new_flat.sub_(tmp_flat)
             del diff_i, tmp_flat
 
-            v_candidate = v_new_flat.reshape(W_inv_disp.shape)
+            v_candidate = v_new_flat.reshape(W_disp.shape)
+            del v_new_flat
             v_candidate.mul_(boundary_mask)
 
             if use_physical:
@@ -961,6 +964,7 @@ def update_inverse_field_nd_anderson(
                 fwd_at_c = sample_field_cf(W_disp_cf, coords_norm_c)
                 del coords_norm_c
                 error_c = fwd_at_c.add_(v_candidate)
+                del fwd_at_c
                 sq_c = _scaled_sq_sum(error_c, spacing_t, divide=True)
                 del error_c
                 residual_aa = _batch_reduce_sum(sq_c)
@@ -970,19 +974,25 @@ def update_inverse_field_nd_anderson(
                 fwd_at_c = sample_field_cf(W_disp_cf, coords_c)
                 del coords_c
                 error_c = fwd_at_c.add_(v_candidate)
+                del fwd_at_c
                 sq_c = _scaled_sq_sum(error_c, voxel_scale, divide=False)
                 del error_c
                 residual_aa = _batch_reduce_sum(sq_c)
                 del sq_c
 
             accept = (residual_aa <= residual_fp * 1.21).reshape(bshape)      # squared norms: 1.1**2
-            v_next = torch.where(accept, v_candidate, g_k)
+            torch.where(accept, v_candidate, g_k, out=v_candidate)
+            # Freeze: any element that has already met the thresholds at ``v_k`` (``done_next``)
+            # keeps ``v_k`` intact (idempotent); when ``B == 1`` and ``should_check`` ran above,
+            # ``done_next`` is guaranteed False so ``v_candidate`` (disjoint from ``G_history``)
+            # transfers directly into ``v_k`` without copying.
+            if B == 1 and should_check:
+                v_k = v_candidate
+            else:
+                torch.where(done_next.reshape(bshape), v_k, v_candidate, out=v_k)
             del v_candidate
 
-        # Freeze: any element that has already met the thresholds at ``v_k`` (``done_next``)
-        # keeps ``v_k`` intact (idempotent); only unconverged elements advance to ``v_next``.
-        v_k = torch.where(done_next.reshape(bshape), v_k, v_next)
-        del v_next, g_k
+        del g_k
         done = done_next
 
         if not should_check and mps_large_field and (iteration + 1) % 4 == 0:
@@ -1168,12 +1178,14 @@ def update_inverse_field_nd(
             forward_at_inv = sample_field_cf(W_disp_cf, coords_norm)
             del coords_norm
             error = forward_at_inv.add_(v_k)
+            del forward_at_inv
             scaled_norm = _scaled_sq_sum(error, spacing_t, divide=True).sqrt_()
         else:
             coords = identity + v_k
             forward_at_inv = sample_field_cf(W_disp_cf, coords)
             del coords
             error = forward_at_inv.add_(v_k)
+            del forward_at_inv
             scaled_norm = _scaled_sq_sum(error, voxel_scale, divide=False).sqrt_()
 
         max_err = _batch_reduce_amax(scaled_norm)
@@ -1209,7 +1221,10 @@ def update_inverse_field_nd(
             g_k = separable_gaussian_filter(g_k, smoothing_sigma)
         g_k.mul_(boundary_mask)
 
-        v_k = torch.where(done_next.reshape(bshape), v_k, g_k)
+        if B == 1 and should_check:
+            v_k.copy_(g_k)
+        else:
+            torch.where(done_next.reshape(bshape), v_k, g_k, out=v_k)
         del g_k
         done = done_next
 

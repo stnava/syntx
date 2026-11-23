@@ -328,3 +328,128 @@ def test_transform_chain_slab_resampling_parity(monkeypatch: pytest.MonkeyPatch,
     assert len(tx_mod._DISP_FIELD_CACHE) == 0
     assert len(tx_mod._MAPPED_GRID_CACHE) == 0
     np.testing.assert_allclose(out_slab.numpy(), out_single.numpy(), atol=1e-5, rtol=1e-5)
+
+
+@pytest.mark.parametrize("method", ["fixed_point", "anderson"])
+@pytest.mark.parametrize("use_physical", [True, False])
+def test_inverse_inplace_where_bitwise_and_non_aliasing(
+    method: str,
+    use_physical: bool,
+) -> None:
+    """Verify in-place ``out=v_k`` / ``B == 1`` buffer reuse preserves bitwise parity across
+    ``B == 1`` vs ``B == 2`` (with early-converging item 0), ``check_interval == 1`` vs ``3``,
+    warm-start non-mutation, Anderson ``G_history`` rollover, and contiguous output layout."""
+    devices = ["cpu"]
+    if hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+        devices.append("mps")
+
+    meta_kwargs = (
+        {
+            "spacing": (0.8, 0.9, 1.1),
+            "origin": (-4.0, 2.5, 1.0),
+            "direction": np.array(
+                [[0.98, -0.15, 0.13], [0.15, 0.99, 0.01], [-0.13, 0.01, 0.99]],
+                dtype=np.float64,
+            ),
+        }
+        if use_physical
+        else {}
+    )
+
+    for dev in devices:
+        torch.manual_seed(2026)
+        raw0 = torch.randn(1, 3, 14, 16, 12, device=dev) * 1e-4
+        raw1 = torch.randn(1, 3, 14, 16, 12, device=dev) * (0.22 if use_physical else 0.06)
+        k = torch.ones(3, 1, 3, 3, 3, device=dev) / 27.0
+        u0 = torch.nn.functional.conv3d(raw0, k, padding=1, groups=3).movedim(1, -1).contiguous()
+        u1 = torch.nn.functional.conv3d(raw1, k, padding=1, groups=3).movedim(1, -1).contiguous()
+        u0[:, 0] = u0[:, -1] = 0.0
+        u0[:, :, 0] = u0[:, :, -1] = 0.0
+        u0[:, :, :, 0] = u0[:, :, :, -1] = 0.0
+        u1[:, 0] = u1[:, -1] = 0.0
+        u1[:, :, 0] = u1[:, :, -1] = 0.0
+        u1[:, :, :, 0] = u1[:, :, :, -1] = 0.0
+
+        u_batch = torch.cat([u0, u1], dim=0).contiguous()
+        warm_batch = (-0.9 * u_batch).contiguous()
+        u_batch_orig = u_batch.clone()
+        warm_batch_orig = warm_batch.clone()
+
+        # Run 8 steps (> m + 1 = 5) so Anderson exercises m_k == 1, m_k >= 2, and G_history eviction.
+        stats_0: dict = {}
+        stats_1: dict = {}
+        inv0_b1 = update_inverse_field_nd(
+            u0,
+            warm_batch[0:1],
+            steps=8,
+            method=method,
+            check_interval=1,
+            max_error_threshold=1e-3,
+            mean_error_threshold=1e-4,
+            stats=stats_0,
+            **meta_kwargs,
+        )
+        inv1_b1 = update_inverse_field_nd(
+            u1,
+            warm_batch[1:2],
+            steps=8,
+            method=method,
+            check_interval=1,
+            max_error_threshold=1e-3,
+            mean_error_threshold=1e-4,
+            stats=stats_1,
+            **meta_kwargs,
+        )
+        assert stats_0["steps"] <= 1
+        assert stats_1["steps"] >= 2
+        assert inv0_b1.is_contiguous()
+        assert inv1_b1.is_contiguous()
+
+        inv_b2_ci1 = update_inverse_field_nd(
+            u_batch,
+            warm_batch,
+            steps=8,
+            method=method,
+            check_interval=1,
+            max_error_threshold=1e-3,
+            mean_error_threshold=1e-4,
+            **meta_kwargs,
+        )
+        inv_b2_ci3 = update_inverse_field_nd(
+            u_batch,
+            warm_batch,
+            steps=8,
+            method=method,
+            check_interval=3,
+            max_error_threshold=1e-3,
+            mean_error_threshold=1e-4,
+            **meta_kwargs,
+        )
+        inv1_b1_ci3 = update_inverse_field_nd(
+            u1,
+            warm_batch[1:2],
+            steps=8,
+            method=method,
+            check_interval=3,
+            max_error_threshold=1e-3,
+            mean_error_threshold=1e-4,
+            **meta_kwargs,
+        )
+
+        # Caller inputs and warm-start buffers must never be mutated in place.
+        assert torch.equal(u_batch, u_batch_orig)
+        assert torch.equal(warm_batch, warm_batch_orig)
+        assert inv_b2_ci1.is_contiguous()
+        assert inv_b2_ci3.is_contiguous()
+
+        # Bitwise parity between B==1 fast path, B==2 in-place torch.where(..., out=v_k), and check_interval=3.
+        assert torch.equal(inv_b2_ci1, inv_b2_ci3)
+        assert torch.equal(inv1_b1, inv1_b1_ci3)
+        if dev == "cpu":
+            assert torch.equal(inv_b2_ci1[0:1], inv0_b1)
+            assert torch.equal(inv_b2_ci1[1:2], inv1_b1)
+        else:
+            # MPS grid_sample/reductions across B=1 vs B=2 batch stride can differ at ~1 ULP; check tight parity.
+            assert torch.equal(inv_b2_ci1[0:1], inv0_b1)
+            assert torch.allclose(inv_b2_ci1[1:2], inv1_b1, atol=1e-6, rtol=1e-6)
+

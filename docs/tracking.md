@@ -2,11 +2,21 @@
 current phase: v6.44.0 (Unified cross-solver Navier-Cauchy default `regularizer='navier', s=2.0, poisson_ratio=0.20` across `greedy`/`syn`/`syngs`/`tvf`, validated on subject-disjoint Held-Out `[28, 55, 84]` `+1.15 pp` 4-solver mean, and verified on full 90-pair Mindboggle-101 benchmark: `greedy 0.6302`, `syngs 0.6389`, `syn 0.6423`, `tvf 0.6529` `90/90` wins, `360/360` `0.0000%` folding)
 next WP: optional 10-task (`N = 50`) Medical Segmentation Decathlon cross-organ evaluation under unified Navier defaults
 blockers: none
-active work: none (`v6.44.0` released; `0` `antsxqc.lint` findings, `19/19` canonical tests green, full test suite green)
+active work: post-v6.44.0 inverse solver buffer-reuse & lifetime tightening (`src/syntx/core/inverse.py`, `tests/test_syn_microct_memory.py`)
 device: Apple Silicon MPS / CPU (macOS arm64)
-last updated: 2026-11-21
+last updated: 2026-11-23
 
 ---
+
+## R49 (In-Place `out=v_k` / `B == 1` Buffer Reuse & Dangling-Local Elimination in Fixed-Point and Anderson Field Inversion; post-v6.44.0, 2026-11-23)
+- **Buffer Reuse & Tensor Lifetime Tightening (`src/syntx/core/inverse.py`, `tests/test_syn_microct_memory.py`)**:
+  - **`update_inverse_field_nd` (`method='fixed_point'`)**: Replaced out-of-place `v_k = torch.where(done_next.reshape(bshape), v_k, g_k)` with `v_k.copy_(g_k)` when `B == 1 and should_check` (preserving contiguous channels-last stride) and `torch.where(done_next.reshape(bshape), v_k, g_k, out=v_k)` otherwise, and added `del forward_at_inv` immediately after `error = forward_at_inv.add_(v_k)` so the `3N` buffer does not stay pinned in local scope across iterations when `not should_check`, `B > 1`, or `smoothing_sigma > 0`.
+  - **`update_inverse_field_nd_anderson` (`method='anderson'`)**: Removed the redundant double-clone (`W_inv_disp = -W_disp.clone(); v_k = W_inv_disp.clone()`) when `W_inv_disp is None`, added `del v_new_flat` after `v_candidate = v_new_flat.reshape(W_disp.shape)` and `del fwd_at_c` after `error_c = fwd_at_c.add_(v_candidate)`, and replaced the two end-of-step `torch.where` allocations (`v_next` and `v_k`) with in-place `torch.where(accept, v_candidate, g_k, out=v_candidate)` plus `v_k = v_candidate` (`B == 1 and should_check`) / `torch.where(..., out=v_k)` (`B > 1` or `not should_check`, with `v_k.copy_(g_k)` at `m_k < 2`), keeping `v_k` strictly disjoint from `G_history` on every step.
+  - **Measured Peak Live MPS Memory & Bitwise Parity (`192 x 256 x 256 x 3`, `144.00 MiB` per `3N` float32 field, `steps = 6`, `seed = 0`, `PeakTracker` `TorchDispatchMode`, $n = 3$ repeats)**:
+    - **Bitwise parity**: `torch.equal == True` (`max_diff = 0`) and `is_contiguous() == True` against pre-edit reference outputs for both `fixed_point` and `anderson` across `check_interval in {1, 3}`.
+    - **`fixed_point` peak live MPS delta**: **`912.19 MiB -> 768.19 MiB`** (**`-144.00 MiB` = `-1 x 3N` field**, `-15.8%`; equivalent to **`-2.86 GiB`** at `477 x 856 x 591` micro-CT scale); runtime `322.81 / 330.07 / 372.87 ms -> 317.96 / 329.81 / 353.98 ms` (min / median / max).
+    - **`anderson` peak live MPS delta**: **`3072.19 MiB -> 2784.19 MiB`** (**`-288.00 MiB` = `-2 x 3N` fields**, `-9.4%`; equivalent to **`-5.72 GiB`** at `477 x 856 x 591` micro-CT scale); runtime `694.82 / 695.58 / 725.45 ms -> 655.43 / 659.30 / 707.39 ms` (`-5.2%` median).
+  - Added `test_inverse_inplace_where_bitwise_and_non_aliasing` in `tests/test_syn_microct_memory.py` verifying `B == 1` vs. `B == 2` (early-converging item 0 + multi-step item 1), `check_interval == 1` vs. `3`, Anderson `G_history` rollover (`steps = 8 > m + 1`), warm-start non-mutation, and contiguous layout across CPU and MPS.
 
 ## R48 (Unified Cross-Model Navier-Cauchy Default `s=2.0, poisson_ratio=0.20`, Subject-Disjoint Held-Out Validation, and 360-Run 90-Pair Mindboggle-101 4-Model Benchmark; v6.44.0, 2026-11-21)
 - **Per-Model Navier Autotuning (`[77, 44, 0]`) & Principled Common Navier Selection (`[28, 55, 84]`) (`src/syntx/core/{regularizers,optimizers}.py`, `src/syntx/{greedy,syn,tvf,syngs,provenance}.py`, `src/syntx/benchmark/{config,evaluate,tune}.py`, `docs/provenance/tuning/{greedy,syn,tvf,syngs}_navier_2026-11-20.md`)**:
