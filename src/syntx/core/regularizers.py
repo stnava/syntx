@@ -145,6 +145,9 @@ def _validate_vector_frame(vector_frame: str, caller: str) -> str:
     return vf
 
 
+_DIRECTION_CONJ_CACHE: collections.OrderedDict = collections.OrderedDict()
+
+
 def _prepare_direction_conjugation(
     direction: Any,
     origin: Any,
@@ -163,7 +166,18 @@ def _prepare_direction_conjugation(
     d_zyx = d_lps[::-1, ::-1].copy()
     if np.allclose(d_zyx, np.eye(dim), atol=1e-6):
         return None, d_lps
-    return torch.as_tensor(d_zyx, device=device, dtype=dtype), d_lps
+    key = (d_zyx.tobytes(), dim, str(device), dtype)
+    with _K_MESH_LOCK:
+        cached = _DIRECTION_CONJ_CACHE.get(key)
+        if cached is not None:
+            _DIRECTION_CONJ_CACHE.move_to_end(key)
+            return cached, d_lps
+    d_t = torch.as_tensor(d_zyx, device=device, dtype=dtype)
+    with _K_MESH_LOCK:
+        _DIRECTION_CONJ_CACHE[key] = d_t
+        if len(_DIRECTION_CONJ_CACHE) > 64:
+            _DIRECTION_CONJ_CACHE.popitem(last=False)
+    return d_t, d_lps
 
 
 def resolve_required_image_geometry(
@@ -259,8 +273,8 @@ def _get_k_mesh_rfft(
             return _K_MESH_CACHE[cache_key]
 
     spacing_zyx = tuple(reversed(normalized_spacing))
-    k_axes_diff = []
-    k_axes_true = []
+    k_mesh = []
+    k_sq = None
     for d in range(dim):
         n_d = spatial_shape[d]
         sp_d = float(spacing_zyx[d])
@@ -274,14 +288,11 @@ def _get_k_mesh_rfft(
             kd_diff = kd_true.clone()
             if n_d % 2 == 0:
                 kd_diff[n_d // 2] = 0.0
-        k_axes_true.append(kd_true)
-        k_axes_diff.append(kd_diff)
-
-    k_mesh = list(torch.meshgrid(*k_axes_diff, indexing='ij'))
-    k_mesh_true = list(torch.meshgrid(*k_axes_true, indexing='ij'))
-    k_sq = torch.zeros_like(k_mesh[0])
-    for d in range(dim):
-        k_sq = k_sq + k_mesh_true[d] ** 2
+        view_shape = [1] * dim
+        view_shape[d] = kd_true.numel()
+        k_mesh.append(kd_diff.view(*view_shape))
+        kd_sq = kd_true.view(*view_shape).square()
+        k_sq = kd_sq if k_sq is None else (k_sq + kd_sq)
 
     mask_zero = (k_sq == 0.0)
     k_sq_safe = torch.where(mask_zero, torch.ones_like(k_sq), k_sq)
@@ -295,16 +306,101 @@ def _get_k_mesh_rfft(
     return result
 
 
-def clear_k_mesh_cache() -> None:
-    """Clear the frequency grid cache (thread-safe)."""
+def clear_k_mesh_cache(max_voxels: Optional[int] = None) -> None:
+    """Clear the frequency grid cache (thread-safe).
+
+    When ``max_voxels`` is given, evicts only entries whose spatial voxel count exceeds
+    ``max_voxels`` so standard-resolution grids remain warm across cohort/template runs
+    while multi-GiB micro-CT grids are released immediately.
+    """
     with _K_MESH_LOCK:
-        _K_MESH_CACHE.clear()
-        _INV_KSQ_CACHE.clear()
-        _SOBOLEV_ENVELOPE_CACHE.clear()
+        if max_voxels is None:
+            _K_MESH_CACHE.clear()
+            _INV_KSQ_CACHE.clear()
+            _SOBOLEV_ENVELOPE_CACHE.clear()
+            _NAVIER_OPS_CACHE.clear()
+            _DIRECTION_CONJ_CACHE.clear()
+            return
+        mv = int(max_voxels)
+        for cache in (_K_MESH_CACHE, _INV_KSQ_CACHE, _SOBOLEV_ENVELOPE_CACHE, _NAVIER_OPS_CACHE):
+            stale = [k for k in cache if isinstance(k, tuple) and k and math.prod(k[0]) > mv]
+            for k in stale:
+                cache.pop(k, None)
 
 
 _INV_KSQ_CACHE: collections.OrderedDict = collections.OrderedDict()
 _SOBOLEV_ENVELOPE_CACHE: collections.OrderedDict = collections.OrderedDict()
+_NAVIER_OPS_CACHE: collections.OrderedDict = collections.OrderedDict()
+
+
+def _get_navier_ops_cached(
+    spatial_shape: Sequence[int],
+    spacing: Optional[Sequence[float]],
+    alpha_val: float,
+    s_val: float,
+    kappa: float,
+    device: torch.device,
+) -> Tuple[List[torch.Tensor], torch.Tensor, torch.Tensor]:
+    """Return cached ``(k_views_1d, K_base, K_proj)`` for ``apply_navier_green_operator``.
+
+    Avoids populating dense 3-D ``meshgrid`` or ``_INV_KSQ_CACHE`` buffers (cutting cached
+    spectral memory by 75%: ``2 x N_rfft`` instead of ``8 x N_rfft``) and pre-fuses
+    ``K_proj = kappa * K_base * inv_ksq_diff`` once per ``(shape, spacing, alpha, s, kappa)``.
+    """
+    dim = len(spatial_shape)
+    sp = _require_spacing(spacing, dim, "_get_navier_ops_cached")
+    min_sp = min(sp)
+    norm_sp = tuple(s_i / min_sp for s_i in sp)
+    key = (tuple(spatial_shape), norm_sp, float(alpha_val), float(s_val), float(kappa), str(device))
+    with _K_MESH_LOCK:
+        cached = _NAVIER_OPS_CACHE.get(key)
+        if cached is not None:
+            _NAVIER_OPS_CACHE.move_to_end(key)
+            return cached
+
+    spacing_zyx = tuple(reversed(norm_sp))
+    k_views: List[torch.Tensor] = []
+    k_sq = None
+    k_sq_diff = None
+    for d in range(dim):
+        n_d = spatial_shape[d]
+        sp_d = float(spacing_zyx[d])
+        if d == dim - 1:
+            kd_true = torch.fft.rfftfreq(n_d, d=max(sp_d, 1e-6), device=device) * (2.0 * math.pi)
+            kd_diff = kd_true.clone()
+            if n_d % 2 == 0:
+                kd_diff[-1] = 0.0
+        else:
+            kd_true = torch.fft.fftfreq(n_d, d=max(sp_d, 1e-6), device=device) * (2.0 * math.pi)
+            kd_diff = kd_true.clone()
+            if n_d % 2 == 0:
+                kd_diff[n_d // 2] = 0.0
+        view_shape = [1] * dim
+        view_shape[d] = kd_true.numel()
+        kv_diff = kd_diff.view(*view_shape)
+        k_views.append(kv_diff)
+        kd_sq = kd_true.view(*view_shape).square()
+        kd_diff_sq = kv_diff.square()
+        k_sq = kd_sq if k_sq is None else (k_sq + kd_sq)
+        k_sq_diff = kd_diff_sq if k_sq_diff is None else (k_sq_diff + kd_diff_sq)
+
+    inv_ksq_diff = torch.where(
+        k_sq_diff == 0.0,
+        torch.zeros_like(k_sq_diff),
+        1.0 / k_sq_diff.clamp(min=1e-30),
+    )
+    del k_sq_diff
+    K_base = (1.0 / (1.0 + float(alpha_val) * k_sq)).pow(float(s_val))
+    del k_sq
+    K_proj = float(kappa) * K_base * inv_ksq_diff
+    del inv_ksq_diff
+
+    out = (k_views, K_base, K_proj)
+    with _K_MESH_LOCK:
+        _NAVIER_OPS_CACHE[key] = out
+        if len(_NAVIER_OPS_CACHE) > _MAX_K_MESH_CACHE_SIZE:
+            _NAVIER_OPS_CACHE.popitem(last=False)
+    return out
 
 
 def _get_inv_ksq_cached(
@@ -597,6 +693,7 @@ def project_solenoidal(
     spatial_dims = tuple(range(2, 2 + dim))
 
     v_cf = torch.movedim(v, -1, 1).to(torch.float32).contiguous()
+    del v
     v_fft = torch.fft.rfftn(v_cf, dim=spatial_dims)
     del v_cf
 
@@ -666,6 +763,7 @@ def apply_solenoidal_sobolev_operator(
     spatial_dims = tuple(range(2, 2 + dim))
 
     m_cf = torch.movedim(m, -1, 1).to(torch.float32).contiguous()
+    del m
     m_fft = torch.fft.rfftn(m_cf, dim=spatial_dims)
     del m_cf
 
@@ -757,6 +855,7 @@ def apply_div_curl_green_operator(
         beta_val = alpha_val * ratio
 
     m_cf = torch.movedim(m, -1, 1).to(torch.float32).contiguous()
+    del m
     m_fft = torch.fft.rfftn(m_cf, dim=spatial_dims)
     del m_cf
 
@@ -850,19 +949,21 @@ def apply_navier_green_operator(
     kappa = 1.0 if nu >= 0.4999 else (1.0 / (2.0 * (1.0 - nu)))
 
     m_cf = torch.movedim(m, -1, 1).to(torch.float32).contiguous()
+    del m
     m_fft = torch.fft.rfftn(m_cf, dim=spatial_dims)
     del m_cf
 
-    k_mesh, _, _, _, inv_ksq_diff = _get_inv_ksq_cached(spatial_shape, sp, device)
-    K_base = _get_sobolev_envelope_cached(spatial_shape, sp, alpha_val, float(s), device)
+    k_views, K_base, K_proj = _get_navier_ops_cached(spatial_shape, sp, alpha_val, float(s), kappa, device)
 
-    k_dot_m = m_fft[:, 0, ...] * k_mesh[0]
+    k_dot_m = m_fft[:, 0, ...] * k_views[0]
     for d in range(1, dim):
-        k_dot_m = k_dot_m + m_fft[:, d, ...] * k_mesh[d]
-    k_dot_m.mul_(kappa * K_base * inv_ksq_diff)
+        k_dot_m = k_dot_m + m_fft[:, d, ...] * k_views[d]
+    k_dot_m.mul_(K_proj)
 
-    for d in range(dim):
-        m_fft[:, d, ...].mul_(K_base).sub_(k_dot_m * k_mesh[d])
+    for d in range(dim - 1):
+        m_fft[:, d, ...].mul_(K_base).sub_(k_dot_m * k_views[d])
+    k_dot_m.mul_(k_views[dim - 1])
+    m_fft[:, dim - 1, ...].mul_(K_base).sub_(k_dot_m)
     del k_dot_m
 
     v_cf = torch.fft.irfftn(m_fft, s=spatial_shape, dim=spatial_dims)
@@ -1062,6 +1163,7 @@ def apply_beltrami_regularizer(
     K_base = _get_sobolev_envelope_cached(spatial_shape, sp, float(alpha), float(s), device)
 
     v_cf = torch.movedim(v, -1, 1).to(torch.float32).contiguous()
+    del v
     v_fft = torch.fft.rfftn(v_cf, dim=spatial_dims)
     del v_cf
 
@@ -1155,8 +1257,11 @@ def apply_poroelastic_filter(
     k_mesh, k_sq, k_sq_safe = _get_k_mesh_rfft(spatial_shape, sp, device)
     mask_zero = (k_sq == 0.0)
 
-    v_cf = torch.movedim(v, -1, 1).to(torch.float32)
+    batch_n = v.shape[0]
+    v_cf = torch.movedim(v, -1, 1).to(torch.float32).contiguous()
+    del v
     v_fft = torch.fft.rfftn(v_cf, dim=spatial_dims)
+    del v_cf
 
     k_dot_v = torch.zeros_like(v_fft[:, 0, ...])
     for d in range(dim):
@@ -1181,7 +1286,7 @@ def apply_poroelastic_filter(
     v_fluid_cf = torch.fft.irfftn(v_fluid_fft, s=spatial_shape, dim=spatial_dims)
 
     if mask is not None:
-        mask_t = _prepare_mask_tensor(mask, spatial_shape, device, batch_size=v.shape[0])
+        mask_t = _prepare_mask_tensor(mask, spatial_shape, device, batch_size=batch_n)
         fluid_weight = (1.0 - mask_t.clamp(0.0, 1.0))
         v_fluid_cf = v_fluid_cf * fluid_weight
 

@@ -144,7 +144,20 @@ _TVF_FIT_KWARGS = frozenset({
     'solver', 'spline_distance', 'spline_order', 'temporal_weight', 'total_alpha', 'trust',
     'trust_coefficient', 'use_analytical_gradients',
 }) | REGULARIZER_EXTRA_KEYS
-_TVF_INIT_KWARGS = frozenset({'adjoint', 'mattes_bins', 'num_bins', 'similarity_metric', 'solver', 'use_analytical_gradients'})
+_TVF_INIT_KWARGS = frozenset({
+    'adjoint', 'init_velocity_shape', 'mattes_bins', 'num_bins', 'similarity_metric', 'solver', 'use_analytical_gradients'
+})
+
+
+def _compute_norm_affine_from_meta(shape_zyx, spacing_rev, origin_rev, direction_rev, device, dtype):
+    """Compute physical->normalized affine (M, b) from Python/NumPy metadata in float64 without GPU->CPU syncs."""
+    M_cpu, b_cpu = get_physical_to_normalized_affine(
+        torch.tensor(list(shape_zyx), dtype=torch.float64),
+        torch.tensor(list(spacing_rev), dtype=torch.float64),
+        torch.tensor(list(origin_rev), dtype=torch.float64),
+        torch.as_tensor(np.asarray(direction_rev, dtype=np.float64), dtype=torch.float64),
+    )
+    return M_cpu.to(device=device, dtype=dtype), b_cpu.to(device=device, dtype=dtype)
 
 
 def _compute_norm_affine_cpu(shape_t, spacing_t, origin_t, direction_t):
@@ -446,8 +459,9 @@ class TVFModel(nn.Module):
         self.similarity_metric = kwargs.get('similarity_metric', 'cc2')
         self.mattes_bins = int(kwargs.get('mattes_bins', kwargs.get('num_bins', 32)))
         
-        # Velocity field parameter: (T, 1, *velocity_shape, dim)
-        self.velocity = nn.Parameter(torch.zeros(n_time_steps, 1, *self.velocity_shape, self.dim))
+        # Velocity field parameter: (T, 1, *init_vel_shape, dim); self.velocity_shape remains max_vel_shape
+        init_vel_sh = tuple(kwargs.get('init_velocity_shape') or self.velocity_shape)
+        self.velocity = nn.Parameter(torch.zeros(n_time_steps, 1, *init_vel_sh, self.dim))
         self.affine = HierarchicalAffine(dim=dim, transform_type=transform_type)
         self._sobolev_kernel_cache = {}
         self._v_max_cache = {}
@@ -762,6 +776,7 @@ class TVFModel(nn.Module):
             return self._v_max_cache[cache_key]
 
         with torch.no_grad():
+            from .core.inverse import _scaled_sq_sum
             sp_key = (target_sp, str(velocity.device), velocity.dtype)
             if not hasattr(self, '_sp_t_cache') or not isinstance(self._sp_t_cache, dict):
                 self._sp_t_cache = {}
@@ -775,9 +790,12 @@ class TVFModel(nn.Module):
                 if len(self._sp_t_cache) > 16:
                     self._sp_t_cache.clear()
                 self._sp_t_cache[sp_key] = sp_t
-            vel_voxel = velocity.detach() / sp_t
-            v_mag_sq = torch.sum(vel_voxel ** 2, dim=-1)
-            v_max_voxel = float(torch.sqrt(v_mag_sq.max()).item())
+            v_det = velocity.detach()
+            max_sq = None
+            for t_idx in range(v_det.shape[0]):
+                sq_t = _scaled_sq_sum(v_det[t_idx], sp_t, divide=True).amax()
+                max_sq = sq_t if max_sq is None else torch.maximum(max_sq, sq_t)
+            v_max_voxel = float(torch.sqrt(max_sq).item()) if max_sq is not None else 0.0
 
         if len(self._v_max_cache) > 32:
             self._v_max_cache.clear()
@@ -830,29 +848,30 @@ class TVFModel(nn.Module):
         dt = (t_end - t_start) / max(1, n_steps)
         
         # Use cached grid and metadata if provided, otherwise compute
+        curr_spacing_local = None
         if _cached_phys_grid is not None and _cached_meta is not None:
             phys_grid = _cached_phys_grid
             shape_t, spacing_t, origin_t, direction_t = _cached_meta
         else:
-            curr_spacing = [
+            curr_spacing_local = [
                 sp * (float(orig_s - 1) / float(curr_s - 1)) if curr_s > 1 else sp
                 for sp, orig_s, curr_s in zip(self.spacing, reversed(self.image_shape), reversed(target_shape))
             ]
             
             phys_grid = get_physical_grid_torch(
-                target_shape, curr_spacing, self.origin, self.direction,
+                target_shape, curr_spacing_local, self.origin, self.direction,
                 device=device, dtype=dtype
             )
             
-            spacing_rev, origin_rev, direction_rev = reverse_metadata(curr_spacing, self.origin, self.direction)
-            
-            shape_t = torch.tensor(list(target_shape), device=device, dtype=dtype)
-            spacing_t = torch.tensor(spacing_rev, device=device, dtype=dtype)
-            origin_t = torch.tensor(origin_rev, device=device, dtype=dtype)
-            direction_t = torch.tensor(direction_rev, device=device, dtype=dtype)
+            spacing_rev, origin_rev, direction_rev = reverse_metadata(curr_spacing_local, self.origin, self.direction)
+            shape_t = spacing_t = origin_t = direction_t = None
 
         if _cached_norm_f is not None:
             M_f_norm, b_f_norm = _cached_norm_f
+        elif curr_spacing_local is not None:
+            M_f_norm, b_f_norm = _compute_norm_affine_from_meta(
+                target_shape, spacing_rev, origin_rev, direction_rev, device, dtype
+            )
         else:
             M_f_norm, b_f_norm = _compute_norm_affine_cpu(shape_t, spacing_t, origin_t, direction_t)
         
@@ -869,12 +888,19 @@ class TVFModel(nn.Module):
         if return_log_jacobian:
             log_jac = torch.zeros(phi_t.shape[:-1], device=device, dtype=dtype)
             n_neg = torch.zeros(phi_t.shape[:-1], device=device, dtype=dtype)
-            h = 0.5 * float(spacing_t.min())
+            h = 0.5 * (min(float(x) for x in curr_spacing_local) if curr_spacing_local is not None else float(spacing_t.min()))
             q_buf = torch.empty_like(phi_t)
         else:
             q_buf = None
 
-        use_adjoint = (solver.startswith('adjoint') or getattr(self, 'adjoint', False)) and not return_log_jacobian
+        n_target_vox = math.prod(int(s) for s in target_shape)
+        auto_large_adjoint = (
+            n_target_vox > 16_777_216
+            and phi_t.requires_grad
+            and not getattr(self, '_adjoint_explicit_false', False)
+            and solver in ('euler', 'rk4')
+        )
+        use_adjoint = (solver.startswith('adjoint') or getattr(self, 'adjoint', False) or auto_large_adjoint) and not return_log_jacobian
         if use_adjoint and velocity_fine_cf is not None:
             base_solver = 'rk4' if 'rk4' in solver else 'euler'
             vel_stack = torch.stack(velocity_fine_cf, dim=0)
@@ -986,18 +1012,14 @@ class TVFModel(nn.Module):
         origin_t = torch.tensor(origin_rev, device=device, dtype=dtype)
         direction_t = torch.tensor(direction_rev, device=device, dtype=dtype)
         _cached_meta = (shape_t, spacing_t, origin_t, direction_t)
-        norm_f = _compute_norm_affine_cpu(shape_t, spacing_t, origin_t, direction_t)
+        norm_f = _compute_norm_affine_from_meta(target_shape, spacing_rev, origin_rev, direction_rev, device, dtype)
 
         curr_moving_spacing = [
             sp * (float(orig_s - 1) / float(curr_s - 1)) if curr_s > 1 else sp
             for sp, orig_s, curr_s in zip(self.moving_spacing, reversed(self.moving_shape), reversed(moving_target_shape))
         ]
         sp_m_rev, orig_m_rev, dir_m_rev = reverse_metadata(curr_moving_spacing, self.moving_origin, self.moving_direction)
-        shape_m = torch.tensor(list(moving_target_shape), device=device, dtype=dtype)
-        spacing_m = torch.tensor(sp_m_rev, device=device, dtype=dtype)
-        origin_m = torch.tensor(orig_m_rev, device=device, dtype=dtype)
-        direction_m = torch.tensor(dir_m_rev, device=device, dtype=dtype)
-        norm_m = _compute_norm_affine_cpu(shape_m, spacing_m, origin_m, direction_m)
+        norm_m = _compute_norm_affine_from_meta(moving_target_shape, sp_m_rev, orig_m_rev, dir_m_rev, device, dtype)
 
         T_grid_cpu = self.affine.get_matrix().detach().cpu()
         M_phys_cpu, t_phys_cpu = grid_to_physical_affine_torch(
@@ -1564,9 +1586,9 @@ class TVFModel(nn.Module):
             else:
                 amp_dtype = torch.float16
 
-            best_level_loss = float('inf')
-            best_level_loss_t = torch.tensor(float('inf'), device=device)
-            best_velocity = None
+            best_level_loss_t = torch.tensor(float('inf'), device=device, dtype=dtype)
+            best_velocity = self.velocity.detach().clone() if epochs > 0 else None
+            have_best_vel = torch.zeros((), device=device, dtype=torch.bool)
 
             for epoch in range(epochs):
                 optimizer.zero_grad(set_to_none=True)
@@ -1696,10 +1718,14 @@ class TVFModel(nn.Module):
                     del total_loss, sim_loss, kinetic
 
                 # Record epoch loss in self.losses history and checkpoint best velocity BEFORE parameter updates
+                # without stalling the GPU on a per-epoch scalar sync or cloning T*3N buffers.
                 self.losses.append(loss_t)
-                if loss_t < best_level_loss_t:
-                    best_level_loss_t = loss_t
-                    best_velocity = self.velocity.detach().clone()
+                with torch.no_grad():
+                    loss_d = loss_t.to(dtype)
+                    improved = loss_d < best_level_loss_t
+                    have_best_vel = have_best_vel | improved
+                    best_level_loss_t = torch.where(improved, loss_d, best_level_loss_t)
+                    torch.where(improved, self.velocity.detach(), best_velocity, out=best_velocity)
                 
                 # Fluid regularization (smoothing velocity gradients)
                 # Batched across all T time steps to minimize conv3d kernel launches
@@ -1885,17 +1911,29 @@ class TVFModel(nn.Module):
                                 sl_last = [slice(None)] * (self.dim + 2)
                                 sl_last[d + 1] = -1
                                 vel_tapered[tuple(sl_last)] = 0.0
-                            reg_total_fn = build_level_regularizer(
+                            _tot_extra = {k: kwargs[k] for k in REGULARIZER_EXTRA_KEYS if k in kwargs and k != 'alpha'}
+                            _tot_dir_key = tuple(float(x) for x in np.asarray(self.direction).ravel().tolist())
+                            _tot_key = (
                                 regularizer_mode,
-                                alpha=total_alpha,
-                                spacing=vel_spacing,
-                                origin=self.origin,
-                                direction=self.direction,
-                                fluid_sigma=elastic_sigma_val or 3.0,
-                                param_domain="physical_mm",
-                                extra_reg_kwargs={k: kwargs[k] for k in REGULARIZER_EXTRA_KEYS if k in kwargs and k != 'alpha'},
+                                float(total_alpha) if total_alpha is not None else None,
+                                tuple(float(x) for x in vel_spacing),
+                                _tot_dir_key,
+                                float(elastic_sigma_val or 3.0),
                             )
-                            vel_smoothed = reg_total_fn(vel_tapered)
+                            if getattr(self, '_tvf_tot_cache_key', None) != _tot_key or _tot_extra != getattr(self, '_tvf_tot_extra', None):
+                                self._tvf_tot_fn = build_level_regularizer(
+                                    regularizer_mode,
+                                    alpha=total_alpha,
+                                    spacing=vel_spacing,
+                                    origin=self.origin,
+                                    direction=self.direction,
+                                    fluid_sigma=elastic_sigma_val or 3.0,
+                                    param_domain="physical_mm",
+                                    extra_reg_kwargs=_tot_extra,
+                                )
+                                self._tvf_tot_cache_key = _tot_key
+                                self._tvf_tot_extra = _tot_extra
+                            vel_smoothed = self._tvf_tot_fn(vel_tapered)
                         elif regularizer_mode in ['bspline', 'bsplinesyn']:
                             from .core.smoothing import smooth_displacement_field_bspline
                             vel_smoothed = smooth_displacement_field_bspline(
@@ -1915,9 +1953,13 @@ class TVFModel(nn.Module):
                         self.velocity.copy_(vel_smoothed.unsqueeze(1))
                     
                     if cfl_max_val > 0:
-                        vel_voxel = self.velocity / sp_t_zyx
-                        vel_voxel_norm = torch.norm(vel_voxel, dim=-1, keepdim=True)
-                        max_vel_norm = torch.amax(vel_voxel_norm)
+                        from .core.inverse import _scaled_sq_sum
+                        sp_zyx_flat = sp_t_zyx.reshape(-1)
+                        max_vel_sq = None
+                        for t_i in range(self.velocity.shape[0]):
+                            sq_ti = _scaled_sq_sum(self.velocity.data[t_i], sp_zyx_flat, divide=True).amax()
+                            max_vel_sq = sq_ti if max_vel_sq is None else torch.maximum(max_vel_sq, sq_ti)
+                        max_vel_norm = torch.sqrt(max_vel_sq)
                         cfl_scale = (cfl_max_val / torch.clamp_min(max_vel_norm, 1e-8)).clamp_max(1.0)
                         self.velocity.mul_(cfl_scale)
                     
@@ -1940,10 +1982,9 @@ class TVFModel(nn.Module):
                             ).view(self.n_time_steps, *([1] * (vel_data.ndim - 1)))
                             vel_data.mul_(scales)
 
-                # Logging and convergence checking (every 5 epochs to reduce GPU-CPU sync barriers)
+                # Logging and convergence checking (every 5 epochs: single batched device->host sync)
                 if epoch % 5 == 0 or epoch == epochs - 1:
-                    loss_val = float(loss_t.item())
-                    best_loss_val = float(best_level_loss_t.item())
+                    loss_val, best_loss_val = [float(v) for v in torch.stack([loss_t.to(dtype), best_level_loss_t]).tolist()]
                     check_loss_collapse(loss_val, best_loss_val, f"syntx.tvf level {level}")
                     recent_losses.append(loss_val)
 
@@ -1961,23 +2002,25 @@ class TVFModel(nn.Module):
             # so comparison against best_level_loss_t uses the identical total objective)
             if epochs > 0:
                 with torch.no_grad():
-                    final_kinetic = float(
-                        self._path_energy(
-                            energy_weight, temporal_weight, energy_alpha, vel_spacing, device, dtype
-                        ).item()
+                    final_kin_t = self._path_energy(
+                        energy_weight, temporal_weight, energy_alpha, vel_spacing, device, dtype
                     )
                     if not getattr(self, 'use_analytical_gradients', False):
-                        final_sim = float(self.forward(
+                        final_sim_t = self.forward(
                             curr_fixed, curr_moving,
                             multipoint_loss=multipoint_loss,
                             lncc_window_size=lncc_ws,
                             _level_ctx=level_ctx,
-                        ).item())
-                        final_total = final_sim + final_kinetic
-                        check_loss_collapse(final_total, float(best_level_loss_t.item()), f"syntx.tvf level {level} final")
-                        if final_total < float(best_level_loss_t.item()):
-                            best_level_loss_t = torch.tensor(final_total, device=device)
-                        elif best_velocity is not None:
+                        )
+                        final_tot_t = final_sim_t.to(dtype) + final_kin_t.to(dtype)
+                        final_total, best_lv, hb_f = [
+                            float(v)
+                            for v in torch.stack([final_tot_t, best_level_loss_t, have_best_vel.to(dtype)]).tolist()
+                        ]
+                        check_loss_collapse(final_total, best_lv, f"syntx.tvf level {level} final")
+                        if final_total < best_lv:
+                            best_level_loss_t = torch.tensor(final_total, device=device, dtype=dtype)
+                        elif hb_f > 0.5 and best_velocity is not None:
                             self.velocity.copy_(best_velocity)
                     else:
                         phi_05_to_0 = self.integrate(0.5, 0.0, image_shape=target_shape,
@@ -1995,24 +2038,32 @@ class TVFModel(nn.Module):
                             phi_moving_aff, shape_m_ag, spacing_m_ag, origin_m_ag, direction_m_ag
                         )
                         J_mid = grid_sample_nd(curr_moving, phi_moving_norm, mode='bilinear', padding_mode='zeros')
-                        final_sim = float(self._eval_similarity(I_mid, J_mid, lncc_window_size=lncc_ws).item())
-                        final_total = final_sim + final_kinetic
-                        if final_total < float(best_level_loss_t.item()):
-                            best_level_loss_t = torch.tensor(final_total, device=device)
-                        elif best_velocity is not None:
+                        final_sim_t = self._eval_similarity(I_mid, J_mid, lncc_window_size=lncc_ws)
+                        final_tot_t = final_sim_t.to(dtype) + final_kin_t.to(dtype)
+                        final_total, best_lv, hb_f = [
+                            float(v)
+                            for v in torch.stack([final_tot_t, best_level_loss_t, have_best_vel.to(dtype)]).tolist()
+                        ]
+                        if final_total < best_lv:
+                            best_level_loss_t = torch.tensor(final_total, device=device, dtype=dtype)
+                        elif hb_f > 0.5 and best_velocity is not None:
                             self.velocity.copy_(best_velocity)
+                del best_velocity
 
             # GPU memory management and garbage collection at level transitions
             if device.type == 'mps':
-                torch.mps.synchronize()
                 torch.mps.empty_cache()
             elif device.type == 'cuda':
                 torch.cuda.empty_cache()
 
             gc.collect()
 
-        # Convert losses to python floats
-        self.losses = [float(x.item()) if torch.is_tensor(x) else float(x) for x in self.losses]
+        # Convert losses to python floats in a single device->host transfer
+        if self.losses:
+            if all(torch.is_tensor(x) for x in self.losses):
+                self.losses = [float(v) for v in torch.stack([x.to(torch.float32) for x in self.losses]).tolist()]
+            else:
+                self.losses = [float(x.item()) if torch.is_tensor(x) else float(x) for x in self.losses]
 
         # Ensure velocity is at full image resolution after fit completes
         final_vel_shape = tuple(self.velocity.shape[2:-1])
@@ -2384,7 +2435,10 @@ def tvf_registration(
     raw_init_tx = initial_transform
     if initial_transform is None and initial_warp is None:
         from .robust_affine import robust_affine
-        reg_aff = robust_affine(fixed_primary, moving_primary, dof=affine_dof, mode=affine_mode, seed=affine_seed, verbose=verbose)
+        reg_aff = robust_affine(
+            fixed_primary, moving_primary, dof=affine_dof, mode=affine_mode, seed=affine_seed,
+            verbose=verbose, return_warped=False,
+        )
         raw_init_tx = reg_aff['fwdtransforms']
 
     _init_dev_tvf = device if backend.lower() == 'pytorch' else None
@@ -2447,11 +2501,19 @@ def tvf_registration(
             fixed, moving, winsorize_quantiles=winsor, backend='pytorch', device=device
         )
 
-        # --- Initialize model (resize parameter on CPU before GPU upload when coarse pyramid starts smaller) ---
+        # --- Initialize model directly at coarse velocity grid shape (avoids full-res zero alloc + resize) ---
+        _init_vel_shape = tuple(grid_shape_zyx)
+        if sum(reg_iterations) > 0 and levels and levels[0] > 1:
+            from .pyramid import plan_levels
+            _max_vel_ds = int(fit_kwargs.get('max_velocity_downsample', 1))
+            _init_vel_shape = tuple(
+                plan_levels(grid_shape_zyx, spacing, [max(levels[0], _max_vel_ds)], 'deformable')[0].shape_zyx
+            )
         model = TVFModel(
             dim=dim,
             image_shape=grid_shape_zyx,
             velocity_shape=grid_shape_zyx,
+            init_velocity_shape=_init_vel_shape,
             n_time_steps=n_time_steps,
             spacing=spacing,
             origin=origin,
@@ -2466,16 +2528,8 @@ def tvf_registration(
             adjoint=resolved_adjoint,
             integration_steps_per_interval=model_kwargs['integration_steps_per_interval'],
             use_analytical_gradients=model_kwargs.get('use_analytical_gradients', False),
-        )
-        if sum(reg_iterations) > 0 and levels and levels[0] > 1:
-            from .pyramid import plan_levels
-            _max_vel_ds = int(fit_kwargs.get('max_velocity_downsample', 1))
-            _init_vel_shape = tuple(
-                plan_levels(grid_shape_zyx, spacing, [max(levels[0], _max_vel_ds)], 'deformable')[0].shape_zyx
-            )
-            if _init_vel_shape != tuple(grid_shape_zyx):
-                model._resize_velocity(_init_vel_shape, 'cpu', torch.float32)
-        model = model.to(device)
+        ).to(device)
+        model._adjoint_explicit_false = ('adjoint' in advanced and not bool(advanced.get('adjoint')))
         model._foreground_mask_lncc = fg_mask
         model._gradient_checkpointing = grad_ckpt
         model.inverse_identity_weight = inverse_identity_weight
@@ -2587,11 +2641,13 @@ def tvf_registration(
             )
             if isinstance(inv_err_dict.get('error_map'), torch.Tensor):
                 inv_err_dict['error_map'] = inv_err_dict['error_map'].cpu()
-            fwd_disp = fwd_disp_gpu.cpu()
-            inv_disp = inv_disp_gpu.cpu()
+            if int(np.prod(grid_shape_zyx)) <= 16_777_216 and str(device) != 'cpu':
+                fwd_disp = fwd_disp_gpu
+                inv_disp = inv_disp_gpu
+            else:
+                fwd_disp = fwd_disp_gpu.cpu()
+                inv_disp = inv_disp_gpu.cpu()
             del fwd_disp_gpu, inv_disp_gpu
-            fwd_np = fwd_disp.squeeze(0).numpy()
-            inv_np = inv_disp.squeeze(0).numpy()
 
 
         T_grid = model.affine.get_matrix().detach().cpu().numpy()
@@ -2778,8 +2834,9 @@ def tvf_registration(
     fwd_file = tempfile.NamedTemporaryFile(suffix='_tvf_fwd_Warp.nii.gz', delete=False).name
     inv_file = tempfile.NamedTemporaryFile(suffix='_tvf_inv_Warp.nii.gz', delete=False).name
     _write_ants_images_fast([(fwd_img, fwd_file), (inv_img, inv_file)], compresslevel=1)
-    _cache_disp_image_and_field(fwd_file, fwd_img, _apply_dev)
-    _cache_disp_image_and_field(inv_file, inv_img, _apply_dev)
+    _cache_disp_image_and_field(fwd_file, fwd_img, _apply_dev, disp_tensor=fwd_disp)
+    _cache_disp_image_and_field(inv_file, inv_img, _apply_dev, disp_tensor=inv_disp)
+    del fwd_disp, inv_disp
 
     # Export physical affine transform using standardized ITK layout
     # Note: affine_file already incorporates initial_transform (absorbed during initialization)
@@ -2815,9 +2872,13 @@ def tvf_registration(
             whichtoinvert_inv = [True]
 
     # Generate warped output images (same as registration())
-    warpedmovout = _apply_transforms(fixed=fixed_primary, moving=moving_primary, transformlist=fwd_transforms)
-    warpedfixout = _apply_transforms(fixed=moving_primary, moving=fixed_primary, transformlist=inv_transforms,
-                                     whichtoinvert=whichtoinvert_inv)
+    warpedmovout = _apply_transforms(
+        fixed=fixed_primary, moving=moving_primary, transformlist=fwd_transforms, device=_apply_dev
+    )
+    warpedfixout = _apply_transforms(
+        fixed=moving_primary, moving=fixed_primary, transformlist=inv_transforms,
+        whichtoinvert=whichtoinvert_inv, device=_apply_dev,
+    )
 
     fit_time = _time.time() - t_start
 

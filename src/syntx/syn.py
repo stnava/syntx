@@ -483,7 +483,7 @@ class SyNTo(nn.Module):
         Per-axis deformation weights in [0, 1], physical (x, y, z) order (see ``syntx.syn``).
     seed : int, default 42
     """
-    def __init__(self, dim=3, grid_shape=(64, 64, 64), spacing=None, origin=None, direction=None, fluid_sigma=3.0, elastic_sigma=0.0, transform_type='Affine', inverse_method='anderson', inverse_steps=30, in_loop_inv_steps=6, project_inverse=True, projection_frequency=1, interpolator='linear', boundary_suppression_thresh=None, image_grad_clip=0.0, antisymmetric=True, use_ants_pseudo_gradient=False, inv_tolerance=None, dual_gradient=False, dual_gradient_weight=0.5, restrict_transformation=None, seed=42, stationary_boundary=True):
+    def __init__(self, dim=3, grid_shape=(64, 64, 64), spacing=None, origin=None, direction=None, fluid_sigma=3.0, elastic_sigma=0.0, transform_type='Affine', inverse_method='anderson', inverse_steps=30, in_loop_inv_steps=6, project_inverse=True, projection_frequency=1, interpolator='linear', boundary_suppression_thresh=None, image_grad_clip=0.0, antisymmetric=True, use_ants_pseudo_gradient=False, inv_tolerance=None, dual_gradient=False, dual_gradient_weight=0.5, restrict_transformation=None, seed=42, stationary_boundary=True, allocate_fields=True):
         super().__init__()
         self.dim = dim
         self.grid_shape = grid_shape
@@ -555,10 +555,17 @@ class SyNTo(nn.Module):
         self.affine = HierarchicalAffine(dim=dim, transform_type=transform_type)
         
         # Dense Symmetric Displacement Fields stored as parameters/buffers
-        self.warp_l2r = nn.Parameter(torch.zeros(1, *grid_shape, dim))
-        self.warp_r2l = nn.Parameter(torch.zeros(1, *grid_shape, dim))
-        self.warp_l2r_inv = nn.Parameter(torch.zeros(1, *grid_shape, dim))
-        self.warp_r2l_inv = nn.Parameter(torch.zeros(1, *grid_shape, dim))
+        # (skipped when allocate_fields=False because fit() builds pyramid-sized fields directly)
+        if allocate_fields:
+            self.warp_l2r = nn.Parameter(torch.zeros(1, *grid_shape, dim))
+            self.warp_r2l = nn.Parameter(torch.zeros(1, *grid_shape, dim))
+            self.warp_l2r_inv = nn.Parameter(torch.zeros(1, *grid_shape, dim))
+            self.warp_r2l_inv = nn.Parameter(torch.zeros(1, *grid_shape, dim))
+        else:
+            self.warp_l2r = None
+            self.warp_r2l = None
+            self.warp_l2r_inv = None
+            self.warp_r2l_inv = None
         
         # Loss convergence tracking
         self.affine_losses = []
@@ -753,14 +760,24 @@ class SyNTo(nn.Module):
             moving_image = moving_image.unsqueeze(0)
 
         lncc_window_size = 2 * lncc_radius + 1
+        sp_axes = tuple(range(2, fixed_image.ndim))
         with torch.no_grad():
-            for c in range(fixed_image.shape[1]):
-                i_min, i_max = torch.min(fixed_image[:, c]), torch.max(fixed_image[:, c])
-                if i_max > i_min + 1e-6:
-                    fixed_image[:, c].sub_(i_min).div_(i_max - i_min)
-                j_min, j_max = torch.min(moving_image[:, c]), torch.max(moving_image[:, c])
-                if j_max > j_min + 1e-6:
-                    moving_image[:, c].sub_(j_min).div_(j_max - j_min)
+            i_min = fixed_image.amin(dim=sp_axes, keepdim=True)
+            i_max = fixed_image.amax(dim=sp_axes, keepdim=True)
+            i_span = i_max - i_min
+            fixed_image = torch.where(
+                i_span > 1e-6,
+                (fixed_image - i_min) / i_span.clamp(min=1e-6),
+                fixed_image,
+            )
+            j_min = moving_image.amin(dim=sp_axes, keepdim=True)
+            j_max = moving_image.amax(dim=sp_axes, keepdim=True)
+            j_span = j_max - j_min
+            moving_image = torch.where(
+                j_span > 1e-6,
+                (moving_image - j_min) / j_span.clamp(min=1e-6),
+                moving_image,
+            )
         
         device = fixed_image.device
         dtype = fixed_image.dtype
@@ -1180,22 +1197,41 @@ class SyNTo(nn.Module):
             loss_sync_every = int(kwargs.get('loss_sync_every', getattr(self, 'loss_sync_every', 5)))
             if loss_sync_every < 1:
                 raise ValueError(f"loss_sync_every must be >= 1, got {loss_sync_every}")
+            _large_level = int(np.prod(curr_spatial)) > 16_777_216
+            _lvl_inv_method = (
+                'fixed_point'
+                if (_large_level and str(self.inverse_method).lower() == 'anderson')
+                else self.inverse_method
+            )
             best_level_loss_t = torch.full((), float('inf'), device=warp_l2r.device, dtype=warp_l2r.dtype)
-            best_warp_l2r = torch.zeros_like(warp_l2r.detach())
-            best_warp_r2l = torch.zeros_like(warp_r2l.detach())
-            best_warp_l2r_inv = torch.zeros_like(warp_l2r_inv.detach())
-            best_warp_r2l_inv = torch.zeros_like(warp_r2l_inv.detach())
+            _best_dev = 'cpu' if _large_level else warp_l2r.device
+            best_warp_l2r = torch.zeros(warp_l2r.shape, device=_best_dev, dtype=warp_l2r.dtype)
+            best_warp_r2l = torch.zeros(warp_r2l.shape, device=_best_dev, dtype=warp_r2l.dtype)
+            best_warp_l2r_inv = torch.zeros(warp_l2r_inv.shape, device=_best_dev, dtype=warp_l2r_inv.dtype)
+            best_warp_r2l_inv = torch.zeros(warp_r2l_inv.shape, device=_best_dev, dtype=warp_r2l_inv.dtype)
             have_best = False
             level_losses_host = []      # floats, filled at sync epochs
             self._inv_step_hint = {}    # Anderson iterations needed by the previous epoch, per call site
             metric_losses_dict = {}
 
             def _inverse_pair(fwd_l, fwd_r, init_l, init_r, key, X_phys_arg=None, use_tol=True):
-                """Invert two fields in one batched call: one stopping test (one host-device
-                sync) covers both, and the iteration count the previous epoch needed is used to
-                defer that test. Returns views (1, ...) of the (2, ...) result."""
+                """Invert two fields: batched (B=2) on standard grids, sequential B=1 fixed-point above 256^3."""
                 tol_kw = (dict(max_error_threshold=self.inv_tolerance, mean_error_threshold=self.inv_tolerance * 0.01)
                           if use_tol else {})
+                if _large_level:
+                    out_l = update_inverse_field_nd(
+                        fwd_l.detach(), init_l.detach(),
+                        steps=in_loop_inv_steps, method=_lvl_inv_method,
+                        spacing=curr_spacing_fixed, origin=fixed_origin, direction=fixed_direction,
+                        X_phys=X_phys_arg, **tol_kw)
+                    del init_l
+                    out_r = update_inverse_field_nd(
+                        fwd_r.detach(), init_r.detach(),
+                        steps=in_loop_inv_steps, method=_lvl_inv_method,
+                        spacing=curr_spacing_fixed, origin=fixed_origin, direction=fixed_direction,
+                        X_phys=X_phys_arg, **tol_kw)
+                    del init_r
+                    return out_l, out_r
                 stats = {}
                 fwd_pair = torch.cat([fwd_l.detach(), fwd_r.detach()])
                 init_pair = torch.cat([init_l.detach(), init_r.detach()])
@@ -1225,6 +1261,46 @@ class SyNTo(nn.Module):
                 if in_loop_inv_steps <= 0:
                     return w_l_inv, w_r_inv
                 with torch.no_grad():
+                    if _large_level:
+                        from .core.digital_diffeomorphism import _d_rev_t_and_scale, _eval_dual_fd_det_min_scalar_slabbed
+                        _sp_rev_dd = list(reversed(curr_spacing_fixed))
+                        _dir_rev_dd = _dir_2d[::-1, ::-1].copy()
+                        _d_rev_t_dd = torch.tensor(_dir_rev_dd.T.copy(), device=w_l.device, dtype=w_l.dtype)
+                        _s_d_dd = float(np.linalg.det(np.linalg.inv(_dir_rev_dd)))
+                        min_l = _eval_dual_fd_det_min_scalar_slabbed(
+                            w_l.detach(), _sp_rev_dd, _d_rev_t_dd, _s_d_dd, False, True
+                        )
+                        min_r = _eval_dual_fd_det_min_scalar_slabbed(
+                            w_r.detach(), _sp_rev_dd, _d_rev_t_dd, _s_d_dd, False, True
+                        )
+                        min_jac_pair = torch.stack([min_l, min_r])
+                        del _d_rev_t_dd, min_l, min_r
+                        fold_flags = (min_jac_pair <= cfl_proj_jac_floor).tolist()
+                        modified = False
+                        for w_b, w_b_inv, is_folded in (
+                            (w_l, w_l_inv, fold_flags[0]),
+                            (w_r, w_r_inv, fold_flags[1]),
+                        ):
+                            b_stats = {}
+                            proj_b = update_inverse_field_nd(
+                                w_b_inv.detach(), w_b.detach(),
+                                steps=in_loop_inv_steps, method=_lvl_inv_method,
+                                spacing=curr_spacing_fixed, origin=fixed_origin, direction=fixed_direction,
+                                X_phys=X_phys_arg,
+                                max_error_threshold=0.0 if is_folded else cfl_proj_tol,
+                                mean_error_threshold=0.0 if is_folded else float('inf'),
+                                check_after=1, stats=b_stats,
+                            )
+                            if is_folded or not (b_stats.get('converged', False) and b_stats.get('steps', 1) == 0):
+                                w_b.copy_(proj_b)
+                                modified = True
+                            del proj_b
+                        if modified:
+                            self._cfl_proj_triggered_epochs += 1
+                            return _inverse_pair(
+                                w_l, w_r, w_l_inv, w_r_inv, 'inv', X_phys_arg=X_phys_arg, use_tol=True
+                            )
+                        return w_l_inv, w_r_inv
                     fwd_pair = torch.cat([w_l.detach(), w_r.detach()])
                     fwd_pair.is_physical = True
                     det_pair = compute_physical_jacobian_determinant(
@@ -1769,14 +1845,21 @@ class SyNTo(nn.Module):
                     self.syn_losses.append(loss_t)
                     level_syn_losses.append(loss_t)
                     with torch.no_grad():
-                        # Best-state snapshot without a host decision: a masked copy into
-                        # preallocated buffers (improved is a device scalar).
+                        # Best-state snapshot without a host decision on <=256^3 grids;
+                        # above 256^3 voxels, best_warp_* live on CPU to save 4x3N GPU VRAM.
                         improved = loss_t < best_level_loss_t
                         best_level_loss_t = torch.minimum(best_level_loss_t, loss_t)
-                        torch.where(improved, warp_l2r.detach(), best_warp_l2r, out=best_warp_l2r)
-                        torch.where(improved, warp_r2l.detach(), best_warp_r2l, out=best_warp_r2l)
-                        torch.where(improved, warp_l2r_inv.detach(), best_warp_l2r_inv, out=best_warp_l2r_inv)
-                        torch.where(improved, warp_r2l_inv.detach(), best_warp_r2l_inv, out=best_warp_r2l_inv)
+                        if _large_level:
+                            if bool(improved.item()):
+                                best_warp_l2r.copy_(warp_l2r.detach())
+                                best_warp_r2l.copy_(warp_r2l.detach())
+                                best_warp_l2r_inv.copy_(warp_l2r_inv.detach())
+                                best_warp_r2l_inv.copy_(warp_r2l_inv.detach())
+                        else:
+                            torch.where(improved, warp_l2r.detach(), best_warp_l2r, out=best_warp_l2r)
+                            torch.where(improved, warp_r2l.detach(), best_warp_r2l, out=best_warp_r2l)
+                            torch.where(improved, warp_l2r_inv.detach(), best_warp_l2r_inv, out=best_warp_l2r_inv)
+                            torch.where(improved, warp_r2l_inv.detach(), best_warp_r2l_inv, out=best_warp_r2l_inv)
                     have_best = True
 
                 del I_mid, J_mid, grad_I_mid_sampled, grad_J_mid_sampled, in_bounds_mask
@@ -1788,6 +1871,11 @@ class SyNTo(nn.Module):
                 curr_fluid_sig = float(curr_fluid_var)
                     
                 kernel_type = kwargs.get('kernel_type', getattr(self, 'kernel_type', 'bessel'))
+                gauss_kernel_type = (
+                    kernel_type
+                    if kernel_type in ('bessel', 'gaussian', 'sobolev', 'compact', 'compact_gaussian', 'erf')
+                    else 'bessel'
+                )
                 regularizer = kwargs.get('regularizer', kwargs.get('kernel_type', 'gaussian'))
                 is_regadam_opt = optimizer_type in (
                     'reg_adam', 'regadam', 'sobolev_adam', 'gaussian_adam', 'dsti_adam'
@@ -1824,9 +1912,9 @@ class SyNTo(nn.Module):
                             warp_r2l.grad = None
                         else:
                             # FFT Sobolev Green's operator + spatial Gaussian post-filter (conservative mode)
-                            grad_l = separable_gaussian_filter(self._apply_sobolev_green_operator(warp_l2r.grad, fluid_sigma=curr_fluid_sig, alpha=alpha_sobolev, spacing=curr_spacing_fixed), curr_fluid_sig * 0.5, kernel_type=kernel_type)
+                            grad_l = separable_gaussian_filter(self._apply_sobolev_green_operator(warp_l2r.grad, fluid_sigma=curr_fluid_sig, alpha=alpha_sobolev, spacing=curr_spacing_fixed), curr_fluid_sig * 0.5, kernel_type=gauss_kernel_type)
                             warp_l2r.grad = None
-                            grad_r = separable_gaussian_filter(self._apply_sobolev_green_operator(warp_r2l.grad, fluid_sigma=curr_fluid_sig, alpha=alpha_sobolev, spacing=curr_spacing_fixed), curr_fluid_sig * 0.5, kernel_type=kernel_type)
+                            grad_r = separable_gaussian_filter(self._apply_sobolev_green_operator(warp_r2l.grad, fluid_sigma=curr_fluid_sig, alpha=alpha_sobolev, spacing=curr_spacing_fixed), curr_fluid_sig * 0.5, kernel_type=gauss_kernel_type)
                             warp_r2l.grad = None
                     elif regularizer in ['dsti', 'dst1', 'dst_i']:
                         if fast_smooth:
@@ -1837,9 +1925,9 @@ class SyNTo(nn.Module):
                             warp_r2l.grad = None
                         else:
                             # FFT DST-I Green's operator + spatial Gaussian post-filter (conservative mode)
-                            grad_l = separable_gaussian_filter(self._apply_dsti_green_operator(warp_l2r.grad, fluid_sigma=curr_fluid_sig, alpha=alpha_sobolev, spacing=curr_spacing_fixed), curr_fluid_sig * 0.5, kernel_type=kernel_type)
+                            grad_l = separable_gaussian_filter(self._apply_dsti_green_operator(warp_l2r.grad, fluid_sigma=curr_fluid_sig, alpha=alpha_sobolev, spacing=curr_spacing_fixed), curr_fluid_sig * 0.5, kernel_type=gauss_kernel_type)
                             warp_l2r.grad = None
-                            grad_r = separable_gaussian_filter(self._apply_dsti_green_operator(warp_r2l.grad, fluid_sigma=curr_fluid_sig, alpha=alpha_sobolev, spacing=curr_spacing_fixed), curr_fluid_sig * 0.5, kernel_type=kernel_type)
+                            grad_r = separable_gaussian_filter(self._apply_dsti_green_operator(warp_r2l.grad, fluid_sigma=curr_fluid_sig, alpha=alpha_sobolev, spacing=curr_spacing_fixed), curr_fluid_sig * 0.5, kernel_type=gauss_kernel_type)
                             warp_r2l.grad = None
                     elif regularizer == 'dsti1':
                         if fast_smooth:
@@ -1850,9 +1938,9 @@ class SyNTo(nn.Module):
                             warp_r2l.grad = None
                         else:
                             # Separable 1D DST-I + spatial Gaussian post-filter
-                            grad_l = separable_gaussian_filter(self._apply_dsti1_green_operator(warp_l2r.grad, fluid_sigma=curr_fluid_sig, alpha=alpha_sobolev, spacing=curr_spacing_fixed), curr_fluid_sig * 0.5, kernel_type=kernel_type)
+                            grad_l = separable_gaussian_filter(self._apply_dsti1_green_operator(warp_l2r.grad, fluid_sigma=curr_fluid_sig, alpha=alpha_sobolev, spacing=curr_spacing_fixed), curr_fluid_sig * 0.5, kernel_type=gauss_kernel_type)
                             warp_l2r.grad = None
-                            grad_r = separable_gaussian_filter(self._apply_dsti1_green_operator(warp_r2l.grad, fluid_sigma=curr_fluid_sig, alpha=alpha_sobolev, spacing=curr_spacing_fixed), curr_fluid_sig * 0.5, kernel_type=kernel_type)
+                            grad_r = separable_gaussian_filter(self._apply_dsti1_green_operator(warp_r2l.grad, fluid_sigma=curr_fluid_sig, alpha=alpha_sobolev, spacing=curr_spacing_fixed), curr_fluid_sig * 0.5, kernel_type=gauss_kernel_type)
                             warp_r2l.grad = None
                     elif regularizer in ['bspline', 'bsplinesyn']:
                         grad_l = self._apply_bspline_operator(
@@ -1896,23 +1984,56 @@ class SyNTo(nn.Module):
                                 extra_reg_kwargs=extra_kwargs,
                             )
                             self._syn_reg_cache_key = _reg_key_syn
-                        grad_l = self._syn_reg_fn(warp_l2r.grad)
-                        warp_l2r.grad = None
-                        grad_r = self._syn_reg_fn(warp_r2l.grad)
-                        warp_r2l.grad = None
-                    else:
-                        if fast_smooth:
-                            # Spectral Gaussian: Sobolev Green's with soft alpha (FFT-based)
-                            grad_l = self._apply_sobolev_green_operator(warp_l2r.grad, fluid_sigma=curr_fluid_sig, alpha=curr_fluid_sig / 2.0, spacing=curr_spacing_fixed)
+                        if _large_level:
+                            grad_l = self._syn_reg_fn(warp_l2r.grad)
                             warp_l2r.grad = None
-                            grad_r = self._apply_sobolev_green_operator(warp_r2l.grad, fluid_sigma=curr_fluid_sig, alpha=curr_fluid_sig / 2.0, spacing=curr_spacing_fixed)
+                            grad_r = self._syn_reg_fn(warp_r2l.grad)
                             warp_r2l.grad = None
                         else:
-                            # Spatial Gaussian: separable convolution filter
-                            grad_l = separable_gaussian_filter(warp_l2r.grad, curr_fluid_sig, kernel_type=kernel_type)
+                            _g_pair = torch.cat([warp_l2r.grad, warp_r2l.grad], dim=0)
                             warp_l2r.grad = None
-                            grad_r = separable_gaussian_filter(warp_r2l.grad, curr_fluid_sig, kernel_type=kernel_type)
                             warp_r2l.grad = None
+                            _g_smooth = self._syn_reg_fn(_g_pair)
+                            del _g_pair
+                            grad_l, grad_r = _g_smooth[0:1], _g_smooth[1:2]
+                            del _g_smooth
+                    else:
+                        if fast_smooth:
+                            if _large_level:
+                                grad_l = self._apply_sobolev_green_operator(
+                                    warp_l2r.grad, fluid_sigma=curr_fluid_sig, alpha=curr_fluid_sig / 2.0, spacing=curr_spacing_fixed
+                                )
+                                warp_l2r.grad = None
+                                grad_r = self._apply_sobolev_green_operator(
+                                    warp_r2l.grad, fluid_sigma=curr_fluid_sig, alpha=curr_fluid_sig / 2.0, spacing=curr_spacing_fixed
+                                )
+                                warp_r2l.grad = None
+                            else:
+                                # Spectral Gaussian: Sobolev Green's with soft alpha (FFT-based, batched B=2)
+                                _g_pair = torch.cat([warp_l2r.grad, warp_r2l.grad], dim=0)
+                                warp_l2r.grad = None
+                                warp_r2l.grad = None
+                                _g_smooth = self._apply_sobolev_green_operator(
+                                    _g_pair, fluid_sigma=curr_fluid_sig, alpha=curr_fluid_sig / 2.0, spacing=curr_spacing_fixed
+                                )
+                                del _g_pair
+                                grad_l, grad_r = _g_smooth[0:1], _g_smooth[1:2]
+                                del _g_smooth
+                        else:
+                            if _large_level:
+                                grad_l = separable_gaussian_filter(warp_l2r.grad, curr_fluid_sig, kernel_type=gauss_kernel_type)
+                                warp_l2r.grad = None
+                                grad_r = separable_gaussian_filter(warp_r2l.grad, curr_fluid_sig, kernel_type=gauss_kernel_type)
+                                warp_r2l.grad = None
+                            else:
+                                # Spatial Gaussian: separable convolution filter (batched B=2)
+                                _g_pair = torch.cat([warp_l2r.grad, warp_r2l.grad], dim=0)
+                                warp_l2r.grad = None
+                                warp_r2l.grad = None
+                                _g_smooth = separable_gaussian_filter(_g_pair, curr_fluid_sig, kernel_type=gauss_kernel_type)
+                                del _g_pair
+                                grad_l, grad_r = _g_smooth[0:1], _g_smooth[1:2]
+                                del _g_smooth
 
                     # Deformed-space smoothing: warp gradient to deformed config,
                     # smooth there, warp back. This bounds ∇_y δ (gradient in deformed
@@ -2067,8 +2188,8 @@ class SyNTo(nn.Module):
                         
                         if self.elastic_sigma > 0.0:
                             elastic_sig_val = float(self.elastic_sigma)
-                            warp_l2r.copy_(separable_gaussian_filter(warp_l2r, elastic_sig_val, kernel_type=kernel_type))
-                            warp_r2l.copy_(separable_gaussian_filter(warp_r2l, elastic_sig_val, kernel_type=kernel_type))
+                            warp_l2r.copy_(separable_gaussian_filter(warp_l2r, elastic_sig_val, kernel_type=gauss_kernel_type))
+                            warp_r2l.copy_(separable_gaussian_filter(warp_r2l, elastic_sig_val, kernel_type=gauss_kernel_type))
                             
                         # ITK-style diffeomorphic projection: compute inverse fields
                         if need_inv_refresh:
@@ -2104,8 +2225,8 @@ class SyNTo(nn.Module):
                                 warp_l2r.copy_(self._apply_bspline_operator(warp_l2r, spacing=curr_spacing_fixed, origin=fixed_origin, spline_distance=kwargs.get('elastic_spline_distance', kwargs.get('spline_distance')), mesh_size=kwargs.get('elastic_mesh_size', kwargs.get('mesh_size')), fluid_sigma=elastic_sig_val, **kwargs))
                                 warp_r2l.copy_(self._apply_bspline_operator(warp_r2l, spacing=curr_spacing_fixed, origin=fixed_origin, spline_distance=kwargs.get('elastic_spline_distance', kwargs.get('spline_distance')), mesh_size=kwargs.get('elastic_mesh_size', kwargs.get('mesh_size')), fluid_sigma=elastic_sig_val, **kwargs))
                             else:
-                                warp_l2r.copy_(separable_gaussian_filter(warp_l2r, elastic_sig_val, kernel_type=kernel_type))
-                                warp_r2l.copy_(separable_gaussian_filter(warp_r2l, elastic_sig_val, kernel_type=kernel_type))
+                                warp_l2r.copy_(separable_gaussian_filter(warp_l2r, elastic_sig_val, kernel_type=gauss_kernel_type))
+                                warp_r2l.copy_(separable_gaussian_filter(warp_r2l, elastic_sig_val, kernel_type=gauss_kernel_type))
                             
                         warp_l2r_inv, warp_r2l_inv = _inverse_pair(
                             warp_l2r, warp_r2l, warp_l2r_inv, warp_r2l_inv, 'inv', X_phys_arg=X_phys, use_tol=False)
@@ -2345,7 +2466,7 @@ class SyNTo(nn.Module):
                     )
                     
             # Evaluate final state after the last optimization step
-            def _eval_syn():
+            def _eval_syn_t():
                 with torch.no_grad():
                     I_m, J_m, _, _, mask_m = prepare_mid_images_and_gradients_torch(
                         warp_l2r, warp_r2l, I_curr, J_curr,
@@ -2357,20 +2478,26 @@ class SyNTo(nn.Module):
                         interpolator=self.interpolator,
                         use_analytical_gradients=False
                     )
-                    l_eval = 0.0
+                    l_eval = None
                     for name, fn, weight in zip(active_metric_names, active_loss_functions, curr_metric_weights):
-                        val_l = fn(I_m, J_m, mask=mask_m)
-                        l_eval += weight * val_l
-                    return float(l_eval.item())
+                        val_l = weight * fn(I_m, J_m, mask=mask_m)
+                        l_eval = val_l if l_eval is None else (l_eval + val_l)
+                    return l_eval
 
             if curr_syn_epochs > 0:
-                final_loss = _eval_syn()
-                if have_best and not (final_loss < float(best_level_loss_t.item())):
-                    with torch.no_grad():
-                        warp_l2r.data.copy_(best_warp_l2r)
-                        warp_r2l.data.copy_(best_warp_r2l)
-                        warp_l2r_inv = best_warp_l2r_inv
-                        warp_r2l_inv = best_warp_r2l_inv
+                final_loss_t = _eval_syn_t()
+                if have_best:
+                    final_loss, best_lv_val = [
+                        float(v)
+                        for v in torch.stack([final_loss_t.to(best_level_loss_t.dtype), best_level_loss_t]).tolist()
+                    ]
+                    if not (final_loss < best_lv_val):
+                        with torch.no_grad():
+                            warp_l2r.data.copy_(best_warp_l2r)
+                            warp_r2l.data.copy_(best_warp_r2l)
+                            warp_l2r_inv = best_warp_l2r_inv.to(warp_l2r.device) if _large_level else best_warp_l2r_inv
+                            warp_r2l_inv = best_warp_r2l_inv.to(warp_r2l.device) if _large_level else best_warp_r2l_inv
+                del final_loss_t
 
                 _polish_steps = int(kwargs.get('polish_inv_steps', 30))
                 _raw_ie = kwargs.get('inv_refresh_every', (1, 2, 4))
@@ -2385,36 +2512,85 @@ class SyNTo(nn.Module):
                         if (_polish_steps > 0 or _lvl_pproj) else float(self.inv_tolerance)
                     )
                     with torch.no_grad():
-                        _fwd_p = torch.cat([warp_l2r.detach(), warp_r2l.detach()])
-                        _init_p = torch.cat([warp_l2r_inv.detach(), warp_r2l_inv.detach()])
-                        _out_p = update_inverse_field_nd(
-                            _fwd_p, _init_p,
-                            steps=_p_steps, method=self.inverse_method,
-                            spacing=curr_spacing_fixed, origin=fixed_origin, direction=fixed_direction,
-                            X_phys=X_phys,
-                            max_error_threshold=_p_tol, mean_error_threshold=_p_tol * 0.01,
-                        )
-                        if _lvl_pproj:
-                            _proj_p = update_inverse_field_nd(
-                                _out_p, _fwd_p,
-                                steps=_p_steps, method=self.inverse_method,
+                        if _large_level:
+                            warp_l2r_inv = update_inverse_field_nd(
+                                warp_l2r.detach(), warp_l2r_inv.detach(),
+                                steps=_p_steps, method=_lvl_inv_method,
                                 spacing=curr_spacing_fixed, origin=fixed_origin, direction=fixed_direction,
                                 X_phys=X_phys,
                                 max_error_threshold=_p_tol, mean_error_threshold=_p_tol * 0.01,
                             )
-                            warp_l2r.data.copy_(_proj_p[0:1])
-                            warp_r2l.data.copy_(_proj_p[1:2])
+                            warp_r2l_inv = update_inverse_field_nd(
+                                warp_r2l.detach(), warp_r2l_inv.detach(),
+                                steps=_p_steps, method=_lvl_inv_method,
+                                spacing=curr_spacing_fixed, origin=fixed_origin, direction=fixed_direction,
+                                X_phys=X_phys,
+                                max_error_threshold=_p_tol, mean_error_threshold=_p_tol * 0.01,
+                            )
+                            if _lvl_pproj:
+                                _proj_l = update_inverse_field_nd(
+                                    warp_l2r_inv.detach(), warp_l2r.detach(),
+                                    steps=_p_steps, method=_lvl_inv_method,
+                                    spacing=curr_spacing_fixed, origin=fixed_origin, direction=fixed_direction,
+                                    X_phys=X_phys,
+                                    max_error_threshold=_p_tol, mean_error_threshold=_p_tol * 0.01,
+                                )
+                                warp_l2r.data.copy_(_proj_l)
+                                del _proj_l
+                                _proj_r = update_inverse_field_nd(
+                                    warp_r2l_inv.detach(), warp_r2l.detach(),
+                                    steps=_p_steps, method=_lvl_inv_method,
+                                    spacing=curr_spacing_fixed, origin=fixed_origin, direction=fixed_direction,
+                                    X_phys=X_phys,
+                                    max_error_threshold=_p_tol, mean_error_threshold=_p_tol * 0.01,
+                                )
+                                warp_r2l.data.copy_(_proj_r)
+                                del _proj_r
+                                warp_l2r_inv = update_inverse_field_nd(
+                                    warp_l2r.detach(), warp_l2r_inv.detach(),
+                                    steps=_p_steps, method=_lvl_inv_method,
+                                    spacing=curr_spacing_fixed, origin=fixed_origin, direction=fixed_direction,
+                                    X_phys=X_phys,
+                                    max_error_threshold=_p_tol, mean_error_threshold=_p_tol * 0.01,
+                                )
+                                warp_r2l_inv = update_inverse_field_nd(
+                                    warp_r2l.detach(), warp_r2l_inv.detach(),
+                                    steps=_p_steps, method=_lvl_inv_method,
+                                    spacing=curr_spacing_fixed, origin=fixed_origin, direction=fixed_direction,
+                                    X_phys=X_phys,
+                                    max_error_threshold=_p_tol, mean_error_threshold=_p_tol * 0.01,
+                                )
+                        else:
+                            _fwd_p = torch.cat([warp_l2r.detach(), warp_r2l.detach()])
+                            _init_p = torch.cat([warp_l2r_inv.detach(), warp_r2l_inv.detach()])
                             _out_p = update_inverse_field_nd(
-                                _proj_p, _out_p,
+                                _fwd_p, _init_p,
                                 steps=_p_steps, method=self.inverse_method,
                                 spacing=curr_spacing_fixed, origin=fixed_origin, direction=fixed_direction,
                                 X_phys=X_phys,
                                 max_error_threshold=_p_tol, mean_error_threshold=_p_tol * 0.01,
                             )
-                            del _proj_p
-                        warp_l2r_inv = _out_p[0:1].clone()
-                        warp_r2l_inv = _out_p[1:2].clone()
-                        del _fwd_p, _init_p, _out_p
+                            if _lvl_pproj:
+                                _proj_p = update_inverse_field_nd(
+                                    _out_p, _fwd_p,
+                                    steps=_p_steps, method=self.inverse_method,
+                                    spacing=curr_spacing_fixed, origin=fixed_origin, direction=fixed_direction,
+                                    X_phys=X_phys,
+                                    max_error_threshold=_p_tol, mean_error_threshold=_p_tol * 0.01,
+                                )
+                                warp_l2r.data.copy_(_proj_p[0:1])
+                                warp_r2l.data.copy_(_proj_p[1:2])
+                                _out_p = update_inverse_field_nd(
+                                    _proj_p, _out_p,
+                                    steps=_p_steps, method=self.inverse_method,
+                                    spacing=curr_spacing_fixed, origin=fixed_origin, direction=fixed_direction,
+                                    X_phys=X_phys,
+                                    max_error_threshold=_p_tol, mean_error_threshold=_p_tol * 0.01,
+                                )
+                                del _proj_p
+                            warp_l2r_inv = _out_p[0:1].clone()
+                            warp_r2l_inv = _out_p[1:2].clone()
+                            del _fwd_p, _init_p, _out_p
 
             warp_l2r.requires_grad_(False)
             warp_r2l.requires_grad_(False)
@@ -2661,6 +2837,7 @@ class SyNTo(nn.Module):
                 del phi_l2r_phys, disp_r2l_sampled
 
                 phi_r2l_phys = X_phys + w_r2l_inv
+                del w_r2l_inv
                 coords_norm_r = physical_to_normalized_torch_cached(
                     phi_r2l_phys, comp_shape_t, comp_spacing_t, comp_origin_t, comp_direction_t
                 )
@@ -2670,6 +2847,12 @@ class SyNTo(nn.Module):
                 del coords_norm_r
                 algebraic_inv = phi_r2l_phys + disp_l2r_sampled - X_phys
                 del phi_r2l_phys, disp_l2r_sampled
+
+                _early_offload = bool(offload_midpoints and math.prod(int(s) for s in target_grid_shape) > 16_777_216)
+                if _early_offload:
+                    w_l2r_inv = w_l2r_inv.cpu()
+                    w_r2l = w_r2l.cpu()
+                    w_l2r = w_l2r.cpu()
 
                 if self.stationary_boundary:
                     _zero_boundary_inplace(fwd_composed)
@@ -2700,7 +2883,7 @@ class SyNTo(nn.Module):
                         if compose_polish_tol is not None and float(compose_polish_tol) > 0.0
                         else 0.30
                     )
-                    _fwd_pre_dd = fwd_composed.clone()
+                    _fwd_pre_dd = fwd_composed
                     fwd_composed, algebraic_inv = enforce_digital_diffeomorphism_nd(
                         fwd_composed,
                         algebraic_inv,
@@ -2713,37 +2896,47 @@ class SyNTo(nn.Module):
                         steps=_dd_steps,
                         stationary_boundary=self.stationary_boundary,
                     )
-                    _delta_dd = fwd_composed - _fwd_pre_dd
-                    del _fwd_pre_dd
-                    w_l2r, w_r2l, w_l2r_inv, w_r2l_inv = pullback_digital_diffeomorphism_to_halves(
-                        _delta_dd,
-                        w_l2r,
-                        w_r2l,
-                        w_l2r_inv,
-                        w_r2l_inv,
-                        spacing=fixed_spacing,
-                        origin=fixed_origin,
-                        direction=fixed_direction,
-                        X_phys=X_phys,
-                        jac_floor=_dd_floor,
-                        stationary_boundary=self.stationary_boundary,
-                    )
-                    del _delta_dd
+                    if fwd_composed is not _fwd_pre_dd:
+                        _delta_dd = fwd_composed - _fwd_pre_dd
+                        del _fwd_pre_dd
+                        if _early_offload:
+                            w_l2r = w_l2r.to(device=device, dtype=dtype)
+                            w_r2l = w_r2l.to(device=device, dtype=dtype)
+                            w_l2r_inv = w_l2r_inv.to(device=device, dtype=dtype)
+                        w_l2r, w_r2l, w_l2r_inv, _ = pullback_digital_diffeomorphism_to_halves(
+                            _delta_dd,
+                            w_l2r,
+                            w_r2l,
+                            w_l2r_inv,
+                            None,
+                            spacing=fixed_spacing,
+                            origin=fixed_origin,
+                            direction=fixed_direction,
+                            X_phys=X_phys,
+                            jac_floor=_dd_floor,
+                            stationary_boundary=self.stationary_boundary,
+                        )
+                        del _delta_dd
+                        if _early_offload:
+                            w_l2r_inv = w_l2r_inv.cpu()
+                            w_r2l = w_r2l.cpu()
+                            w_l2r = w_l2r.cpu()
+                    else:
+                        del _fwd_pre_dd
 
-                del w_r2l_inv
-                mid_l2r_inv = w_l2r_inv.cpu() if offload_midpoints else w_l2r_inv
+                mid_l2r_inv = w_l2r_inv.cpu() if (offload_midpoints and w_l2r_inv.device.type != 'cpu') else w_l2r_inv
                 del w_l2r_inv
                 self.midpoint_warp_l2r_inv = nn.Parameter(mid_l2r_inv, requires_grad=False)
                 self.midpoint_warp_l2r_inv.is_physical = True
                 del mid_l2r_inv
 
-                mid_r2l = w_r2l.cpu() if offload_midpoints else w_r2l
+                mid_r2l = w_r2l.cpu() if (offload_midpoints and w_r2l.device.type != 'cpu') else w_r2l
                 del w_r2l
                 self.midpoint_warp_r2l = nn.Parameter(mid_r2l, requires_grad=False)
                 self.midpoint_warp_r2l.is_physical = True
                 del mid_r2l
 
-                mid_l2r = w_l2r.cpu() if offload_midpoints else w_l2r
+                mid_l2r = w_l2r.cpu() if (offload_midpoints and w_l2r.device.type != 'cpu') else w_l2r
                 del w_l2r
                 self.midpoint_warp_l2r = nn.Parameter(mid_l2r, requires_grad=False)
                 self.midpoint_warp_l2r.is_physical = True
@@ -3351,6 +3544,7 @@ def registration(
     if isinstance(_raw_mc, bool) or not isinstance(_raw_mc, int) or _raw_mc < 1:
         raise ValueError(f"syntx.syn: metric_chunks must be a positive integer, got {_raw_mc!r}")
 
+    _mind_gpu_pair = None
     # Turnkey Sulcal Guidance: automatically extract probability maps and configure weights
     if guided in (True, 'sulcal'):
         from .surface import extract_sulcal_probability_map
@@ -3389,15 +3583,21 @@ def registration(
             p_sz = 3 if min(int(n) for n in f0_m.shape) < 32 else 5
             fixed_mind_t = compute_mind(f0_m, n_offsets=mind_offsets, patch_size=p_sz, offset_distance=off_mm, device=kwargs.get('device'))
             moving_mind_t = compute_mind(m0_m, n_offsets=mind_offsets, patch_size=p_sz, offset_distance=off_mm, device=kwargs.get('device'))
-            fixed = fixed_base + [
-                ants.from_numpy(fixed_mind_t[0, c].detach().cpu().numpy(), origin=f0_m.origin, spacing=f0_m.spacing, direction=f0_m.direction)
-                for c in range(fixed_mind_t.shape[1])
-            ]
-            moving = moving_base + [
-                ants.from_numpy(moving_mind_t[0, c].detach().cpu().numpy(), origin=m0_m.origin, spacing=m0_m.spacing, direction=m0_m.direction)
-                for c in range(moving_mind_t.shape[1])
-            ]
-            n_extra = len(fixed) - n_base
+            n_extra = int(fixed_mind_t.shape[1])
+            if backend == 'pytorch' and not _greedy:
+                # Keep MIND tensors directly on GPU instead of downloading 12 channels to CPU ANTsImages and re-uploading
+                _mind_gpu_pair = (fixed_mind_t, moving_mind_t)
+                fixed = fixed_base
+                moving = moving_base
+            else:
+                fixed = fixed_base + [
+                    ants.from_numpy(fixed_mind_t[0, c].detach().cpu().numpy(), origin=f0_m.origin, spacing=f0_m.spacing, direction=f0_m.direction)
+                    for c in range(n_extra)
+                ]
+                moving = moving_base + [
+                    ants.from_numpy(moving_mind_t[0, c].detach().cpu().numpy(), origin=m0_m.origin, spacing=m0_m.spacing, direction=m0_m.direction)
+                    for c in range(n_extra)
+                ]
             if syn_metric is None or syn_metric in ('cc2', 'lncc'):
                 syn_metric = ['cc2'] * n_base + ['cc2'] * n_extra
             elif isinstance(syn_metric, str):
@@ -3486,6 +3686,7 @@ def registration(
             aff_res = robust_affine(
                 fixed_primary, moving_primary,
                 dof=_affine_dof_resolved, mode=affine_mode, seed=affine_seed, verbose=verbose,
+                return_warped=False,
                 **_aff_kwargs
             )
             raw_init_tx = aff_res['fwdtransforms']
@@ -3514,23 +3715,7 @@ def registration(
     moving_reg = moving
     
     from .core.pipeline import normalize_and_tensorize, auto_detect_device, cleanup_gpu
-    
-    # 2. Winsorize and Normalize numpy arrays
-    I_tensor_unused, J_tensor_unused = normalize_and_tensorize(
-        fixed, moving_reg, winsorize_quantiles=kwargs.get('winsorize_quantiles', None), backend=backend
-    )
-    # Re-fetch normalized arrays since SyNTo setup might still rely on numpy logic initially
-    fi_np = fixed_primary.numpy()
-    mi_np = moving_primary.numpy()
-    if kwargs.get('winsorize_quantiles', None) is not None:
-        wq = kwargs.get('winsorize_quantiles')
-        lo_f, hi_f = np.quantile(fi_np[fi_np > 0], wq) if (fi_np > 0).any() else (fi_np.min(), fi_np.max())
-        fi_np = np.clip(fi_np, lo_f, hi_f)
-        lo_m, hi_m = np.quantile(mi_np[mi_np > 0], wq) if (mi_np > 0).any() else (mi_np.min(), mi_np.max())
-        mi_np = np.clip(mi_np, lo_m, hi_m)
-    fi_norm = (fi_np - fi_np.mean()) / (fi_np.std() + 1e-8)
-    mi_norm = (mi_np - mi_np.mean()) / (mi_np.std() + 1e-8)
-    
+
     # Keep spacing in native X-first order (reversal handled internally by helper functions)
     sp_ordered = spacing
     
@@ -3693,6 +3878,13 @@ def registration(
             fixed, moving_reg, winsorize_quantiles=kwargs.get('winsorize_quantiles', None),
             backend='pytorch', device=device
         ))
+        if _mind_gpu_pair is not None:
+            _fm_t, _mm_t = _mind_gpu_pair
+            _fm_zyx = torch.clamp(_fm_t.detach().to(device=device, dtype=torch.float32).permute(0, 1, 4, 3, 2), 0.0, 1.0).contiguous()
+            _mm_zyx = torch.clamp(_mm_t.detach().to(device=device, dtype=torch.float32).permute(0, 1, 4, 3, 2), 0.0, 1.0).contiguous()
+            _ij_tensors[0] = torch.cat([_ij_tensors[0], _fm_zyx], dim=1)
+            _ij_tensors[1] = torch.cat([_ij_tensors[1], _mm_zyx], dim=1)
+            del _fm_t, _mm_t, _fm_zyx, _mm_zyx, _mind_gpu_pair
         
         model = SyNToPy(
             dim=dim, grid_shape=grid_shape_zyx, spacing=sp_ordered, origin=fixed_primary.origin, direction=direction,
@@ -3708,7 +3900,8 @@ def registration(
             dual_gradient=kwargs.get('dual_gradient', False),
             dual_gradient_weight=kwargs.get('dual_gradient_weight', 0.5),
             restrict_transformation=restrict_transformation,
-            seed=seed
+            seed=seed,
+            allocate_fields=(sum(reg_iterations) <= 0),
         ).to(device)
         model.formulation = kwargs.get('formulation', 'eulerian')
         model.smooth_in_deformed_space = kwargs.get('smooth_in_deformed_space', False)
@@ -3998,8 +4191,8 @@ def registration(
             [(fwd_img, fwd_file), (inv_img, inv_file)],
             compresslevel=4 if outprefix is not None else 1,
         )
-        _cache_disp_image_and_field(fwd_file, fwd_img, _apply_dev)
-        _cache_disp_image_and_field(inv_file, inv_img, _apply_dev)
+        _cache_disp_image_and_field(fwd_file, fwd_img, _apply_dev, disp_tensor=total_fwd_deformable)
+        _cache_disp_image_and_field(inv_file, inv_img, _apply_dev, disp_tensor=total_inv_deformable)
         fwd_warp_image = fwd_img
         inv_warp_image = inv_img
         
@@ -4094,8 +4287,8 @@ def registration(
         inv_mid_img = disp_tensor_to_itk(model.midpoint_warp_r2l, fixed_primary)
 
         _write_ants_images_fast([(fwd_mid_img, fwd_mid_file), (inv_mid_img, inv_mid_file)], compresslevel=1)
-        _cache_disp_image_and_field(fwd_mid_file, fwd_mid_img, _apply_dev)
-        _cache_disp_image_and_field(inv_mid_file, inv_mid_img, _apply_dev)
+        _cache_disp_image_and_field(fwd_mid_file, fwd_mid_img, _apply_dev, disp_tensor=model.midpoint_warp_l2r)
+        _cache_disp_image_and_field(inv_mid_file, inv_mid_img, _apply_dev, disp_tensor=model.midpoint_warp_r2l)
 
         fwd_midpoint_warp = fwd_mid_file
         inv_midpoint_warp = inv_mid_file
@@ -4444,7 +4637,10 @@ def auto_reg(
         from .robust_affine import robust_affine as run_robust_affine
         if verbose:
             print(f"Computing deterministic multi-start robust affine initialization (mode='{aff_mode}')...")
-        aff_res = run_robust_affine(fixed_primary, moving_primary, mode=aff_mode, device=target_device, seed=seed, verbose=verbose)
+        aff_res = run_robust_affine(
+            fixed_primary, moving_primary, mode=aff_mode, device=target_device,
+            seed=seed, verbose=verbose, return_warped=False,
+        )
         initial_transform = aff_res['fwdtransforms']
 
     # Apply physical CT attenuation windowing / multi-band decomposition for deformable stage

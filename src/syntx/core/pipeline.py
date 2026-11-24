@@ -101,8 +101,9 @@ def normalize_and_tensorize(fixed, moving, winsorize_quantiles=None, backend='py
             fg = arr[arr > 0]
 
         if len(fg) > 0:
-            p02 = -1000.0 if is_hu else float(np.percentile(fg, 100.0 * q_lo))
-            p98 = float(np.percentile(fg, 100.0 * q_hi))
+            fg_q = fg[:: max(1, len(fg) // 2_000_000)] if arr.size > 16_777_216 and len(fg) > 4_000_000 else fg
+            p02 = -1000.0 if is_hu else float(np.percentile(fg_q, 100.0 * q_lo))
+            p98 = float(np.percentile(fg_q, 100.0 * q_hi))
             if is_hu:
                 p98 = max(p98, 300.0)
             if p98 <= p02 + 1e-4:
@@ -115,6 +116,7 @@ def normalize_and_tensorize(fixed, moving, winsorize_quantiles=None, backend='py
         
     dim = fixed_list[0].dimension
     perm = [0, 1] + list(range(dim + 1, 1, -1))
+    rev_spatial = tuple(range(dim - 1, -1, -1))
     
     if backend == 'pytorch':
         import torch
@@ -123,10 +125,12 @@ def normalize_and_tensorize(fixed, moving, winsorize_quantiles=None, backend='py
         for f, m in zip(fixed_list, moving_list):
             f_norm = _norm_fg(f.numpy())
             m_norm = _norm_fg(m.numpy())
-            I_channels.append(torch.tensor(f_norm, dtype=torch.float32, device=device).unsqueeze(0).unsqueeze(0).permute(perm))
-            J_channels.append(torch.tensor(m_norm, dtype=torch.float32, device=device).unsqueeze(0).unsqueeze(0).permute(perm))
-        I_tensor = torch.cat(I_channels, dim=1)
-        J_tensor = torch.cat(J_channels, dim=1)
+            f_t = torch.from_numpy(f_norm).to(device=device, dtype=torch.float32).permute(*rev_spatial).contiguous()
+            m_t = torch.from_numpy(m_norm).to(device=device, dtype=torch.float32).permute(*rev_spatial).contiguous()
+            I_channels.append(f_t.unsqueeze(0).unsqueeze(0))
+            J_channels.append(m_t.unsqueeze(0).unsqueeze(0))
+        I_tensor = I_channels[0] if len(I_channels) == 1 else torch.cat(I_channels, dim=1)
+        J_tensor = J_channels[0] if len(J_channels) == 1 else torch.cat(J_channels, dim=1)
     elif backend == 'jax':
         import jax.numpy as jnp
         I_channels = []
@@ -156,7 +160,7 @@ def cleanup_gpu(device, backend='pytorch'):
         from .regularizers import clear_k_mesh_cache
         dev_str = str(device).lower() if device is not None else ''
         if ('mps' in dev_str) or ('cuda' in dev_str):
-            clear_k_mesh_cache()
+            clear_k_mesh_cache(max_voxels=16_777_216)
         gc.collect()
         if 'mps' in dev_str and hasattr(torch.mps, 'empty_cache'):
             torch.mps.empty_cache()

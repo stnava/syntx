@@ -694,7 +694,11 @@ def local_ncc_loss_nd(
             window_size = max(1, window_size - 1)
 
     slab_axis = _longest_slab_axis(tuple(I.shape))
-    n_chunks = min(int(metric_chunks), int(I.shape[slab_axis]))
+    spatial_vox = int(I[0, 0].numel()) if I.numel() > 0 else 0
+    eff_mc = int(metric_chunks)
+    if eff_mc == 1 and spatial_vox > _FUSE_MAX_VOXELS:
+        eff_mc = (spatial_vox + _FUSE_MAX_VOXELS - 1) // _FUSE_MAX_VOXELS
+    n_chunks = min(eff_mc, int(I.shape[slab_axis]))
     if n_chunks > 1:
         floor_c = 1e-6 if use_pseudo else max(float(var_floor), 1e-6)
         if not torch.is_grad_enabled() or (not I.requires_grad and not J.requires_grad):

@@ -278,13 +278,28 @@ def batched_mattes_mi_from_weights(w_x_batch: torch.Tensor, w_y: torch.Tensor, c
     return -torch.sum(pxy * torch.log(torch.clamp(ratio, min=1e-8)), dim=(1, 2))
 
 
+_MATTES_SAMPLE_IDX_CACHE: dict[tuple[int, int, str], torch.Tensor] = {}
+
+
 def mattes_sample_indices(n: int, sampling_percentage: float, device: torch.device | None = None) -> torch.Tensor:
     """Indices of regular Mattes subsample with exact integer rounding identical across devices."""
     k = max(1, round(float(sampling_percentage) * n))
+    tgt_dev = torch.device("cpu") if device is None else torch.device(device)
     if k == 1:
-        return torch.zeros(1, dtype=torch.long, device=device)
-    i = torch.arange(k, dtype=torch.long)
-    return ((2 * i * (n - 1) + (k - 1)) // (2 * (k - 1))).to(device)
+        return torch.zeros(1, dtype=torch.long, device=tgt_dev)
+    cache_ok = k <= 2_000_000
+    if cache_ok:
+        key = (int(n), int(k), str(tgt_dev))
+        cached = _MATTES_SAMPLE_IDX_CACHE.get(key)
+        if cached is not None:
+            return cached
+    i = torch.arange(k, dtype=torch.long, device=tgt_dev)
+    idx = torch.div(2 * i * (n - 1) + (k - 1), 2 * (k - 1), rounding_mode="floor")
+    if cache_ok:
+        while len(_MATTES_SAMPLE_IDX_CACHE) >= 32:
+            _MATTES_SAMPLE_IDX_CACHE.pop(next(iter(_MATTES_SAMPLE_IDX_CACHE)))
+        _MATTES_SAMPLE_IDX_CACHE[key] = idx
+    return idx
 
 
 def mattes_mi_loss_core(

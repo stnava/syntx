@@ -274,12 +274,16 @@ def _eval_low_res_mi(fi_low: ants.ANTsImage, mi_low: ants.ANTsImage, tx_path: st
         return 999.0
 
 
+_RODRIGUES_CONSTS: dict[tuple[str, torch.dtype], tuple[torch.Tensor, torch.Tensor]] = {}
+
+
 def _rodrigues_rotation_matrix_3d(omega: torch.Tensor) -> torch.Tensor:
     """
     Differentiable Rodrigues Lie Algebra $so(3) \\rightarrow SO(3)$ 3D rotation matrix parameterization.
 
-    Uses first-order Taylor expansion near zero ($\\|\\omega\\| < 10^{-5}$) to prevent zero-angle
-    gradient locking (GEMINI.md Rule 6).
+    Uses branchless ``torch.where`` Taylor expansion near zero ($\\|\\omega\\|^2 < 10^{-8}$) with
+    double-where autograd protection so evaluation neither stalls the GPU on a host scalar sync
+    nor produces ``0/0`` gradients at $\\omega = 0$ (GEMINI.md Rule 6).
 
     Parameters
     ----------
@@ -291,28 +295,30 @@ def _rodrigues_rotation_matrix_3d(omega: torch.Tensor) -> torch.Tensor:
     torch.Tensor
         `3x3` rotation matrix $R \\in SO(3)$.
     """
-    theta = torch.norm(omega)
-    if theta < 1e-5:
-        w0, w1, w2 = omega[0], omega[1], omega[2]
-        K = torch.stack([
-            torch.stack([torch.tensor(0.0, device=omega.device), -w2, w1]),
-            torch.stack([w2, torch.tensor(0.0, device=omega.device), -w0]),
-            torch.stack([-w1, w0, torch.tensor(0.0, device=omega.device)])
-        ])
-        return torch.eye(3, device=omega.device, dtype=torch.float32) + K
-    else:
-        u = omega / theta
-        u0, u1, u2 = u[0], u[1], u[2]
-        K = torch.stack([
-            torch.stack([torch.tensor(0.0, device=omega.device), -u2, u1]),
-            torch.stack([u2, torch.tensor(0.0, device=omega.device), -u0]),
-            torch.stack([-u1, w0 if 'w0' in locals() else u0, torch.tensor(0.0, device=omega.device)])
-        ]) if False else torch.stack([
-            torch.stack([torch.tensor(0.0, device=omega.device), -u2, u1]),
-            torch.stack([u2, torch.tensor(0.0, device=omega.device), -u0]),
-            torch.stack([-u1, u0, torch.tensor(0.0, device=omega.device)])
-        ])
-        return torch.eye(3, device=omega.device, dtype=torch.float32) + torch.sin(theta) * K + (1.0 - torch.cos(theta)) * (K @ K)
+    key = (str(omega.device), omega.dtype)
+    consts = _RODRIGUES_CONSTS.get(key)
+    if consts is None:
+        z0 = torch.zeros((), device=omega.device, dtype=omega.dtype)
+        eye3 = torch.eye(3, device=omega.device, dtype=omega.dtype)
+        consts = (z0, eye3)
+        if len(_RODRIGUES_CONSTS) < 32:
+            _RODRIGUES_CONSTS[key] = consts
+    z0, eye3 = consts
+
+    theta_sq = (omega * omega).sum()
+    small = theta_sq < 1e-8
+    theta_sq_safe = torch.where(small, torch.ones_like(theta_sq), theta_sq)
+    theta_safe = torch.sqrt(theta_sq_safe)
+    c1 = torch.where(small, 1.0 - theta_sq * (1.0 / 6.0), torch.sin(theta_safe) / theta_safe)
+    c2 = torch.where(small, 0.5 - theta_sq * (1.0 / 24.0), (1.0 - torch.cos(theta_safe)) / theta_sq_safe)
+
+    w0, w1, w2 = omega[0], omega[1], omega[2]
+    K = torch.stack([
+        torch.stack([z0, -w2, w1]),
+        torch.stack([w2, z0, -w0]),
+        torch.stack([-w1, w0, z0]),
+    ])
+    return eye3 + c1 * K + c2 * (K @ K)
 
 
 def _rotation_matrix_2d(theta: torch.Tensor) -> torch.Tensor:
@@ -644,7 +650,7 @@ _PYTORCH_SOLVER_ONLY_KWARGS = frozenset({
     'smooth_sigma_per_level', 'fg_dice_weight', 'fg_level', 'sample_weighting', 'sample_seed',
     'enable_landmarks', 'lambda_shear', 'lambda_scale', 'cluster_threshold', 'wide_angles',
     'levels', 'iterations', 'reg_iterations', '_level_builder', 'valid_margin_slices',
-    'translation_scan_steps',
+    'translation_scan_steps', 'return_warped',
 })
 
 
@@ -1345,7 +1351,8 @@ def _run_pytorch_affine_solver(fixed: ants.ANTsImage, moving: ants.ANTsImage, in
                                cluster_threshold: float = 0.35,
                                wide_angles: bool = False, max_pyramid_voxels: int = 2 ** 24, _level_builder=None,
                                convergence_tol_vox: float = 0.05, max_extend_factor: int = 4, max_sample_points: int = 250000,
-                               valid_margin_slices: int = 1, translation_scan_steps: int = 0, **kwargs) -> dict:
+                               valid_margin_slices: int = 1, translation_scan_steps: int = 0,
+                               return_warped: bool = True, **kwargs) -> dict:
     """
     Native PyTorch multi-resolution affine solver (``mode='pytorch'``), Mattes MI objective.
 
@@ -1699,18 +1706,28 @@ def _run_pytorch_affine_solver(fixed: ants.ANTsImage, moving: ants.ANTsImage, in
                 lvl_region = torch.from_numpy(np.ascontiguousarray(np.transpose(reg_np, tuple(reversed(range(dim)))))).reshape(-1)
             if w_np is not None:
                 lvl_w = torch.from_numpy(np.ascontiguousarray(np.transpose(w_np, tuple(reversed(range(dim)))).astype(np.float32))).reshape(-1)
-        domain = lvl_region.to(fmask.device) if mask_mode == 'fixed_fg' else torch.ones_like(fmask.reshape(-1))
-        if valid_lev is not None:
-            domain = domain & valid_lev.reshape(-1)
-        idx_fg = torch.nonzero(domain, as_tuple=False).squeeze(1).cpu()
-        sel_all = idx_fg.to(device_obj)
-        # Candidate scoring, path selection, full_grid stages and the self-check COMPARE poses with the same bias on both sides, on every domain voxel:
-        # they stay on the voxel centres (jittering them mis-ranked starts on sharp synthetic images: scattered-SyN 2-D, 2026-10-21).
-        entry['points_full'] = dict(
-            phys=phys_xyz[sel_all],
-            fvals=fi_lev.reshape(-1)[sel_all],
-            fmind=fi_mind_lev.reshape(6, -1)[:, sel_all].contiguous() if fi_mind_lev is not None else None,
-        )
+        is_full_domain = (mask_mode != 'fixed_fg') and (valid_lev is None)
+        if is_full_domain:
+            n_dom = int(fmask.numel())
+            idx_fg = None
+            sel_all = None
+            entry['points_full'] = dict(
+                phys=phys_xyz,
+                fvals=fi_lev.reshape(-1),
+                fmind=fi_mind_lev.reshape(6, -1).contiguous() if fi_mind_lev is not None else None,
+            )
+        else:
+            domain = lvl_region.to(fmask.device) if mask_mode == 'fixed_fg' else torch.ones_like(fmask.reshape(-1))
+            if valid_lev is not None:
+                domain = domain & valid_lev.reshape(-1)
+            sel_all = torch.nonzero(domain, as_tuple=False).squeeze(1)
+            n_dom = int(sel_all.numel())
+            idx_fg = sel_all.cpu() if (needs_point_sample and lvl_w is not None) else None
+            entry['points_full'] = dict(
+                phys=phys_xyz[sel_all],
+                fvals=fi_lev.reshape(-1)[sel_all],
+                fmind=fi_mind_lev.reshape(6, -1)[:, sel_all].contiguous() if fi_mind_lev is not None else None,
+            )
         entry['points_jit'] = None
 
         if needs_point_sample:
@@ -1718,7 +1735,8 @@ def _run_pytorch_affine_solver(fixed: ants.ANTsImage, moving: ants.ANTsImage, in
             # value interpolated there (still DWI phantom, 2026-10-21). Skipped when every stage at this level uses full_grid=True.
             shape_xyz_t = torch.tensor([float(n) for n in reversed(shape_zyx)], **f32)
             jitter_amp = 1.0 if level == 1 else 0.0   # the pose-dependent noise-averaging bias is a fine-scale effect; pooled levels are smoothed
-            work_xyz = (vox_xyz[sel_all] - o_t) / f_t + jitter_amp * (torch.rand((sel_all.numel(), dim), generator=gen) - 0.5).to(device_obj)
+            vox_dom = vox_xyz if sel_all is None else vox_xyz[sel_all]
+            work_xyz = (vox_dom - o_t) / f_t + jitter_amp * (torch.rand((n_dom, dim), generator=gen) - 0.5).to(device_obj)
             work_xyz = torch.minimum(work_xyz.clamp(min=0.0), shape_xyz_t - 1.0)
             norm = (2.0 * work_xyz / (shape_xyz_t - 1.0) - 1.0).reshape(1, *([1] * (dim - 1)), -1, dim)
             fvals_all = F.grid_sample(fi_lev, norm, mode='bilinear', padding_mode='border', align_corners=True).reshape(-1)
@@ -1734,9 +1752,9 @@ def _run_pytorch_affine_solver(fixed: ants.ANTsImage, moving: ants.ANTsImage, in
 
             k = None
             if n_sample_points is not None:
-                k = min(int(n_sample_points), idx_fg.numel())
+                k = min(int(n_sample_points), n_dom)
             elif level_sampling is not None and float(level_sampling) > 0.0 and float(level_sampling) < 1.0:
-                k = max(1000, min(int(round(idx_fg.numel() * float(level_sampling))), idx_fg.numel()))
+                k = max(1000, min(int(round(n_dom * float(level_sampling))), n_dom))
                 if max_sample_points is not None:
                     k = min(k, max(1000, int(max_sample_points)))   # a 12-parameter fit needs ~1e5 points, not 10 % of a 12-million-voxel volume
 
@@ -1745,8 +1763,8 @@ def _run_pytorch_affine_solver(fixed: ants.ANTsImage, moving: ants.ANTsImage, in
                 # Gumbel top-k with the strategy's weights (deterministic with `gen`)
                 from .sampling import draw_indices
 
-                w_dom = None if lvl_w is None else lvl_w[idx_fg]
-                pos = draw_indices(w_dom, int(idx_fg.numel()), k, gen).to(device_obj)
+                w_dom = None if lvl_w is None else (lvl_w if idx_fg is None else lvl_w[idx_fg])
+                pos = draw_indices(w_dom, n_dom, k, gen).to(device_obj)
                 entry['points'] = dict(
                     phys=entry['points_jit']['phys'][pos],
                     fvals=entry['points_jit']['fvals'][pos],
@@ -1773,6 +1791,14 @@ def _run_pytorch_affine_solver(fixed: ants.ANTsImage, moving: ants.ANTsImage, in
 
     def _make_path(B_mat, t_vec, p_name):
         return _AffinePath(B_mat, t_vec, dim, device_obj, p_name, spacing=sp_fix)
+
+    ct_tomo_anchors = None
+    if ct_tomo is not None:
+        ct_tomo_anchors = (
+            ct_tomo['axis_lps'],
+            torch.tensor(ct_tomo['c_anchor_f'], dtype=torch.float32, device=device_obj),
+            torch.tensor(ct_tomo['c_anchor_m'], dtype=torch.float32, device=device_obj),
+        )
 
     from .core.losses import box_lncc_loss_nd
 
@@ -1850,11 +1876,9 @@ def _run_pytorch_affine_solver(fixed: ants.ANTsImage, moving: ants.ANTsImage, in
             loss = loss + fg_dice_weight * soft_dice_loss_nd(fm, wm)
         if eff_lambda_shear > 0 or eff_lambda_scale > 0:
             loss = loss + path.regularization_loss(dof, lambda_shear=eff_lambda_shear, lambda_scale=eff_lambda_scale)
-        if ct_tomo is not None:
+        if ct_tomo_anchors is not None:
             # Dead-zone cranio-caudal tomography anchor: 0 penalty within +-30 mm respiratory range, smooth quadratic beyond
-            ax_a = ct_tomo['axis_lps']
-            cf_t = torch.tensor(ct_tomo['c_anchor_f'], dtype=torch.float32, device=device_obj)
-            cm_t = torch.tensor(ct_tomo['c_anchor_m'], dtype=torch.float32, device=device_obj)
+            ax_a, cf_t, cm_t = ct_tomo_anchors
             mapped_cf = cf_t @ A.t() + teff
             dz_dev = (mapped_cf[ax_a] - cm_t[ax_a]).abs()
             loss = loss + 0.14 * (F.relu(dz_dev - 30.0) / 25.0).pow(2)
@@ -1862,9 +1886,9 @@ def _run_pytorch_affine_solver(fixed: ants.ANTsImage, moving: ants.ANTsImage, in
         smooth_in = torch.sigmoid(20.0 * (1.02 - max_abs_y)).mean()
         ov_req = 0.84 * expected_ov if (is_internal_fov_pair or has_slab_asymmetry) else 0.65 * expected_ov
         ov_deficit = F.relu(ov_req - smooth_in)
-        if float(ov_deficit.detach().item()) > 0.0:
-            ov_w = 3.5 if (is_internal_fov_pair or has_slab_asymmetry) else 1.8
-            loss = loss + ov_w * ov_deficit + 0.05 * F.relu(max_abs_y - 1.0).mean()
+        ov_w = 3.5 if (is_internal_fov_pair or has_slab_asymmetry) else 1.8
+        has_def = (ov_deficit.detach() > 0.0).to(loss.dtype)
+        loss = loss + ov_w * ov_deficit + (0.05 * has_def) * F.relu(max_abs_y - 1.0).mean()
         return loss
 
     coarse = levels[0]
@@ -1892,13 +1916,18 @@ def _run_pytorch_affine_solver(fixed: ants.ANTsImage, moving: ants.ANTsImage, in
         Dm = np.asarray(fixed.direction, dtype=np.float64).reshape(3, 3)
         rng_k = range(-translation_scan_steps, translation_scan_steps + 1)
         lattice = [Dm @ (coarse_mm * np.array([i, j, k], dtype=np.float64)) for i in rng_k for j in rng_k for k in rng_k]
-        scanned = []
+        scanned_pts = []
         with torch.no_grad():
+            scan_probe = _make_path(np.eye(dim), t_init, '_scan_probe')
+            scan_losses = []
             for b_ in [t_init] + list(t_phase_corr):
                 for off_ in lattice:
                     tt_ = b_ + off_
-                    scanned.append((float(objective(_AffinePath(np.eye(dim), tt_, dim, device_obj, 'scan', spacing=sp_fix), 'rigid',
-                                                    levels[0], full=True, sampling=1.0).item()), tt_))
+                    scan_probe.t = torch.as_tensor(tt_, dtype=torch.float32, device=device_obj)
+                    scan_losses.append(objective(scan_probe, 'rigid', levels[0], full=True, sampling=1.0))
+                    scanned_pts.append(tt_)
+            scan_vals = torch.stack(scan_losses).tolist()
+        scanned = [(float(sv), tt_) for sv, tt_ in zip(scan_vals, scanned_pts)]
         scanned.sort(key=lambda x: x[0])
         for _, tt_ in scanned:
             if all(np.linalg.norm(tt_ - o_) >= 1.5 * coarse_mm for o_ in [t_init] + list(t_phase_corr) + scan_bases):
@@ -2024,10 +2053,19 @@ def _run_pytorch_affine_solver(fixed: ants.ANTsImage, moving: ants.ANTsImage, in
                         cands.append((f'{base_name}_rot_{deg:+.0f}deg', np.array([[np.cos(rad), -np.sin(rad)], [np.sin(rad), np.cos(rad)]]), t_base))
 
     scored = []
-    with torch.no_grad():
-        for name, B, tt in cands:
-            p = _make_path(B, tt, name)
-            scored.append((float(objective(p, 'rigid', coarse, full=True, sampling=1.0).item()), name, B, tt))
+    if cands:
+        with torch.no_grad():
+            cand_probe = _make_path(cands[0][1], cands[0][2], '_cand_probe')
+            cand_losses = []
+            for name, B, tt in cands:
+                cand_probe.B = torch.as_tensor(B, dtype=torch.float32, device=device_obj)
+                cand_probe.t = torch.as_tensor(tt, dtype=torch.float32, device=device_obj)
+                cand_losses.append(objective(cand_probe, 'rigid', coarse, full=True, sampling=1.0))
+            cand_vals = torch.stack(cand_losses).tolist()
+        scored = [
+            (float(sv), name, B, tt)
+            for sv, (name, B, tt) in zip(cand_vals, cands)
+        ]
     scored.sort(key=lambda x: x[0])
 
 
@@ -2105,15 +2143,30 @@ def _run_pytorch_affine_solver(fixed: ants.ANTsImage, moving: ants.ANTsImage, in
 
     def _path_axes(p, dof, level):
         pts = _check_pts_for_level(level)
+        rel_sq = (pts - C_phys).pow(2)
         ax = [ParamAxis(p.t, (j,), 1.0) for j in range(dim)]
         if dim == 3:
-            ax += [ParamAxis(p.omega, (j,), rotation_axis_scale(pts, C_phys, j)) for j in range(3)]
-        else:
-            ax += [ParamAxis(p.omega, (0,), float((pts - C_phys).pow(2).sum(-1).mean().sqrt()))]
+            col_ms = rel_sq.mean(dim=0)
+            rot_ms = torch.stack([col_ms[1] + col_ms[2], col_ms[0] + col_ms[2], col_ms[0] + col_ms[1]])
+            if dof == 'affine':
+                sc_vals = torch.cat([rot_ms.sqrt(), col_ms.sqrt()]).tolist()
+                r_sc, c_sc = sc_vals[:3], sc_vals[3:]
+                ax += [ParamAxis(p.omega, (j,), float(r_sc[j])) for j in range(3)]
+                ax += [ParamAxis(p.scale, (j,), float(c_sc[j])) for j in range(3)]
+                ax += [ParamAxis(p.shear, (j,), float(c_sc[c])) for j, c in enumerate((1, 2, 2))]
+            else:
+                r_sc = rot_ms.sqrt().tolist()
+                ax += [ParamAxis(p.omega, (j,), float(r_sc[j])) for j in range(3)]
+            return ax
+        col_ms = rel_sq.mean(dim=0)
+        rot_ms = (col_ms[0] + col_ms[1]).unsqueeze(0)
         if dof == 'affine':
-            ax += [ParamAxis(p.scale, (j,), matrix_element_scale(pts, C_phys, j)) for j in range(dim)]
-            cols = [1, 2, 2] if dim == 3 else [1]
-            ax += [ParamAxis(p.shear, (j,), matrix_element_scale(pts, C_phys, c)) for j, c in enumerate(cols)]
+            sc_vals = torch.cat([rot_ms.sqrt(), col_ms.sqrt()]).tolist()
+            ax += [ParamAxis(p.omega, (0,), float(sc_vals[0]))]
+            ax += [ParamAxis(p.scale, (j,), float(sc_vals[1 + j])) for j in range(2)]
+            ax += [ParamAxis(p.shear, (0,), float(sc_vals[2]))]
+        else:
+            ax += [ParamAxis(p.omega, (0,), float(rot_ms.sqrt().item()))]
         return ax
 
     def _run_converging_path(p, dof, level, optimizer, iters, step, lr, eta_frac, eta_min, closure_loss):
@@ -2188,18 +2241,30 @@ def _run_pytorch_affine_solver(fixed: ants.ANTsImage, moving: ants.ANTsImage, in
                 _assign(leaf=True)
                 p.clamp_()
                 done += check_every
-                _confirm(tracker.update(_path_points(p, dof, level)))
-                last_loss[p.name] = loss.detach() if torch.is_tensor(loss) else float(loss)
-                if tracker.all_converged:
+                newly = tracker.update(_path_points(p, dof, level))
+                flags_lbfgs = torch.stack([newly.any(), tracker.active.any()]).tolist()
+                if flags_lbfgs[0]:
+                    pr = probe_manifold(closure_loss, _path_axes(p, dof, level), stage_voxel, probe_vox=0.5)
+                    if not bool(pr.remaining_vox[0] <= 3.0 * float(convergence_tol_vox)):
+                        tracker.reject(newly)
+                        rejected += 1
+                    elif not bool(tracker.active.any()):
+                        last_loss[p.name] = loss.detach() if torch.is_tensor(loss) else float(loss)
+                        break
+                elif not flags_lbfgs[1]:
+                    last_loss[p.name] = loss.detach() if torch.is_tensor(loss) else float(loss)
                     break
+                last_loss[p.name] = loss.detach() if torch.is_tensor(loss) else float(loss)
             blocks = math.ceil((call + 1) / n_blocks)
         else:
             scale = 1.0
             last_check = 0
             pts_ = _path_points(p, dof, level)[0]
             pt_radius = float((pts_ - C_phys).pow(2).sum(-1).mean().sqrt())
-            best_stage_loss = float('inf')
-            best_stage_state = None
+            best_stage_loss_t = torch.tensor(float('inf'), device=device_obj, dtype=torch.float32)
+            best_stage_state = {n: getattr(p, n).detach().clone() for n in ('t', 'omega', 'scale', 'shear')}
+            have_best_stage = torch.zeros((), device=device_obj, dtype=torch.bool)
+            conv_flag = False
             for cycle in range(max_ext):
                 blocks = cycle + 1
                 lr_c = tuple(v * scale for v in lr)
@@ -2213,10 +2278,13 @@ def _run_pytorch_affine_solver(fixed: ants.ANTsImage, moving: ants.ANTsImage, in
                 for it in range(iters):
                     opt.zero_grad(set_to_none=True)
                     loss = closure_loss()
-                    lv_now = float(loss.detach().item())
-                    if math.isfinite(lv_now) and lv_now < best_stage_loss:
-                        best_stage_loss = lv_now
-                        best_stage_state = {n: getattr(p, n).detach().clone() for n in ('t', 'omega', 'scale', 'shear')}
+                    with torch.no_grad():
+                        ld = loss.detach().to(torch.float32)
+                        imp = torch.isfinite(ld) & (ld < best_stage_loss_t)
+                        have_best_stage = have_best_stage | imp
+                        best_stage_loss_t = torch.where(imp, ld, best_stage_loss_t)
+                        for n, buf in best_stage_state.items():
+                            torch.where(imp, getattr(p, n).detach(), buf, out=buf)
                     loss.backward()
                     opt.step()
                     if sched is not None:
@@ -2228,21 +2296,33 @@ def _run_pytorch_affine_solver(fixed: ants.ANTsImage, moving: ants.ANTsImage, in
                         cur = 0.02 + 0.98 * 0.5 * (1.0 + math.cos(math.pi * (it + 1) / iters))   # cosine fraction of the cycle's lr
                         cap = (done - last_check) * cur * scale * (lr[0] + lr[1] * pt_radius)    # farthest the points could have moved (mm)
                         last_check = done
-                        _confirm(tracker.update(_path_points(p, dof, level), capacity=cap))
-                        if tracker.all_converged:
-                            break
-                if tracker.all_converged:
+                        newly = tracker.update(_path_points(p, dof, level), capacity=cap)
+                        if judged or it == iters - 1:
+                            flags_ad = torch.stack([newly.any(), tracker.active.any()]).tolist()
+                            if flags_ad[0]:
+                                pr = probe_manifold(closure_loss, _path_axes(p, dof, level), stage_voxel, probe_vox=0.5)
+                                if not bool(pr.remaining_vox[0] <= 3.0 * float(convergence_tol_vox)):
+                                    tracker.reject(newly)
+                                    rejected += 1
+                                elif not bool(tracker.active.any()):
+                                    conv_flag = True
+                                    break
+                            elif not flags_ad[1]:
+                                conv_flag = True
+                                break
+                if conv_flag:
                     break
                 scale *= 0.5
-            if best_stage_state is not None:
-                with torch.no_grad():
-                    end_lv = float(closure_loss().detach().item())
-                    if not math.isfinite(end_lv) or best_stage_loss < end_lv:
-                        for n, v in best_stage_state.items():
-                            getattr(p, n).copy_(v)
-                        last_loss[p.name] = torch.tensor(best_stage_loss, device=device_obj, dtype=torch.float32)
+            with torch.no_grad():
+                end_ld = closure_loss().detach().to(torch.float32)
+                end_vals = torch.stack([have_best_stage.to(torch.float32), best_stage_loss_t, end_ld]).tolist()
+                if end_vals[0] > 0.5 and (not math.isfinite(end_vals[2]) or end_vals[1] < end_vals[2]):
+                    for n, v in best_stage_state.items():
+                        getattr(p, n).copy_(v)
+                    last_loss[p.name] = best_stage_loss_t
+        fin_sync = torch.stack([tracker.active.any().to(torch.float32), tracker.last_step[0].to(torch.float32)]).tolist()
         return {'stage': f"{optimizer}@L{level}", 'level': int(level), 'path': p.name, 'iterations': int(done), 'blocks': int(blocks),
-                'tol_mm': tracker.tol, 'probe_rejections': int(rejected), 'converged': bool(tracker.all_converged), 'fixed_block': (not judged), 'final_step_mm': float(tracker.last_step[0]),
+                'tol_mm': tracker.tol, 'probe_rejections': int(rejected), 'converged': not (fin_sync[0] > 0.5), 'fixed_block': (not judged), 'final_step_mm': float(fin_sync[1]),
                 'seconds': round(time.time() - t_stage, 2)}
 
     def _run_schedule(paths):
@@ -2279,15 +2359,19 @@ def _run_pytorch_affine_solver(fixed: ants.ANTsImage, moving: ants.ANTsImage, in
     # optimiser failed (or the pair is not registrable); that is an error, not a result.
     with torch.no_grad():
         coarse_dof = schedule[-1]['dof']
-        final_coarse = float(objective(winner, coarse_dof, coarse, full=True, sampling=1.0).item())
         base_starts = [('Identity', np.zeros(dim)), ('Identity_FOV', t_fov)] if is_internal_fov_pair else [('Identity', np.zeros(dim)), ('Identity_CoM', t_init)]
         if ct_tomo is not None and t_tomo_base is not None and A_tomo_base is not None:
             base_starts = [('CT_Tomo_Scaled', t_tomo_base), ('CT_Tomo_Rigid', ct_tomo['c_anchor_m'] - ct_tomo['c_anchor_f'])] + base_starts
-        baselines = {}
+        check_losses = [objective(winner, coarse_dof, coarse, full=True, sampling=1.0)]
+        base_probe = _make_path(np.eye(dim), np.zeros(dim), '_base_probe')
         for b_name, b_t in base_starts:
             B_b = A_tomo_base if b_name == 'CT_Tomo_Scaled' else np.eye(dim)
-            baselines[b_name] = float(objective(_make_path(B_b, b_t, b_name),
-                                                coarse_dof, coarse, full=True, sampling=1.0).item())
+            base_probe.B = torch.as_tensor(B_b, dtype=torch.float32, device=device_obj)
+            base_probe.t = torch.as_tensor(b_t, dtype=torch.float32, device=device_obj)
+            check_losses.append(objective(base_probe, coarse_dof, coarse, full=True, sampling=1.0))
+        check_vals = torch.stack(check_losses).tolist()
+        final_coarse = float(check_vals[0])
+        baselines = {b_name: float(val) for (b_name, _), val in zip(base_starts, check_vals[1:])}
     best_baseline = min(baselines.values())
     def _fails(loss):
         return not np.isfinite(loss) or loss > best_baseline + max(SELF_CHECK_TOLERANCE, SELF_CHECK_RELATIVE_TOLERANCE * abs(best_baseline))
@@ -2328,8 +2412,13 @@ def _run_pytorch_affine_solver(fixed: ants.ANTsImage, moving: ants.ANTsImage, in
     out_dir = tempfile.mkdtemp(prefix="robust_affine_pt_")
     final_tx_path = os.path.join(out_dir, "affine.mat")
     ants.write_transform(tx_final, final_tx_path)
-    from .transforms import apply_transforms as _apply_transforms
-    warped_mov_out = _apply_transforms(fixed=fixed, moving=moving, transformlist=[final_tx_path], interpolator='linear')
+    if return_warped:
+        from .transforms import apply_transforms as _apply_transforms
+        warped_mov_out = _apply_transforms(fixed=fixed, moving=moving, transformlist=[final_tx_path], interpolator='linear', device=str(device_obj))
+    else:
+        warped_mov_out = None
+    final_loss_raw = last_loss.get(winner.name, float('nan'))
+    final_loss_val = float(final_loss_raw.item()) if torch.is_tensor(final_loss_raw) else float(final_loss_raw)
     elapsed = time.time() - t0
     return {
         'warpedmovout': warped_mov_out,
@@ -2340,7 +2429,7 @@ def _run_pytorch_affine_solver(fixed: ants.ANTsImage, moving: ants.ANTsImage, in
         'time': elapsed,
         'init_candidate': winner.name,
         'init_score': float(keep[0][0]),
-        'final_loss': float(last_loss.get(winner.name, float('nan'))),
+        'final_loss': final_loss_val,
         'candidates_scored': [(n, s) for s, n, _, _ in scored],
         'status': 'SUCCESS',
         'solver': 'pytorch',
@@ -2386,6 +2475,7 @@ def _run_tournament_affine(
     preset: str = 'default',
     sampling_percentage: float = 0.02,
     enable_pca_candidates: bool = False,
+    return_warped: bool = True,
     **kwargs
 ) -> dict:
     """
@@ -2412,6 +2502,7 @@ def _run_tournament_affine(
             device=device,
             verbose=verbose,
             seed=seed,
+            return_warped=return_warped,
             **kwargs
         )
 
@@ -2426,6 +2517,8 @@ def _run_tournament_affine(
 
     fi_n = normalize_image(fixed, method="auto")
     mi_n = normalize_image(moving, method="auto")
+    fi_tour = cap_ants_image(fi_n, 2.0) if int(np.prod(fi_n.shape[:3])) > 16_777_216 else fi_n
+    mi_tour = cap_ants_image(mi_n, 2.0) if int(np.prod(mi_n.shape[:3])) > 16_777_216 else mi_n
 
     from .device import resolve_device as _resolve_device
     dev = _resolve_device(device, task='affine')
@@ -2442,6 +2535,7 @@ def _run_tournament_affine(
             device=dev,
             verbose=verbose,
             seed=seed,
+            return_warped=False,
             **kwargs
         )
         candidates["robust_affine"] = {
@@ -2475,8 +2569,8 @@ def _run_tournament_affine(
     pts_f_inl, pts_m_inl = None, None
     t0 = time.time()
     try:
-        cf, df = detect_sift3d(fi_n, preprocess=False, max_keypoints=250)
-        cm, dm = detect_sift3d(mi_n, preprocess=False, max_keypoints=250)
+        cf, df = detect_sift3d(fi_tour, preprocess=False, max_keypoints=250)
+        cm, dm = detect_sift3d(mi_tour, preprocess=False, max_keypoints=250)
         if len(cf) >= 10 and len(cm) >= 10:
             m = match_landmarks(cf, cm, df, dm, ratio_thresh=0.92, mutual=True, device=dev)
             inl, M_sift = ransac_filter(cf, cm, m, model="rigid", max_iter=2000, inlier_thresh_mm=10.0)
@@ -2579,8 +2673,8 @@ def _run_tournament_affine(
     scores = {}
     for cand_name, info in candidates.items():
         tx_path = info["tx"]
-        warped_i = _apply_transforms(fixed=fi_n, moving=mi_n, transformlist=[tx_path], interpolator="linear")
-        c_sal = _compute_salient_gradient_correlation(fi_n, warped_i)
+        warped_i = _apply_transforms(fixed=fi_tour, moving=mi_tour, transformlist=[tx_path], interpolator="linear", device=str(dev))
+        c_sal = _compute_salient_gradient_correlation(fi_tour, warped_i)
 
         tre = float("nan")
         if has_sift and pts_f_inl is not None:
@@ -2636,6 +2730,7 @@ def _run_tournament_affine(
                 device=dev,
                 verbose=verbose,
                 seed=seed,
+                return_warped=False,
                 **kwargs
             )
             final_tx = res_polished["fwdtransforms"][0]
@@ -2643,7 +2738,7 @@ def _run_tournament_affine(
             logger.warning("Polish of winning candidate '%s' failed (%s); retaining unpolished transform", winner_name, e)
             final_tx = winner_cand["tx"]
 
-    warped_mov = _apply_transforms(fixed=fixed, moving=moving, transformlist=[final_tx])
+    warped_mov = _apply_transforms(fixed=fixed, moving=moving, transformlist=[final_tx], device=str(dev)) if return_warped else None
     return {
         'fwdtransforms': [final_tx],
         'invtransforms': [final_tx],
@@ -2690,6 +2785,7 @@ def _robust_affine_impl(
     iterations: list = None,
     reg_iterations: list = None,
     setting: str = 'default',
+    return_warped: bool = True,
     **kwargs
 ) -> dict:
     """
@@ -2833,7 +2929,10 @@ def _robust_affine_impl(
         moving = _cap_anisotropic_working_image(moving, 1.0)
 
     def _finalize_result(res: dict) -> dict:
-        if is_large_submm_ct and (fixed is not fixed_native or moving is not moving_native):
+        if not return_warped:
+            res['warpedmovout'] = None
+            res['warpedfixout'] = fixed_native
+        elif is_large_submm_ct and (fixed is not fixed_native or moving is not moving_native):
             from .transforms import apply_transforms as _apply_transforms
             warped_mov = _apply_transforms(
                 fixed=fixed_native,
@@ -2899,6 +2998,7 @@ def _robust_affine_impl(
             dof=dof,
             levels=levels,
             iterations=iterations,
+            return_warped=return_warped,
             **kwargs
         ))
 
@@ -2908,8 +3008,11 @@ def _robust_affine_impl(
         com_m = compute_center_of_mass(moving, weighted=True)
         t_com = com_m - com_f
         tx_path, temp_dir = create_translation_transform(fixed, moving, t_com)
-        from .transforms import apply_transforms as _apply_transforms
-        warped_mov = _apply_transforms(fixed=fixed_native, moving=moving_native, transformlist=[tx_path])
+        if return_warped:
+            from .transforms import apply_transforms as _apply_transforms
+            warped_mov = _apply_transforms(fixed=fixed_native, moving=moving_native, transformlist=[tx_path])
+        else:
+            warped_mov = None
         return {
             'fwdtransforms': [tx_path],
             'invtransforms': [tx_path],
@@ -2945,7 +3048,8 @@ def _robust_affine_impl(
                                               multi_start=multi_start, n_starts=n_starts, cone_angles_deg=cone_angles_deg,
                                               seed=seed, enable_landmarks=enable_landmarks, lambda_shear=lambda_shear,
                                               lambda_scale=lambda_scale, cluster_threshold=cluster_threshold,
-                                              wide_angles=wide_angles, levels=levels, iterations=iterations, dof=dof, **kwargs))
+                                              wide_angles=wide_angles, levels=levels, iterations=iterations, dof=dof,
+                                              return_warped=return_warped, **kwargs))
         except Exception as e:
             # No silent fallback: a solver failure is the caller's information, whatever the mode.
             # The ANTs path is reachable only by asking for it (mode='ants' / 'ants_fast').
@@ -3237,7 +3341,7 @@ def robust_cross_modal_rigid(
         print("[robust_cross_modal_rigid] Stage 1: coarse robust initial alignment...")
     reg_coarse = robust_affine(
         fixed=fixed_fgd, moving=moving_fgd, mode='auto', dof='rigid', seed=seed,
-        device=device, verbose=verbose,
+        device=device, verbose=verbose, return_warped=False,
     )
     initial_tx = reg_coarse['fwdtransforms'][0]
 

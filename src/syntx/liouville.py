@@ -121,21 +121,22 @@ def syngs_jacobian_determinant(model, image_shape=None) -> torch.Tensor:
     spacing_rev, origin_rev, direction_rev = reverse_metadata(spacing, model.origin, model.direction)
     phys_grid = get_physical_grid_torch(target_shape, spacing, model.origin, model.direction,
                                         device=device, dtype=dtype)
-    shape_t = torch.tensor(list(target_shape), device=device, dtype=dtype)
-    spacing_t = torch.tensor(spacing_rev, device=device, dtype=dtype)
-    origin_t = torch.tensor(origin_rev, device=device, dtype=dtype)
-    direction_t = torch.tensor(direction_rev, device=device, dtype=dtype)
     v = model.velocity_0_fwd
     v_up = resize_field(v, target_shape) if tuple(v.shape[1:-1]) != target_shape else v
     v0_cf = torch.movedim(model.apply_green_operator(v_up, target_shape, spacing_rev), -1, 1).contiguous()
-    # physical -> normalised, exactly as GeodesicShootingModel.shoot
-    scale_t = 2.0 / (spacing_t * (shape_t - 1.0))
-    M = direction_t * scale_t.unsqueeze(0)
-    b = -(origin_t @ M) - 1.0
-    M_norm, b_norm = torch.flip(M, dims=[1]), torch.flip(b, dims=[0])
+    # physical -> normalised on CPU NumPy (zero GPU->CPU syncs), matching GeodesicShootingModel.shoot
+    shape_np = np.asarray(target_shape, dtype=np.float64)
+    spacing_np = np.asarray(spacing_rev, dtype=np.float64)
+    origin_np = np.asarray(origin_rev, dtype=np.float64)
+    dir_np = np.asarray(direction_rev, dtype=np.float64)
+    scale_np = 2.0 / (spacing_np * np.maximum(shape_np - 1.0, 1e-8))
+    M_np = dir_np * scale_np[None, :]
+    b_np = -(origin_np @ M_np) - 1.0
+    M_norm = torch.as_tensor(np.ascontiguousarray(M_np[:, ::-1], dtype=np.float32), device=device, dtype=dtype)
+    b_norm = torch.as_tensor(np.ascontiguousarray(b_np[::-1], dtype=np.float32), device=device, dtype=dtype)
     dim = model.dim
 
-    h = 0.5 * float(spacing_t.min())
+    h = 0.5 * float(spacing_np.min())
     dt = 1.0 / model.n_steps
     phi = phys_grid.clone()
     q_buf = torch.empty_like(phi)
@@ -260,6 +261,60 @@ def _tensor_to_image(arr: np.ndarray, fixed):
                            direction=fixed.direction)
 
 
+def _grad_axis_2nd(u: torch.Tensor, dim: int) -> torch.Tensor:
+    """2nd-order interior / 1st-order boundary central difference matching ``torch.gradient(u, dim=dim)[0]``."""
+    n = int(u.shape[dim])
+    if n <= 1:
+        return torch.zeros_like(u)
+    out = torch.empty_like(u)
+    if n > 2:
+        sl_mid = [slice(None)] * u.ndim
+        sl_p = [slice(None)] * u.ndim
+        sl_m = [slice(None)] * u.ndim
+        sl_mid[dim] = slice(1, n - 1)
+        sl_p[dim] = slice(2, n)
+        sl_m[dim] = slice(0, n - 2)
+        torch.sub(u[tuple(sl_p)], u[tuple(sl_m)], out=out[tuple(sl_mid)])
+        out[tuple(sl_mid)].mul_(0.5)
+    sl0 = [slice(None)] * u.ndim
+    sl1 = [slice(None)] * u.ndim
+    sl0[dim] = 0
+    sl1[dim] = 1
+    torch.sub(u[tuple(sl1)], u[tuple(sl0)], out=out[tuple(sl0)])
+    sln1 = [slice(None)] * u.ndim
+    sln2 = [slice(None)] * u.ndim
+    sln1[dim] = n - 1
+    sln2[dim] = n - 2
+    torch.sub(u[tuple(sln1)], u[tuple(sln2)], out=out[tuple(sln1)])
+    return out
+
+
+def _fd_det_3d_zyx(disp_zyx: Any, model_ref: Any, eval_dev: torch.device) -> torch.Tensor:
+    """Device-native 3-D signed Jacobian determinant in ``(Nz, Ny, Nx)`` tensor layout, matching ``_fd_det``."""
+    if torch.is_tensor(disp_zyx):
+        u = disp_zyx.detach().to(device=eval_dev, dtype=torch.float32)
+    else:
+        u = torch.as_tensor(np.asarray(disp_zyx, dtype=np.float32), device=eval_dev, dtype=torch.float32)
+    while u.ndim > 4 and int(u.shape[0]) == 1:
+        u = u[0]
+    u_xyz = torch.flip(u, dims=[-1])
+    del u
+    ds_mat = np.asarray(model_ref.direction, dtype=np.float64)[:3, :3] @ np.diag(
+        np.asarray(model_ref.spacing, dtype=np.float64)[:3]
+    )
+    inv_det_ds = float(1.0 / np.linalg.det(ds_mat))
+    a_cols = torch.as_tensor(ds_mat.astype(np.float32), device=eval_dev)
+    c0 = _grad_axis_2nd(u_xyz, 2).add_(a_cols[:, 0])
+    c1 = _grad_axis_2nd(u_xyz, 1).add_(a_cols[:, 1])
+    c2 = _grad_axis_2nd(u_xyz, 0).add_(a_cols[:, 2])
+    del u_xyz, a_cols
+    cross_12 = torch.cross(c1, c2, dim=-1)
+    del c1, c2
+    det_zyx = (c0 * cross_12).sum(dim=-1).mul_(inv_det_ds)
+    del c0, cross_12
+    return det_zyx
+
+
 def _fd_det(fixed, disp_tensor):
     """Finite-difference Jacobian determinant (ANTs) of a physical displacement tensor
     (1, *spatial, dim) on the fixed grid."""
@@ -315,37 +370,57 @@ def liouville_determinant(result: Dict[str, Any], fixed, method: Optional[str] =
         need = ("midpoint_warp_l2r", "midpoint_warp_r2l", "midpoint_warp_l2r_inv")
         if model is None or not all(hasattr(model, a) for a in need):
             raise ValueError("syn result lacks the half fields (midpoint_warp_l2r / _r2l / _l2r_inv)")
-        w_l2r_cpu = _to_cpu_tensor(model.midpoint_warp_l2r)
-        w_r2l_cpu = _to_cpu_tensor(model.midpoint_warp_r2l)
-        w_l2r_inv_cpu = _to_cpu_tensor(model.midpoint_warp_l2r_inv)
 
-        sp_t = tuple(int(s) for s in w_l2r_cpu.shape[1:-1])
-        model_ref, same_grid = _model_ref_image(model, sp_t, fixed)
-        det_l2r = _fd_det(model_ref, w_l2r_cpu)
-        det_r2l = _fd_det(model_ref, w_r2l_cpu)
-        l2r, r2l = det_l2r.numpy(), det_r2l.numpy()
-
-        # Pull back det_r2l(y) and det_l2r(y) at y = X_phys + w_l2r_inv(X_phys) using
-        # border clamping, matching syn.py's forward composition (F.grid_sample padding_mode='border')
-        # so out-of-FOV boundary pullbacks never inject 0.0 -> -0.0 synthetic folds.
+        from .device import resolve_device
         from .spatial import (
             get_physical_grid_torch,
-            physical_to_normalized_torch_cached,
             reverse_metadata,
         )
 
-        from .device import resolve_device
-
+        w_l2r_raw = model.midpoint_warp_l2r
+        w_r2l_raw = model.midpoint_warp_r2l
+        w_l2r_inv_raw = model.midpoint_warp_l2r_inv
+        sp_t = tuple(int(s) for s in w_l2r_raw.shape[1:-1])
         dim = len(sp_t)
         rev_axes = tuple(range(dim))[::-1]
         n_vox = int(np.prod(sp_t))
         eval_dev = (
             torch.device(resolve_device(None, task="model"))
             if n_vox >= 65_536
-            else w_l2r_inv_cpu.device
+            else (w_l2r_inv_raw.device if torch.is_tensor(w_l2r_inv_raw) else torch.device("cpu"))
         )
-        l2r_t = torch.from_numpy(np.ascontiguousarray(np.transpose(l2r, rev_axes))).to(eval_dev)
-        r2l_t = torch.from_numpy(np.ascontiguousarray(np.transpose(r2l, rev_axes))).to(eval_dev)
+        model_ref, same_grid = _model_ref_image(model, sp_t, fixed)
+
+        use_gpu_fd3 = dim == 3 and not hasattr(ants.create_jacobian_determinant_image, "_mock_name")
+        if use_gpu_fd3:
+            l2r_t = _fd_det_3d_zyx(w_l2r_raw, model_ref, eval_dev)
+            r2l_t = _fd_det_3d_zyx(w_r2l_raw, model_ref, eval_dev)
+            if return_details:
+                det_l2r = _tensor_to_image(l2r_t.detach().cpu().numpy(), model_ref)
+                det_r2l = _tensor_to_image(r2l_t.detach().cpu().numpy(), model_ref)
+            else:
+                det_l2r = None
+                det_r2l = None
+            w_inv_dev = (
+                w_l2r_inv_raw.detach().to(device=eval_dev, dtype=torch.float32)
+                if torch.is_tensor(w_l2r_inv_raw)
+                else torch.as_tensor(np.asarray(w_l2r_inv_raw, dtype=np.float32), device=eval_dev)
+            )
+            w_l2r_inv_cpu = None
+        else:
+            w_l2r_cpu = _to_cpu_tensor(w_l2r_raw)
+            w_r2l_cpu = _to_cpu_tensor(w_r2l_raw)
+            w_l2r_inv_cpu = _to_cpu_tensor(w_l2r_inv_raw)
+            det_l2r = _fd_det(model_ref, w_l2r_cpu)
+            det_r2l = _fd_det(model_ref, w_r2l_cpu)
+            l2r, r2l = det_l2r.numpy(), det_r2l.numpy()
+            l2r_t = torch.as_tensor(np.ascontiguousarray(np.transpose(l2r, rev_axes)), device=eval_dev)
+            r2l_t = torch.as_tensor(np.ascontiguousarray(np.transpose(r2l, rev_axes)), device=eval_dev)
+            w_inv_dev = w_l2r_inv_cpu.to(eval_dev)
+
+        # Pull back det_r2l(y) and det_l2r(y) at y = X_phys + w_l2r_inv(X_phys) using
+        # border clamping, matching syn.py's forward composition (F.grid_sample padding_mode='border')
+        # so out-of-FOV boundary pullbacks never inject 0.0 -> -0.0 synthetic folds.
         half_min_grid = torch.minimum(l2r_t, r2l_t).unsqueeze(0).unsqueeze(0)
         pair_t = torch.stack([r2l_t, l2r_t], dim=0).unsqueeze(0)
         del l2r_t, r2l_t
@@ -357,14 +432,18 @@ def liouville_determinant(result: Dict[str, Any], fixed, method: Optional[str] =
             sp_t, m_spacing, m_origin, m_dir, device=eval_dev, dtype=torch.float32
         )
         sp_rev, org_rev, dir_rev = reverse_metadata(m_spacing, m_origin, m_dir)
-        coords_norm = physical_to_normalized_torch_cached(
-            X_phys.add_(w_l2r_inv_cpu.to(eval_dev)),
-            torch.tensor(list(sp_t), device=eval_dev, dtype=torch.float32),
-            torch.tensor(sp_rev, device=eval_dev, dtype=torch.float32),
-            torch.tensor(org_rev, device=eval_dev, dtype=torch.float32),
-            torch.tensor(dir_rev, device=eval_dev, dtype=torch.float32),
-        )
-        del X_phys
+        shape_np = np.asarray(sp_t, dtype=np.float64)
+        sp_np = np.asarray(sp_rev, dtype=np.float64)
+        org_np = np.asarray(org_rev, dtype=np.float64)
+        inv_dir_np = np.linalg.inv(np.asarray(dir_rev, dtype=np.float64).T)
+        scale_np = 2.0 / (sp_np * np.maximum(shape_np - 1.0, 1e-8))
+        M_zyx = inv_dir_np * scale_np[None, :]
+        b_zyx = -(org_np @ M_zyx) - 1.0
+        M_norm = torch.as_tensor(np.ascontiguousarray(M_zyx[:, ::-1], dtype=np.float32), device=eval_dev)
+        b_norm = torch.as_tensor(np.ascontiguousarray(b_zyx[::-1], dtype=np.float32), device=eval_dev)
+        X_phys.add_(w_inv_dev)
+        coords_norm = (X_phys.view(-1, dim) @ M_norm + b_norm).view(*X_phys.shape)
+        del X_phys, M_norm, b_norm
 
         sampled_pair = F.grid_sample(pair_t, coords_norm, mode="bilinear", padding_mode="border", align_corners=True)
         del pair_t
@@ -378,8 +457,13 @@ def liouville_determinant(result: Dict[str, Any], fixed, method: Optional[str] =
             # Where a half folds or l2r -> 0, the inverse-function ratio r2l / l2r diverges;
             # evaluate the signed chain-rule product det D phi_r2l(y) * det D phi_l2r^-1(x)
             # bounded above by the folded half determinant (<= 0) without negating positive expansions.
-            det_l2r_inv = _fd_det(model_ref, w_l2r_inv_cpu)
-            l2r_inv_t = torch.from_numpy(np.ascontiguousarray(np.transpose(det_l2r_inv.numpy(), rev_axes))).to(eval_dev)
+            if use_gpu_fd3:
+                l2r_inv_t = _fd_det_3d_zyx(w_inv_dev, model_ref, eval_dev)
+            else:
+                det_l2r_inv = _fd_det(model_ref, w_l2r_inv_cpu)
+                l2r_inv_t = torch.as_tensor(
+                    np.ascontiguousarray(np.transpose(det_l2r_inv.numpy(), rev_axes)), device=eval_dev
+                )
             chain_det = r2l_y * l2r_inv_t
             folded_val = torch.minimum(
                 chain_det, torch.minimum(half_min_y, torch.minimum(l2r_y, r2l_y))
@@ -387,12 +471,15 @@ def liouville_determinant(result: Dict[str, Any], fixed, method: Optional[str] =
             det_t = torch.where(valid_pos, r2l_y / l2r_y.clamp(min=1e-4), folded_val)
         else:
             det_t = r2l_y / l2r_y
-        del sampled_pair
+        del sampled_pair, w_inv_dev
 
         det_ants = np.transpose(det_t.detach().cpu().numpy(), rev_axes).astype(np.float32)
         img_model = ants.from_numpy(det_ants, origin=model_ref.origin, spacing=model_ref.spacing, direction=model_ref.direction)
         img = _resample_det_to_fixed(img_model, fixed, same_grid)
-        details.update(measure="finite difference of each half field", det_l2r=det_l2r, det_r2l=det_r2l)
+        if return_details:
+            details.update(measure="finite difference of each half field", det_l2r=det_l2r, det_r2l=det_r2l)
+        else:
+            details["measure"] = "finite difference of each half field"
     else:  # greedy
         warp = next((x for x in result["fwdtransforms"] if isinstance(x, str) and x.endswith(".nii.gz")), None)
         if warp is None:

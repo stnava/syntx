@@ -143,6 +143,42 @@ class ContinuousField:
             dtype=self.dtype,
         )
 
+    @classmethod
+    def from_tensor(
+        cls,
+        tensor_cdhw: torch.Tensor,
+        *,
+        spatial_shape: tuple[int, int, int],
+        origin: tuple[float, float, float] = (0.0, 0.0, 0.0),
+        spacing: tuple[float, float, float] = (1.0, 1.0, 1.0),
+        direction: np.ndarray | None = None,
+        is_vector: bool = True,
+    ) -> "ContinuousField":
+        """Construct a ``ContinuousField`` directly from a device-resident ``(1, C, Nz, Ny, Nx)`` tensor
+        without CPU NumPy materialization or host-to-device re-upload."""
+        obj = cls.__new__(cls)
+        obj.device = tensor_cdhw.device
+        obj.dtype = tensor_cdhw.dtype
+        obj.is_vector = bool(is_vector)
+        obj.spatial_shape = tuple(int(s) for s in spatial_shape[:3])
+        obj.origin = tuple(float(x) for x in origin[:3])
+        obj.spacing = tuple(float(x) for x in spacing[:3])
+        obj.direction = (
+            np.asarray(direction[:3, :3], dtype=np.float64)
+            if direction is not None
+            else np.eye(3, dtype=np.float64)
+        )
+        obj.tensor = tensor_cdhw if tensor_cdhw.is_contiguous() else tensor_cdhw.contiguous()
+        obj.M_norm, obj.b_norm = get_physical_to_normalized_affine(
+            shape=obj.spatial_shape,
+            spacing=obj.spacing,
+            origin=obj.origin,
+            direction=obj.direction,
+            device=obj.device,
+            dtype=obj.dtype,
+        )
+        return obj
+
     def sample(
         self,
         coords_phys: torch.Tensor,
@@ -472,16 +508,26 @@ def _write_ants_images_fast(
         try:
             file_sz = os.path.getsize(src_nii)
             if max_chunk_workers > 1 and file_sz >= 8 * 1024 * 1024:
-                n_chunks = min(max_chunk_workers, max(1, file_sz // (4 * 1024 * 1024)))
-                chunk_sz = (file_sz + n_chunks - 1) // n_chunks
-                with open(src_nii, "rb") as fin:
-                    raw_chunks = [fin.read(chunk_sz) for _ in range(n_chunks)]
-                raw_chunks = [c for c in raw_chunks if c]
-                with ThreadPoolExecutor(max_workers=len(raw_chunks)) as ex:
-                    parts = list(ex.map(_gz_chunk, raw_chunks))
-                with open(tmp_gz, "wb") as fout:
-                    for part in parts:
-                        fout.write(part)
+                from collections import deque
+
+                stream_chunk_sz = 8 * 1024 * 1024
+                max_inflight = max(2, max_chunk_workers * 2)
+                with (
+                    open(src_nii, "rb") as fin,
+                    open(tmp_gz, "wb") as fout,
+                    ThreadPoolExecutor(max_workers=max_chunk_workers) as ex,
+                ):
+                    inflight = deque()
+                    while True:
+                        chunk = fin.read(stream_chunk_sz)
+                        if not chunk:
+                            break
+                        inflight.append(ex.submit(_gz_chunk, chunk))
+                        del chunk
+                        if len(inflight) >= max_inflight:
+                            fout.write(inflight.popleft().result())
+                    while inflight:
+                        fout.write(inflight.popleft().result())
             else:
                 comp = zlib.compressobj(lvl, zlib.DEFLATED, 16 + zlib.MAX_WBITS)
                 with open(src_nii, "rb") as fin, open(tmp_gz, "wb") as fout:
@@ -513,10 +559,17 @@ def _write_ants_images_fast(
             list(ex.map(lambda j: _compress_one(j, max_chunk_workers=per_job_workers), gz_jobs))
 
 
-def _cache_disp_image_and_field(path: str, disp_img: Any, device: Any | None = None) -> None:
+def _cache_disp_image_and_field(
+    path: str,
+    disp_img: Any,
+    device: Any | None = None,
+    disp_tensor: Any | None = None,
+) -> None:
     """Seed ``_DISP_IMG_CACHE`` and (for standard-sized grids) ``_DISP_FIELD_CACHE`` for a
     just-written 3D displacement ``ANTsImage`` so immediate downstream ``jacobian_modulation`` /
-    ``apply_transforms`` / ``resample_series`` calls skip ``ants.image_read`` gzip decompression."""
+    ``apply_transforms`` / ``resample_series`` calls skip ``ants.image_read`` gzip decompression.
+    When ``disp_tensor`` (a ``(1, Nz, Ny, Nx, 3)`` or ``(Nz, Ny, Nx, 3)`` ``(dz, dy, dx)`` tensor)
+    is provided, builds ``ContinuousField`` directly on ``device`` without CPU NumPy or H2D upload."""
     if not isinstance(path, str) or len(getattr(disp_img, "shape", ())) != 3:
         return
     try:
@@ -533,7 +586,27 @@ def _cache_disp_image_and_field(path: str, disp_img: Any, device: Any | None = N
         dev = device if isinstance(device, torch.device) else torch.device(resolve_device(device, task="model"))
         if str(dev) == "cpu" or n_vox <= _MAX_GPU_CACHE_VOXELS:
             disp_key = (path, os.path.getmtime(path), str(dev))
-            field = ContinuousField(disp_img, device=dev, dtype=torch.float32)
+            if (
+                isinstance(disp_tensor, torch.Tensor)
+                and disp_tensor.ndim in (4, 5)
+                and int(disp_tensor.shape[-1]) == 3
+            ):
+                t = disp_tensor.detach()
+                if t.ndim == 4:
+                    t = t.unsqueeze(0)
+                tensor_cdhw = (
+                    torch.flip(t, dims=[-1]).movedim(-1, 1).to(device=dev, dtype=torch.float32).contiguous()
+                )
+                field = ContinuousField.from_tensor(
+                    tensor_cdhw,
+                    spatial_shape=tuple(int(s) for s in disp_img.shape[:3]),
+                    origin=tuple(float(x) for x in disp_img.origin[:3]),
+                    spacing=tuple(float(x) for x in disp_img.spacing[:3]),
+                    direction=np.asarray(disp_img.direction[:3, :3], dtype=np.float64),
+                    is_vector=True,
+                )
+            else:
+                field = ContinuousField(disp_img, device=dev, dtype=torch.float32)
             max_disp_entries = 8 if str(dev) == "cpu" else 2
             while len(_DISP_FIELD_CACHE) >= max_disp_entries:
                 _DISP_FIELD_CACHE.pop(next(iter(_DISP_FIELD_CACHE)))
@@ -801,61 +874,90 @@ def _read_itk_affine(path_or_tx: Any, invert: bool = False) -> tuple[np.ndarray,
     return M, b
 
 
-def _get_disp_and_grad_fields(path: str, device: Any) -> tuple[ContinuousField, ContinuousField]:
+def _fd4_axis_cdhw(x: torch.Tensor, ax: int) -> torch.Tensor:
+    """4th-order central-difference derivative along spatial axis ``ax`` of a ``(3, Nz, Ny, Nx)`` tensor."""
+    n = int(x.shape[ax])
+    idx = torch.arange(n, device=x.device)
+    ip1 = (idx + 1).clamp(max=max(0, n - 1))
+    im1 = (idx - 1).clamp(min=0)
+    ip2 = (idx + 2).clamp(max=max(0, n - 1))
+    im2 = (idx - 2).clamp(min=0)
+    d1 = x.index_select(ax, ip1).sub_(x.index_select(ax, im1)).mul_(0.5)
+    d2 = x.index_select(ax, ip2).sub_(x.index_select(ax, im2)).mul_(0.25)
+    return d1.mul_(4.0).sub_(d2).mul_(1.0 / 3.0)
+
+
+def _get_disp_and_grad_fields(
+    path: str,
+    device: Any,
+    local_disp_grad_cache: dict[tuple[str, float, str], tuple[ContinuousField, ContinuousField]] | None = None,
+) -> tuple[ContinuousField, ContinuousField]:
     """Load and cache both the 3-component displacement ContinuousField and its 9-component
     ITK physical-space gradient ContinuousField (with 1-voxel boundary shell zeroed to match
     ITK DisplacementFieldTransform::ComputeInverseJacobianWithRespectToPosition)."""
     import ants
 
+    dev = device if isinstance(device, torch.device) else torch.device(device)
     mtime = os.path.getmtime(path) if os.path.exists(path) else 0.0
-    key = (path, mtime, str(device))
+    key = (path, mtime, str(dev))
+    if local_disp_grad_cache is not None and key in local_disp_grad_cache:
+        return local_disp_grad_cache[key]
     field = _DISP_FIELD_CACHE.get(key)
     grad_field = _DISP_GRAD_CACHE.get(key)
-    if field is None or grad_field is None:
-        disp_img = ants.image_read(path)
-        field = ContinuousField(disp_img, device=device, dtype=torch.float32)
-        u = np.asarray(disp_img.numpy(), dtype=np.float32)
-        sp_shape = u.shape[:3]
-        du_didx = np.zeros(sp_shape + (3, 3), dtype=np.float32)
-        inv_three = np.float32(1.0 / 3.0)
-        for d in range(3):
-            n = sp_shape[d]
-            idx = np.arange(n)
-            ip1 = np.clip(idx + 1, 0, n - 1)
-            im1 = np.clip(idx - 1, 0, n - 1)
-            ip2 = np.clip(idx + 2, 0, n - 1)
-            im2 = np.clip(idx - 2, 0, n - 1)
-            d1 = np.float32(0.5) * (np.take(u, ip1, axis=d) - np.take(u, im1, axis=d))
-            d2 = np.float32(0.25) * (np.take(u, ip2, axis=d) - np.take(u, im2, axis=d))
-            du_didx[..., :, d] = (np.float32(4.0) * d1 - d2) * inv_three
-        for ax in range(3):
-            if sp_shape[ax] >= 2:
-                sl0 = [slice(None)] * 3
-                sl1 = [slice(None)] * 3
-                sl0[ax] = 0
-                sl1[ax] = -1
-                du_didx[tuple(sl0)] = 0.0
-                du_didx[tuple(sl1)] = 0.0
-        d_mat = np.asarray(disp_img.direction, dtype=np.float64)[:3, :3]
-        s_vec = np.asarray(disp_img.spacing, dtype=np.float64)[:3]
+    if field is None:
+        disp_img = None
+        try:
+            st = os.stat(path)
+            disp_img = _DISP_IMG_CACHE.get((path, st.st_mtime_ns, st.st_size))
+        except OSError:
+            pass
+        if disp_img is None:
+            disp_img = ants.image_read(path)
+        field = ContinuousField(disp_img, device=dev, dtype=torch.float32)
+        del disp_img
+    if grad_field is None:
+        t = field.tensor[0]  # (3, Nz, Ny, Nx) in (ux, uy, uz) component order
+        _, nz, ny, nx = t.shape
+        du_didx = torch.empty((3, 3, nz, ny, nx), device=dev, dtype=torch.float32)
+        du_didx[:, 0] = _fd4_axis_cdhw(t, 3)
+        du_didx[:, 1] = _fd4_axis_cdhw(t, 2)
+        du_didx[:, 2] = _fd4_axis_cdhw(t, 1)
+        if nz >= 2:
+            du_didx[:, :, 0, :, :] = 0.0
+            du_didx[:, :, -1, :, :] = 0.0
+        if ny >= 2:
+            du_didx[:, :, :, 0, :] = 0.0
+            du_didx[:, :, :, -1, :] = 0.0
+        if nx >= 2:
+            du_didx[:, :, :, :, 0] = 0.0
+            du_didx[:, :, :, :, -1] = 0.0
+        d_mat = np.asarray(field.direction, dtype=np.float64)[:3, :3]
+        s_vec = np.asarray(field.spacing, dtype=np.float64)[:3]
         ds_inv = np.linalg.inv(d_mat @ np.diag(s_vec)).astype(np.float32)
-        grad_phys = (du_didx @ ds_inv).reshape(*sp_shape, 9)
-        grad_field = ContinuousField(
-            grad_phys,
+        ds_inv_t = torch.as_tensor(ds_inv, device=dev, dtype=torch.float32)
+        # Contract derivative axis d: grad_phys[c, k, n] = sum_d ds_inv_T[k, d] * du_didx[c, d, n]
+        grad_cdhw = torch.matmul(ds_inv_t.T.unsqueeze(0), du_didx.view(3, 3, -1)).view(1, 9, nz, ny, nx)
+        del du_didx, ds_inv_t
+        grad_field = ContinuousField.from_tensor(
+            grad_cdhw,
+            spatial_shape=field.spatial_shape,
             origin=field.origin,
             spacing=field.spacing,
             direction=field.direction,
-            device=device,
-            dtype=torch.float32,
+            is_vector=True,
         )
-        if str(device) == "cpu" or int(np.prod(sp_shape)) <= _MAX_GPU_CACHE_VOXELS:
-            max_disp_entries = 8 if str(device) == "cpu" else 2
-            while len(_DISP_FIELD_CACHE) >= max_disp_entries:
-                _DISP_FIELD_CACHE.pop(next(iter(_DISP_FIELD_CACHE)))
+        n_vox = int(np.prod(field.spatial_shape))
+        if str(dev) == "cpu" or n_vox <= _MAX_GPU_CACHE_VOXELS:
+            max_disp_entries = 8 if str(dev) == "cpu" else 2
+            if key not in _DISP_FIELD_CACHE:
+                while len(_DISP_FIELD_CACHE) >= max_disp_entries:
+                    _DISP_FIELD_CACHE.pop(next(iter(_DISP_FIELD_CACHE)))
+                _DISP_FIELD_CACHE[key] = field
             while len(_DISP_GRAD_CACHE) >= max_disp_entries:
                 _DISP_GRAD_CACHE.pop(next(iter(_DISP_GRAD_CACHE)))
-            _DISP_FIELD_CACHE[key] = field
             _DISP_GRAD_CACHE[key] = grad_field
+        elif local_disp_grad_cache is not None:
+            local_disp_grad_cache[key] = (field, grad_field)
     return field, grad_field
 
 
@@ -916,7 +1018,10 @@ def _map_points_to_moving_tensor(
 
 
 def _map_points_and_inv_jacobian_tensor(
-    points_lps: torch.Tensor, chain: TransformChain, device: Any
+    points_lps: torch.Tensor,
+    chain: TransformChain,
+    device: Any,
+    local_disp_grad_cache: dict[tuple[str, float, str], tuple[ContinuousField, ContinuousField]] | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Map fixed physical points (LPS mm) to moving space AND accumulate ITK's composite
     inverse Jacobian ``J_inv`` of shape ``(N, 3, 3)`` along the trajectory."""
@@ -940,7 +1045,9 @@ def _map_points_and_inv_jacobian_tensor(
         else:
             if element.invert:
                 raise ValueError(f"{element.path}: a displacement field cannot be inverted on the fly")
-            field, grad_field = _get_disp_and_grad_fields(element.path, device)
+            field, grad_field = _get_disp_and_grad_fields(
+                element.path, device, local_disp_grad_cache=local_disp_grad_cache
+            )
             g = _sample_field_itk(grad_field, pts, mode="nearest").view(-1, 3, 3)
             j_step = eye.unsqueeze(0) - g
             j_inv = torch.bmm(j_step, j_inv)
@@ -949,11 +1056,9 @@ def _map_points_and_inv_jacobian_tensor(
     return pts, j_inv
 
 
-def _polar_svd_3x3(mat: torch.Tensor) -> torch.Tensor:
-    """Exact orthogonal polar factor R in SO(3) (det = +1) for a batch of 3x3 matrices (..., 3, 3)."""
-    orig_shape = mat.shape
-    m_cpu = mat.detach().cpu().numpy().astype(np.float64).reshape(-1, 3, 3)
-    u, _, vt = np.linalg.svd(m_cpu)
+def _polar_svd_cpu_exact(mat_np_f64: np.ndarray) -> np.ndarray:
+    """Exact float64 SVD orthogonal Procrustes / polar SO(3) factor on CPU for ``(K, 3, 3)``."""
+    u, _, vt = np.linalg.svd(mat_np_f64)
     r = u @ vt
     dets = np.linalg.det(r)
     reflection_mask = dets < 0.0
@@ -961,7 +1066,86 @@ def _polar_svd_3x3(mat: torch.Tensor) -> torch.Tensor:
         vt_copy = vt.copy()
         vt_copy[reflection_mask, -1, :] *= -1.0
         r[reflection_mask] = u[reflection_mask] @ vt_copy[reflection_mask]
-    return torch.as_tensor(r.astype(np.float32), dtype=mat.dtype, device=mat.device).reshape(orig_shape)
+    return r
+
+
+def _det_and_cofactor_3x3(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    """Closed-form determinant and cofactor matrix ``Cof(x) = det(x) * x^{-T}`` for ``(..., 3, 3)``."""
+    x00, x01, x02 = x[..., 0, 0], x[..., 0, 1], x[..., 0, 2]
+    x10, x11, x12 = x[..., 1, 0], x[..., 1, 1], x[..., 1, 2]
+    x20, x21, x22 = x[..., 2, 0], x[..., 2, 1], x[..., 2, 2]
+    c00 = x11 * x22 - x12 * x21
+    c01 = x12 * x20 - x10 * x22
+    c02 = x10 * x21 - x11 * x20
+    c10 = x02 * x21 - x01 * x22
+    c11 = x00 * x22 - x02 * x20
+    c12 = x01 * x20 - x00 * x21
+    c20 = x01 * x12 - x02 * x11
+    c21 = x02 * x10 - x00 * x12
+    c22 = x00 * x11 - x01 * x10
+    det = x00 * c00 + x01 * c01 + x02 * c02
+    cof = torch.stack(
+        (
+            torch.stack((c00, c01, c02), dim=-1),
+            torch.stack((c10, c11, c12), dim=-1),
+            torch.stack((c20, c21, c22), dim=-1),
+        ),
+        dim=-2,
+    )
+    return det, cof
+
+
+def _polar_svd_3x3(mat: torch.Tensor) -> torch.Tensor:
+    """Exact orthogonal polar factor R in SO(3) (det = +1) for a batch of 3x3 matrices (..., 3, 3).
+
+    On GPU/MPS, evaluates Higham's determinantal-scaled Newton-polar iteration with closed-form 3x3
+    cofactors (~1e-7 accuracy in 6 iterations without LU/SVD host fallbacks), routing only reflected
+    or nearly singular matrices (det <= 1e-4 * ||M||_F^3) through exact float64 CPU SVD Procrustes.
+    """
+    orig_shape = mat.shape
+    if mat.numel() == 0:
+        return mat.clone()
+    if mat.device.type == "cpu":
+        m_cpu = mat.detach().numpy().astype(np.float64).reshape(-1, 3, 3)
+        r = _polar_svd_cpu_exact(m_cpu)
+        return torch.as_tensor(r.astype(np.float32), dtype=mat.dtype, device=mat.device).reshape(orig_shape)
+
+    m_flat = mat.detach().to(dtype=torch.float32).reshape(-1, 3, 3)
+    n_mat = int(m_flat.shape[0])
+    chunk_n = 262_144
+    out_r = torch.empty_like(m_flat)
+    any_bad = torch.zeros((), dtype=torch.bool, device=mat.device)
+
+    for s in range(0, n_mat, chunk_n):
+        e = min(n_mat, s + chunk_n)
+        mc = m_flat[s:e]
+        frob = mc.norm(dim=(-2, -1), keepdim=True).clamp_(min=1e-12)
+        x = mc / frob
+        del frob
+        det0, _ = _det_and_cofactor_3x3(x)
+        bad_c = det0 <= 1e-4
+        any_bad = any_bad | bad_c.any()
+        del det0, bad_c
+        for _ in range(6):
+            det_x, cof_x = _det_and_cofactor_3x3(x)
+            gamma = det_x.abs().clamp(min=1e-20).pow(-1.0 / 3.0).unsqueeze(-1).unsqueeze(-1)
+            cof_x.div_(det_x.unsqueeze(-1).unsqueeze(-1).clamp(min=1e-20)).div_(gamma)
+            x.mul_(gamma).add_(cof_x).mul_(0.5)
+            del det_x, cof_x, gamma
+        out_r[s:e] = x
+        del x
+
+    if bool(any_bad.item()):
+        frob_all = m_flat.norm(dim=(-2, -1)).clamp_(min=1e-12)
+        det_all, _ = _det_and_cofactor_3x3(m_flat / frob_all.unsqueeze(-1).unsqueeze(-1))
+        bad = det_all <= 1e-4
+        del frob_all, det_all
+        if bool(bad.any().item()):
+            m_bad = m_flat[bad].cpu().numpy().astype(np.float64)
+            r_bad = _polar_svd_cpu_exact(m_bad)
+            out_r[bad] = torch.as_tensor(r_bad.astype(np.float32), device=mat.device, dtype=torch.float32)
+
+    return out_r.to(dtype=mat.dtype).reshape(orig_shape)
 
 
 def _apply_vector_3d(
@@ -972,25 +1156,71 @@ def _apply_vector_3d(
     mode: str,
     defaultvalue: float,
     dev: torch.device,
+    max_slab_voxels: int | None = None,
 ) -> Any:
     """Resample and reorient a 3D 3-component vector ANTsImage (imagetype=1) matching ITK/ANTs:
     v_fix(x) = D_fix^T @ polar(J_inv(x)) @ D_mov @ v_mov(y(x))."""
     import ants
 
     ref_shape = tuple(int(s) for s in reference.shape[:3])
-    pts_fixed = _reference_grid_points_lps(reference, dev)
-    pts_moving, j_inv = _map_points_and_inv_jacobian_tensor(pts_fixed, chain, dev)
+    n_ref_vox = int(ref_shape[0]) * int(ref_shape[1]) * int(ref_shape[2])
+    slab_vox_cap = int(max_slab_voxels) if max_slab_voxels is not None else (_MAX_GPU_CACHE_VOXELS * 2)
 
     field = ContinuousField(image, device=dev, dtype=torch.float32)
-    v_sampled = _sample_field_itk(field, pts_moving, mode=mode, defaultvalue=defaultvalue)  # (N, 3)
-
-    r_inv = _polar_svd_3x3(j_inv)  # (N, 3, 3)
     d_fix = torch.as_tensor(np.asarray(reference.direction)[:3, :3], dtype=torch.float32, device=dev)
     d_mov = torch.as_tensor(np.asarray(image.direction)[:3, :3], dtype=torch.float32, device=dev)
+
+    if str(dev) != "cpu" and mode != "bspline" and n_ref_vox > slab_vox_cap:
+        local_dg_cache: dict[tuple[str, float, str], tuple[ContinuousField, ContinuousField]] = {}
+        arr_out = np.empty((*ref_shape, 3), dtype=np.float32)
+        slab_x = max(1, slab_vox_cap // max(1, int(ref_shape[1]) * int(ref_shape[2])))
+        try:
+            for s_x in range(0, ref_shape[0], slab_x):
+                e_x = min(ref_shape[0], s_x + slab_x)
+                pts_fixed = _reference_grid_points_lps(reference, dev, x_slice=(s_x, e_x))
+                pts_moving, j_inv = _map_points_and_inv_jacobian_tensor(
+                    pts_fixed, chain, dev, local_disp_grad_cache=local_dg_cache
+                )
+                del pts_fixed
+                v_sampled = _sample_field_itk(field, pts_moving, mode=mode, defaultvalue=defaultvalue)
+                del pts_moving
+                r_inv = _polar_svd_3x3(j_inv)
+                del j_inv
+                rot_total = torch.matmul(d_fix.T.unsqueeze(0), torch.matmul(r_inv, d_mov.unsqueeze(0)))
+                del r_inv
+                v_out = torch.bmm(rot_total, v_sampled.unsqueeze(-1)).squeeze(-1)
+                del rot_total, v_sampled
+                arr_out[s_x:e_x] = (
+                    v_out.reshape(e_x - s_x, ref_shape[1], ref_shape[2], 3).detach().cpu().numpy()
+                )
+                del v_out
+        finally:
+            local_dg_cache.clear()
+            del local_dg_cache, field
+        return ants.from_numpy(
+            arr_out,
+            origin=tuple(float(x) for x in reference.origin[:3]),
+            spacing=tuple(float(x) for x in reference.spacing[:3]),
+            direction=np.asarray(reference.direction)[:3, :3],
+            has_components=True,
+        )
+
+    pts_fixed = _reference_grid_points_lps(reference, dev)
+    pts_moving, j_inv = _map_points_and_inv_jacobian_tensor(pts_fixed, chain, dev)
+    del pts_fixed
+
+    v_sampled = _sample_field_itk(field, pts_moving, mode=mode, defaultvalue=defaultvalue)  # (N, 3)
+    del field, pts_moving
+
+    r_inv = _polar_svd_3x3(j_inv)  # (N, 3, 3)
+    del j_inv
     rot_total = torch.matmul(d_fix.T.unsqueeze(0), torch.matmul(r_inv, d_mov.unsqueeze(0)))  # (N, 3, 3)
+    del r_inv
     v_out = torch.bmm(rot_total, v_sampled.unsqueeze(-1)).squeeze(-1)  # (N, 3)
+    del rot_total, v_sampled
 
     arr_out = v_out.reshape(*ref_shape, 3).detach().cpu().numpy().astype(np.float32, copy=False)
+    del v_out
     return ants.from_numpy(
         arr_out,
         origin=tuple(float(x) for x in reference.origin[:3]),
@@ -1060,6 +1290,7 @@ def _apply_tensor_3d(
     chain: TransformChain,
     mode: str,
     dev: torch.device,
+    max_slab_voxels: int | None = None,
 ) -> Any:
     """Resample and reorient a 3D 6-component symmetric tensor ANTsImage (imagetype=2,
     ``[Dxx, Dxy, Dxz, Dyy, Dyz, Dzz]``) matching ITK/ANTs: log-Euclidean interpolation
@@ -1067,6 +1298,9 @@ def _apply_tensor_3d(
     import ants
 
     ref_shape = tuple(int(s) for s in reference.shape[:3])
+    n_ref_vox = int(ref_shape[0]) * int(ref_shape[1]) * int(ref_shape[2])
+    slab_vox_cap = int(max_slab_voxels) if max_slab_voxels is not None else (_MAX_GPU_CACHE_VOXELS * 2)
+
     arr_in = np.asarray(image.numpy(), dtype=np.float64)
     if arr_in.ndim != 4 or arr_in.shape[-1] != 6:
         raise ValueError(f"imagetype=2 expects a 6-component symmetric tensor image, got shape {arr_in.shape}")
@@ -1092,9 +1326,6 @@ def _apply_tensor_3d(
         ).astype(np.float32)
     log_arr = log_flat.reshape(arr_in.shape)
 
-    pts_fixed = _reference_grid_points_lps(reference, dev)
-    pts_moving, j_inv = _map_points_and_inv_jacobian_tensor(pts_fixed, chain, dev)
-
     field = ContinuousField(
         log_arr,
         origin=tuple(float(x) for x in image.origin[:3]),
@@ -1103,16 +1334,61 @@ def _apply_tensor_3d(
         device=dev,
         dtype=torch.float32,
     )
-    flat_coords = pts_moving.view(-1, 3).to(device=dev, dtype=torch.float32)
-    coords_norm = physical_to_normalized(flat_coords, field.M_norm, field.b_norm)
     shape_t = torch.tensor(field.spatial_shape, dtype=torch.float32, device=dev)
-    cidx = (coords_norm + 1.0) * (0.5 * (shape_t - 1.0))
-    inside = ((cidx >= -0.5 - 1e-5) & (cidx < (shape_t - 0.5) - 1e-5)).all(dim=-1).detach().cpu().numpy()
-
-    sampled_log = _sample_field_itk(field, pts_moving, mode=mode).detach().cpu().numpy()
     d_fix = np.asarray(reference.direction, dtype=np.float64)[:3, :3]
     d_mov = np.asarray(image.direction, dtype=np.float64)[:3, :3]
+
+    if str(dev) != "cpu" and mode != "bspline" and n_ref_vox > slab_vox_cap:
+        local_dg_cache: dict[tuple[str, float, str], tuple[ContinuousField, ContinuousField]] = {}
+        arr_out = np.zeros((*ref_shape, 6), dtype=np.float32)
+        slab_x = max(1, slab_vox_cap // max(1, int(ref_shape[1]) * int(ref_shape[2])))
+        try:
+            for s_x in range(0, ref_shape[0], slab_x):
+                e_x = min(ref_shape[0], s_x + slab_x)
+                pts_fixed = _reference_grid_points_lps(reference, dev, x_slice=(s_x, e_x))
+                pts_moving, j_inv = _map_points_and_inv_jacobian_tensor(
+                    pts_fixed, chain, dev, local_disp_grad_cache=local_dg_cache
+                )
+                del pts_fixed
+                flat_coords = pts_moving.view(-1, 3).to(device=dev, dtype=torch.float32)
+                coords_norm = physical_to_normalized(flat_coords, field.M_norm, field.b_norm)
+                cidx = (coords_norm + 1.0) * (0.5 * (shape_t - 1.0))
+                inside = ((cidx >= -0.5 - 1e-5) & (cidx < (shape_t - 0.5) - 1e-5)).all(dim=-1).detach().cpu().numpy()
+                del flat_coords, coords_norm, cidx
+                sampled_log = _sample_field_itk(field, pts_moving, mode=mode).detach().cpu().numpy()
+                del pts_moving
+                j_inv_np = j_inv.detach().cpu().numpy().astype(np.float64)
+                del j_inv
+                if np.any(inside):
+                    f_total = d_fix.T @ j_inv_np[inside] @ d_mov
+                    out_slab = np.zeros_like(sampled_log, dtype=np.float32)
+                    out_slab[inside] = _ppd_reorient_sym6(sampled_log[inside], f_total, from_log_domain=True)
+                    arr_out[s_x:e_x] = out_slab.reshape(e_x - s_x, ref_shape[1], ref_shape[2], 6)
+        finally:
+            local_dg_cache.clear()
+            del local_dg_cache, field
+        return ants.from_numpy(
+            arr_out,
+            origin=tuple(float(x) for x in reference.origin[:3]),
+            spacing=tuple(float(x) for x in reference.spacing[:3]),
+            direction=np.asarray(reference.direction)[:3, :3],
+            has_components=True,
+        )
+
+    pts_fixed = _reference_grid_points_lps(reference, dev)
+    pts_moving, j_inv = _map_points_and_inv_jacobian_tensor(pts_fixed, chain, dev)
+    del pts_fixed
+
+    flat_coords = pts_moving.view(-1, 3).to(device=dev, dtype=torch.float32)
+    coords_norm = physical_to_normalized(flat_coords, field.M_norm, field.b_norm)
+    cidx = (coords_norm + 1.0) * (0.5 * (shape_t - 1.0))
+    inside = ((cidx >= -0.5 - 1e-5) & (cidx < (shape_t - 0.5) - 1e-5)).all(dim=-1).detach().cpu().numpy()
+    del flat_coords, coords_norm, cidx
+
+    sampled_log = _sample_field_itk(field, pts_moving, mode=mode).detach().cpu().numpy()
+    del field, pts_moving
     j_inv_np = j_inv.detach().cpu().numpy().astype(np.float64)
+    del j_inv
     f_total = d_fix.T @ j_inv_np @ d_mov
 
     sampled_log[~inside] = 0.0

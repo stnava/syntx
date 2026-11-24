@@ -508,18 +508,25 @@ class FieldStepOptimizer:
             if self.cfl_momentum > 0.0:
                 self.vel_mom.mul_(self.cfl_momentum).add_(v_vox, alpha=1.0 - self.cfl_momentum)
                 m_vox = self.vel_mom
+                out = v_vox.clone() if v_vox.data_ptr() == grad.data_ptr() else v_vox
             else:
                 m_vox = v_vox
+                out = v_vox.clone() if v_vox.data_ptr() == grad.data_ptr() else v_vox
 
             v_norm_max = m_vox.norm(p=2, dim=-1, keepdim=True).flatten(1).max(1).values
             v_norm_max = v_norm_max.reshape(-1, *([1] * (dim + 1)))
-            m_unit = torch.where(
-                v_norm_max > 1e-20,
-                m_vox / v_norm_max.clamp(min=1e-20),
-                torch.zeros_like(m_vox),
-            )
             step_scale = half_res_xyz if self.param_domain == 'normalized_grid' else sp_t_zyx
-            return -float(learning_rate) * step_scale * m_unit
+            active = v_norm_max > 1e-20
+            factor = torch.where(
+                active,
+                -float(learning_rate) * step_scale,
+                torch.zeros_like(step_scale),
+            )
+            if out.data_ptr() != m_vox.data_ptr():
+                torch.div(m_vox, v_norm_max.clamp(min=1e-20), out=out)
+            else:
+                out.div_(v_norm_max.clamp(min=1e-20))
+            return out.mul_(factor)
 
         # 'adam' / 'reg_adam'
         g = grad
@@ -534,26 +541,34 @@ class FieldStepOptimizer:
         self._step += 1
         self.exp_avg.mul_(self.beta1).add_(g, alpha=1.0 - self.beta1)
         self.exp_avg_sq.mul_(self.beta2).addcmul_(g, g, value=1.0 - self.beta2)
+        del g
 
         b1_corr = 1.0 - self.beta1 ** self._step
         b2_corr = 1.0 - self.beta2 ** self._step
         b2_sqrt = math.sqrt(b2_corr)
         step_size = b2_sqrt / b1_corr
         eps_scaled = self.eps * b2_sqrt
-        raw_update = (self.exp_avg * step_size).div_(self.exp_avg_sq.sqrt().add_(eps_scaled))
+        num = self.exp_avg * step_size
+        denom = self.exp_avg_sq.sqrt().add_(eps_scaled)
+        raw_update = num.div_(denom)
+        del denom
 
         if self.mode == 'reg_adam':
             active_post_fn = post_reg_fn if post_reg_fn is not None else reg_fn
             if active_post_fn is not None:
                 u_reg = active_post_fn(raw_update)
+                if u_reg.data_ptr() == raw_update.data_ptr():
+                    u_reg = raw_update
+                del raw_update
                 max_norm = u_reg.norm(p=2, dim=-1, keepdim=True).flatten(1).max(1).values
                 max_norm = max_norm.reshape(-1, *([1] * (dim + 1)))
                 step_scale = half_res_xyz if self.param_domain == 'normalized_grid' else sp_t_zyx
-                return torch.where(
+                factor = torch.where(
                     max_norm > 1e-20,
-                    -float(learning_rate) * step_scale * (u_reg / max_norm.clamp(min=1e-20)),
-                    torch.zeros_like(u_reg),
+                    -float(learning_rate) * step_scale,
+                    torch.zeros_like(step_scale),
                 )
+                return u_reg.div_(max_norm.clamp(min=1e-20)).mul_(factor)
             if reg_smooth_fn is not None:
                 u_reg = reg_smooth_fn(raw_update)
             else:
@@ -562,6 +577,7 @@ class FieldStepOptimizer:
                     u_reg = sobolev_fallback_fn(raw_update, ra_alpha)
                 else:
                     u_reg = raw_update
+            del raw_update
         else:
             u_reg = raw_update
 
@@ -569,7 +585,7 @@ class FieldStepOptimizer:
             self.eps + u_reg.norm(p=2, dim=-1, keepdim=True).flatten(1).max(1).values
         ).reshape(-1, *([1] * (dim + 1))).clamp(min=1.0)
         step_scale = half_resolution if self.param_domain == 'normalized_grid' else 1.0
-        return -float(learning_rate) * step_scale * (u_reg / gradmax)
+        return u_reg.div_(gradmax).mul_(-float(learning_rate) * step_scale)
 
 
 

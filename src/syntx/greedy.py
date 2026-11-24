@@ -273,6 +273,7 @@ class GreedyRegistrationModel(nn.Module):
         digital_diffeomorphism: bool = True,
         digital_diffeomorphism_floor: float = 0.05,
         digital_diffeomorphism_steps: int = 25,
+        metric_chunks: int = 1,
     ):
         super().__init__()
         self.digital_diffeomorphism = bool(digital_diffeomorphism)
@@ -334,7 +335,9 @@ class GreedyRegistrationModel(nn.Module):
             sampling_percentage=sampling_percentage,
             fixed_range=(0.0, 1.0),
             auto_mask=False,
+            metric_chunks=metric_chunks,
         )
+        self.metric_chunks = int(self.loss_config.metric_chunks)
         self.squared = self.loss_config.squared
         self.num_bins = int(self.loss_config.num_bins)
         self.sampling_percentage = self.loss_config.sampling_percentage
@@ -496,7 +499,11 @@ class GreedyRegistrationModel(nn.Module):
             )
 
             # Precompute constant fixed-image LNCC local mean and variance once per pyramid level
-            use_fast_lncc = bool(getattr(self.loss_fn, '_is_default_greedy_lncc', False))
+            # for grids <= 256^3 (16.78M voxels); larger grids automatically slab via self.loss_fn.
+            use_fast_lncc = (
+                bool(getattr(self.loss_fn, '_is_default_greedy_lncc', False))
+                and int(fi_down[0, 0].numel()) <= 16_777_216
+            )
             if use_fast_lncc:
                 ws_lvl = min(int(self.window_size), int(min(size_down)))
                 if ws_lvl % 2 == 0:
@@ -890,7 +897,9 @@ def greedy_registration(
     if initial_transform is None and initial_warp is None:
         if verbose:
             print("[greedy] Running syntx.robust_affine(mode='auto')...")
-        reg_aff = robust_affine(fi_norm, mi_norm, mode=affine_mode, verbose=False, device=torch_device)
+        reg_aff = robust_affine(
+            fi_norm, mi_norm, mode=affine_mode, verbose=False, device=torch_device, return_warped=False
+        )
         raw_init_tx = reg_aff['fwdtransforms'][0]
     t1_aff = time.time() - t0_aff
 
@@ -910,17 +919,15 @@ def greedy_registration(
 
     theta, P_F, P_M = _build_torch_affine_matrix(fi_norm, mi_norm, M_phys, t_phys, torch_device)
 
-    # 5. Prepare Image Tensors (ZYX layout)
-    fi_np = fi_norm.numpy().T
-    mi_np = mi_norm.numpy().T
-
-    fi_t = torch.from_numpy(fi_np).float().unsqueeze(0).unsqueeze(0).to(torch_device)
-    mi_t = torch.from_numpy(mi_np).float().unsqueeze(0).unsqueeze(0).to(torch_device)
+    # 5. Prepare Image Tensors (contiguous ZYX layout, transposed on device from C-contiguous XYZ)
+    dim_sp = fixed.dimension
+    rev_sp = tuple(range(dim_sp - 1, -1, -1))
+    fi_t = torch.from_numpy(fi_norm.numpy()).to(device=torch_device, dtype=torch.float32).permute(*rev_sp).contiguous().unsqueeze(0).unsqueeze(0)
+    mi_t = torch.from_numpy(mi_norm.numpy()).to(device=torch_device, dtype=torch.float32).permute(*rev_sp).contiguous().unsqueeze(0).unsqueeze(0)
 
     mask_t = None
     if fixed_mask is not None:
-        mask_np = fixed_mask.numpy().T
-        mask_t = torch.from_numpy(mask_np).float().unsqueeze(0).unsqueeze(0).to(torch_device)
+        mask_t = torch.from_numpy(fixed_mask.numpy()).to(device=torch_device, dtype=torch.float32).permute(*rev_sp).contiguous().unsqueeze(0).unsqueeze(0)
 
     convergence_slope = kwargs.pop('convergence_slope', DEFAULT_SLOPE_THRESHOLD)   # None / 0 disables the early stop
     # Support aliases and kwargs
@@ -976,15 +983,25 @@ def greedy_registration(
         else:
             lncc_radius = int(syn_samp_val)
 
+    raw_mc = kwargs.pop('metric_chunks', 1)
+    if raw_mc is None:
+        raw_mc = 1
     cfg = parse_similarity_metric(
         similarity_metric,
         lncc_radius=lncc_radius,
         num_bins=int(num_bins_val) if num_bins_val is not None else 32,
         squared=squared,
         sampling_percentage=kwargs.pop('sampling_percentage', None),
+        metric_chunks=raw_mc,
     )
     num_bins = cfg.num_bins
     sampling_percentage = cfg.sampling_percentage
+    metric_chunks_val = int(cfg.metric_chunks)
+    if metric_chunks_val > 1 and cfg.metric not in ('cc2', 'lncc'):
+        raise ValueError(
+            f"syntx.greedy: metric_chunks={metric_chunks_val} requires a local cross-correlation metric "
+            f"(got similarity_metric={similarity_metric!r})"
+        )
     digital_diffeomorphism = bool(kwargs.pop('digital_diffeomorphism', True))
     digital_diffeomorphism_floor = float(kwargs.pop('digital_diffeomorphism_floor', 0.05))
     digital_diffeomorphism_steps = int(kwargs.pop('digital_diffeomorphism_steps', 25))
@@ -1019,6 +1036,7 @@ def greedy_registration(
         digital_diffeomorphism=digital_diffeomorphism,
         digital_diffeomorphism_floor=digital_diffeomorphism_floor,
         digital_diffeomorphism_steps=digital_diffeomorphism_steps,
+        metric_chunks=metric_chunks_val,
     )
 
     model.has_initial_warp = resolved_init.has_initial_warp
@@ -1065,14 +1083,27 @@ def greedy_registration(
 
     # Optional physical inverse and/or digital_diffeomorphism projection
     inv_disp_img = None
+    inv_disp_t = None
+    inv_err_dict = {}
     t1_inv = 0.0
     if return_inverse:
         t0_inv = time.time()
         if verbose:
-            print("[greedy] Computing physical inverse displacement field with Anderson acceleration...")
+            print("[greedy] Computing physical inverse displacement field...")
         inv_steps = max(anderson_steps, 15)
         if sum(reg_iterations) == 0 and resolved_init.u0_inv_phys is not None:
             inv_disp_t = resolved_init.u0_inv_phys
+        elif int(np.prod(fixed.shape)) > 16_777_216:
+            from .core.inverse import update_inverse_field_nd
+            inv_disp_t = update_inverse_field_nd(
+                disp_t,
+                resolved_init.u0_inv_phys,
+                steps=inv_steps,
+                method='fixed_point',
+                spacing=fixed.spacing,
+                origin=fixed.origin,
+                direction=fixed.direction,
+            )
         else:
             inv_disp_t = update_inverse_field_nd_anderson(
                 W_disp=disp_t,
@@ -1100,6 +1131,14 @@ def greedy_registration(
             with torch.no_grad():
                 disp_t = disp_t * restr_t_zyx
                 inv_disp_t = inv_disp_t * restr_t_zyx
+        with torch.no_grad():
+            from .core.inverse import calculate_inverse_identity_error
+            _ice_calc = calculate_inverse_identity_error(
+                disp_t, inv_disp_t, spacing=fixed.spacing, origin=fixed.origin, direction=fixed.direction
+            )
+            if isinstance(_ice_calc.get('error_map'), torch.Tensor):
+                _ice_calc['error_map'] = _ice_calc['error_map'].cpu()
+            inv_err_dict = {'phi_1': _ice_calc}
         disp_img = disp_tensor_to_itk(disp_t, fixed)
         inv_disp_img = disp_tensor_to_itk(inv_disp_t, fixed)
         t1_inv = time.time() - t0_inv
@@ -1157,11 +1196,12 @@ def greedy_registration(
         else:
             inv_file = tempfile.NamedTemporaryFile(suffix='_inv_warp.nii.gz', delete=False).name
         _write_ants_images_fast([(disp_img, fwd_file), (inv_disp_img, inv_file)], compresslevel=_compress_lvl)
-        _cache_disp_image_and_field(fwd_file, disp_img, _apply_dev)
-        _cache_disp_image_and_field(inv_file, inv_disp_img, _apply_dev)
+        _cache_disp_image_and_field(fwd_file, disp_img, _apply_dev, disp_tensor=disp_t)
+        _cache_disp_image_and_field(inv_file, inv_disp_img, _apply_dev, disp_tensor=inv_disp_t)
     else:
         _write_ants_images_fast([(disp_img, fwd_file)], compresslevel=_compress_lvl)
-        _cache_disp_image_and_field(fwd_file, disp_img, _apply_dev)
+        _cache_disp_image_and_field(fwd_file, disp_img, _apply_dev, disp_tensor=disp_t)
+    del disp_t, inv_disp_t
 
     if affine_file is not None:
         if isinstance(aff_tx, list) and len(aff_tx) > 1 and outprefix is None:
@@ -1222,6 +1262,7 @@ def greedy_registration(
         'total_sigma': total_sigma,
         'padding_mode': padding_mode,
         'similarity_metric': similarity_metric,
+        'metric_chunks': metric_chunks_val,
         'anderson': anderson,
         'anderson_steps': anderson_steps if (anderson or return_inverse) else 0,
         'anderson_freq': anderson_freq if anderson else 'none',
@@ -1250,6 +1291,7 @@ def greedy_registration(
         'model': model,
         'convergence': model.stop.summary(),
         'provenance': provenance,
+        'inverse_identity_errors': inv_err_dict,
         # Whatever affine `initial_transform` actually resolved to internally -- a file path
         # from syntx.robust_affine (initial_transform=None), the caller's own supplied
         # transform(s) echoed back, or None (initial_transform was False/'identity', no

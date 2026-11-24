@@ -204,14 +204,114 @@ def _eval_dual_fd_det_min_fast(
     return torch.minimum(det2, det4)
 
 
+def _eval_dual_fd_det_min_scalar_slabbed(
+    u: torch.Tensor,
+    steps_rev: list[float],
+    D_rev_T: torch.Tensor,
+    s_D: float,
+    include_4th: bool,
+    use_physical: bool,
+    max_slab_voxels: int = 16_777_216,
+) -> torch.Tensor:
+    """Evaluate exact global ``amin(_eval_dual_fd_det_min_fast(u, ...))`` in slabs along axis 0
+    without allocating full-volume ``6 x 3N`` neighbor tensors on micro-CT grids."""
+    dim = u.shape[-1]
+    u_fd = u if use_physical else torch.flip(u, dims=[-1])
+    n0 = int(u_fd.shape[1])
+    plane_vox = max(1, int(np.prod(u_fd.shape[2:-1])))
+    slab_z = max(4, int(max_slab_voxels) // plane_vox)
+    if slab_z >= n0:
+        return _eval_dual_fd_det_min_fast(u, steps_rev, D_rev_T, s_D, include_4th, use_physical).amin()
+
+    view_bcast_base = [1] * (u_fd.ndim - 1) + [dim]
+    h0 = float(steps_rev[0])
+    d_row0 = D_rev_T[0].view(*view_bcast_base)
+    min_det: Optional[torch.Tensor] = None
+
+    for s0 in range(0, n0, slab_z):
+        s1 = min(n0, s0 + slab_z)
+        slen = s1 - s0
+        r2_list: list[torch.Tensor] = []
+        r4_list: list[torch.Tensor] = []
+        u_slab = u_fd.narrow(1, s0, slen)
+
+        if n0 <= 1:
+            z_row0 = d_row0.expand_as(u_slab)
+            r2_list.append(z_row0)
+            if include_4th:
+                r4_list.append(z_row0)
+        else:
+            idx0 = torch.arange(s0, s1, device=u_fd.device)
+            im1_0 = (idx0 - 1).clamp(0, n0 - 1)
+            ip1_0 = (idx0 + 1).clamp(0, n0 - 1)
+            u_m1_0 = torch.index_select(u_fd, 1, im1_0)
+            u_p1_0 = torch.index_select(u_fd, 1, ip1_0)
+            span2_0 = ((ip1_0 - im1_0).to(u_fd.dtype) * h0).clamp(min=1e-12)
+            sh_0 = [1] * u_fd.ndim
+            sh_0[1] = slen
+            r2_list.append(d_row0 + (u_p1_0 - u_m1_0) * (1.0 / span2_0).view(*sh_0))
+            if include_4th:
+                im2_0 = (idx0 - 2).clamp(0, n0 - 1)
+                ip2_0 = (idx0 + 2).clamp(0, n0 - 1)
+                u_m2_0 = torch.index_select(u_fd, 1, im2_0)
+                u_p2_0 = torch.index_select(u_fd, 1, ip2_0)
+                inv_12h0 = 1.0 / max(12.0 * h0, 1e-12)
+                r4_list.append(d_row0 + (u_m2_0 - 8.0 * u_m1_0 + 8.0 * u_p1_0 - u_p2_0) * inv_12h0)
+                del u_m2_0, u_p2_0
+            del u_m1_0, u_p1_0
+
+        for ax in range(1, dim):
+            n = int(u_slab.shape[ax + 1])
+            h = float(steps_rev[ax])
+            d_row = D_rev_T[ax].view(*view_bcast_base)
+            if n <= 1:
+                z_row = d_row.expand_as(u_slab)
+                r2_list.append(z_row)
+                if include_4th:
+                    r4_list.append(z_row)
+                continue
+            idx = torch.arange(n, device=u_slab.device)
+            im1 = (idx - 1).clamp(0, n - 1)
+            ip1 = (idx + 1).clamp(0, n - 1)
+            u_m1 = torch.index_select(u_slab, ax + 1, im1)
+            u_p1 = torch.index_select(u_slab, ax + 1, ip1)
+            span2 = ((ip1 - im1).to(u_slab.dtype) * h).clamp(min=1e-12)
+            sh_ax = [1] * u_slab.ndim
+            sh_ax[ax + 1] = n
+            r2_list.append(d_row + (u_p1 - u_m1) * (1.0 / span2).view(*sh_ax))
+            if include_4th:
+                im2 = (idx - 2).clamp(0, n - 1)
+                ip2 = (idx + 2).clamp(0, n - 1)
+                u_m2 = torch.index_select(u_slab, ax + 1, im2)
+                u_p2 = torch.index_select(u_slab, ax + 1, ip2)
+                inv_12h = 1.0 / max(12.0 * h, 1e-12)
+                r4_list.append(d_row + (u_m2 - 8.0 * u_m1 + 8.0 * u_p1 - u_p2) * inv_12h)
+                del u_m2, u_p2
+            del u_m1, u_p1
+
+        det_s = _det_from_rows_nd(r2_list, s_D)
+        if include_4th:
+            det_s = torch.minimum(det_s, _det_from_rows_nd(r4_list, s_D))
+        slab_min = det_s.amin()
+        del det_s, r2_list, r4_list
+        min_det = slab_min if min_det is None else torch.minimum(min_det, slab_min)
+
+    assert min_det is not None
+    return min_det
+
+
 def _physical_fd4_det_only(
     u: torch.Tensor,
     steps_rev: list[float],
     D_rev_inv: torch.Tensor,
+    *,
+    D_rev_T: Optional[torch.Tensor] = None,
+    s_D: Optional[float] = None,
 ) -> torch.Tensor:
     """Exact 4th-order 5-point central-difference physical Jacobian determinant matching ITK/ANTs
     ``CreateJacobianDeterminantImage`` (``ZeroFluxNeumann`` clamped indices ``i-2, i-1, i+1, i+2``)."""
-    D_rev_T, s_D = _d_rev_t_and_scale(D_rev_inv)
+    if D_rev_T is None or s_D is None:
+        D_rev_T, s_D = _d_rev_t_and_scale(D_rev_inv)
     dim = u.shape[-1]
     r4_list: list[torch.Tensor] = []
     view_bcast_base = [1] * (u.ndim - 1) + [dim]
@@ -2422,12 +2522,16 @@ def enforce_digital_diffeomorphism_nd(
             np.diag(1.0 / sp_rev_np) @ D_inv_np, device=device, dtype=dtype
         )
         D_rev_inv = torch.tensor(D_inv_np, device=device, dtype=dtype)
+        D_rev_T = torch.tensor(direction_rev.T.copy(), device=device, dtype=dtype)
+        s_D = float(np.linalg.det(D_inv_np))
         err_to_vox_mat = right_mat.T
         steps_fd = spacing_rev
         mean_sp = float(np.mean(spacing_rev))
         max_step_unit = float(min(spacing_rev)) * 2.0
     else:
         D_rev_inv = torch.eye(dim, device=device, dtype=dtype)
+        D_rev_T = D_rev_inv
+        s_D = 1.0
         err_to_vox_scale = torch.tensor(
             [float(max(s - 1, 1) / 2.0) for s in reversed(spatial)], device=device, dtype=dtype
         )
@@ -2436,7 +2540,8 @@ def enforce_digital_diffeomorphism_nd(
         mean_sp = float(np.mean(steps_fd))
         max_step_unit = (2.0 / float(max(max(spatial) - 1, 1))) * 2.0
 
-    D_rev_T, s_D = _d_rev_t_and_scale(D_rev_inv)
+    n_spatial_vox = int(np.prod(spatial))
+    use_slab_screen = n_spatial_vox > 16_777_216
 
     def _eval_det_min(u_t: torch.Tensor) -> torch.Tensor:
         return _eval_dual_fd_det_min_fast(
@@ -2445,8 +2550,16 @@ def enforce_digital_diffeomorphism_nd(
 
     if unidirectional:
         with torch.no_grad():
-            det_f0 = _eval_det_min(W_fwd_in)
-            init_min_det_f = float(det_f0.amin().item())
+            if use_slab_screen:
+                init_min_det_f = float(
+                    _eval_dual_fd_det_min_scalar_slabbed(
+                        W_fwd_in, steps_fd, D_rev_T, s_D, include_4th, use_physical
+                    ).item()
+                )
+                det_f0 = None
+            else:
+                det_f0 = _eval_det_min(W_fwd_in)
+                init_min_det_f = float(det_f0.amin().item())
             if steps <= 0 or init_min_det_f >= float(jac_floor):
                 if stats is not None:
                     stats["steps"] = 0
@@ -2456,6 +2569,8 @@ def enforce_digital_diffeomorphism_nd(
                     stats["initial_max_ice_vox"] = 0.0
                     stats["final_max_ice_vox"] = 0.0
                 return W_fwd
+            if det_f0 is None:
+                det_f0 = _eval_det_min(W_fwd_in)
 
     boundary_mask = get_boundary_mask(spatial, device, dtype)
     domain_mask = (
@@ -2466,7 +2581,7 @@ def enforce_digital_diffeomorphism_nd(
 
     if not unidirectional:
         if use_physical:
-            if X_phys is None:
+            if X_phys is None and not use_slab_screen:
                 X_phys = get_physical_grid_torch(
                     spatial, spacing, origin, direction, device=device, dtype=dtype
                 )
@@ -2553,11 +2668,41 @@ def enforce_digital_diffeomorphism_nd(
             tgt = tgt & dom_b
         return tgt, warm
 
+    def _eval_max_if_slabbed(u_f: torch.Tensor, u_i: torch.Tensor, max_slab_voxels: int = 16_777_216) -> torch.Tensor:
+        u_f_cf = torch.movedim(u_f, -1, 1)
+        n0 = int(u_i.shape[1])
+        plane_vox = max(1, int(np.prod(u_i.shape[2:-1])))
+        slab_z = max(4, int(max_slab_voxels) // plane_vox)
+        max_if: Optional[torch.Tensor] = None
+        for s0 in range(0, n0, slab_z):
+            s1 = min(n0, s0 + slab_z)
+            slen = s1 - s0
+            u_i_s = u_i.narrow(1, s0, slen)
+            if X_base is not None:
+                x_base_s = X_base.narrow(1, s0, slen)
+            else:
+                dir_lps_m = dir_arr.reshape(dim, dim)
+                orig_s = np.asarray(origin, dtype=np.float64) + dir_lps_m[:, dim - 1] * (float(s0) * float(spacing[dim - 1]))
+                x_base_s = get_physical_grid_torch(
+                    (slen,) + spatial[1:], spacing, orig_s, dir_lps_m, device=device, dtype=dtype
+                )
+            dom_s = domain_mask.narrow(0, s0, slen).unsqueeze(0)
+            x_norm_s = (
+                physical_to_normalized_fast(x_base_s + u_i_s, M_norm, b_norm)
+                if use_physical
+                else (x_base_s + u_i_s)
+            )
+            del x_base_s
+            in_x_s = ((x_norm_s >= -1.0) & (x_norm_s <= 1.0)).all(dim=-1) & dom_s
+            r_if_s = (u_i_s + sample_field_cf(u_f_cf, x_norm_s)) @ err_to_vox_mat
+            s_max = (torch.linalg.vector_norm(r_if_s, dim=-1) * in_x_s.to(dtype)).amax()
+            del x_norm_s, in_x_s, r_if_s
+            max_if = s_max if max_if is None else torch.maximum(max_if, s_max)
+        assert max_if is not None
+        return max_if
+
     with torch.no_grad():
         dom_b = domain_mask.unsqueeze(0).expand(B, *spatial)
-        if not unidirectional:
-            det_f0 = _eval_det_min(W_fwd_in)
-            init_min_det_f = float(det_f0.amin().item())
         n_full_lut = B * max(int(np.prod(spatial)), 1)
 
         if unidirectional:
@@ -2604,10 +2749,28 @@ def enforce_digital_diffeomorphism_nd(
             return torch.movedim(u_f, -1, 1) if channels_first else u_f
 
         # Symmetric paired mode (W_inv is not None)
-        _, _, n_fi0, n_if0 = _eval_chord_errors_vox(W_fwd_in, W_inv_in)
-        det_i0 = _eval_det_min(W_inv_in)
-        init_min_det_i = float(det_i0.amin().item())
-        init_max_if = float(n_if0.amax().item())
+        if use_slab_screen:
+            min_df_t = _eval_dual_fd_det_min_scalar_slabbed(
+                W_fwd_in, steps_fd, D_rev_T, s_D, include_4th, use_physical
+            )
+            min_di_t = _eval_dual_fd_det_min_scalar_slabbed(
+                W_inv_in, steps_fd, D_rev_T, s_D, include_4th, use_physical
+            )
+            max_if_t = _eval_max_if_slabbed(W_fwd_in, W_inv_in)
+            init_min_det_f, init_min_det_i, init_max_if = [
+                float(v) for v in torch.stack([min_df_t, min_di_t, max_if_t]).tolist()
+            ]
+            det_f0 = None
+            det_i0 = None
+            n_fi0 = None
+            n_if0 = None
+        else:
+            det_f0 = _eval_det_min(W_fwd_in)
+            _, _, n_fi0, n_if0 = _eval_chord_errors_vox(W_fwd_in, W_inv_in)
+            det_i0 = _eval_det_min(W_inv_in)
+            init_min_det_f, init_min_det_i, init_max_if = [
+                float(v) for v in torch.stack([det_f0.amin(), det_i0.amin(), n_if0.amax()]).tolist()
+            ]
 
         # Theorem 2 (Idempotency): calculate_inverse_identity_error(W_fwd, W_inv) measures n_if;
         # n_fi has O(h^2 ||nabla^2 u_i||) trilinear curvature even at the exact lattice inverse.
@@ -2624,6 +2787,16 @@ def enforce_digital_diffeomorphism_nd(
                 stats["initial_max_ice_vox"] = init_max_if
                 stats["final_max_ice_vox"] = init_max_if
             return W_fwd, W_inv
+
+        if X_base is None and use_physical:
+            X_phys = get_physical_grid_torch(
+                spatial, spacing, origin, direction, device=device, dtype=dtype
+            )
+            X_base = X_phys
+        if det_f0 is None:
+            det_f0 = _eval_det_min(W_fwd_in)
+            _, _, n_fi0, n_if0 = _eval_chord_errors_vox(W_fwd_in, W_inv_in)
+            det_i0 = _eval_det_min(W_inv_in)
 
         u_f = W_fwd_in.clone()
         u_i = W_inv_in.clone()

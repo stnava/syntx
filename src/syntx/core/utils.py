@@ -237,8 +237,9 @@ def normalize_image(
         p_min, p_max = auto_select_intensity_percentiles(arr)
         pos = (arr[arr > -900.0] if is_hu else arr[arr > 0]) if foreground_only else arr
         if len(pos) > 0:
-            q_min = -1000.0 if (is_hu and foreground_only) else float(np.percentile(pos, p_min))
-            q_max = float(np.percentile(pos, max(p_max, 99.0) if is_hu else p_max))
+            pos_q = pos[:: max(1, len(pos) // 2_000_000)] if arr.size > 16_777_216 and len(pos) > 4_000_000 else pos
+            q_min = -1000.0 if (is_hu and foreground_only) else float(np.percentile(pos_q, p_min))
+            q_max = float(np.percentile(pos_q, max(p_max, 99.0) if is_hu else p_max))
             if is_hu and foreground_only:
                 q_max = max(q_max, 300.0)
             if q_max <= q_min + 1e-4:
@@ -252,8 +253,9 @@ def normalize_image(
     elif method in ('robust', 'percentile'):
         pos = (arr[arr > -900.0] if is_hu else arr[arr > 0]) if foreground_only else arr
         if len(pos) > 0:
-            q_min = -1000.0 if (is_hu and foreground_only) else float(np.percentile(pos, p_min))
-            q_max = float(np.percentile(pos, p_max))
+            pos_q = pos[:: max(1, len(pos) // 2_000_000)] if arr.size > 16_777_216 and len(pos) > 4_000_000 else pos
+            q_min = -1000.0 if (is_hu and foreground_only) else float(np.percentile(pos_q, p_min))
+            q_max = float(np.percentile(pos_q, p_max))
             if q_max <= q_min + 1e-4:
                 q_min = -1000.0 if is_hu else 0.0
                 q_max = float(pos.max())

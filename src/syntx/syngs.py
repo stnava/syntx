@@ -329,16 +329,35 @@ class GeodesicShootingModel(nn.Module):
                 if len(bmask_cache) > 32:
                     bmask_cache.clear()
                 bmask_cache[bkey] = bmask
-            reg_fn = build_level_regularizer(
+            reg_cache = getattr(self, '_continuum_reg_cache', None)
+            if reg_cache is None:
+                reg_cache = {}
+                self._continuum_reg_cache = reg_cache
+            extra_kw = getattr(self, 'extra_reg_kwargs', {}) or {}
+            dir_key = tuple(float(x) for x in np.asarray(self.direction).ravel().tolist())
+            rkey = (
                 self.regularizer,
-                alpha=self.alpha,
-                fluid_sigma=self.fluid_sigma or 3.0,
-                spacing=spacing_itk,
-                origin=self.origin,
-                direction=self.direction,
-                param_domain="physical_mm",
-                extra_reg_kwargs=getattr(self, 'extra_reg_kwargs', {}),
+                None if self.alpha is None else float(self.alpha),
+                tuple(float(s) for s in spacing_itk),
+                dir_key,
+                float(self.fluid_sigma or 3.0),
+                tuple(sorted((k, float(v) if isinstance(v, (int, float)) else str(v)) for k, v in extra_kw.items())),
             )
+            reg_fn = reg_cache.get(rkey)
+            if reg_fn is None:
+                reg_fn = build_level_regularizer(
+                    self.regularizer,
+                    alpha=self.alpha,
+                    fluid_sigma=self.fluid_sigma or 3.0,
+                    spacing=spacing_itk,
+                    origin=self.origin,
+                    direction=self.direction,
+                    param_domain="physical_mm",
+                    extra_reg_kwargs=extra_kw,
+                )
+                if len(reg_cache) > 32:
+                    reg_cache.clear()
+                reg_cache[rkey] = reg_fn
             return reg_fn(m * bmask) * bmask
 
         # Standard Sobolev with boundary cosine tapering (cached per shape/spacing/alpha/device/dtype)
@@ -462,10 +481,24 @@ class GeodesicShootingModel(nn.Module):
                 return disp
             else:
                 disp = dt * v0_smooth
-                for _ in range(1, self.n_steps):
-                    phi_norm = _to_norm(disp)
-                    v_sampled = sample_field_cf(v0_cf, phi_norm)
-                    disp = disp + dt * v_sampled
+                use_ckpt = (
+                    v0_smooth.requires_grad
+                    and math.prod(int(s) for s in target_shape) > 16_777_216
+                )
+                if use_ckpt:
+                    from torch.utils.checkpoint import checkpoint
+
+                    def _shoot_step(curr_disp, v_cf_arg, m_n, u_i):
+                        phi_n = u_i + (curr_disp.view(-1, self.dim) @ m_n).view(curr_disp.shape)
+                        return curr_disp + dt * sample_field_cf(v_cf_arg, phi_n)
+
+                    for _ in range(1, self.n_steps):
+                        disp = checkpoint(_shoot_step, disp, v0_cf, M_norm, u_id, use_reentrant=False)
+                else:
+                    for _ in range(1, self.n_steps):
+                        phi_norm = _to_norm(disp)
+                        v_sampled = sample_field_cf(v0_cf, phi_norm)
+                        disp = disp + dt * v_sampled
                 return disp
 
         disp = torch.zeros_like(phys_grid)
@@ -890,10 +923,14 @@ class GeodesicShootingModel(nn.Module):
 
             lncc_ws = 2 * lncc_radius + 1
 
-            best_level_loss = float('inf')
-            best_v0_fwd = None
-            best_v0_inv = None
-            best_level_loss_t = torch.tensor(best_level_loss, device=curr_fixed.device)
+            best_level_loss_t = torch.tensor(float('inf'), device=curr_fixed.device, dtype=curr_fixed.dtype)
+            have_best_v0 = torch.zeros((), device=curr_fixed.device, dtype=torch.bool)
+            best_v0_fwd = self.velocity_0_fwd.detach().clone() if epochs > 0 else None
+            best_v0_inv = (
+                self.velocity_0_inv.detach().clone()
+                if (epochs > 0 and self.velocity_0_inv is not None)
+                else None
+            )
 
             stop.start_level(idx, epochs)
             for ep in range(epochs):
@@ -908,42 +945,50 @@ class GeodesicShootingModel(nn.Module):
                 total_loss.backward()
                 loss_t = total_loss.detach()
                 del total_loss
-                if loss_t < best_level_loss_t:
-                    best_level_loss_t = loss_t
-                    best_v0_fwd = self.velocity_0_fwd.detach().clone()
-                    if self.velocity_0_inv is not None:
-                        best_v0_inv = self.velocity_0_inv.detach().clone()
+                with torch.no_grad():
+                    loss_d = loss_t.to(best_level_loss_t.dtype)
+                    improved = loss_d < best_level_loss_t
+                    have_best_v0 = have_best_v0 | improved
+                    best_level_loss_t = torch.where(improved, loss_d, best_level_loss_t)
+                    torch.where(improved, self.velocity_0_fwd.detach(), best_v0_fwd, out=best_v0_fwd)
+                    if self.velocity_0_inv is not None and best_v0_inv is not None:
+                        torch.where(improved, self.velocity_0_inv.detach(), best_v0_inv, out=best_v0_inv)
 
                 optimizer.step()
-                if (ep + 1) % 5 == 0 or ep == epochs - 1:   # one device sync per 5 epochs + level end
-                    ep_loss = float(loss_t.item())
-                    check_loss_collapse(
-                        ep_loss, float(best_level_loss_t.item()), f"syntx.syngs level {level}"
-                    )
+                if (ep + 1) % 5 == 0 or ep == epochs - 1:   # one batched device sync per 5 epochs + level end
+                    ep_loss, best_lv_now = [
+                        float(v) for v in torch.stack([loss_t.to(best_level_loss_t.dtype), best_level_loss_t]).tolist()
+                    ]
+                    check_loss_collapse(ep_loss, best_lv_now, f"syntx.syngs level {level}")
                     if stop.update(ep, ep_loss):
                         break
             if epochs > 0:
                 stop.end_level(ep + 1)
 
-            best_level_loss = float(best_level_loss_t.item())
-
             if epochs > 0:
                 with torch.no_grad():
-                    final_loss = float(self.forward(
+                    final_loss_t = self.forward(
                         curr_fixed, curr_moving,
                         lncc_window_size=lncc_ws,
                         similarity_metric=similarity_metric,
                         _prealigned_moving=curr_moving_aff,
                         _level_ctx=level_ctx,
-                    ).item())
+                    )
+                    final_loss, best_level_loss, hb_f = [
+                        float(v)
+                        for v in torch.stack(
+                            [final_loss_t.to(best_level_loss_t.dtype), best_level_loss_t, have_best_v0.to(best_level_loss_t.dtype)]
+                        ).tolist()
+                    ]
                 check_loss_collapse(final_loss, best_level_loss, f"syntx.syngs level {level} final")
                 if final_loss < best_level_loss:
                     best_level_loss = final_loss
-                elif best_v0_fwd is not None:
+                elif hb_f > 0.5 and best_v0_fwd is not None:
                     with torch.no_grad():
                         self.velocity_0_fwd.copy_(best_v0_fwd)
                         if self.velocity_0_inv is not None and best_v0_inv is not None:
                             self.velocity_0_inv.copy_(best_v0_inv)
+                del best_v0_fwd, best_v0_inv
 
         # Resize parameters back to native resolution for final export
         final_vel_shape = tuple(self.velocity_0_fwd.shape[1:-1])
@@ -1209,7 +1254,8 @@ def syngs_registration(
     if initial_transform is None and initial_warp is None:
         from .robust_affine import robust_affine
         aff_res = robust_affine(
-            fixed, moving, dof=affine_dof, mode=affine_mode, seed=affine_seed, verbose=verbose
+            fixed, moving, dof=affine_dof, mode=affine_mode, seed=affine_seed,
+            verbose=verbose, return_warped=False,
         )
         raw_init_tx = aff_res['fwdtransforms']
 
@@ -1418,15 +1464,9 @@ def syngs_registration(
                 }
             }
 
-            fwd_disp_cpu = fwd_disp.cpu()
-            inv_disp_cpu = inv_disp.cpu()
-            del fwd_disp, inv_disp
-            fwd_disp = fwd_disp_cpu
-            inv_disp = inv_disp_cpu
-            fwd_np = fwd_disp.squeeze(0).numpy()
-            inv_np = inv_disp.squeeze(0).numpy()
-            v0_fwd_np = model.velocity_0_fwd.detach().cpu().squeeze(0).numpy()
-            v0_inv_np = model.velocity_0_inv.detach().cpu().squeeze(0).numpy() if model.velocity_0_inv is not None else -v0_fwd_np
+            if int(np.prod(grid_shape_zyx)) > 16_777_216 or str(device_str) == 'cpu':
+                fwd_disp = fwd_disp.cpu()
+                inv_disp = inv_disp.cpu()
 
         T_grid = model.affine.get_matrix().detach().cpu().numpy()
 
@@ -1628,8 +1668,9 @@ def syngs_registration(
         ],
         compresslevel=1,
     )
-    _cache_disp_image_and_field(fwd_file, fwd_img, _apply_dev)
-    _cache_disp_image_and_field(inv_file, inv_img, _apply_dev)
+    _cache_disp_image_and_field(fwd_file, fwd_img, _apply_dev, disp_tensor=fwd_disp)
+    _cache_disp_image_and_field(inv_file, inv_img, _apply_dev, disp_tensor=inv_disp)
+    del fwd_disp, inv_disp
 
     # Export affine transform & build single-interpolation transform lists
     if resolved_init.has_initial_warp:
@@ -1659,15 +1700,18 @@ def syngs_registration(
 
     # Apply single-interpolation composite transforms
     from .transforms import apply_transforms as _apply_transforms
-    warpedmovout = _apply_transforms(fixed=fixed, moving=moving, transformlist=fwd_transforms)
-    warpedfixout = _apply_transforms(fixed=moving, moving=fixed, transformlist=inv_transforms,
-                                     whichtoinvert=whichtoinvert_inv)
+    warpedmovout = _apply_transforms(
+        fixed=fixed, moving=moving, transformlist=fwd_transforms, device=_apply_dev
+    )
+    warpedfixout = _apply_transforms(
+        fixed=moving, moving=fixed, transformlist=inv_transforms,
+        whichtoinvert=whichtoinvert_inv, device=_apply_dev,
+    )
 
     fit_time = _time.time() - t_start
 
     # Clean up GPU memory
     if device_str == 'mps':
-        torch.mps.synchronize()
         torch.mps.empty_cache()
     elif device_str == 'cuda':
         torch.cuda.empty_cache()
