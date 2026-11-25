@@ -25,6 +25,7 @@ from .spatial import (
     reverse_metadata,
     itk_shape_to_tensor_shape,
     compute_autograd_physical_scale,
+    disp_itk_to_tensor,
     disp_tensor_to_itk,
     export_ants_affine_transform,
     grid_to_physical_affine,
@@ -2615,6 +2616,7 @@ class SyNTo(nn.Module):
             target_grid_shape = tuple(self.grid_shape)
             interp_mode_full = 'bilinear' if dim == 2 else 'trilinear'
             offload_midpoints = int(np.prod(target_grid_shape)) >= 4_194_304
+            offload_primary_midpoints = int(np.prod(target_grid_shape)) > 16_777_216
 
             def _upsample_or_take(field_t: torch.Tensor) -> torch.Tensor:
                 field_d = field_t.detach()
@@ -2725,7 +2727,7 @@ class SyNTo(nn.Module):
                 # w_r2l is no longer needed for composition; preserve as midpoint_warp_r2l and free
                 if self.stationary_boundary:
                     _zero_boundary_inplace(w_r2l)
-                mid_r2l = w_r2l.cpu() if offload_midpoints else w_r2l
+                mid_r2l = w_r2l.cpu() if offload_primary_midpoints else w_r2l
                 del w_r2l
                 self.midpoint_warp_r2l = nn.Parameter(mid_r2l, requires_grad=False)
                 self.midpoint_warp_r2l.is_physical = True
@@ -2749,7 +2751,7 @@ class SyNTo(nn.Module):
                 # w_l2r is no longer needed for composition; preserve as midpoint_warp_l2r and free
                 if self.stationary_boundary:
                     _zero_boundary_inplace(w_l2r)
-                mid_l2r = w_l2r.cpu() if offload_midpoints else w_l2r
+                mid_l2r = w_l2r.cpu() if offload_primary_midpoints else w_l2r
                 del w_l2r
                 self.midpoint_warp_l2r = nn.Parameter(mid_l2r, requires_grad=False)
                 self.midpoint_warp_l2r.is_physical = True
@@ -2932,13 +2934,13 @@ class SyNTo(nn.Module):
                 self.midpoint_warp_l2r_inv.is_physical = True
                 del mid_l2r_inv
 
-                mid_r2l = w_r2l.cpu() if (offload_midpoints and w_r2l.device.type != 'cpu') else w_r2l
+                mid_r2l = w_r2l.cpu() if (offload_primary_midpoints and w_r2l.device.type != 'cpu') else w_r2l
                 del w_r2l
                 self.midpoint_warp_r2l = nn.Parameter(mid_r2l, requires_grad=False)
                 self.midpoint_warp_r2l.is_physical = True
                 del mid_r2l
 
-                mid_l2r = w_l2r.cpu() if (offload_midpoints and w_l2r.device.type != 'cpu') else w_l2r
+                mid_l2r = w_l2r.cpu() if (offload_primary_midpoints and w_l2r.device.type != 'cpu') else w_l2r
                 del w_l2r
                 self.midpoint_warp_l2r = nn.Parameter(mid_l2r, requires_grad=False)
                 self.midpoint_warp_l2r.is_physical = True
@@ -3655,6 +3657,9 @@ def registration(
 
     init_M_phys, init_t_phys = None, None
     resolved_init = None
+    _pre_raw_zyx = None
+    _syn_fix_unit_t = None
+    _syn_mov_unit_t = None
 
     _tot_lower_early = type_of_transform.lower()
     _skip_align_early = (
@@ -3685,6 +3690,22 @@ def registration(
                     _aff_kwargs['levels'] = levels
                 if reg_iterations is not None:
                     _aff_kwargs['iterations'] = reg_iterations
+            if (
+                backend == 'pytorch'
+                and not isinstance(fixed, (list, tuple))
+                and not isinstance(moving, (list, tuple))
+                and int(np.prod(fixed_primary.shape)) <= 16_777_216
+            ):
+                from .core.pipeline import auto_detect_device as _auto_dev, upload_raw_image_zyx
+                _pre_dev = _auto_dev(backend='pytorch', requested_device=kwargs.get('device', None))
+                if str(_pre_dev) != 'cpu':
+                    _pre_raw_zyx = (
+                        upload_raw_image_zyx(fixed_primary, _pre_dev),
+                        upload_raw_image_zyx(moving_primary, _pre_dev),
+                    )
+                    _aff_kwargs['_preuploaded_input_zyx'] = _pre_raw_zyx
+                    if kwargs.get('device', None) is not None:
+                        _aff_kwargs['device'] = kwargs['device']
             aff_res = robust_affine(
                 fixed_primary, moving_primary,
                 dof=_affine_dof_resolved, mode=affine_mode, seed=affine_seed, verbose=verbose,
@@ -3716,7 +3737,12 @@ def registration(
             tx_list = resolved_init.aff_tx or []
     moving_reg = moving
     
-    from .core.pipeline import normalize_and_tensorize, auto_detect_device, cleanup_gpu
+    from .core.pipeline import (
+        auto_detect_device,
+        cleanup_gpu,
+        is_unclipped_unit_image,
+        normalize_and_tensorize,
+    )
 
     # Keep spacing in native X-first order (reversal handled internally by helper functions)
     sp_ordered = spacing
@@ -3878,8 +3904,20 @@ def registration(
         
         _ij_tensors = list(normalize_and_tensorize(
             fixed, moving_reg, winsorize_quantiles=kwargs.get('winsorize_quantiles', None),
-            backend='pytorch', device=device
+            backend='pytorch', device=device, _preuploaded_zyx=_pre_raw_zyx,
         ))
+        _pre_raw_zyx = None
+        if (
+            return_warped
+            and not midpoint_only
+            and int(np.prod(fixed_primary.shape)) <= 16_777_216
+            and len(fixed_primary.shape) == 3
+            and len(moving_primary.shape) == 3
+        ):
+            if is_unclipped_unit_image(fixed_primary):
+                _syn_fix_unit_t = _ij_tensors[0][:, :1]
+            if is_unclipped_unit_image(moving_primary):
+                _syn_mov_unit_t = _ij_tensors[1][:, :1]
         if _mind_gpu_pair is not None:
             _fm_t, _mm_t = _mind_gpu_pair
             _fm_zyx = torch.clamp(_fm_t.detach().to(device=device, dtype=torch.float32).permute(0, 1, 4, 3, 2), 0.0, 1.0).contiguous()
@@ -4227,50 +4265,118 @@ def registration(
     inverse_identity_errors = {}
     if not midpoint_only and _has_init_warp and total_fwd_deformable is not None and total_inv_deformable is not None:
         import torch
+        from .core.inverse import _LazyKeyDict
         with torch.no_grad():
             tf = total_fwd_deformable if isinstance(total_fwd_deformable, torch.Tensor) else torch.from_numpy(np.asarray(total_fwd_deformable))
             ti = total_inv_deformable if isinstance(total_inv_deformable, torch.Tensor) else torch.from_numpy(np.asarray(total_inv_deformable))
-            err_1 = calculate_inverse_identity_error(tf, ti, fixed_primary.spacing, fixed_primary.origin, fixed_primary.direction)
-            if isinstance(err_1.get('error_map'), torch.Tensor):
-                err_1['error_map'] = err_1['error_map'].cpu()
+            if tf.device.type != 'cpu' and fwd_warp_image is not None and inv_warp_image is not None:
+                err_1 = calculate_inverse_identity_error(
+                    tf, ti, fixed_primary.spacing, fixed_primary.origin, fixed_primary.direction, return_error_map=False
+                )
+
+                def _load_init_phi1_map():
+                    with torch.no_grad():
+                        return calculate_inverse_identity_error(
+                            disp_itk_to_tensor(fwd_warp_image),
+                            disp_itk_to_tensor(inv_warp_image),
+                            fixed_primary.spacing,
+                            fixed_primary.origin,
+                            fixed_primary.direction,
+                            return_error_map=True,
+                        )['error_map']
+
+                err_1 = _LazyKeyDict(err_1, lazy_loaders={'error_map': _load_init_phi1_map})
+            else:
+                err_1 = calculate_inverse_identity_error(tf, ti, fixed_primary.spacing, fixed_primary.origin, fixed_primary.direction)
+                if isinstance(err_1.get('error_map'), torch.Tensor):
+                    err_1['error_map'] = err_1['error_map'].cpu()
             inverse_identity_errors['phi_1'] = err_1
     elif not midpoint_only and sum(reg_iterations) > 0 and hasattr(model, 'warp_l2r') and hasattr(model, 'warp_r2l'):
         import torch
+        from .core.inverse import _LazyKeyDict
         with torch.no_grad():
             if backend == 'pytorch':
                 w_l2r = model.warp_l2r.data
                 w_r2l = model.warp_r2l.data
-                w_l2r_inv = (
-                    w_r2l
-                    if model.warp_l2r_inv.data.data_ptr() == model.warp_r2l.data.data_ptr()
-                    else model.warp_l2r_inv.data
-                )
-                w_r2l_inv = (
-                    w_l2r
-                    if model.warp_r2l_inv.data.data_ptr() == model.warp_l2r.data.data_ptr()
-                    else model.warp_r2l_inv.data
-                )
+                _shared_l2r_inv = model.warp_l2r_inv.data.data_ptr() == model.warp_r2l.data.data_ptr()
+                _shared_r2l_inv = model.warp_r2l_inv.data.data_ptr() == model.warp_l2r.data.data_ptr()
+                w_l2r_inv = w_r2l if _shared_l2r_inv else model.warp_l2r_inv.data
+                w_r2l_inv = w_l2r if _shared_r2l_inv else model.warp_r2l_inv.data
             else:
                 w_l2r = torch.from_numpy(np.array(model.warp_l2r))
                 w_l2r_inv = torch.from_numpy(np.array(model.warp_l2r_inv))
                 w_r2l = torch.from_numpy(np.array(model.warp_r2l))
                 w_r2l_inv = torch.from_numpy(np.array(model.warp_r2l_inv))
+                _shared_l2r_inv = False
+                _shared_r2l_inv = False
 
-            err_1 = calculate_inverse_identity_error(w_l2r, w_l2r_inv, fixed_primary.spacing, fixed_primary.origin, fixed_primary.direction)
-            err_2 = calculate_inverse_identity_error(w_r2l, w_r2l_inv, fixed_primary.spacing, fixed_primary.origin, fixed_primary.direction)
-            if isinstance(err_1.get('error_map'), torch.Tensor):
-                err_1['error_map'] = err_1['error_map'].cpu()
-            if isinstance(err_2.get('error_map'), torch.Tensor):
-                err_2['error_map'] = err_2['error_map'].cpu()
+            if backend == 'pytorch' and w_l2r.device.type != 'cpu':
+                err_1 = calculate_inverse_identity_error(
+                    w_l2r, w_l2r_inv, fixed_primary.spacing, fixed_primary.origin, fixed_primary.direction, return_error_map=False
+                )
+                err_2 = calculate_inverse_identity_error(
+                    w_r2l, w_r2l_inv, fixed_primary.spacing, fixed_primary.origin, fixed_primary.direction, return_error_map=False
+                )
+
+                def _load_syn_phi1_map():
+                    with torch.no_grad():
+                        if fwd_warp_image is not None and inv_warp_image is not None and _shared_l2r_inv:
+                            return calculate_inverse_identity_error(
+                                disp_itk_to_tensor(fwd_warp_image),
+                                disp_itk_to_tensor(inv_warp_image),
+                                fixed_primary.spacing,
+                                fixed_primary.origin,
+                                fixed_primary.direction,
+                                return_error_map=True,
+                            )['error_map']
+                        _inv = model.warp_r2l.data if _shared_l2r_inv else model.warp_l2r_inv.data
+                        return calculate_inverse_identity_error(
+                            model.warp_l2r.data,
+                            _inv,
+                            fixed_primary.spacing,
+                            fixed_primary.origin,
+                            fixed_primary.direction,
+                            return_error_map=True,
+                        )['error_map'].cpu()
+
+                def _load_syn_phi2_map():
+                    with torch.no_grad():
+                        if fwd_warp_image is not None and inv_warp_image is not None and _shared_r2l_inv:
+                            return calculate_inverse_identity_error(
+                                disp_itk_to_tensor(inv_warp_image),
+                                disp_itk_to_tensor(fwd_warp_image),
+                                fixed_primary.spacing,
+                                fixed_primary.origin,
+                                fixed_primary.direction,
+                                return_error_map=True,
+                            )['error_map']
+                        _inv = model.warp_l2r.data if _shared_r2l_inv else model.warp_r2l_inv.data
+                        return calculate_inverse_identity_error(
+                            model.warp_r2l.data,
+                            _inv,
+                            fixed_primary.spacing,
+                            fixed_primary.origin,
+                            fixed_primary.direction,
+                            return_error_map=True,
+                        )['error_map'].cpu()
+
+                err_1 = _LazyKeyDict(err_1, lazy_loaders={'error_map': _load_syn_phi1_map})
+                err_2 = _LazyKeyDict(err_2, lazy_loaders={'error_map': _load_syn_phi2_map})
+            else:
+                err_1 = calculate_inverse_identity_error(w_l2r, w_l2r_inv, fixed_primary.spacing, fixed_primary.origin, fixed_primary.direction)
+                err_2 = calculate_inverse_identity_error(w_r2l, w_r2l_inv, fixed_primary.spacing, fixed_primary.origin, fixed_primary.direction)
+                if isinstance(err_1.get('error_map'), torch.Tensor):
+                    err_1['error_map'] = err_1['error_map'].cpu()
+                if isinstance(err_2.get('error_map'), torch.Tensor):
+                    err_2['error_map'] = err_2['error_map'].cpu()
             inverse_identity_errors['phi_1'] = err_1
             inverse_identity_errors['phi_2'] = err_2
             del w_l2r, w_l2r_inv, w_r2l, w_r2l_inv
         
     # 6. Apply transforms to generate warped output images
     _need_midpoint_export = bool(_has_midpoint_warps and (export_midpoint or midpoint_only))
-    _can_reuse_cf = (
+    _can_wrap_cf = (
         bool(return_warped)
-        and _need_midpoint_export
         and not _skip_full_warps
         and _apply_dev is not None
         and not hasattr(ants.apply_transforms, "_mock_name")
@@ -4280,27 +4386,55 @@ def registration(
         and len(fixed_primary.shape) == 3
         and len(moving_primary.shape) == 3
     )
+    _can_reuse_cf = _can_wrap_cf and _need_midpoint_export
     _fix_cf = None
     _mov_cf = None
-    if _can_reuse_cf:
+    if _can_wrap_cf:
         import torch
         from .transforms import ContinuousField as _ContinuousField
         _cf_dev = torch.device(_apply_dev)
-        _mov_cf = _ContinuousField(moving_primary, device=_cf_dev, dtype=torch.float32)
+        if _syn_mov_unit_t is not None and _syn_mov_unit_t.device.type == _cf_dev.type and (_syn_mov_unit_t.device.index or 0) == (_cf_dev.index or 0):
+            _mov_cf = _ContinuousField.from_tensor(
+                _syn_mov_unit_t,
+                spatial_shape=moving_primary.shape,
+                origin=moving_primary.origin,
+                spacing=moving_primary.spacing,
+                direction=moving_primary.direction,
+                is_vector=False,
+            )
+        elif _can_reuse_cf:
+            _mov_cf = _ContinuousField(moving_primary, device=_cf_dev, dtype=torch.float32)
 
     if return_warped and not _skip_full_warps:
         warpedmovout = _apply_transforms(
             fixed=fixed_primary, moving=moving_primary, transformlist=fwd_transforms, device=_apply_dev, _moving_field=_mov_cf
         )
-        if _can_reuse_cf:
-            _fix_cf = _ContinuousField(fixed_primary, device=_cf_dev, dtype=torch.float32)
+        if not _need_midpoint_export:
+            del _mov_cf
+            _mov_cf = None
+        if _can_wrap_cf:
+            if _syn_fix_unit_t is not None and _syn_fix_unit_t.device.type == _cf_dev.type and (_syn_fix_unit_t.device.index or 0) == (_cf_dev.index or 0):
+                _fix_cf = _ContinuousField.from_tensor(
+                    _syn_fix_unit_t,
+                    spatial_shape=fixed_primary.shape,
+                    origin=fixed_primary.origin,
+                    spacing=fixed_primary.spacing,
+                    direction=fixed_primary.direction,
+                    is_vector=False,
+                )
+            elif _can_reuse_cf:
+                _fix_cf = _ContinuousField(fixed_primary, device=_cf_dev, dtype=torch.float32)
         warpedfixout = _apply_transforms(
             fixed=moving_primary, moving=fixed_primary, transformlist=inv_transforms,
             whichtoinvert=whichtoinvert_inv, device=_apply_dev, _moving_field=_fix_cf,
         )
+        if not _need_midpoint_export:
+            del _fix_cf
+            _fix_cf = None
     else:
         warpedmovout = None
         warpedfixout = None
+    del _syn_fix_unit_t, _syn_mov_unit_t
     
     fwd_midpoint_warp = None
     inv_midpoint_warp = None
@@ -4319,6 +4453,18 @@ def registration(
         _write_ants_images_fast([(fwd_mid_img, fwd_mid_file), (inv_mid_img, inv_mid_file)], compresslevel=1)
         _cache_disp_image_and_field(fwd_mid_file, fwd_mid_img, _apply_dev, disp_tensor=model.midpoint_warp_l2r)
         _cache_disp_image_and_field(inv_mid_file, inv_mid_img, _apply_dev, disp_tensor=model.midpoint_warp_r2l)
+        if backend == 'pytorch' and int(np.prod(fixed_primary.shape)) >= 4_194_304:
+            import torch
+            if model.midpoint_warp_l2r.device.type != 'cpu':
+                model.midpoint_warp_l2r = torch.nn.Parameter(
+                    disp_itk_to_tensor(fwd_mid_img), requires_grad=False
+                )
+                model.midpoint_warp_l2r.is_physical = True
+            if model.midpoint_warp_r2l.device.type != 'cpu':
+                model.midpoint_warp_r2l = torch.nn.Parameter(
+                    disp_itk_to_tensor(inv_mid_img), requires_grad=False
+                )
+                model.midpoint_warp_r2l.is_physical = True
 
         fwd_midpoint_warp = fwd_mid_file
         inv_midpoint_warp = inv_mid_file

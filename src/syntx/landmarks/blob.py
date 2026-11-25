@@ -67,8 +67,10 @@ def _normalize_intensity(t: torch.Tensor) -> torch.Tensor:
     only clamped to [0, 1].
     """
     fg = t[t > 0]
+    t_min = t.amin()
+    t_max = t.amax()
     if fg.numel() < 10:
-        vmin, vmax = t.min(), t.max()
+        vmin, vmax = t_min, t_max
     else:
         if fg.numel() > 1_000_000:
             stride = fg.numel() // 1_000_000
@@ -77,15 +79,14 @@ def _normalize_intensity(t: torch.Tensor) -> torch.Tensor:
             fg_sample = fg
         vmin = torch.quantile(fg_sample, 0.02)
         vmax = torch.quantile(fg_sample, 0.98)
-    if (vmax - vmin) < 1e-4:
-        # Degenerate range: fall back to global extent
-        vmin = t.min()
-        vmax = t.max()
-    if (vmax - vmin) < 1e-6:
-        # Completely flat image — return as-is clamped
-        return t.clamp(0.0, 1.0)
-    out = (t - vmin) / (vmax - vmin)
-    return out.clamp(0.0, 1.0)
+    degen = (vmax - vmin) < 1e-4
+    vmin = torch.where(degen, t_min, vmin)
+    vmax = torch.where(degen, t_max, vmax)
+    span = vmax - vmin
+    flat = span < 1e-6
+    safe_span = torch.where(flat, torch.ones_like(span), span)
+    scaled = ((t - vmin) / safe_span).clamp(0.0, 1.0)
+    return torch.where(flat, t.clamp(0.0, 1.0), scaled)
 
 
 def _gaussian_kernel_1d(sigma: float, truncate: float = 3.0, dtype: torch.dtype = torch.float32) -> torch.Tensor:

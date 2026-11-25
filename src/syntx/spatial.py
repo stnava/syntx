@@ -1435,8 +1435,18 @@ def image_to_tensor(img, device="cpu", dtype=None, to_zyx=False):
     """
     if dtype is None:
         dtype = torch.float32
+    _is_accel = device is not None and torch.device(device).type != "cpu"
     if ants is not None and isinstance(img, ants.ANTsImage):
-        arr = img.numpy().astype(np.float32)
+        raw_arr = img.numpy()
+        arr = np.ascontiguousarray(raw_arr, dtype=np.float32)
+        if _is_accel:
+            t = torch.from_numpy(arr).to(device=device, dtype=dtype)
+            if to_zyx:
+                if t.ndim == 2:
+                    t = t.t().contiguous()
+                elif t.ndim == 3:
+                    t = t.permute(2, 1, 0).contiguous()
+            return _format_tensor_batch_channel(t)
         if to_zyx:
             if arr.ndim == 2:
                 arr = arr.T
@@ -1457,7 +1467,15 @@ def image_to_tensor(img, device="cpu", dtype=None, to_zyx=False):
                 t = t.permute(0, 1, 4, 3, 2).contiguous()
         return _format_tensor_batch_channel(t)
     else:
-        arr = np.asarray(_to_numpy(img), dtype=np.float32)
+        arr = np.ascontiguousarray(_to_numpy(img), dtype=np.float32)
+        if _is_accel:
+            t = torch.from_numpy(arr).to(device=device, dtype=dtype)
+            if to_zyx:
+                if t.ndim == 2:
+                    t = t.t().contiguous()
+                elif t.ndim == 3:
+                    t = t.permute(2, 1, 0).contiguous()
+            return _format_tensor_batch_channel(t)
         if to_zyx:
             if arr.ndim == 2:
                 arr = arr.T
@@ -2167,15 +2185,21 @@ def voxel_gradient_to_physical(image, grad_axes: np.ndarray) -> np.ndarray:
 
 def landmark_image_to_tensor(image, device=None):
     """``ants.ANTsImage`` / ndarray / tensor -> float32 tensor ``[1, 1, nx, ny, nz]`` preserving XYZ layout."""
+    if isinstance(image, torch.Tensor):
+        t = image.detach()
+        if t.ndim == 4:
+            t = t[..., 0]
+        t = t.to(device=device, dtype=torch.float32) if device is not None else t.to(dtype=torch.float32)
+        while t.ndim < 5:
+            t = t.unsqueeze(0)
+        return t if t.is_contiguous() else t.contiguous()
     if hasattr(image, "numpy"):
         arr = image.numpy()
-    elif isinstance(image, torch.Tensor):
-        arr = image.detach().cpu().numpy()
     else:
         arr = np.asarray(image)
     if arr.ndim == 4:
         arr = arr[..., 0]
-    t = torch.from_numpy(np.ascontiguousarray(arr.astype(np.float32)))
+    t = torch.from_numpy(np.ascontiguousarray(arr, dtype=np.float32))
     while t.ndim < 5:
         t = t.unsqueeze(0)
     return t.to(device) if device is not None else t

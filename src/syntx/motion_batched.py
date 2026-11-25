@@ -41,7 +41,7 @@ from .robust_affine import compute_center_of_mass
 from .sampling import DEFAULT_SAMPLING
 from .core.losses import batched_mattes_mi_from_weights, huber_loss_nd, parzen_weights, pearson_correlation_loss
 from .core.optimizers import PointStepTracker
-from .core.parameter_scales import ParamAxis, probe_manifold, rigid_axes, rotation_axis_scale
+from .core.parameter_scales import ParamAxis, probe_manifold, rigid_axes, rotation_axis_scale, rotation_axis_scales
 from .pyramid import build_pyramid, prebuild_warp
 from .core.grid import grid_sample_nd, _image_spatial_gradient
 
@@ -1113,22 +1113,27 @@ def _run_converging_stage(*, optimizer, params, per_frame_params, loss_fn, point
 
     def _freeze(newly):
         counts_init = [int(v) for v in torch.stack([newly.sum(), tracker.active.sum()]).tolist()]
+        n_act_now = counts_init[1]
         if counts_init[0] > 0:
-            newly = _confirm(newly)
-            changed = bool(newly.any().item()) if probe_fn is not None else True
+            if probe_fn is not None:
+                newly = _confirm(newly)
+                post_counts = [int(v) for v in torch.stack([newly.sum(), tracker.active.sum()]).tolist()]
+                changed = post_counts[0] > 0
+                n_act_now = post_counts[1]
+            else:
+                changed = True
         else:
             changed = False
         if changed:
             has_any_frozen[0] = True
             for p in per_frame_params:
                 frozen[id(p)][newly] = p.detach()[newly]
-        n_act_now = int(tracker.active.sum().item()) if (changed and shared_list and not shared_is_frozen[0]) else counts_init[1]
         if shared_list and not shared_is_frozen[0] and n_act_now < min_active_for_shared:
             for p in shared_list:
                 frozen_shared[id(p)] = p.detach().clone()
             shared_is_frozen[0] = True
             changed = True
-        return changed
+        return changed, (n_act_now == 0)
 
     def _restore():
         if not has_any_frozen[0] and not shared_is_frozen[0]:
@@ -1244,12 +1249,13 @@ def _run_converging_stage(*, optimizer, params, per_frame_params, loss_fn, point
             remaining = dv0.abs().max(dim=1).values
             tracker.last_step = torch.where(tracker.active, remaining * vox, tracker.last_step)
             done_now = tracker.active & (remaining <= confirm_vox)
-            if bool(done_now.any()):          # the Newton step is its own evidence of convergence: no extra probe
-                tracker.active = tracker.active & ~done_now
-                act = torch.nonzero(tracker.active).flatten()
-            if tracker.all_converged:
+            tracker.active = tracker.active & ~done_now
+            flags_nw = torch.stack([done_now.any(), tracker.active.any()]).tolist()
+            if not flags_nw[1]:
                 done += 1
                 break
+            if flags_nw[0]:          # the Newton step is its own evidence of convergence: no extra probe
+                act = torch.nonzero(tracker.active).flatten()
             dv = dv * torch.clamp(trust.unsqueeze(1) / dv.norm(dim=1, keepdim=True).clamp_min(1e-12), max=1.0) * tracker.active.unsqueeze(1).float()
             with torch.no_grad():
                 base = [ax.tensor[ax.index].clone() for ax in axes]
@@ -1378,12 +1384,12 @@ def _run_converging_stage(*, optimizer, params, per_frame_params, loss_fn, point
                         p.copy_(torch.where(mask_f, frame_before[id(p)], p))
                 reset_needed = True
 
-            froze_any = _freeze(tracker.update(points_fn()))
+            froze_any, all_conv_lbfgs = _freeze(tracker.update(points_fn()))
             _restore()
             with torch.no_grad():
                 for p, z, s in zip(params, z_params, param_scales):
                     z.copy_(p.detach() * s)
-            if tracker.all_converged:
+            if all_conv_lbfgs:
                 break
             if resample_fn is not None:
                 resample_fn()
@@ -1428,9 +1434,8 @@ def _run_converging_stage(*, optimizer, params, per_frame_params, loss_fn, point
                     cur = 0.02 + 0.98 * 0.5 * (1.0 + math.cos(math.pi * (i + 1) / iters))   # cosine fraction of the cycle's lr
                     cap = (done - last_check) * cur * lr_scale * (lr_t + lr_r * point_radius)
                     last_check = done
-                    _freeze(tracker.update(points_fn(), capacity=cap))
+                    _, all_conv = _freeze(tracker.update(points_fn(), capacity=cap))
                     _restore()
-                    all_conv = tracker.all_converged
                     if all_conv:
                         break
                     if resample_fn is not None:
@@ -2216,7 +2221,7 @@ def _batched_rigid_register_pass_core(
     coarse_level = min(4, max_level)
 
     ref_min_sp = float(min(reference_img.spacing))   # the working grid (callers cap the resolution before this call)
-    rot_scale_mean = float(np.mean([rotation_axis_scale(phys_X, C_phys, j) for j in range(3)]))   # mm of point displacement per radian
+    rot_scale_mean = float(np.mean(rotation_axis_scales(phys_X, C_phys)))   # mm of point displacement per radian
     # The pilot branch (pilot/motion-sampling-and-epi-debias) also rescaled the eddy shear / scale columns by the
     # rotation lever arm on large references. Evaluated and NOT adopted: it left a volume of a still 3-shell series
     # capped (antsxdwi test_motion_convergence) and raised the DWI phantom rotation error 0.392 -> 0.430 deg (5 seeds);
@@ -3613,8 +3618,8 @@ def batched_group_bias_register_pass(
         if level != 1:
             raise ValueError(f"batched_group_bias_register_pass has no pyramid; level {level} was requested (only level 1 exists)")
         if not _warp1:
-            _warp1['fn'] = prebuild_warp(orig_xyz.cpu().numpy(), dir_xyz.cpu().numpy(), sp_xyz.cpu().numpy(), (1.0,) * 3, (0.0,) * 3,
-                                         [int(x) for x in shape_lvl.tolist()][::-1], device=y_phys.device, dtype=y_phys.dtype)
+            _warp1['fn'] = prebuild_warp(reference_img.origin, reference_img.direction, reference_img.spacing, (1.0,) * 3, (0.0,) * 3,
+                                         list(reference_img.shape)[::-1], device=y_phys.device, dtype=y_phys.dtype)
         return _warp1['fn'](y_phys)
 
     pool_entry = dict(X=phys_X, w_y=w_y, moving=moving_stack, shape=shape_xyz, fixed_vals=fixed_vals, w=sampler.weights())
@@ -3705,7 +3710,7 @@ def batched_group_bias_register_pass(
         return per_frame_loss
 
     ref_min_sp = float(min(reference_img.spacing))
-    rot_scale_mean = float(np.mean([rotation_axis_scale(phys_X, C_phys, j) for j in range(3)]))
+    rot_scale_mean = float(np.mean(rotation_axis_scales(phys_X, C_phys)))
     convergence_log = []
     for stage in schedule:
         level = stage.get("level", 1)
@@ -3741,10 +3746,11 @@ def batched_group_bias_register_pass(
             lr_groups = [{"params": [t_param, t_group], "lr": stage["step_t_vox"] * ref_min_sp},
                          {"params": [omega, omega_group], "lr": stage["step_r_vox"] * ref_min_sp / rot_scale_mean}]
         _pts_g = X_stage[::max(1, X_stage.shape[0] // _N_CONVERGENCE_POINTS)]
-        group_axes = rigid_axes(t_param, omega, _pts_g, C_phys) + [
+        _frame_axes = rigid_axes(t_param, omega, _pts_g, C_phys)
+        group_axes = _frame_axes + [
             ParamAxis(t_group, (j,), 1.0) for j in range(3)
         ] + [
-            ParamAxis(omega_group, (j,), rotation_axis_scale(_pts_g, C_phys, j)) for j in range(3)
+            ParamAxis(omega_group, (j,), _frame_axes[3 + j].scale_mm) for j in range(3)
         ]
         stage_voxel_g = ref_min_sp * max(int(level), 1)
         rec = _run_converging_stage(

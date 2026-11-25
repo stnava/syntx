@@ -26,6 +26,7 @@ from .spatial import (
     reverse_metadata,
     itk_shape_to_tensor_shape,
     compute_autograd_physical_scale,
+    disp_itk_to_tensor,
     disp_tensor_to_itk,
     export_ants_affine_transform,
     export_ants_displacement_field,
@@ -2072,13 +2073,13 @@ class TVFModel(nn.Module):
                             self.velocity.copy_(best_velocity)
                 del best_velocity
 
-            # GPU memory management and garbage collection at level transitions
-            if device.type == 'mps':
-                torch.mps.empty_cache()
-            elif device.type == 'cuda':
-                torch.cuda.empty_cache()
-
-            gc.collect()
+            # GPU memory management and garbage collection at large-volume level transitions
+            if device.type in ('mps', 'cuda') and int(np.prod(curr_fixed.shape[2:])) > 4_194_304:
+                gc.collect()
+                if device.type == 'mps':
+                    torch.mps.empty_cache()
+                else:
+                    torch.cuda.empty_cache()
 
         # Convert losses to python floats in a single device->host transfer
         if self.losses:
@@ -2519,8 +2520,19 @@ def tvf_registration(
         device = auto_detect_device(backend='pytorch', requested_device=device)
         device_str = str(device)
 
+        from .core.pipeline import is_unclipped_unit_image
         I_tensor, J_tensor = normalize_and_tensorize(
             fixed, moving, winsorize_quantiles=winsor, backend='pytorch', device=device
+        )
+        _tvf_fix_unit_t = (
+            I_tensor[:, :1]
+            if (int(np.prod(grid_shape_zyx)) <= 16_777_216 and len(fixed_primary.shape) == 3 and is_unclipped_unit_image(fixed_primary))
+            else None
+        )
+        _tvf_mov_unit_t = (
+            J_tensor[:, :1]
+            if (int(np.prod(grid_shape_zyx)) <= 16_777_216 and len(moving_primary.shape) == 3 and is_unclipped_unit_image(moving_primary))
+            else None
         )
 
         # --- Initialize model directly at coarse velocity grid shape (avoids full-res zero alloc + resize) ---
@@ -2654,15 +2666,39 @@ def tvf_registration(
                     steps=_dd_steps,
                     stationary_boundary=True,
                 )
-            inv_err_dict = calculate_inverse_identity_error(
-                fwd_disp_gpu,
-                inv_disp_gpu,
-                spacing=spacing,
-                origin=origin,
-                direction=direction,
-            )
-            if isinstance(inv_err_dict.get('error_map'), torch.Tensor):
-                inv_err_dict['error_map'] = inv_err_dict['error_map'].cpu()
+            from .core.inverse import _LazyKeyDict
+            if fwd_disp_gpu.device.type != 'cpu':
+                inv_err_dict = calculate_inverse_identity_error(
+                    fwd_disp_gpu,
+                    inv_disp_gpu,
+                    spacing=spacing,
+                    origin=origin,
+                    direction=direction,
+                    return_error_map=False,
+                )
+
+                def _load_tvf_phi1_map():
+                    with torch.no_grad():
+                        return calculate_inverse_identity_error(
+                            disp_itk_to_tensor(fwd_img),
+                            disp_itk_to_tensor(inv_img),
+                            spacing=spacing,
+                            origin=origin,
+                            direction=direction,
+                            return_error_map=True,
+                        )['error_map']
+
+                inv_err_dict = _LazyKeyDict(inv_err_dict, lazy_loaders={'error_map': _load_tvf_phi1_map})
+            else:
+                inv_err_dict = calculate_inverse_identity_error(
+                    fwd_disp_gpu,
+                    inv_disp_gpu,
+                    spacing=spacing,
+                    origin=origin,
+                    direction=direction,
+                )
+                if isinstance(inv_err_dict.get('error_map'), torch.Tensor):
+                    inv_err_dict['error_map'] = inv_err_dict['error_map'].cpu()
             if int(np.prod(grid_shape_zyx)) <= 16_777_216 and str(device) != 'cpu':
                 fwd_disp = fwd_disp_gpu
                 inv_disp = inv_disp_gpu
@@ -2894,30 +2930,68 @@ def tvf_registration(
             whichtoinvert_inv = [True]
 
     # Generate warped output images (same as registration())
+    _tvf_mov_cf = None
+    _tvf_fix_cf = None
+    if (
+        _apply_dev is not None
+        and not hasattr(ants.apply_transforms, "_mock_name")
+        and hasattr(ants, "is_image")
+        and ants.is_image(fixed_primary)
+        and ants.is_image(moving_primary)
+        and len(fixed_primary.shape) == 3
+        and len(moving_primary.shape) == 3
+    ):
+        from .transforms import ContinuousField as _ContinuousField
+        _cf_dev = torch.device(_apply_dev)
+        if '_tvf_mov_unit_t' in locals() and _tvf_mov_unit_t is not None and _tvf_mov_unit_t.device.type == _cf_dev.type and (_tvf_mov_unit_t.device.index or 0) == (_cf_dev.index or 0):
+            _tvf_mov_cf = _ContinuousField.from_tensor(
+                _tvf_mov_unit_t,
+                spatial_shape=moving_primary.shape,
+                origin=moving_primary.origin,
+                spacing=moving_primary.spacing,
+                direction=moving_primary.direction,
+                is_vector=False,
+            )
+        if '_tvf_fix_unit_t' in locals() and _tvf_fix_unit_t is not None and _tvf_fix_unit_t.device.type == _cf_dev.type and (_tvf_fix_unit_t.device.index or 0) == (_cf_dev.index or 0):
+            _tvf_fix_cf = _ContinuousField.from_tensor(
+                _tvf_fix_unit_t,
+                spatial_shape=fixed_primary.shape,
+                origin=fixed_primary.origin,
+                spacing=fixed_primary.spacing,
+                direction=fixed_primary.direction,
+                is_vector=False,
+            )
     warpedmovout = _apply_transforms(
-        fixed=fixed_primary, moving=moving_primary, transformlist=fwd_transforms, device=_apply_dev
+        fixed=fixed_primary, moving=moving_primary, transformlist=fwd_transforms, device=_apply_dev, _moving_field=_tvf_mov_cf
     )
+    del _tvf_mov_cf
     warpedfixout = _apply_transforms(
         fixed=moving_primary, moving=fixed_primary, transformlist=inv_transforms,
-        whichtoinvert=whichtoinvert_inv, device=_apply_dev,
+        whichtoinvert=whichtoinvert_inv, device=_apply_dev, _moving_field=_tvf_fix_cf,
     )
+    del _tvf_fix_cf
+    if '_tvf_mov_unit_t' in locals():
+        del _tvf_mov_unit_t, _tvf_fix_unit_t
 
     fit_time = _time.time() - t_start
 
     # Clean up GPU memory after all tensor work is complete (no post-cleanup GPU re-uploads)
     cleanup_gpu(device=device if 'device' in locals() else None, backend=backend)
 
-    ret_dict = {
-        'convergence': model.stop.summary() if hasattr(model, 'stop') else None,
-        'warpedmovout': warpedmovout,
-        'warpedfixout': warpedfixout,
-        'fwdtransforms': fwd_transforms,
-        'invtransforms': inv_transforms,
-        'whichtoinvert_inv': whichtoinvert_inv,
-        'model': model,
-        'inverse_identity_error_map': inv_err_dict['error_map'],
-        'inverse_identity_errors': {'phi_1': inv_err_dict}
-    }
+    from .core.inverse import _LazyKeyDict
+    ret_dict = _LazyKeyDict(
+        {
+            'convergence': model.stop.summary() if hasattr(model, 'stop') else None,
+            'warpedmovout': warpedmovout,
+            'warpedfixout': warpedfixout,
+            'fwdtransforms': fwd_transforms,
+            'invtransforms': inv_transforms,
+            'whichtoinvert_inv': whichtoinvert_inv,
+            'model': model,
+            'inverse_identity_errors': {'phi_1': inv_err_dict},
+        },
+        lazy_loaders={'inverse_identity_error_map': lambda: inv_err_dict['error_map']},
+    )
 
     try:
         from .viz import build_engine_provenance

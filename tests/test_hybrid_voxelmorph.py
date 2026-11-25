@@ -30,12 +30,29 @@ from syntx.spatial import (
 from syntx.transforms import apply_transforms as syntx_apply_transforms
 
 
+_OBLIQUE_BLOB_CACHE = {}
+
+
 def _make_oblique_blob_pair(
     shape: Tuple[int, int, int] = (24, 28, 32),
     shift_mm: Tuple[float, float, float] = (1.5, -1.0, 0.8),
 ) -> Tuple[ants.ANTsImage, ants.ANTsImage, str, torch.Tensor, torch.Tensor, ants.ANTsImage, ants.ANTsImage, str, str]:
     """Create a non-cubic anisotropic oblique-direction 3-D phantom pair with a known
     affine ``.mat`` and smooth 0%-folding initial warp ``(u0_norm, u0_inv_norm)``."""
+    cache_key = (tuple(shape), tuple(float(x) for x in shift_mm))
+    cached = _OBLIQUE_BLOB_CACHE.get(cache_key)
+    if cached is not None and os.path.exists(cached[2]) and os.path.exists(cached[7]) and os.path.exists(cached[8]):
+        return (
+            cached[0].clone(),
+            cached[1].clone(),
+            cached[2],
+            cached[3].clone(),
+            cached[4].clone(),
+            cached[5].clone(),
+            cached[6].clone(),
+            cached[7],
+            cached[8],
+        )
     nx, ny, nz = shape
     spacing = (1.2, 1.0, 1.5)
     origin = (-12.0, 5.0, -8.0)
@@ -111,7 +128,7 @@ def _make_oblique_blob_pair(
         whichtoinvert=[True, False],
         interpolator="linear",
     )
-    return (
+    res_tuple = (
         fixed_img,
         moving_img,
         aff_path,
@@ -122,6 +139,8 @@ def _make_oblique_blob_pair(
         warp_path,
         inv_warp_path,
     )
+    _OBLIQUE_BLOB_CACHE[cache_key] = res_tuple
+    return res_tuple
 
 
 def test_coordinate_roundtrip_oblique_anisotropic():

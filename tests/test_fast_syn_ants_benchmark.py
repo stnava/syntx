@@ -26,7 +26,7 @@ def _make_synthetic_mindboggle_fixture(root: Path) -> tuple[Path, Path]:
     """Create a tiny 2-subject 3-D Mindboggle directory and pairs.csv with non-trivial geometry."""
     data_dir = root / "volumes"
     cohort_dir = data_dir / "OASIS-TRT-20_volumes"
-    grid = np.linspace(-1.0, 1.0, 32, dtype=np.float32)
+    grid = np.linspace(-1.0, 1.0, 20, dtype=np.float32)
     xx, yy, zz = np.meshgrid(grid, grid, grid, indexing="ij")
 
     for idx, shift in ((1, -0.08), (2, 0.08)):
@@ -42,14 +42,14 @@ def _make_synthetic_mindboggle_fixture(root: Path) -> tuple[Path, Path]:
 
         img = ants.from_numpy(
             brain.astype(np.float32),
-            origin=(-24.0, -24.0, -24.0),
-            spacing=(2.0, 2.0, 2.0),
+            origin=(-28.5, -28.5, -28.5),
+            spacing=(3.0, 3.0, 3.0),
             direction=np.eye(3),
         )
         lbl = ants.from_numpy(
             labels,
-            origin=(-24.0, -24.0, -24.0),
-            spacing=(2.0, 2.0, 2.0),
+            origin=(-28.5, -28.5, -28.5),
+            spacing=(3.0, 3.0, 3.0),
             direction=np.eye(3),
         )
         ants.image_write(img, str(subj_dir / "t1weighted_brain.nii.gz"))
@@ -98,6 +98,7 @@ def test_fast_syn_ants_benchmark_smoke_and_contracts(tmp_path: Path):
             "3",
             "2",
             "--skip-figures",
+            "--in-process",
             "--out-dir",
             str(out_dir),
             "--report-stem",
@@ -197,6 +198,7 @@ def test_pair_by_pair_shuffle_best_models_mode(tmp_path: Path):
             "--syntx-aff-iterations",
             "3",
             "2",
+            "--in-process",
             "--out-dir",
             str(out_dir),
             "--report-stem",

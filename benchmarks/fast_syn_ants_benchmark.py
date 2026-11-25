@@ -488,9 +488,14 @@ def _execute_single_registration(
             )
             return res, "cpu/itk"
         if arm == "ants_affine_fast":
-            res = ants.registration(
-                fixed=fi, moving=mi, type_of_transform="AffineFast", verbose=False
-            )
+            if ants_aff_iterations:
+                res = ants.registration(
+                    fixed=fi, moving=mi, type_of_transform="Affine", verbose=False, **aff_kw
+                )
+            else:
+                res = ants.registration(
+                    fixed=fi, moving=mi, type_of_transform="AffineFast", verbose=False
+                )
             return res, "cpu/itk"
         raise ValueError(f"Unknown affine arm: {arm!r}")
 
@@ -515,13 +520,25 @@ def _execute_single_registration(
             )
             return res, "cpu/itk"
         if arm == "ants_syn_quick":
-            res = ants.registration(
-                fixed=fi,
-                moving=mi,
-                type_of_transform="antsRegistrationSyNQuick[so]",
-                initial_transform=shared_affine_path,
-                verbose=False,
-            )
+            if ants_aff_iterations:
+                res = ants.registration(
+                    fixed=fi,
+                    moving=mi,
+                    type_of_transform="SyNOnly",
+                    initial_transform=shared_affine_path,
+                    syn_metric="MI",
+                    syn_sampling=32,
+                    reg_iterations=reg_iters_tuple,
+                    verbose=False,
+                )
+            else:
+                res = ants.registration(
+                    fixed=fi,
+                    moving=mi,
+                    type_of_transform="antsRegistrationSyNQuick[so]",
+                    initial_transform=shared_affine_path,
+                    verbose=False,
+                )
             return res, "cpu/itk"
         if arm == "syngs_best":
             res = syntx.syngs(
@@ -741,9 +758,15 @@ def _execute_single_registration(
     raise ValueError(f"Unknown track: {track!r}")
 
 
+_IN_PROCESS_CACHE: Dict[str, Any] = {}
+
+
 def run_worker_single(args: argparse.Namespace) -> None:
     """Isolated single-registration worker process."""
-    clean_device_cache()
+    _in_proc_code = _IN_PROCESS_CACHE.get("code")
+    _in_proc_env = _IN_PROCESS_CACHE.get("env")
+    if _in_proc_code is None or str(args.device).lower() != "cpu":
+        clean_device_cache()
     pair_idx = int(args.pair_idx)
     rep = int(args.rep)
     track = str(args.track)
@@ -790,7 +813,7 @@ def run_worker_single(args: argparse.Namespace) -> None:
     load_before = list(os.getloadavg()) if hasattr(os, "getloadavg") else None
     itk_threads_env = os.environ.get("ITK_GLOBAL_DEFAULT_NUMBER_OF_THREADS", "default_all_cores")
 
-    with capture_registration_calls() as cap:
+    with capture_registration_calls(precomputed_code=_in_proc_code) as cap:
         t0 = time.perf_counter()
         res, exec_device = _execute_single_registration(
             track=track,
@@ -821,7 +844,13 @@ def run_worker_single(args: argparse.Namespace) -> None:
         "device_resolved": exec_device,
         "shared_affine_sha256": shared_aff_sha256,
     }
-    manifest = build_manifest(calls=cap.calls, run=run_meta, start=cap.start_state)
+    manifest = build_manifest(
+        calls=cap.calls,
+        run=run_meta,
+        start=cap.start_state,
+        end_code_state=_in_proc_code,
+        precomputed_env=_in_proc_env,
+    )
     assert_manifest_complete(manifest, require_calls=True)
 
     fwd_tx = [str(x) for x in res["fwdtransforms"]]
@@ -992,12 +1021,16 @@ def run_worker_single(args: argparse.Namespace) -> None:
                 except OSError:
                     pass
 
-    clean_device_cache()
+    if _in_proc_code is None or str(args.device).lower() != "cpu":
+        clean_device_cache()
 
 
 def run_worker_same_process_repro(args: argparse.Namespace) -> None:
     """Back-to-back two-run reproducibility check inside a single Python process."""
-    clean_device_cache()
+    _in_proc_code = _IN_PROCESS_CACHE.get("code")
+    _in_proc_env = _IN_PROCESS_CACHE.get("env")
+    if _in_proc_code is None or str(args.device).lower() != "cpu":
+        clean_device_cache()
     pair_idx = int(args.pair_idx)
     track = str(args.track)
     arm = str(args.arm)
@@ -1027,7 +1060,7 @@ def run_worker_same_process_repro(args: argparse.Namespace) -> None:
     for sub_rep in (0, 1):
         torch.manual_seed(pairs_seed)
         np.random.seed(pairs_seed)
-        with capture_registration_calls() as cap:
+        with capture_registration_calls(precomputed_code=_in_proc_code) as cap:
             t0 = time.perf_counter()
             res, exec_dev = _execute_single_registration(
                 track=track,
@@ -1047,6 +1080,8 @@ def run_worker_same_process_repro(args: argparse.Namespace) -> None:
             calls=cap.calls,
             run={"mode": "same_process_repro", "track": track, "arm": arm, "sub_rep": sub_rep},
             start=cap.start_state,
+            end_code_state=_in_proc_code,
+            precomputed_env=_in_proc_env,
         )
         assert_manifest_complete(manifest, require_calls=True)
 
@@ -1090,10 +1125,10 @@ def run_worker_same_process_repro(args: argparse.Namespace) -> None:
 
 
 def _build_smoke_fixture(root: Path) -> Tuple[Path, Path]:
-    """Build a 3-subject / 2-pair (counts=2) 32^3 Mindboggle fixture for ``--smoke``."""
+    """Build a 3-subject / 2-pair (counts=2) 20^3 Mindboggle fixture for ``--smoke``."""
     data_dir = root / "volumes"
     cohort_dir = data_dir / "OASIS-TRT-20_volumes"
-    grid = np.linspace(-1.0, 1.0, 32, dtype=np.float32)
+    grid = np.linspace(-1.0, 1.0, 20, dtype=np.float32)
     xx, yy, zz = np.meshgrid(grid, grid, grid, indexing="ij")
 
     for idx, shift in ((1, -0.08), (2, 0.08), (3, 0.04)):
@@ -1109,14 +1144,14 @@ def _build_smoke_fixture(root: Path) -> Tuple[Path, Path]:
 
         img = ants.from_numpy(
             brain.astype(np.float32),
-            origin=(-24.0, -24.0, -24.0),
-            spacing=(2.0, 2.0, 2.0),
+            origin=(-28.5, -28.5, -28.5),
+            spacing=(3.0, 3.0, 3.0),
             direction=np.eye(3),
         )
         lbl = ants.from_numpy(
             labels,
-            origin=(-24.0, -24.0, -24.0),
-            spacing=(2.0, 2.0, 2.0),
+            origin=(-28.5, -28.5, -28.5),
+            spacing=(3.0, 3.0, 3.0),
             direction=np.eye(3),
         )
         ants.image_write(img, str(subj_dir / "t1weighted_brain.nii.gz"))
@@ -2643,6 +2678,11 @@ def build_parser() -> argparse.ArgumentParser:
             "executes 100%% of stages including syntx.viz figures, JSON, Markdown, and HTML)."
         ),
     )
+    p.add_argument(
+        "--in-process",
+        action="store_true",
+        help="Execute worker runs in-process (used by --smoke and contract unit tests; production benchmarks keep subprocess isolation).",
+    )
     p.add_argument("--max-subjects", type=int, default=None, help="Optional cap on number of pairs.")
     p.add_argument("--iters", type=int, nargs="+", default=None, dest="iters_alias")
     p.add_argument(
@@ -2689,7 +2729,7 @@ def main(argv: Optional[Sequence[str]] = None) -> Dict[str, Any]:
         args.reg_iterations = list(args.iters_alias)
 
     smoke_tmp: Optional[tempfile.TemporaryDirectory[str]] = None
-    in_process = False
+    in_process = bool(args.in_process)
     if args.smoke:
         smoke_tmp = tempfile.TemporaryDirectory(prefix="syntx_fast_bench_smoke_")
         smoke_root = Path(smoke_tmp.name)
@@ -2799,8 +2839,11 @@ def main(argv: Optional[Sequence[str]] = None) -> Dict[str, Any]:
             ants_deform_arms = ()
             run_e2e = False
 
-        cs = code_state(include_diff=False)
+        cs = code_state(include_diff=in_process)
         env_snapshot = environment()
+        if in_process:
+            _IN_PROCESS_CACHE["code"] = cs
+            _IN_PROCESS_CACHE["env"] = env_snapshot
         rendered_4panel_pairs: set[int] = set()
 
         def _common_flags(pair_i: int, persist: bool = False, regional: bool = False) -> List[str]:
@@ -3462,6 +3505,7 @@ def main(argv: Optional[Sequence[str]] = None) -> Dict[str, Any]:
             "summary": summary_payload,
         }
     finally:
+        _IN_PROCESS_CACHE.clear()
         if smoke_tmp is not None:
             smoke_tmp.cleanup()
 

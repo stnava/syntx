@@ -208,8 +208,15 @@ def weighted_procrustes(
     # Weighted covariance: H = (src_cent * w)^T @ dst_cent
     H = torch.matmul((src_cent * w).T, dst_cent)
 
-    # linalg.svd on CPU to avoid MPS backend fallback quirks
-    H_cpu = H.detach().cpu()
+    # Single D2H transfer for 3x3 SVD (+ Umeyama denominator when scaling is enabled)
+    if allow_scaling:
+        denom_scale = ((src_cent ** 2) * w).sum()
+        hs_cpu = torch.cat([H.detach().reshape(-1), denom_scale.detach().reshape(1)]).cpu()
+        H_cpu = hs_cpu[:9].reshape(3, 3)
+        denom_val = float(hs_cpu[9].item())
+    else:
+        H_cpu = H.detach().cpu()
+        denom_val = 1.0
     U, S, Vt = torch.linalg.svd(H_cpu)
 
     R_np = (Vt.T @ U.T).numpy()
@@ -222,14 +229,13 @@ def weighted_procrustes(
         R_np = (Vt.T @ U.T).numpy()
         sign_last = -1.0
 
-    R = torch.tensor(R_np, device=device, dtype=coords_src.dtype)
+    R = torch.as_tensor(np.ascontiguousarray(R_np), device=device, dtype=coords_src.dtype)
 
     # Scale estimation (Umeyama)
     scale = 1.0
     if allow_scaling:
-        var_src = ((src_cent ** 2) * w).sum() / w_sum
-        s_trace = S[:-1].sum() + sign_last * S[-1]
-        scale = float((s_trace / (var_src.cpu() * w_sum.cpu())).item())
+        s_trace = float((S[:-1].sum() + sign_last * S[-1]).item())
+        scale = float(s_trace / max(denom_val, 1e-12))
 
     # Translation: t = c_dst - scale * (c_src @ R^T)
     t = (c_dst - scale * torch.matmul(c_src, R.T)).squeeze(0)
@@ -368,12 +374,19 @@ def sampled_optimal_transport_affine(
     pts_f_mm = vox_to_physical(fixed, vox_f)
     pts_m_mm = vox_to_physical(moving, vox_m)
 
-    # Extract sampled descriptors: native XYZ layout [1, C, nx, ny, nz]
-    feat_f = mind_fi_norm[0, :, vox_f[:, 0], vox_f[:, 1], vox_f[:, 2]].T
-    feat_m = mind_mi_norm[0, :, vox_m[:, 0], vox_m[:, 1], vox_m[:, 2]].T
+    # Extract sampled descriptors: native XYZ layout [1, C, nx, ny, nz] via single 1D flat index upload per image
+    _, c_mind, _, ny_f, nz_f = mind_fi_norm.shape
+    _, _, _, ny_m, nz_m = mind_mi_norm.shape
+    flat_f = (vox_f[:, 0] * (ny_f * nz_f) + vox_f[:, 1] * nz_f + vox_f[:, 2]).astype(np.int64, copy=False)
+    flat_m = (vox_m[:, 0] * (ny_m * nz_m) + vox_m[:, 1] * nz_m + vox_m[:, 2]).astype(np.int64, copy=False)
+    idx_f_dev = torch.as_tensor(np.ascontiguousarray(flat_f), dtype=torch.long, device=device)
+    idx_m_dev = torch.as_tensor(np.ascontiguousarray(flat_m), dtype=torch.long, device=device)
+    feat_f = mind_fi_norm.reshape(c_mind, -1).index_select(1, idx_f_dev).T
+    feat_m = mind_mi_norm.reshape(c_mind, -1).index_select(1, idx_m_dev).T
+    del idx_f_dev, idx_m_dev
 
-    pts_f_dev = torch.tensor(pts_f_mm, dtype=torch.float32, device=device)
-    pts_m_dev = torch.tensor(pts_m_mm, dtype=torch.float32, device=device)
+    pts_f_dev = torch.as_tensor(np.ascontiguousarray(pts_f_mm, dtype=np.float32), device=device)
+    pts_m_dev = torch.as_tensor(np.ascontiguousarray(pts_m_mm, dtype=np.float32), device=device)
 
     # Step 3: Solve Sinkhorn Optimal Transport with Dustbin
     P_match, weights = sinkhorn_matching(
@@ -407,14 +420,14 @@ def sampled_optimal_transport_affine(
         allow_scaling=allow_scaling,
     )
 
-    R_np = R.detach().cpu().numpy()
-    t_np = t.detach().cpu().numpy()
     aff_mat_np = aff_mat.detach().cpu().numpy()
+    t_np = aff_mat_np[:3, 3].copy()
+    R_np = (aff_mat_np[:3, :3] / max(float(scale), 1e-12)).copy() if allow_scaling else aff_mat_np[:3, :3].copy()
 
     # Step 6: Package into ITK ANTs Transform
     # ITK convention: y = A(x - c) + c + t => with c=0, y = A x + t
     tx = ants.new_ants_transform(precision='float', dimension=3, transform_type='AffineTransform')
-    matrix_param = (scale * R_np).flatten()
+    matrix_param = aff_mat_np[:3, :3].flatten()
     tx.set_parameters(np.concatenate([matrix_param, t_np]))
     tx.set_fixed_parameters(np.zeros(3))
 

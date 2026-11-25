@@ -1445,23 +1445,50 @@ def syngs_registration(
                     steps=_dd_steps,
                     stationary_boundary=True,
                 )
-            inv_err_calc = calculate_inverse_identity_error(
-                fwd_disp, inv_disp, spacing=spacing, origin=origin, direction=direction
-            )
-            _err_map = inv_err_calc.get('error_map')
-            if isinstance(_err_map, torch.Tensor):
-                _err_map = _err_map.cpu()
-            inv_err_dict = {
-                'mean': float(inv_err_calc['mean_error']),
-                'max': float(inv_err_calc['max_error']),
-                'phi_1': {
+            from .core.inverse import _LazyKeyDict
+            if fwd_disp.device.type != 'cpu':
+                inv_err_calc = calculate_inverse_identity_error(
+                    fwd_disp, inv_disp, spacing=spacing, origin=origin, direction=direction, return_error_map=False
+                )
+
+                def _load_syngs_phi1_map():
+                    with torch.no_grad():
+                        return calculate_inverse_identity_error(
+                            disp_itk_to_tensor(fwd_img),
+                            disp_itk_to_tensor(inv_img),
+                            spacing=spacing,
+                            origin=origin,
+                            direction=direction,
+                            return_error_map=True,
+                        )['error_map']
+
+                _phi1_dict = _LazyKeyDict(
+                    {
+                        'mean': float(inv_err_calc['mean_error']),
+                        'max': float(inv_err_calc['max_error']),
+                        'max_error': float(inv_err_calc['max_error']),
+                        'mean_error': float(inv_err_calc['mean_error']),
+                    },
+                    lazy_loaders={'error_map': _load_syngs_phi1_map},
+                )
+            else:
+                inv_err_calc = calculate_inverse_identity_error(
+                    fwd_disp, inv_disp, spacing=spacing, origin=origin, direction=direction
+                )
+                _err_map = inv_err_calc.get('error_map')
+                if isinstance(_err_map, torch.Tensor):
+                    _err_map = _err_map.cpu()
+                _phi1_dict = {
                     'mean': float(inv_err_calc['mean_error']),
                     'max': float(inv_err_calc['max_error']),
-                    # like registration(): lets benchmarks report interior / p95 statistics
                     'max_error': float(inv_err_calc['max_error']),
                     'mean_error': float(inv_err_calc['mean_error']),
                     'error_map': _err_map,
                 }
+            inv_err_dict = {
+                'mean': float(inv_err_calc['mean_error']),
+                'max': float(inv_err_calc['max_error']),
+                'phi_1': _phi1_dict,
             }
 
             if int(np.prod(grid_shape_zyx)) > 16_777_216 or str(device_str) == 'cpu':

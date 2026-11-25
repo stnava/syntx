@@ -1339,7 +1339,76 @@ def compute_inverse_identity_error_nd(
     return torch.norm(disp_fwd + disp_inv_sampled, dim=-1)
 
 
-def calculate_inverse_identity_error(W_disp: torch.Tensor, W_inv_disp: torch.Tensor, spacing, origin, direction) -> dict:
+class _LazyKeyDict(dict):
+    """Dict subclass that materializes deferred keys on first read without eager D2H transfer."""
+
+    def __init__(self, initial=(), lazy_loaders=None):
+        super().__init__(initial)
+        self._lazy_loaders = dict(lazy_loaders) if lazy_loaders else {}
+        for k in self._lazy_loaders:
+            if not super().__contains__(k):
+                super().__setitem__(k, None)
+
+    def _materialize(self, key):
+        loader = self._lazy_loaders.pop(key, None)
+        if loader is not None:
+            val = loader()
+            super().__setitem__(key, val)
+            return val
+        return super().__getitem__(key)
+
+    def __getitem__(self, key):
+        if key in self._lazy_loaders:
+            return self._materialize(key)
+        return super().__getitem__(key)
+
+    def get(self, key, default=None):
+        if key in self._lazy_loaders:
+            return self._materialize(key)
+        return super().get(key, default)
+
+    def pop(self, key, *args):
+        if key in self._lazy_loaders:
+            self._materialize(key)
+        return super().pop(key, *args)
+
+    def __setitem__(self, key, value):
+        self._lazy_loaders.pop(key, None)
+        super().__setitem__(key, value)
+
+    def __delitem__(self, key):
+        self._lazy_loaders.pop(key, None)
+        super().__delitem__(key)
+
+    def items(self):
+        for k in list(self._lazy_loaders):
+            self._materialize(k)
+        return super().items()
+
+    def values(self):
+        for k in list(self._lazy_loaders):
+            self._materialize(k)
+        return super().values()
+
+    def copy(self):
+        for k in list(self._lazy_loaders):
+            self._materialize(k)
+        return dict(self)
+
+    def __reduce__(self):
+        for k in list(self._lazy_loaders):
+            self._materialize(k)
+        return (dict, (dict(self),))
+
+
+def calculate_inverse_identity_error(
+    W_disp: torch.Tensor,
+    W_inv_disp: torch.Tensor,
+    spacing,
+    origin,
+    direction,
+    return_error_map: bool = True,
+) -> dict:
     """
     Inverse-consistency error of a displacement field and its inverse, in mm:
     |u_inv(x) + u(x + u_inv(x))|, i.e. how far x -> inverse -> forward lands from x. The
@@ -1350,13 +1419,17 @@ def calculate_inverse_identity_error(W_disp: torch.Tensor, W_inv_disp: torch.Ten
     W_disp, W_inv_disp : Tensor (1, *spatial, dim) or (*spatial, dim)
         Physical displacements u and u_inv, tensor order (spatial z, y, x).
     spacing, origin, direction : ANTs metadata of the grid (all required).
+    return_error_map : bool, default True
+        When False, skips returning the dense ``(*spatial)`` error map (sets ``'error_map': None``)
+        so GPU callers avoid transferring a full-volume float32 map to CPU when only scalar
+        ``max_error`` / ``mean_error`` diagnostics are needed.
 
     Returns
     -------
     dict
         - ``'max_error'``: max over interior voxels.
         - ``'mean_error'``: sum over interior voxels / number of interior voxels.
-        - ``'error_map'``: Tensor (*spatial).
+        - ``'error_map'``: Tensor (*spatial) when ``return_error_map=True``, else ``None``.
 
         Interior voxels exclude the one-voxel boundary rim and points whose x + u_inv(x)
         leaves the grid; they are set to 0 in the map and excluded from the mean.
@@ -1409,6 +1482,13 @@ def calculate_inverse_identity_error(W_disp: torch.Tensor, W_inv_disp: torch.Ten
         err_sum = float(error_norm.sum(dtype=torch.float64).item())
         err_max = float(error_norm.max().item())
     del valid_mask
+    if not return_error_map:
+        del error_norm
+        return {
+            'max_error': err_max,
+            'mean_error': err_sum / n_valid,
+            'error_map': None,
+        }
     return {
         'max_error': err_max,
         'mean_error': err_sum / n_valid,

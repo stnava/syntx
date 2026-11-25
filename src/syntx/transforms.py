@@ -116,23 +116,41 @@ class ContinuousField:
         if arr.ndim == 3:
             self.is_vector = False
             self.spatial_shape = arr.shape
-            arr_cdhw = arr.transpose(2, 1, 0)[None, None, ...]
+            if self.device.type != "cpu" and not (self.device.type == "mps" and arr.dtype == np.float64):
+                t = torch.as_tensor(np.ascontiguousarray(arr), device=self.device, dtype=self.dtype)
+                self.tensor = t.permute(2, 1, 0).contiguous().unsqueeze(0).unsqueeze(0)
+            else:
+                arr_cdhw = arr.transpose(2, 1, 0)[None, None, ...]
+                self.tensor = torch.as_tensor(np.ascontiguousarray(arr_cdhw), device=self.device, dtype=self.dtype)
         elif arr.ndim == 4 and arr.shape[-1] == 3:
             self.is_vector = True
             self.spatial_shape = arr.shape[:3]
-            arr_cdhw = np.transpose(arr, (3, 2, 1, 0))[None, ...]
+            if self.device.type != "cpu" and not (self.device.type == "mps" and arr.dtype == np.float64):
+                t = torch.as_tensor(np.ascontiguousarray(arr), device=self.device, dtype=self.dtype)
+                self.tensor = t.permute(3, 2, 1, 0).contiguous().unsqueeze(0)
+            else:
+                arr_cdhw = np.transpose(arr, (3, 2, 1, 0))[None, ...]
+                self.tensor = torch.as_tensor(np.ascontiguousarray(arr_cdhw), device=self.device, dtype=self.dtype)
         elif arr.ndim == 4 and arr.shape[0] == 3:
             self.is_vector = True
             self.spatial_shape = arr.shape[1:]
-            arr_cdhw = np.transpose(arr, (0, 3, 2, 1))[None, ...]
+            if self.device.type != "cpu" and not (self.device.type == "mps" and arr.dtype == np.float64):
+                t = torch.as_tensor(np.ascontiguousarray(arr), device=self.device, dtype=self.dtype)
+                self.tensor = t.permute(0, 3, 2, 1).contiguous().unsqueeze(0)
+            else:
+                arr_cdhw = np.transpose(arr, (0, 3, 2, 1))[None, ...]
+                self.tensor = torch.as_tensor(np.ascontiguousarray(arr_cdhw), device=self.device, dtype=self.dtype)
         elif arr.ndim == 4:
             self.is_vector = True
             self.spatial_shape = arr.shape[:3]
-            arr_cdhw = np.transpose(arr, (3, 2, 1, 0))[None, ...]
+            if self.device.type != "cpu" and not (self.device.type == "mps" and arr.dtype == np.float64):
+                t = torch.as_tensor(np.ascontiguousarray(arr), device=self.device, dtype=self.dtype)
+                self.tensor = t.permute(3, 2, 1, 0).contiguous().unsqueeze(0)
+            else:
+                arr_cdhw = np.transpose(arr, (3, 2, 1, 0))[None, ...]
+                self.tensor = torch.as_tensor(np.ascontiguousarray(arr_cdhw), device=self.device, dtype=self.dtype)
         else:
             raise ValueError(f"Unsupported array shape for ContinuousField: {arr.shape}")
-
-        self.tensor = torch.as_tensor(np.ascontiguousarray(arr_cdhw), device=self.device, dtype=self.dtype)
 
         self.M_norm, self.b_norm = get_physical_to_normalized_affine(
             shape=self.spatial_shape,
@@ -392,7 +410,11 @@ class TransformChain:
         n_ref_vox = int(ref_shape[0]) * int(ref_shape[1]) * int(ref_shape[2])
         max_single_shot_vox = _MAX_GPU_CACHE_VOXELS * 4
         if str(dev) != "cpu" and mode != "bspline" and n_ref_vox > max_single_shot_vox:
-            field = _moving_field if (_moving_field is not None and _moving_field.device == dev) else ContinuousField(image, device=dev, dtype=torch.float32)
+            field = (
+            _moving_field
+            if (_moving_field is not None and _moving_field.device.type == dev.type and (_moving_field.device.index or 0) == (dev.index or 0))
+            else ContinuousField(image, device=dev, dtype=torch.float32)
+        )
             local_disp_cache: dict[tuple[str, float, str], ContinuousField] = {}
             arr_out = np.empty(ref_shape, dtype=np.float32)
             slab_x = max(1, max_single_shot_vox // max(1, int(ref_shape[1]) * int(ref_shape[2])))
@@ -437,7 +459,11 @@ class TransformChain:
                     _MAPPED_GRID_CACHE.pop(next(iter(_MAPPED_GRID_CACHE)))
                 _MAPPED_GRID_CACHE[cache_key] = pts_moving
 
-        field = _moving_field if (_moving_field is not None and _moving_field.device == dev) else ContinuousField(image, device=dev, dtype=torch.float32)
+        field = (
+            _moving_field
+            if (_moving_field is not None and _moving_field.device.type == dev.type and (_moving_field.device.index or 0) == (dev.index or 0))
+            else ContinuousField(image, device=dev, dtype=torch.float32)
+        )
         out = _sample_field_itk(field, pts_moving, mode=mode, defaultvalue=defaultvalue)
         del field, pts_moving
         arr_out = out.reshape(ref_shape).detach().cpu().numpy().astype(np.float32, copy=False)
@@ -612,6 +638,20 @@ def _cache_disp_image_and_field(
             while len(_DISP_FIELD_CACHE) >= max_disp_entries:
                 _DISP_FIELD_CACHE.pop(next(iter(_DISP_FIELD_CACHE)))
             _DISP_FIELD_CACHE[disp_key] = field
+
+
+def _read_disp_image_cached(path: str):
+    """Return an in-memory cached displacement ``ants.ANTsImage`` if mtime matches, else read from disk."""
+    import ants
+
+    try:
+        img_key = (path, os.path.getmtime(path))
+        cached = _DISP_IMG_CACHE.get(img_key)
+        if cached is not None:
+            return cached
+    except OSError:
+        pass
+    return ants.image_read(path)
 
 
 def _bspline_prefilter_1d_matrix(

@@ -543,18 +543,46 @@ def sift3d_keypoints(
             local_rms = torch.sqrt(_separable_gaussian3d(curr ** 2, sig_vox) + 1e-6)
             curr_eval = curr_abs / (local_rms + 1e-3)
 
-        scale_max = float((curr_eval * fg).max())
-        if scale_max < 1e-12:
-            continue
+        scale_max_t = (curr_eval * fg).amax()
+        eff_thresh = torch.where(
+            scale_max_t >= 1e-12,
+            threshold * scale_max_t,
+            torch.full_like(scale_max_t, float("inf")),
+        )
         max_pool = F.max_pool3d(curr_eval, 3, 1, 1)
-        is_local = (curr_eval == max_pool) & (curr_eval > threshold * scale_max)
-        is_scale = (curr.abs() > prev.abs()) & (curr.abs() > nxt.abs())
-        mask_np = (is_local & is_scale & fg).squeeze().cpu().numpy()
-        idxs = np.argwhere(mask_np)                                   # [K, 3] (ix, iy, iz)
-        if idxs.shape[0] == 0:
+        is_local = (curr_eval == max_pool) & (curr_eval > eff_thresh)
+        is_scale = (curr_abs > prev.abs()) & (curr_abs > nxt.abs())
+        cand_mask = (is_local & is_scale & (fg > 0)).squeeze(0).squeeze(0)
+        idxs_t = torch.nonzero(cand_mask, as_tuple=False)             # [K, 3] (ix, iy, iz) on device
+        if idxs_t.shape[0] == 0:
             continue
-        dog_np = curr.squeeze().cpu().numpy()
-        nx_d, ny_d, nz_d = dog_np.shape
+        dog_vol = curr.squeeze(0).squeeze(0)
+        nx_d, ny_d, nz_d = dog_vol.shape
+        ix_t, iy_t, iz_t = idxs_t[:, 0], idxs_t[:, 1], idxs_t[:, 2]
+        xm_t = (ix_t - 1).clamp_min(0)
+        xp_t = (ix_t + 1).clamp_max(nx_d - 1)
+        ym_t = (iy_t - 1).clamp_min(0)
+        yp_t = (iy_t + 1).clamp_max(ny_d - 1)
+        zm_t = (iz_t - 1).clamp_min(0)
+        zp_t = (iz_t + 1).clamp_max(nz_d - 1)
+        st_x = ny_d * nz_d
+        st_y = nz_d
+        dog_flat = dog_vol.reshape(-1)
+        flat_7 = torch.stack(
+            [
+                ix_t * st_x + iy_t * st_y + iz_t,
+                xm_t * st_x + iy_t * st_y + iz_t,
+                xp_t * st_x + iy_t * st_y + iz_t,
+                ix_t * st_x + ym_t * st_y + iz_t,
+                ix_t * st_x + yp_t * st_y + iz_t,
+                ix_t * st_x + iy_t * st_y + zm_t,
+                ix_t * st_x + iy_t * st_y + zp_t,
+            ],
+            dim=1,
+        )
+        packed_cpu = torch.cat([idxs_t.to(torch.float32), dog_flat[flat_7].to(torch.float32)], dim=1).cpu().numpy()
+        idxs = packed_cpu[:, :3].astype(np.int64)
+        stencil = packed_cpu[:, 3:]                                   # [K, 7]: c000, xm, xp, ym, yp, zm, zp
         sub_idxs = idxs.astype(np.float64)
         ix_a, iy_a, iz_a = idxs[:, 0], idxs[:, 1], idxs[:, 2]
         interior = (
@@ -565,14 +593,14 @@ def sift3d_keypoints(
         if np.any(interior):
             # Per-axis 1-D parabolic sub-voxel extremum refinement (frame-equivariant and well-conditioned in float32)
             ii = np.where(interior)[0]
-            x0, y0, z0 = ix_a[ii], iy_a[ii], iz_a[ii]
-            c000 = dog_np[x0, y0, z0].astype(np.float64)
+            st_in = stencil[ii].astype(np.float64)
+            c000 = st_in[:, 0]
             curv_floor = np.maximum(1e-5, 0.05 * np.abs(c000))
             delta = np.zeros((len(ii), 3), dtype=np.float64)
             for ax_d, (v_m, v_p) in enumerate((
-                (dog_np[x0 - 1, y0, z0].astype(np.float64), dog_np[x0 + 1, y0, z0].astype(np.float64)),
-                (dog_np[x0, y0 - 1, z0].astype(np.float64), dog_np[x0, y0 + 1, z0].astype(np.float64)),
-                (dog_np[x0, y0, z0 - 1].astype(np.float64), dog_np[x0, y0, z0 + 1].astype(np.float64)),
+                (st_in[:, 1], st_in[:, 2]),
+                (st_in[:, 3], st_in[:, 4]),
+                (st_in[:, 5], st_in[:, 6]),
             )):
                 curv = v_m - 2.0 * c000 + v_p
                 ok_c = np.abs(curv) >= curv_floor
@@ -583,7 +611,7 @@ def sift3d_keypoints(
                     delta[ok_rows[valid_ax], ax_d] = d_ax[valid_ax]
             sub_idxs[ii] += delta
         phys = vox_to_physical(affine, sub_idxs)
-        resp = dog_np[tuple(idxs.T)]
+        resp = stencil[:, 0]
         all_pts.append(np.column_stack([
             phys,
             np.full(len(idxs), dog_sigmas[s], dtype=np.float32),

@@ -667,7 +667,12 @@ class PointStepTracker:
         self.last_step = torch.where(self.active, step, self.last_step)
         below = step < self.tol
         if capacity is not None:
-            below = below & (step < float(capacity_fraction) * float(capacity))
+            cap_bound = (
+                capacity * float(capacity_fraction)
+                if torch.is_tensor(capacity)
+                else float(capacity_fraction) * float(capacity)
+            )
+            below = below & (step < cap_bound)
         self.stable = torch.where(self.active & below, self.stable + 1, torch.where(self.active, torch.zeros_like(self.stable), self.stable))
         newly = self.active & (self.stable >= self.patience)
         self.active = self.active & ~newly

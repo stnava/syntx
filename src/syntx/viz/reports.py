@@ -90,6 +90,91 @@ def _compute_jacobian_stats(warp, fixed=None):
     }
 
 
+_GIT_HEAD_CACHE: dict[str, tuple[int, int, str]] = {}
+
+
+def _resolve_git_commit_cached(pkg_dir: str) -> str:
+    """Resolve ``HEAD`` commit SHA of ``pkg_dir``'s repository in pure Python (mtime-validated)
+    so every registration call avoids forking a ``git`` subprocess."""
+    import subprocess
+
+    if hasattr(subprocess.check_output, "_mock_name"):
+        return subprocess.check_output(
+            ["git", "-C", pkg_dir, "rev-parse", "HEAD"], stderr=subprocess.DEVNULL, text=True
+        ).strip()
+
+    cur = os.path.abspath(pkg_dir)
+    dot_git = None
+    while True:
+        cand = os.path.join(cur, ".git")
+        if os.path.exists(cand):
+            dot_git = cand
+            break
+        parent = os.path.dirname(cur)
+        if parent == cur:
+            break
+        cur = parent
+
+    if dot_git is None:
+        return "N/A"
+
+    git_dir = dot_git
+    common_dir = dot_git
+    if os.path.isfile(dot_git):
+        with open(dot_git, "r", encoding="utf-8") as f:
+            line = f.readline().strip()
+        if line.startswith("gitdir:"):
+            rel = line.split(":", 1)[1].strip()
+            git_dir = rel if os.path.isabs(rel) else os.path.normpath(os.path.join(os.path.dirname(dot_git), rel))
+            commondir_file = os.path.join(git_dir, "commondir")
+            if os.path.isfile(commondir_file):
+                with open(commondir_file, "r", encoding="utf-8") as cf:
+                    crel = cf.readline().strip()
+                common_dir = crel if os.path.isabs(crel) else os.path.normpath(os.path.join(git_dir, crel))
+            else:
+                common_dir = git_dir
+
+    head_path = os.path.join(git_dir, "HEAD")
+    st_head = os.stat(head_path)
+    with open(head_path, "r", encoding="utf-8") as hf:
+        head_txt = hf.readline().strip()
+
+    if not head_txt.startswith("ref:"):
+        return head_txt if len(head_txt) >= 7 else "N/A"
+
+    ref_rel = head_txt.split(":", 1)[1].strip()
+    ref_path = os.path.join(common_dir, *ref_rel.split("/"))
+    if os.path.isfile(ref_path):
+        st_ref = os.stat(ref_path)
+        cached = _GIT_HEAD_CACHE.get(git_dir)
+        if cached is not None and cached[0] == st_head.st_mtime_ns and cached[1] == st_ref.st_mtime_ns:
+            return cached[2]
+        with open(ref_path, "r", encoding="utf-8") as rf:
+            sha = rf.readline().strip()
+        if sha:
+            _GIT_HEAD_CACHE[git_dir] = (st_head.st_mtime_ns, st_ref.st_mtime_ns, sha)
+            return sha
+
+    packed_path = os.path.join(common_dir, "packed-refs")
+    if os.path.isfile(packed_path):
+        st_pk = os.stat(packed_path)
+        cached = _GIT_HEAD_CACHE.get(git_dir)
+        if cached is not None and cached[0] == st_head.st_mtime_ns and cached[1] == st_pk.st_mtime_ns:
+            return cached[2]
+        with open(packed_path, "r", encoding="utf-8") as pf:
+            for pline in pf:
+                if pline.startswith("#") or pline.startswith("^"):
+                    continue
+                parts = pline.strip().split()
+                if len(parts) == 2 and parts[1] == ref_rel:
+                    _GIT_HEAD_CACHE[git_dir] = (st_head.st_mtime_ns, st_pk.st_mtime_ns, parts[0])
+                    return parts[0]
+
+    return subprocess.check_output(
+        ["git", "-C", pkg_dir, "rev-parse", "HEAD"], stderr=subprocess.DEVNULL, text=True
+    ).strip()
+
+
 def build_engine_provenance(
     algorithm="syntx.syn",
     backend="pytorch",
@@ -159,10 +244,8 @@ def build_engine_provenance(
     # the installed syntx (not whatever repository the current directory happens to be in)
     prov["syntx_version"] = __import__("syntx").__version__
     try:
-        import subprocess
         pkg_dir = os.path.dirname(os.path.abspath(__import__("syntx").__file__))
-        prov["syntx_git_commit"] = subprocess.check_output(
-            ["git", "-C", pkg_dir, "rev-parse", "HEAD"], stderr=subprocess.DEVNULL, text=True).strip()
+        prov["syntx_git_commit"] = _resolve_git_commit_cached(pkg_dir)
     except Exception:
         prov["syntx_git_commit"] = "N/A"
     prov.update(kwargs)

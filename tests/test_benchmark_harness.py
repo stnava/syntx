@@ -231,11 +231,15 @@ class TestBugH5TaskLabelSemanticsAndStratum:
 class TestBugH6BaselinesAndQC:
     """Bug H6: ANTs baselines, Liouville determinant QC, and light-theme visualizers."""
 
-    def test_liouville_determinant_qc_evaluation(self):
+    @pytest.fixture(scope="class")
+    def hippocampus_syn_run(self):
         im0 = ants.image_read("/Users/stnava/data/decathlon/Task04_Hippocampus/imagesTr/hippocampus_367.nii.gz")
         im1 = ants.image_read("/Users/stnava/data/decathlon/Task04_Hippocampus/imagesTr/hippocampus_304.nii.gz")
-
         reg_syn = syntx.syn(im0, im1, regularizer="sobolev", reg_iterations=[5, 2], verbose=False)
+        return im0, im1, reg_syn
+
+    def test_liouville_determinant_qc_evaluation(self, hippocampus_syn_run):
+        im0, im1, reg_syn = hippocampus_syn_run
         from syntx.registration_metrics import evaluate_registration_qc
         qc = evaluate_registration_qc(fixed=im0, moving=im1, registration_result=reg_syn)
 
@@ -244,11 +248,8 @@ class TestBugH6BaselinesAndQC:
         assert qc.folding_pct >= 0.0
         assert qc.min_jacobian > 0.0
 
-    def test_light_theme_visualizer_call(self):
-        im0 = ants.image_read("/Users/stnava/data/decathlon/Task04_Hippocampus/imagesTr/hippocampus_367.nii.gz")
-        im1 = ants.image_read("/Users/stnava/data/decathlon/Task04_Hippocampus/imagesTr/hippocampus_304.nii.gz")
-        reg_syn = syntx.syn(im0, im1, regularizer="sobolev", reg_iterations=[5, 2], verbose=False)
-
+    def test_light_theme_visualizer_call(self, hippocampus_syn_run):
+        im0, _, reg_syn = hippocampus_syn_run
         with tempfile.NamedTemporaryFile(suffix=".png") as tmp_png:
             from syntx.viz import render_standard_4panel
             render_standard_4panel(

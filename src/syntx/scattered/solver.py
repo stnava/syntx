@@ -532,11 +532,13 @@ def _make_identity_grid(spatial_shape: Tuple[int, ...], dtype: torch.dtype = tor
 def _deformation_energies(u: torch.Tensor) -> Dict[str, float]:
     """'harmonic': sum over components k and axes j of mean((du_k / dx_j)^2) (as
     ``benchmark.metrics``), 'l2': mean(u^2); [-1, 1] units, grid step 2 / (n - 1)."""
-    spatial = u.shape[1:-1]
+    u_det = u.detach()
+    spatial = u_det.shape[1:-1]
     steps = [2.0 / (n - 1) for n in spatial]
-    grads = torch.gradient(u.detach(), spacing=steps, dim=tuple(range(1, len(spatial) + 1)))
-    harmonic = sum(float(torch.mean(g ** 2)) * u.shape[-1] for g in grads)
-    return {'harmonic': harmonic, 'l2': float(torch.mean(u.detach() ** 2))}
+    grads = torch.gradient(u_det, spacing=steps, dim=tuple(range(1, len(spatial) + 1)))
+    vals = torch.stack([torch.mean(g ** 2) for g in grads] + [torch.mean(u_det ** 2)]).tolist()
+    harmonic = sum(float(v) * u_det.shape[-1] for v in vals[:-1])
+    return {'harmonic': harmonic, 'l2': float(vals[-1])}
 
 
 def _compute_grid_folding(warp_field: torch.Tensor, domain_mask: Optional[torch.Tensor] = None) -> Tuple[float, float, float]:
@@ -567,10 +569,8 @@ def _compute_grid_folding(warp_field: torch.Tensor, domain_mask: Optional[torch.
     if active_jac.numel() == 0:
         return 0.0, 1.0, 1.0
 
-    folding_pct = float((active_jac <= 0.0).float().mean().item()) * 100.0
-    min_jac = float(active_jac.min().item())
-    mean_jac = float(active_jac.mean().item())
-    return folding_pct, min_jac, mean_jac
+    stats_3 = torch.stack([(active_jac <= 0.0).float().mean(), active_jac.amin(), active_jac.mean()]).tolist()
+    return float(stats_3[0]) * 100.0, float(stats_3[1]), float(stats_3[2])
 
 
 
@@ -587,8 +587,8 @@ def _inverse_consistency_error(fwd: torch.Tensor, inv: torch.Tensor, pts: Option
     y = warp_scattered_coordinates(pts, fwd, direction='forward', vector_convention='xyz')
     rec = warp_scattered_coordinates(y, inv, direction='forward', vector_convention='xyz')
     diff = rec - pts
-    return {'max_error': float(diff.abs().max().item()),
-            'mean_error': float(torch.norm(diff, dim=-1).mean().item())}
+    err_2 = torch.stack([diff.abs().amax(), torch.norm(diff, dim=-1).mean()]).tolist()
+    return {'max_error': float(err_2[0]), 'mean_error': float(err_2[1])}
 
 
 class SyNScattered(nn.Module):
@@ -1487,15 +1487,16 @@ class SyNScattered(nn.Module):
                             delta_l = v_l * scale_l
                             delta_r = v_r * scale_r
                         else:
-                            norm_l = torch.sqrt(torch.sum((v_l / spacing_t)**2, dim=-1)).max()
-                            norm_r = torch.sqrt(torch.sum((v_r / spacing_t)**2, dim=-1)).max()
-                            max_norm = torch.max(norm_l, norm_r).clamp_min(1e-4)
-                            if float(max_norm) > 1e-4:
-                                delta_l = (effective_step / max_norm) * v_l
-                                delta_r = (effective_step / max_norm) * v_r
-                            else:
-                                delta_l = torch.zeros_like(v_l)
-                                delta_r = torch.zeros_like(v_r)
+                            norm_l = torch.sqrt(torch.sum((v_l / spacing_t)**2, dim=-1)).amax()
+                            norm_r = torch.sqrt(torch.sum((v_r / spacing_t)**2, dim=-1)).amax()
+                            max_norm = torch.maximum(norm_l, norm_r)
+                            step_scale = torch.where(
+                                max_norm > 1e-4,
+                                effective_step / max_norm.clamp_min(1e-4),
+                                torch.zeros_like(max_norm),
+                            )
+                            delta_l = step_scale * v_l
+                            delta_r = step_scale * v_r
                     elif opt_type == 'reg_adam':
                         beta1, beta2 = 0.9, 0.999
                         step = epoch + 1

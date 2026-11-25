@@ -87,8 +87,7 @@ def _search_best_patch(target_t, atlases_ext, labels_ext, offsets, margin, rad, 
     label and offset index (into ``offsets``), plus the fraction of ``roi`` voxels moved.
     """
     roi_t = torch.from_numpy(np.ascontiguousarray(roi)).to(dev)
-    n_roi = max(int(roi_t.sum().item()), 1)
-    sel_a, sel_l, sel_o, fracs = [], [], [], []
+    sel_a, sel_l, sel_o, moved_counts_t = [], [], [], [roi_t.sum()]
     for A, L in zip(atlases_ext, labels_ext):
         best = None
         for oi, off in enumerate(offsets):
@@ -109,7 +108,10 @@ def _search_best_patch(target_t, atlases_ext, labels_ext, offsets, margin, rad, 
         sel_a.append(a_sel)
         sel_l.append(l_sel)
         sel_o.append(o_sel)
-        fracs.append(float(((o_sel[0, 0] != 0) & roi_t).sum().item()) / n_roi)
+        moved_counts_t.append(((o_sel[0, 0] != 0) & roi_t).sum())
+    moved_vals = torch.stack(moved_counts_t).tolist()
+    n_roi = max(int(moved_vals[0]), 1)
+    fracs = [float(v) / n_roi for v in moved_vals[1:]]
     return sel_a, sel_l, sel_o, fracs
 
 
@@ -587,7 +589,7 @@ def joint_label_fusion(
     # offset) that is a box sum of the weight field, so it is exact and deterministic. Unanimous voxels
     # take their shared label (probability 1).
     t_a = time.perf_counter()
-    num_classes = int(max(int(l.max().item()) for l in labels_ext)) + 1
+    num_classes = int(torch.stack([l.amax() for l in labels_ext]).amax().item()) + 1
     seg_flat = lmin.clone()
     P = None
     if M > 0:

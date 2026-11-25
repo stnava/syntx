@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 import os
 import tempfile
 
@@ -722,3 +723,170 @@ def test_motion_correction_batched_seed_and_restore_sync_budget():
     else:
         mc = syntx.motion_correction(img4d, reference=0, type_of_transform="Rigid", device=str(dev))
     assert mc.motion_corrected.shape == img4d.shape
+
+
+def test_pass3_blob_normalize_and_sift3d_stencil_d2h_budget():
+    """R52 Pass 3: sync-free _normalize_intensity, zero-roundtrip landmark_image_to_tensor, and <64 KiB SIFT3D D2H."""
+    from syntx.landmarks.blob import _normalize_intensity
+    from syntx.landmarks.sift3d import sift3d_keypoints
+    from syntx.spatial import landmark_image_to_tensor
+
+    dev = _accel_device()
+    rng = np.random.RandomState(41)
+    x = torch.as_tensor(rng.uniform(10.0, 200.0, size=(1, 1, 24, 24, 24)).astype(np.float32), device=dev)
+    flat = torch.full((1, 1, 12, 12, 12), 7.0, device=dev, dtype=torch.float32)
+
+    if dev.type != "cpu":
+        prof = DispatchTransferSyncCounter(dev.type)
+        with prof:
+            xn = _normalize_intensity(x)
+            fn = _normalize_intensity(flat)
+            lt = landmark_image_to_tensor(x, device=dev)
+        assert prof.sync_count == 0
+        assert prof.d2h_count == 0
+        assert prof.h2d_count == 0
+    else:
+        xn = _normalize_intensity(x)
+        fn = _normalize_intensity(flat)
+        lt = landmark_image_to_tensor(x, device=dev)
+
+    assert float(xn.min().item()) >= 0.0 and float(xn.max().item()) <= 1.0
+    # Per _normalize_intensity docstring, a fully flat image is clamped to [0, 1] (7.0 -> 1.0)
+    assert float(fn.min().item()) == 1.0 and float(fn.max().item()) == 1.0
+    assert lt.shape == (1, 1, 24, 24, 24) and lt.device.type == dev.type
+
+    # SIFT3D D2H budget & CPU/GPU parity on a textured 48^3 volume
+    grid = np.linspace(-1.0, 1.0, 48, dtype=np.float32)
+    zz, yy, xx = np.meshgrid(grid, grid, grid, indexing="ij")
+    r2 = xx**2 + (1.1 * yy) ** 2 + (0.9 * zz) ** 2
+    vol = np.clip(np.exp(-2.5 * r2) * (0.6 + 0.4 * np.cos(6.0 * xx) * np.cos(6.0 * yy)), 0.0, 1.0).astype(np.float32)
+    vol[r2 > 0.85] = 0.0
+    img = ants.from_numpy(vol, origin=(-24.0, -24.0, -24.0), spacing=(1.0, 1.0, 1.0), direction=_oblique_direction())
+
+    st_cpu = sift3d_keypoints(img, max_keypoints=64, preprocess=False, device="cpu")
+    assert len(st_cpu["pts"]) >= 2
+    if dev.type != "cpu":
+        prof_sift = DispatchTransferSyncCounter(dev.type)
+        with prof_sift:
+            st_gpu = sift3d_keypoints(img, max_keypoints=64, preprocess=False, device=str(dev))
+        # Full 40^3 float32 DoG stack was >2 MiB D2H; compact [K, 10] stencil must stay <64 KiB!
+        assert prof_sift.d2h_bytes < 65_536
+        np.testing.assert_allclose(st_gpu["pts"], st_cpu["pts"], atol=1e-4)
+        np.testing.assert_allclose(st_gpu["response"], st_cpu["response"], atol=1e-4)
+
+
+def test_pass3_lazy_inverse_identity_error_map_across_solvers():
+    """R52 Pass 3: error_map is lazy (0 D2H when unaccessed) across greedy, syn, syngs, and tvf."""
+    from syntx.core.inverse import _LazyKeyDict, calculate_inverse_identity_error
+
+    fi, mi = _synthetic_3d_pair((18, 20, 16))
+    dev = _accel_device()
+    exp_shape = tuple(reversed(fi.shape))
+
+    u = 0.2 * torch.randn(1, *exp_shape, 3, device=dev, dtype=torch.float32)
+    v = -0.2 * u
+    ref_full = calculate_inverse_identity_error(u, v, fi.spacing, fi.origin, fi.direction, return_error_map=True)
+    ref_scal = calculate_inverse_identity_error(u, v, fi.spacing, fi.origin, fi.direction, return_error_map=False)
+    assert ref_scal["error_map"] is None
+    assert abs(ref_full["max_error"] - ref_scal["max_error"]) < 1e-6
+    assert abs(ref_full["mean_error"] - ref_scal["mean_error"]) < 1e-6
+
+    r_greedy = syntx.greedy(
+        fi, mi, initial_transform=False, scales=[2, 1], reg_iterations=[2, 1], return_inverse=True, device=str(dev)
+    )
+    r_syn = syntx.syn(fi, mi, affine_dof="none", levels=[2, 1], reg_iterations=[2, 1], device=str(dev))
+    r_syngs = syntx.syngs(fi, mi, initial_transform="Identity", levels=[2, 1], reg_iterations=[2, 1], device=str(dev))
+    r_tvf = syntx.tvf(fi, mi, initial_transform="Identity", levels=[2, 1], reg_iterations=[2, 1], device=str(dev))
+
+    if dev.type != "cpu":
+        assert isinstance(r_greedy["inverse_identity_errors"]["phi_1"], _LazyKeyDict)
+        assert "error_map" in r_greedy["inverse_identity_errors"]["phi_1"]._lazy_loaders
+        assert isinstance(r_syn["inverse_identity_errors"]["phi_1"], _LazyKeyDict)
+        assert "error_map" in r_syn["inverse_identity_errors"]["phi_1"]._lazy_loaders
+        assert isinstance(r_syngs["inverse_identity_errors"]["phi_1"], _LazyKeyDict)
+        assert "error_map" in r_syngs["inverse_identity_errors"]["phi_1"]._lazy_loaders
+        assert isinstance(r_tvf, _LazyKeyDict)
+        assert "inverse_identity_error_map" in r_tvf._lazy_loaders
+
+    for solver_res in (r_greedy, r_syn, r_syngs, r_tvf):
+        phi1 = solver_res["inverse_identity_errors"]["phi_1"]
+        assert "error_map" in phi1
+        assert math.isfinite(float(phi1["max_error"]))
+        emap = phi1["error_map"]
+        assert isinstance(emap, torch.Tensor)
+        assert emap.device.type == "cpu"
+        assert tuple(emap.shape) == exp_shape
+
+    assert tuple(r_tvf["inverse_identity_error_map"].shape) == exp_shape
+
+
+def test_pass3_rotation_axis_scales_and_gpu_capacity_tracker():
+    """R52 Pass 3: rotation_axis_scales uses 1 sync and PointStepTracker.update accepts GPU 0-D capacity with 0 syncs."""
+    from syntx.core.optimizers import PointStepTracker
+    from syntx.core.parameter_scales import rigid_axes, rotation_axis_scales
+
+    dev = _accel_device()
+    pts = torch.randn(512, 3, device=dev, dtype=torch.float32) * 30.0
+    ctr = torch.tensor([2.0, -3.0, 1.5], device=dev, dtype=torch.float32)
+
+    if dev.type != "cpu":
+        prof = DispatchTransferSyncCounter(dev.type)
+        with prof:
+            sc = rotation_axis_scales(pts, ctr)
+        assert prof.sync_count <= 1
+    else:
+        sc = rotation_axis_scales(pts, ctr)
+    axes_ref = rigid_axes(
+        torch.zeros(2, 3, device=dev), torch.zeros(2, 3, device=dev), pts, ctr
+    )
+    np.testing.assert_allclose(sc, [a.scale_mm for a in axes_ref[3:]], rtol=1e-6, atol=1e-6)
+
+    trk = PointStepTracker(tol=0.05)
+    trk.start(torch.stack([pts, pts + 1.0], dim=0))
+    cap_t = torch.tensor(0.25, device=dev, dtype=torch.float32)
+    pts_next = torch.stack([pts + 0.01, pts + 1.01], dim=0)
+    if dev.type != "cpu":
+        prof_t = DispatchTransferSyncCounter(dev.type)
+        with prof_t:
+            newly = trk.update(pts_next, capacity=cap_t)
+        assert prof_t.sync_count == 0
+    else:
+        newly = trk.update(pts_next, capacity=cap_t)
+    assert newly.shape == (2,)
+
+
+def test_pass3_e2e_single_upload_and_git_commit_pure_python():
+    """R52 Pass 3: E2E greedy/syn avoid 3x image H2D re-uploads and build_engine_provenance avoids git subprocesses."""
+    from unittest.mock import patch
+    from syntx.viz.reports import _GIT_HEAD_CACHE, _resolve_git_commit_cached
+
+    # 1. Pure-Python git HEAD resolution requires 0 subprocess forks
+    pkg_dir = os.path.dirname(os.path.abspath(syntx.__file__))
+    _GIT_HEAD_CACHE.clear()
+    with patch("subprocess.Popen", side_effect=AssertionError("git subprocess must not be spawned")):
+        sha = _resolve_git_commit_cached(pkg_dir)
+    assert len(sha) == 40 and all(c in "0123456789abcdef" for c in sha)
+
+    # 2. End-to-end H2D budget on unit-normalized [0, 1] 3D pair
+    fi_raw, mi_raw = _synthetic_3d_pair((24, 28, 24))
+    fi = syntx.core.utils.normalize_image(fi_raw, method="robust", force=True)
+    mi = syntx.core.utils.normalize_image(mi_raw, method="robust", force=True)
+    dev = _accel_device()
+    if dev.type != "cpu":
+        one_vol_bytes = int(np.prod(fi.shape)) * 4
+        prof_g = DispatchTransferSyncCounter(dev.type)
+        with prof_g:
+            rg = syntx.greedy(
+                fi, mi, initial_transform=None, scales=[2, 1], reg_iterations=[2, 1], return_inverse=True, device=str(dev)
+            )
+        # Single upload of (fi, mi) is 2 * one_vol_bytes; pre-Pass-3 uploaded 6 * one_vol_bytes + point samples
+        assert prof_g.h2d_bytes < int(3.5 * one_vol_bytes)
+        assert rg["warpedmovout"] is not None and rg["warpedfixout"] is not None
+
+        prof_s = DispatchTransferSyncCounter(dev.type)
+        with prof_s:
+            rs = syntx.syn(
+                fi, mi, initial_transform=None, export_midpoint=False, levels=[2, 1], reg_iterations=[2, 1], device=str(dev)
+            )
+        assert prof_s.h2d_bytes < int(3.5 * one_vol_bytes)
+        assert rs["warpedmovout"] is not None and rs["warpedfixout"] is not None

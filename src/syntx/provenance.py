@@ -164,15 +164,20 @@ def code_state(root: Optional[str] = None, include_diff: bool = True,
     import syntx
     pkg_dir = os.path.abspath(pkg_dir or os.path.dirname(os.path.abspath(syntx.__file__)))
     root = root or pkg_dir
-    top = _git(root, "rev-parse", "--show-toplevel")
+    rev_out = _git(root, "rev-parse", "--show-toplevel", "HEAD", "--abbrev-ref", "HEAD")
     state: Dict[str, Any] = {
         "syntx_version": getattr(syntx, "__version__", None),
         "syntx_path": pkg_dir,
         "git": None,
     }
-    if top is None:
+    if rev_out is None:
         return state
-    top = top.strip()
+    rev_lines = [ln.strip() for ln in rev_out.splitlines() if ln.strip()]
+    if not rev_lines:
+        return state
+    top = rev_lines[0]
+    commit_sha = rev_lines[1] if len(rev_lines) > 1 else ((_git(top, "rev-parse", "HEAD") or "").strip() or None)
+    branch_name = rev_lines[2] if len(rev_lines) > 2 else ((_git(top, "rev-parse", "--abbrev-ref", "HEAD") or "").strip() or None)
     diff = _git(top, "diff", "HEAD", "--binary", "--", ".", ":(exclude)docs/reports") or ""
     untracked = [p for p in (_git(top, "ls-files", "-z", "--others", "--exclude-standard") or "").split("\0") if p]
     status = _git(top, "status", "--porcelain", "--untracked-files=no", "--", ".", ":(exclude)docs/reports") or ""
@@ -188,8 +193,8 @@ def code_state(root: Optional[str] = None, include_diff: bool = True,
         rel.encode() + b"\0" + data for rel, data in sorted(untracked_pkg.items()))
     git = {
         "root": top,
-        "commit": (_git(top, "rev-parse", "HEAD") or "").strip() or None,
-        "branch": (_git(top, "rev-parse", "--abbrev-ref", "HEAD") or "").strip() or None,
+        "commit": commit_sha or None,
+        "branch": branch_name or None,
         "describe": (_git(top, "describe", "--tags", "--always", "--dirty") or "").strip() or None,
         "dirty": bool(status.strip()) or bool(untracked_pkg),
         "diff_sha256": _sha256(diff_bytes),  # tracked diff + untracked package sources
@@ -441,8 +446,9 @@ class capture_registration_calls:
     in other threads are not attributed.
     """
 
-    def __init__(self):
+    def __init__(self, precomputed_code: Optional[Dict[str, Any]] = None):
         self.calls: List[dict] = []
+        self._precomputed_code = precomputed_code
 
     def start(self, include_diff: bool = True) -> "capture_registration_calls":
         """Record ``start_state`` (time, ``code_state(include_diff)``) and activate this
@@ -452,7 +458,11 @@ class capture_registration_calls:
         # records it and flags any change on disk while the run was executing.
         self.start_state = {
             "timestamp_utc": _dt.datetime.now(_dt.timezone.utc).isoformat(),
-            "code": code_state(include_diff=include_diff),
+            "code": (
+                self._precomputed_code
+                if self._precomputed_code is not None
+                else code_state(include_diff=include_diff)
+            ),
         }
         with _LOCK:
             _ACTIVE.append(self)
@@ -486,7 +496,9 @@ def _fingerprint(code: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def build_manifest(calls: Optional[List[dict]] = None, run: Optional[Dict[str, Any]] = None,
-                   include_diff: bool = True, start: Optional[Dict[str, Any]] = None
+                   include_diff: bool = True, start: Optional[Dict[str, Any]] = None,
+                   end_code_state: Optional[Dict[str, Any]] = None,
+                   precomputed_env: Optional[Dict[str, Any]] = None,
                    ) -> Dict[str, Any]:
     """Assemble a provenance manifest (JSON-serialisable).
 
@@ -520,12 +532,15 @@ def build_manifest(calls: Optional[List[dict]] = None, run: Optional[Dict[str, A
         "started_utc": start["timestamp_utc"] if start else now,
         "code": code,
         "script": script,
-        "environment": environment(),
+        "environment": precomputed_env if precomputed_env is not None else environment(),
         "run": jsonable(run or {}),
         "calls": calls or [],
         "changed_during_run": False,
     }
-    end_code = _fingerprint(code_state(include_diff=False)) if start else _fingerprint(code)
+    if end_code_state is not None:
+        end_code = _fingerprint(end_code_state)
+    else:
+        end_code = _fingerprint(code_state(include_diff=False)) if start else _fingerprint(code)
     end_script = script_state().get("sha256") if script.get("path") else None
     if end_code != _fingerprint(code) or (end_script and end_script != script.get("sha256")):
         manifest["changed_during_run"] = True

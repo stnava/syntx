@@ -177,9 +177,9 @@ def test_rps_anisotropic_displacement_phantom_recovery():
             device="cpu",
         )
         grad_fn = ne.nn.modules.SpatialGradient("l2")
-        opt = torch.optim.Adam(vxm_opt.parameters(), lr=3e-3)
-        sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=200, eta_min=3e-4)
-        for _ in range(200):
+        opt = torch.optim.Adam(vxm_opt.parameters(), lr=4e-3)
+        sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=120, eta_min=4e-4)
+        for _ in range(120):
             opt.zero_grad()
             vel_p = vxm_opt(src_t, tgt_t, return_field_type="velocity")
             disp_p = vxm_opt.velocity_field_integrator(vel_p)

@@ -422,13 +422,15 @@ def build_template(
             last_invtransforms[k] = w1["invtransforms"]
 
             has_field = is_greedy or L >= 2
+            if has_field:
+                from .transforms import _read_disp_image_cached
             if k == 0:
                 if has_field:
-                    wavg = ants.image_read(w1["fwdtransforms"][0]) * weights[k]
+                    wavg = _read_disp_image_cached(w1["fwdtransforms"][0]) * weights[k]
                 xavgNew = w1["warpedmovout"] * weights[k]
             else:
                 if has_field:
-                    wavg = wavg + ants.image_read(w1["fwdtransforms"][0]) * weights[k]
+                    wavg = wavg + _read_disp_image_cached(w1["fwdtransforms"][0]) * weights[k]
                 xavgNew = xavgNew + w1["warpedmovout"] * weights[k]
 
             if verbose:

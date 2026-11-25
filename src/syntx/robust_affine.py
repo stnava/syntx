@@ -1447,6 +1447,7 @@ def _run_pytorch_affine_solver(fixed: ants.ANTsImage, moving: ants.ANTsImage, in
     torch.manual_seed(seed); np.random.seed(seed)
     from .device import resolve_device as _resolve_device
     device_obj = torch.device(_resolve_device(device, task='affine'))
+    _preuploaded_input_zyx = kwargs.pop('_preuploaded_input_zyx', None)
     dof = kwargs.get('dof', 'affine')
     if iterations is None:
         iterations = reg_iterations
@@ -1595,8 +1596,30 @@ def _run_pytorch_affine_solver(fixed: ants.ANTsImage, moving: ants.ANTsImage, in
             ct_tomo = None
     use_mind_guidance = bool((is_internal_fov_pair or (has_slab_asymmetry and ct_tomo is None)) and dim == 3 and _level_builder is None)
 
-    fi_arr = image_to_tensor(fixed_norm, device=device_obj, to_zyx=True)
-    mi_arr = image_to_tensor(moving_norm, device=device_obj, to_zyx=True)
+    _used_preuploaded = False
+    if (
+        isinstance(_preuploaded_input_zyx, tuple)
+        and len(_preuploaded_input_zyx) == 2
+        and _preuploaded_input_zyx[0] is not None
+        and _preuploaded_input_zyx[1] is not None
+        and _preuploaded_input_zyx[0].device.type == device_obj.type
+        and (_preuploaded_input_zyx[0].device.index or 0) == (device_obj.index or 0)
+        and _preuploaded_input_zyx[1].device.type == device_obj.type
+        and (_preuploaded_input_zyx[1].device.index or 0) == (device_obj.index or 0)
+        and tuple(reversed(_preuploaded_input_zyx[0].shape[2:])) == tuple(fixed.shape[:dim])
+        and tuple(reversed(_preuploaded_input_zyx[1].shape[2:])) == tuple(moving.shape[:dim])
+    ):
+        from syntx.core.utils import compute_auto_norm_scale_offset
+        _qf, _df = compute_auto_norm_scale_offset(fixed.numpy())
+        _qm, _dm = compute_auto_norm_scale_offset(moving.numpy())
+        with torch.no_grad():
+            fi_arr = ((_preuploaded_input_zyx[0] - float(_qf)) / float(_df)).clamp(0.0, 1.0)
+            mi_arr = ((_preuploaded_input_zyx[1] - float(_qm)) / float(_dm)).clamp(0.0, 1.0)
+        _used_preuploaded = True
+    if not _used_preuploaded:
+        fi_arr = image_to_tensor(fixed_norm, device=device_obj, to_zyx=True)
+        mi_arr = image_to_tensor(moving_norm, device=device_obj, to_zyx=True)
+    del _preuploaded_input_zyx
 
     f32 = dict(dtype=torch.float32, device=device_obj)
     sp_xyz = torch.tensor(fixed.spacing, **f32); orig_xyz = torch.tensor(fixed.origin, **f32); dir_xyz = torch.tensor(fixed.direction, **f32)
@@ -1771,6 +1794,7 @@ def _run_pytorch_affine_solver(fixed: ants.ANTsImage, moving: ants.ANTsImage, in
                     fmind=entry['points_jit']['fmind'][:, pos].contiguous() if fmind_all is not None else None,
                 )
         pyr[level] = entry
+    del fi_arr, mi_arr
 
     # Gate default Tikhonov scale/shear shrinkage to genuinely thin anisotropic slabs (<90 mm or <24 slices)
     # so full-FOV inter-subject brain and body scaling (5-20%) is not penalised unless explicitly requested.
@@ -2273,7 +2297,7 @@ def _run_pytorch_affine_solver(fixed: ants.ANTsImage, moving: ants.ANTsImage, in
             scale = 1.0
             last_check = 0
             pts_ = _path_points(p, dof, level)[0]
-            pt_radius = float((pts_ - C_phys).pow(2).sum(-1).mean().sqrt())
+            pt_radius = (pts_ - C_phys).pow(2).sum(-1).mean().sqrt()
             best_stage_loss_t = torch.tensor(float('inf'), device=device_obj, dtype=torch.float32)
             best_stage_state = {n: getattr(p, n).detach().clone() for n in ('t', 'omega', 'scale', 'shear')}
             have_best_stage = torch.zeros((), device=device_obj, dtype=torch.bool)
@@ -2328,25 +2352,22 @@ def _run_pytorch_affine_solver(fixed: ants.ANTsImage, moving: ants.ANTsImage, in
                 scale *= 0.5
             with torch.no_grad():
                 end_ld = closure_loss().detach().to(torch.float32)
-                end_vals = torch.stack([
-                    have_best_stage.to(torch.float32),
-                    best_stage_loss_t,
-                    end_ld,
-                    tracker.active.any().to(torch.float32),
-                    tracker.last_step[0].to(torch.float32),
-                ]).tolist()
-                if end_vals[0] > 0.5 and (not math.isfinite(end_vals[2]) or end_vals[1] < end_vals[2]):
-                    for n, v in best_stage_state.items():
-                        getattr(p, n).copy_(v)
-                    last_loss[p.name] = best_stage_loss_t
-            fin_sync = [end_vals[3], end_vals[4]]
+                use_best = have_best_stage & (~torch.isfinite(end_ld) | (best_stage_loss_t < end_ld))
+                for n, v in best_stage_state.items():
+                    cur_p = getattr(p, n)
+                    torch.where(use_best, v, cur_p, out=cur_p)
+                last_loss[p.name] = torch.where(use_best, best_stage_loss_t, end_ld)
+                act_t = tracker.active.any().to(torch.float32)
+                step_t = tracker.last_step[0].to(torch.float32)
             return {'stage': f"{optimizer}@L{level}", 'level': int(level), 'path': p.name, 'iterations': int(done), 'blocks': int(blocks),
-                    'tol_mm': tracker.tol, 'probe_rejections': int(rejected), 'converged': not (fin_sync[0] > 0.5), 'fixed_block': (not judged), 'final_step_mm': float(fin_sync[1]),
-                    'seconds': round(time.time() - t_stage, 2)}
-        fin_sync = torch.stack([tracker.active.any().to(torch.float32), tracker.last_step[0].to(torch.float32)]).tolist()
+                    'tol_mm': tracker.tol, 'probe_rejections': int(rejected), 'converged': None, 'fixed_block': (not judged), 'final_step_mm': None,
+                    '_active_t': act_t, '_step_t': step_t, 'seconds': round(time.time() - t_stage, 2)}
+        with torch.no_grad():
+            act_t = tracker.active.any().to(torch.float32)
+            step_t = tracker.last_step[0].to(torch.float32)
         return {'stage': f"{optimizer}@L{level}", 'level': int(level), 'path': p.name, 'iterations': int(done), 'blocks': int(blocks),
-                'tol_mm': tracker.tol, 'probe_rejections': int(rejected), 'converged': not (fin_sync[0] > 0.5), 'fixed_block': (not judged), 'final_step_mm': float(fin_sync[1]),
-                'seconds': round(time.time() - t_stage, 2)}
+                'tol_mm': tracker.tol, 'probe_rejections': int(rejected), 'converged': None, 'fixed_block': (not judged), 'final_step_mm': None,
+                '_active_t': act_t, '_step_t': step_t, 'seconds': round(time.time() - t_stage, 2)}
 
     def _run_schedule(paths):
         snap = {}
@@ -2451,7 +2472,27 @@ def _run_pytorch_affine_solver(fixed: ants.ANTsImage, moving: ants.ANTsImage, in
     else:
         warped_mov_out = None
     final_loss_raw = last_loss.get(winner.name, float('nan'))
-    final_loss_val = float(final_loss_raw.item()) if torch.is_tensor(final_loss_raw) else float(final_loss_raw)
+    sync_tensors = []
+    has_loss_tensor = torch.is_tensor(final_loss_raw)
+    if has_loss_tensor:
+        sync_tensors.append(final_loss_raw.detach().to(torch.float32).reshape(()))
+    pending_stages = [entry for entry in convergence_log if '_active_t' in entry]
+    for entry in pending_stages:
+        sync_tensors.append(entry.pop('_active_t').reshape(()))
+        sync_tensors.append(entry.pop('_step_t').reshape(()))
+    if sync_tensors:
+        synced_vals = torch.stack(sync_tensors).tolist()
+        ofs = 0
+        if has_loss_tensor:
+            final_loss_val = float(synced_vals[0])
+            ofs = 1
+        else:
+            final_loss_val = float(final_loss_raw)
+        for idx_s, entry in enumerate(pending_stages):
+            entry['converged'] = not (float(synced_vals[ofs + 2 * idx_s]) > 0.5)
+            entry['final_step_mm'] = float(synced_vals[ofs + 2 * idx_s + 1])
+    else:
+        final_loss_val = float(final_loss_raw)
     elapsed = time.time() - t0
     return {
         'warpedmovout': warped_mov_out,
@@ -2947,6 +2988,7 @@ def _robust_affine_impl(
     t0 = time.time()
     dim = fixed.dimension
     temp_dirs = []
+    _preuploaded_input_zyx = kwargs.pop('_preuploaded_input_zyx', None)
 
     fixed_native = fixed
     moving_native = moving
@@ -2960,6 +3002,7 @@ def _robust_affine_impl(
     if is_large_submm_ct:
         fixed = _cap_anisotropic_working_image(fixed, 1.0)
         moving = _cap_anisotropic_working_image(moving, 1.0)
+        _preuploaded_input_zyx = None
 
     def _finalize_result(res: dict) -> dict:
         if not return_warped:
@@ -3082,7 +3125,7 @@ def _robust_affine_impl(
                                               seed=seed, enable_landmarks=enable_landmarks, lambda_shear=lambda_shear,
                                               lambda_scale=lambda_scale, cluster_threshold=cluster_threshold,
                                               wide_angles=wide_angles, levels=levels, iterations=iterations, dof=dof,
-                                              return_warped=return_warped, **kwargs))
+                                              return_warped=return_warped, _preuploaded_input_zyx=_preuploaded_input_zyx, **kwargs))
         except Exception as e:
             # No silent fallback: a solver failure is the caller's information, whatever the mode.
             # The ANTs path is reachable only by asking for it (mode='ants' / 'ants_fast').
@@ -3239,15 +3282,19 @@ def _robust_affine_impl(
                     shutil.rmtree(d, ignore_errors=True)
             except Exception:
                 pass
+        _gpu_alloc = 0
         if torch.cuda.is_available():
+            _gpu_alloc = torch.cuda.memory_allocated() if hasattr(torch.cuda, 'memory_allocated') else 0
             torch.cuda.empty_cache()
         elif torch.backends.mps.is_available():
             try:
+                _gpu_alloc = torch.mps.current_allocated_memory() if hasattr(torch.mps, 'current_allocated_memory') else 0
                 torch.mps.empty_cache()
             except Exception:
                 pass
-        import gc
-        gc.collect()
+        if temp_dirs or _gpu_alloc > 64 * 1024 * 1024:
+            import gc
+            gc.collect()
 
 
 @functools.wraps(_robust_affine_impl)

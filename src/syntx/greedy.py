@@ -27,6 +27,7 @@ import torch.nn.functional as F
 import ants
 
 from .spatial import (
+    disp_itk_to_tensor,
     disp_tensor_to_itk,
     itk_shape_to_tensor_shape,
     export_ants_affine_transform,
@@ -42,7 +43,7 @@ from .core.losses import (
 from .core.losses.cross_correlation import _box_pool, box_mean_nd
 from .core.smoothing import separable_gaussian_filter
 from .core.inverse import update_inverse_field_nd_anderson
-from .core.pipeline import auto_detect_device, cleanup_gpu
+from .core.pipeline import auto_detect_device, cleanup_gpu, is_unclipped_unit_image
 from .core.convergence import DEFAULT_SLOPE_THRESHOLD, LossSlopeStop
 from .core.utils import require_finite_images
 from .robust_affine import robust_affine
@@ -886,10 +887,15 @@ def greedy_registration(
     elif isinstance(scales, int):
         scales = [scales]
 
-    # 2. Intensity Normalization (Foreground 2nd-98th percentile policy)
+    # 2. Intensity Normalization & Single-Pass Device Upload
     from .benchmark.evaluate import normalize_intensity
     fi_norm = normalize_intensity(fixed)
     mi_norm = normalize_intensity(moving)
+
+    dim_sp = fixed.dimension
+    rev_sp = tuple(range(dim_sp - 1, -1, -1))
+    fi_t = torch.from_numpy(np.ascontiguousarray(fi_norm.numpy(), dtype=np.float32)).to(device=torch_device, dtype=torch.float32).permute(*rev_sp).contiguous().unsqueeze(0).unsqueeze(0)
+    mi_t = torch.from_numpy(np.ascontiguousarray(mi_norm.numpy(), dtype=np.float32)).to(device=torch_device, dtype=torch.float32).permute(*rev_sp).contiguous().unsqueeze(0).unsqueeze(0)
 
     # 3. Initial Affine Alignment & Optional Dense Initial Warp
     t0_aff = time.time()
@@ -897,9 +903,17 @@ def greedy_registration(
     if initial_transform is None and initial_warp is None:
         if verbose:
             print("[greedy] Running syntx.robust_affine(mode='auto')...")
+        _pre_pair = (fi_t, mi_t) if int(np.prod(fixed.shape)) <= 16_777_216 else None
         reg_aff = robust_affine(
-            fi_norm, mi_norm, mode=affine_mode, verbose=False, device=torch_device, return_warped=False
+            fi_norm,
+            mi_norm,
+            mode=affine_mode,
+            verbose=False,
+            device=torch_device,
+            return_warped=False,
+            _preuploaded_input_zyx=_pre_pair,
         )
+        del _pre_pair
         raw_init_tx = reg_aff['fwdtransforms'][0]
     t1_aff = time.time() - t0_aff
 
@@ -918,12 +932,6 @@ def greedy_registration(
     init_warp_t = resolved_init.u0_norm
 
     theta, P_F, P_M = _build_torch_affine_matrix(fi_norm, mi_norm, M_phys, t_phys, torch_device)
-
-    # 5. Prepare Image Tensors (contiguous ZYX layout, transposed on device from C-contiguous XYZ)
-    dim_sp = fixed.dimension
-    rev_sp = tuple(range(dim_sp - 1, -1, -1))
-    fi_t = torch.from_numpy(fi_norm.numpy()).to(device=torch_device, dtype=torch.float32).permute(*rev_sp).contiguous().unsqueeze(0).unsqueeze(0)
-    mi_t = torch.from_numpy(mi_norm.numpy()).to(device=torch_device, dtype=torch.float32).permute(*rev_sp).contiguous().unsqueeze(0).unsqueeze(0)
 
     mask_t = None
     if fixed_mask is not None:
@@ -1153,16 +1161,42 @@ def greedy_registration(
         if restr_t_zyx is not None:
             with torch.no_grad():
                 inv_disp_t = inv_disp_t * restr_t_zyx
-        with torch.no_grad():
-            from .core.inverse import calculate_inverse_identity_error
-            _ice_calc = calculate_inverse_identity_error(
-                disp_t, inv_disp_t, spacing=fixed.spacing, origin=fixed.origin, direction=fixed.direction
-            )
-            if isinstance(_ice_calc.get('error_map'), torch.Tensor):
-                _ice_calc['error_map'] = _ice_calc['error_map'].cpu()
-            inv_err_dict = {'phi_1': _ice_calc}
         disp_img = disp_tensor_to_itk(disp_t, fixed)
         inv_disp_img = disp_tensor_to_itk(inv_disp_t, fixed)
+        with torch.no_grad():
+            from .core.inverse import _LazyKeyDict, calculate_inverse_identity_error
+            if disp_t.device.type != 'cpu':
+                _ice_calc = calculate_inverse_identity_error(
+                    disp_t,
+                    inv_disp_t,
+                    spacing=fixed.spacing,
+                    origin=fixed.origin,
+                    direction=fixed.direction,
+                    return_error_map=False,
+                )
+
+                def _load_greedy_error_map():
+                    with torch.no_grad():
+                        return calculate_inverse_identity_error(
+                            disp_itk_to_tensor(disp_img),
+                            disp_itk_to_tensor(inv_disp_img),
+                            spacing=fixed.spacing,
+                            origin=fixed.origin,
+                            direction=fixed.direction,
+                            return_error_map=True,
+                        )['error_map']
+
+                _ice_calc = _LazyKeyDict(_ice_calc, lazy_loaders={'error_map': _load_greedy_error_map})
+            else:
+                _ice_calc = calculate_inverse_identity_error(
+                    disp_t,
+                    inv_disp_t,
+                    spacing=fixed.spacing,
+                    origin=fixed.origin,
+                    direction=fixed.direction,
+                    return_error_map=True,
+                )
+            inv_err_dict = {'phi_1': _ice_calc}
         t1_inv = time.time() - t0_inv
     else:
         disp_img = disp_tensor_to_itk(disp_t, fixed)
@@ -1219,13 +1253,37 @@ def greedy_registration(
         fwd_transforms = [fwd_file]
 
     # 8. Warped Moving Image Output (Single Interpolation directly on native moving image)
+    from .transforms import ContinuousField as _ContinuousField
+    _can_wrap_cf = (
+        _apply_dev is not None
+        and not hasattr(ants.apply_transforms, "_mock_name")
+        and hasattr(ants, "is_image")
+        and ants.is_image(fixed)
+        and ants.is_image(moving)
+        and len(fixed.shape) == 3
+        and len(moving.shape) == 3
+    )
+    _mov_cf = (
+        _ContinuousField.from_tensor(
+            mi_t,
+            spatial_shape=moving.shape,
+            origin=moving.origin,
+            spacing=moving.spacing,
+            direction=moving.direction,
+            is_vector=False,
+        )
+        if (_can_wrap_cf and is_unclipped_unit_image(moving))
+        else None
+    )
     warpedmovout = _apply_transforms(
         fixed=fixed,
         moving=moving,
         transformlist=fwd_transforms,
         interpolator=interpolator,
         device=_apply_dev,
+        _moving_field=_mov_cf,
     )
+    del _mov_cf, mi_t
 
     # 9. Optional Physical Inverse Transform Export
     inv_transforms = []
@@ -1243,6 +1301,18 @@ def greedy_registration(
             inv_transforms = [inv_file]
             whichtoinvert_inv = [False]
 
+        _fix_cf = (
+            _ContinuousField.from_tensor(
+                fi_t,
+                spatial_shape=fixed.shape,
+                origin=fixed.origin,
+                spacing=fixed.spacing,
+                direction=fixed.direction,
+                is_vector=False,
+            )
+            if (_can_wrap_cf and is_unclipped_unit_image(fixed))
+            else None
+        )
         warpedfixout = _apply_transforms(
             fixed=moving,
             moving=fixed,
@@ -1250,7 +1320,10 @@ def greedy_registration(
             whichtoinvert=whichtoinvert_inv,
             interpolator=interpolator,
             device=_apply_dev,
+            _moving_field=_fix_cf,
         )
+        del _fix_cf
+    del fi_t
 
     total_runtime = time.time() - t0_total
 

@@ -175,6 +175,30 @@ def auto_select_intensity_percentiles(
     return best_pair
 
 
+def compute_auto_norm_scale_offset(arr, foreground_only: bool = True, eps: float = 1e-6):
+    """Return ``(q_min, denom)`` matching ``normalize_image(..., method='auto', force=True)``."""
+    import numpy as np
+
+    arr_min = float(arr.min())
+    arr_max = float(arr.max())
+    is_hu = bool(arr_min <= -500.0 and arr_max >= 100.0)
+    p_min, p_max = auto_select_intensity_percentiles(arr)
+    pos = (arr[arr > -900.0] if is_hu else arr[arr > 0]) if foreground_only else arr
+    if len(pos) > 0:
+        pos_q = pos[:: max(1, len(pos) // 2_000_000)] if arr.size > 16_777_216 and len(pos) > 4_000_000 else pos
+        q_min = -1000.0 if (is_hu and foreground_only) else float(np.percentile(pos_q, p_min))
+        q_max = float(np.percentile(pos_q, max(p_max, 99.0) if is_hu else p_max))
+        if is_hu and foreground_only:
+            q_max = max(q_max, 300.0)
+        if q_max <= q_min + 1e-4:
+            q_min = -1000.0 if is_hu else 0.0
+            q_max = float(pos.max())
+    else:
+        q_min = arr_min
+        q_max = arr_max
+    return float(q_min), float(q_max - q_min + eps)
+
+
 def normalize_image(
     image,
     method: str = 'auto',
@@ -234,21 +258,8 @@ def normalize_image(
     is_hu = bool(arr_min <= -500.0 and arr_max >= 100.0)
 
     if method in ('auto', 'entropy'):
-        p_min, p_max = auto_select_intensity_percentiles(arr)
-        pos = (arr[arr > -900.0] if is_hu else arr[arr > 0]) if foreground_only else arr
-        if len(pos) > 0:
-            pos_q = pos[:: max(1, len(pos) // 2_000_000)] if arr.size > 16_777_216 and len(pos) > 4_000_000 else pos
-            q_min = -1000.0 if (is_hu and foreground_only) else float(np.percentile(pos_q, p_min))
-            q_max = float(np.percentile(pos_q, max(p_max, 99.0) if is_hu else p_max))
-            if is_hu and foreground_only:
-                q_max = max(q_max, 300.0)
-            if q_max <= q_min + 1e-4:
-                q_min = -1000.0 if is_hu else 0.0
-                q_max = float(pos.max())
-        else:
-            q_min = float(arr.min())
-            q_max = float(arr.max())
-        norm_arr = np.clip((arr - q_min) / (q_max - q_min + eps), 0.0, 1.0).astype(np.float32)
+        q_min, denom = compute_auto_norm_scale_offset(arr, foreground_only=foreground_only, eps=eps)
+        norm_arr = np.clip((arr - q_min) / denom, 0.0, 1.0).astype(np.float32)
 
     elif method in ('robust', 'percentile'):
         pos = (arr[arr > -900.0] if is_hu else arr[arr > 0]) if foreground_only else arr

@@ -36,6 +36,14 @@ class ParamAxis(NamedTuple):
     scale_mm: float
 
 
+def rotation_axis_scales(points: torch.Tensor, center: torch.Tensor) -> Tuple[float, float, float]:
+    """Displacement (mm, RMS) of the sample points per radian about each of the 3 coordinate axes through ``center``
+    in a single device-to-host synchronization."""
+    col_ms = (points - center).pow(2).mean(dim=0)
+    vals = torch.stack([col_ms[1] + col_ms[2], col_ms[0] + col_ms[2], col_ms[0] + col_ms[1]]).sqrt().tolist()
+    return (float(vals[0]), float(vals[1]), float(vals[2]))
+
+
 def rotation_axis_scale(points: torch.Tensor, center: torch.Tensor, axis: int) -> float:
     """Displacement (mm, RMS) of the sample points per radian of rotation about coordinate ``axis`` through ``center``: the RMS
     distance of the points from that axis (a rotation moves a point by its perpendicular distance times the angle)."""
@@ -47,8 +55,9 @@ def rotation_axis_scale(points: torch.Tensor, center: torch.Tensor, axis: int) -
 def rigid_axes(t_param: torch.Tensor, omega: torch.Tensor, points: torch.Tensor, center: torch.Tensor) -> List[ParamAxis]:
     """The six axes of a per-frame rigid model (translation in mm, axis-angle rotation in radians) on (B, 3) tensors, each
     with its physical-shift scale measured on the sample ``points``."""
+    r_scales = rotation_axis_scales(points, center)
     axes = [ParamAxis(t_param, (slice(None), j), 1.0) for j in range(3)]
-    axes += [ParamAxis(omega, (slice(None), j), rotation_axis_scale(points, center, j)) for j in range(3)]
+    axes += [ParamAxis(omega, (slice(None), j), r_scales[j]) for j in range(3)]
     return axes
 
 
