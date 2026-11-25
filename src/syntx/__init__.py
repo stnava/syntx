@@ -187,6 +187,11 @@ from .greedy import (
     greedy_registration,
     GreedyRegistrationModel,
 )
+from .cohort import (
+    FixedTarget,
+    batch_greedy,
+    batch_robust_affine,
+)
 from .joint_label_fusion import joint_label_fusion
 
 from .surface import (
@@ -326,6 +331,8 @@ from .transforms import (
     TransformChain,
     map_points_to_moving,
     apply_transforms,
+    batch_apply_transforms,
+    clear_transform_gpu_caches,
     apply_transforms_to_points,
     resample_image_to_target,
     compose_displacement_fields,
@@ -367,7 +374,7 @@ from .liouville import liouville_determinant, determinant_summary
 syngs = syngs_registration
 affine_benchmark = evaluate_affine_benchmark
 
-__version__ = "6.45.2"
+__version__ = "6.46.0"
 
 
 
@@ -381,6 +388,8 @@ __all__ = [
     "TransformChain",
     "map_points_to_moving",
     "apply_transforms",
+    "batch_apply_transforms",
+    "clear_transform_gpu_caches",
     "apply_transforms_to_points",
     "resample_image_to_target",
     "compose_displacement_fields",
@@ -553,6 +562,9 @@ __all__ = [
     "greedy",
     "greedy_registration",
     "GreedyRegistrationModel",
+    "FixedTarget",
+    "batch_greedy",
+    "batch_robust_affine",
     "ImageDiagnosis",
     "PairDiagnosis",
     "diagnose_image",

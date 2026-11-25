@@ -414,9 +414,10 @@ class FieldStepOptimizer:
         if self.mode == 'cfl':
             if self.vel_mom is None or list(self.vel_mom.shape[1:-1]) != target:
                 if self.vel_mom is not None:
+                    b_sz = int(self.vel_mom.shape[0])
                     dim = self.vel_mom.shape[-1]
                     self.vel_mom = torch.zeros(
-                        (1, *target, dim),
+                        (b_sz, *target, dim),
                         dtype=self.vel_mom.dtype,
                         device=self.vel_mom.device,
                     )

@@ -650,7 +650,7 @@ _PYTORCH_SOLVER_ONLY_KWARGS = frozenset({
     'smooth_sigma_per_level', 'fg_dice_weight', 'fg_level', 'sample_weighting', 'sample_seed',
     'enable_landmarks', 'lambda_shear', 'lambda_scale', 'cluster_threshold', 'wide_angles',
     'levels', 'iterations', 'reg_iterations', '_level_builder', 'valid_margin_slices',
-    'translation_scan_steps', 'return_warped',
+    'translation_scan_steps', 'return_warped', 'write_transforms', '_fixed_target',
 })
 
 
@@ -1352,7 +1352,7 @@ def _run_pytorch_affine_solver(fixed: ants.ANTsImage, moving: ants.ANTsImage, in
                                wide_angles: bool = False, max_pyramid_voxels: int = 2 ** 24, _level_builder=None,
                                convergence_tol_vox: float = 0.05, max_extend_factor: int = 4, max_sample_points: int = 250000,
                                valid_margin_slices: int = 1, translation_scan_steps: int = 0,
-                               return_warped: bool = True, **kwargs) -> dict:
+                               return_warped: bool = True, write_transforms: bool = True, **kwargs) -> dict:
     """
     Native PyTorch multi-resolution affine solver (``mode='pytorch'``), Mattes MI objective.
 
@@ -1525,30 +1525,45 @@ def _run_pytorch_affine_solver(fixed: ants.ANTsImage, moving: ants.ANTsImage, in
 
     # 1. centres, normalisation, tensors --------------------------------------------------
     from syntx.core.utils import normalize_image
-    # force=True: robust percentile normalisation ALWAYS runs. With the default (force=False) an image
-    # already in [0, 1] -- e.g. min-max normalised by the caller -- skips it and keeps an
-    # outlier-dominated range, which makes the Mattes histogram worse conditioned.
-    fixed_norm = normalize_image(fixed, method='auto', force=True)
+    _fixed_target = kwargs.pop('_fixed_target', None)
+    if _fixed_target is not None and getattr(_fixed_target, '_is_syntx_fixed_target', False):
+        fixed_norm = _fixed_target.affine_norm_image
+        _f_sup = _fixed_target.affine_support
+        com_f_pos = _f_sup['com_f_pos']
+        com_f_neg = _f_sup['com_f_neg']
+        com_f = _f_sup['com_f']
+        fov_f = _f_sup['fov_f']
+        ext_f_world = _f_sup['ext_f_world']
+        support_f = _f_sup['support_f']
+    else:
+        _fixed_target = None
+        # force=True: robust percentile normalisation ALWAYS runs. With the default (force=False) an image
+        # already in [0, 1] -- e.g. min-max normalised by the caller -- skips it and keeps an
+        # outlier-dominated range, which makes the Mattes histogram worse conditioned.
+        fixed_norm = normalize_image(fixed, method='auto', force=True)
+        com_f_pos, com_f_neg = robust_center_of_mass(fixed_norm, weighted=True)
+        com_f = np.asarray(com_f_pos if com_f_pos is not None else (com_f_neg if com_f_neg is not None else compute_center_of_mass(fixed_norm, weighted=False)), dtype=np.float64)
+        fov_f = np.asarray(compute_fov_center(fixed_norm), dtype=np.float64)
+        ext_f_world = np.abs(np.asarray(fixed.direction, dtype=np.float64).reshape(dim, dim)) @ (np.asarray(fixed.shape[:dim], dtype=np.float64) * np.asarray(fixed.spacing[:dim], dtype=np.float64))
+        support_f = _analyze_volume_support_3d(fixed, fixed_norm) if (dim == 3 and hasattr(fixed, 'direction')) else None
+
     moving_norm = normalize_image(moving, method='auto', force=True)
-    com_f_pos, com_f_neg = robust_center_of_mass(fixed_norm, weighted=True)
     com_m_pos, com_m_neg = robust_center_of_mass(moving_norm, weighted=True)
-    com_f = np.asarray(com_f_pos if com_f_pos is not None else (com_f_neg if com_f_neg is not None else compute_center_of_mass(fixed_norm, weighted=False)), dtype=np.float64)
     com_m = np.asarray(com_m_pos if com_m_pos is not None else (com_m_neg if com_m_neg is not None else compute_center_of_mass(moving_norm, weighted=False)), dtype=np.float64)
     t_init = com_m - com_f
-    fov_f = np.asarray(compute_fov_center(fixed_norm), dtype=np.float64)
     fov_m = np.asarray(compute_fov_center(moving_norm), dtype=np.float64)
     t_fov = fov_m - fov_f
-    ext_f_world = np.abs(np.asarray(fixed.direction, dtype=np.float64).reshape(dim, dim)) @ (np.asarray(fixed.shape[:dim], dtype=np.float64) * np.asarray(fixed.spacing[:dim], dtype=np.float64))
     ext_m_world = np.abs(np.asarray(moving.direction, dtype=np.float64).reshape(dim, dim)) @ (np.asarray(moving.shape[:dim], dtype=np.float64) * np.asarray(moving.spacing[:dim], dtype=np.float64))
     expected_ov = float(np.clip(np.prod(np.minimum(1.0, ext_m_world / np.maximum(ext_f_world, 1e-3))), 0.05, 1.0))
 
-    support_f = support_m = None
+    support_m = None
     is_internal_fov_pair = False
     has_slab_asymmetry = False
     asym_axes = []
     t_trunk = t_init
     if dim == 3 and hasattr(fixed, 'direction') and hasattr(moving, 'direction'):
-        support_f = _analyze_volume_support_3d(fixed, fixed_norm)
+        if support_f is None:
+            support_f = _analyze_volume_support_3d(fixed, fixed_norm)
         support_m = _analyze_volume_support_3d(moving, moving_norm)
         t_trunk = support_m['center_lps'] - support_f['center_lps']
         is_internal_fov_pair = bool(support_f['is_internal_fov'] and support_m['is_internal_fov'])
@@ -1617,7 +1632,14 @@ def _run_pytorch_affine_solver(fixed: ants.ANTsImage, moving: ants.ANTsImage, in
             mi_arr = ((_preuploaded_input_zyx[1] - float(_qm)) / float(_dm)).clamp(0.0, 1.0)
         _used_preuploaded = True
     if not _used_preuploaded:
-        fi_arr = image_to_tensor(fixed_norm, device=device_obj, to_zyx=True)
+        if _fixed_target is not None and _fixed_target.affine_tensor_zyx.device.type == device_obj.type and (
+            (_fixed_target.affine_tensor_zyx.device.index or 0) == (device_obj.index or 0) if device_obj.type != 'cpu' else True
+        ):
+            fi_arr = _fixed_target.affine_tensor_zyx
+        elif _fixed_target is not None:
+            fi_arr = _fixed_target.affine_tensor_zyx.to(device=device_obj, dtype=torch.float32)
+        else:
+            fi_arr = image_to_tensor(fixed_norm, device=device_obj, to_zyx=True)
         mi_arr = image_to_tensor(moving_norm, device=device_obj, to_zyx=True)
     del _preuploaded_input_zyx
 
@@ -1661,25 +1683,40 @@ def _run_pytorch_affine_solver(fixed: ants.ANTsImage, moving: ants.ANTsImage, in
             fi_lev, f_fix, o_fix = res_f[:3]
             valid_lev = res_f[3] if len(res_f) > 3 else None
             mi_lev, f_mov, o_mov = _level_builder('moving', mi_arr, moving.spacing, ctx)[:3]
+            cached_fix_geom = None
+        elif _fixed_target is not None:
+            _lf, cached_fix_geom = _fixed_target.get_affine_level(
+                level=level,
+                aniso_any=bool(aniso_f or aniso_m),
+                smooth_sigma_per_level=float(smooth_sigma_per_level),
+                max_pyramid_voxels=int(max_pyramid_voxels),
+                valid_margin_slices=int(valid_margin_slices),
+                fg_level=float(fg_level),
+                device=device_obj,
+            )
+            fi_lev, f_fix, o_fix = _lf.tensor, list(_lf.f), list(_lf.off)
+            valid_lev = _lf.valid
+            _lm = _central_level(mi_arr, level, moving.spacing, moving, sig_mm, False)
+            mi_lev, f_mov, o_mov = _lm.tensor, list(_lm.f), list(_lm.off)
         else:
+            cached_fix_geom = None
             _lf = _central_level(fi_arr, level, fixed.spacing, fixed, sig_mm, True)
             fi_lev, f_fix, o_fix = _lf.tensor, list(_lf.f), list(_lf.off)
             valid_lev = _lf.valid
-        if _level_builder is None:
             _lm = _central_level(mi_arr, level, moving.spacing, moving, sig_mm, False)
             mi_lev, f_mov, o_mov = _lm.tensor, list(_lm.f), list(_lm.off)
         shape_zyx = fi_lev.shape[2:]
-        axes = [torch.arange(n, device=device_obj, dtype=torch.float32) for n in shape_zyx]
-        mesh = torch.meshgrid(*axes, indexing='ij')                       # z, y, x  (or y, x)
-        # working index i sits at full-res continuous index f*i + off: a pooled voxel averages f full-res
-        # voxels so off = (f-1)/2 (f = level); the millimetre-based levels of anisotropic images have per-axis,
-        # non-integer f and, on finer axes, off = 0 (centre-to-centre grid)
         f_t = torch.tensor(f_fix, **f32); o_t = torch.tensor(o_fix, **f32)
-        vox_xyz = torch.stack(list(reversed(mesh)), dim=-1).reshape(-1, dim) * f_t + o_t
-        phys_xyz = orig_xyz + (vox_xyz * sp_xyz) @ dir_xyz.t()
-        fmask = (fi_lev > fg_level)
-        if valid_lev is not None:
-            valid_lev = valid_lev.to(device=device_obj, dtype=torch.bool).reshape(fmask.shape)
+        if cached_fix_geom is not None:
+            vox_xyz, phys_xyz, fmask, valid_lev = cached_fix_geom
+        else:
+            axes = [torch.arange(n, device=device_obj, dtype=torch.float32) for n in shape_zyx]
+            mesh = torch.meshgrid(*axes, indexing='ij')                       # z, y, x  (or y, x)
+            vox_xyz = torch.stack(list(reversed(mesh)), dim=-1).reshape(-1, dim) * f_t + o_t
+            phys_xyz = orig_xyz + (vox_xyz * sp_xyz) @ dir_xyz.t()
+            fmask = (fi_lev > fg_level)
+            if valid_lev is not None:
+                valid_lev = valid_lev.to(device=device_obj, dtype=torch.bool).reshape(fmask.shape)
         # prebuilt once per level (the constants are not rebuilt in the objective's thousands of calls)
         warp_mov = prebuild_warp(moving.origin, moving.direction, moving.spacing, f_mov, o_mov, mi_lev.shape[2:], device_obj)
         fi_mind_lev = mi_mind_lev = None
@@ -1825,23 +1862,49 @@ def _run_pytorch_affine_solver(fixed: ants.ANTsImage, moving: ants.ANTsImage, in
         )
 
     from .core.losses import box_lncc_loss_nd
+    _fw_cache: dict[tuple[int, int], tuple[torch.Tensor, torch.Tensor, torch.Tensor | None, torch.Tensor | None]] = {}
+
+    def _get_cached_subset_and_fw(level: int, full: bool, samp_val):
+        e = pyr[level]
+        if e['points'] is not None and not full:
+            key = (level, -1)
+        elif samp_val is not None and float(samp_val) < 1.0:
+            fv_full = e['points_full']['fvals']
+            eff_s = min(1.0, max(float(samp_val), 1000.0 / max(fv_full.numel(), 1)))
+            k_key = max(1, round(float(eff_s) * fv_full.numel())) if eff_s < 1.0 else fv_full.numel()
+            key = (level, k_key)
+        else:
+            key = (level, 0)
+        cached = _fw_cache.get(key)
+        if cached is not None:
+            return cached
+        if key[1] == -1:
+            phys_p, fv, fv_mind = e['points']['phys'], e['points']['fvals'], e['points'].get('fmind')
+        else:
+            phys_p, fv, fv_mind = e['points_full']['phys'], e['points_full']['fvals'], e['points_full'].get('fmind')
+            if key[1] > 0 and key[1] < fv.numel():
+                eff_s = min(1.0, max(float(samp_val), 1000.0 / max(fv.numel(), 1)))
+                idx = mattes_sample_indices(fv.numel(), eff_s, fv.device)
+                phys_p, fv = phys_p[idx], fv[idx]
+                if fv_mind is not None:
+                    fv_mind = fv_mind[:, idx]
+        fw = None
+        if fixed_range is not None:
+            fr = fixed_range if not isinstance(fixed_range[0], (int, float)) else (fixed_range, fixed_range)
+            min_j, max_j = float(fr[1][0]), float(fr[1][1])
+            with torch.no_grad():
+                y_sc = (fv.to(torch.float32) - min_j) / (max_j - min_j + 1e-8) * 2.0 - 1.0
+                fw = parzen_weights(y_sc, num_bins=num_bins, min_val=-1.0, max_val=1.0, pad=2.0)
+        out_c = (phys_p, fv, fv_mind, fw)
+        _fw_cache[key] = out_c
+        return out_c
 
     def objective(path: '_AffinePath', dof: str, level: int, full: bool = False, sampling: float = None):
         e = pyr[level]
         samp = sampling_percentage if sampling is None else sampling
         A = path.matrix(dof)
         teff = path.t + C_phys - A @ C_phys
-        if e['points'] is not None and not full:
-            phys_p, fv, fv_mind = e['points']['phys'], e['points']['fvals'], e['points'].get('fmind')
-        else:
-            phys_p, fv, fv_mind = e['points_full']['phys'], e['points_full']['fvals'], e['points_full'].get('fmind')
-            if samp is not None and float(samp) < 1.0:
-                eff_samp = min(1.0, max(float(samp), 1000.0 / max(fv.numel(), 1)))
-                if eff_samp < 1.0:
-                    idx = mattes_sample_indices(fv.numel(), eff_samp, fv.device)   # the regular subsample of the dense evaluation
-                    phys_p, fv = phys_p[idx], fv[idx]
-                    if fv_mind is not None:
-                        fv_mind = fv_mind[:, idx]
+        phys_p, fv, fv_mind, fw = _get_cached_subset_and_fw(level, full, samp)
         y = e['warp'](phys_p @ A.t() + teff)
         grid = y.reshape(1, 1, *([1] * (dim - 2)), -1, dim) if dim == 3 else y.reshape(1, 1, -1, dim)
         w = F.grid_sample(e['mi'], grid, mode='bilinear', padding_mode='zeros', align_corners=True).reshape(-1)
@@ -1860,7 +1923,10 @@ def _run_pytorch_affine_solver(fixed: ants.ANTsImage, moving: ants.ANTsImage, in
             if int(ax_in_b.sum().item()) >= 64:
                 m = ax_in_b
         # 'fixed_fg' and the valid margin are already in the point domain; 'none' is every voxel
-        loss = mattes_mi_loss_nd(w, fv, mask=m, num_bins=num_bins, auto_mask=False, fixed_range=fixed_range)
+        loss = mattes_mi_loss_nd(
+            w, fv, mask=m, num_bins=num_bins, auto_mask=False, fixed_range=fixed_range,
+            fixed_weights=(fw if m is None else None),
+        )
         if use_mind_guidance and fv_mind is not None and e.get('mi_mind') is not None:
             if has_slab_asymmetry and full and (samp is None or float(samp) >= 1.0) and min(e['shape']) >= 5:
                 # Physical ~60 mm spatial window LNCC on precomputed MIND + physical attenuation strictly inside valid interior
@@ -2459,16 +2525,34 @@ def _run_pytorch_affine_solver(fixed: ants.ANTsImage, moving: ants.ANTsImage, in
             f"than doing nothing ({baselines}); the solver did not find a usable alignment for this pair.")
 
     # 5. export --------------------------------------------------------------------------
+    from .transforms import TransformChain, TransformElement, apply_transforms as _apply_transforms
     A_fin, t_fin = winner.numpy_affine()
-    tx_final = ants.create_ants_transform(transform_type='AffineTransform', precision='float', dimension=dim)
-    tx_final.set_parameters(np.concatenate([A_fin.flatten(), t_fin]))
-    tx_final.set_fixed_parameters(com_f)
-    out_dir = tempfile.mkdtemp(prefix="robust_affine_pt_")
-    final_tx_path = os.path.join(out_dir, "affine.mat")
-    ants.write_transform(tx_final, final_tx_path)
+    b_phys = com_f + t_fin - A_fin @ com_f
+    _kind_lin = 'rigid' if dof == 'rigid' else 'affine'
+    if write_transforms:
+        tx_final = ants.create_ants_transform(transform_type='AffineTransform', precision='float', dimension=dim)
+        tx_final.set_parameters(np.concatenate([A_fin.flatten(), t_fin]))
+        tx_final.set_fixed_parameters(com_f)
+        out_dir = tempfile.mkdtemp(prefix="robust_affine_pt_")
+        final_tx_path = os.path.join(out_dir, "affine.mat")
+        ants.write_transform(tx_final, final_tx_path)
+        fwd_tx_out = [final_tx_path]
+        inv_tx_out = [final_tx_path]
+        fwd_chain = TransformChain.from_paths([final_tx_path])
+        inv_chain = TransformChain.from_paths([final_tx_path], [True])
+    else:
+        fwd_tx_out = []
+        inv_tx_out = []
+        fwd_chain = TransformChain([TransformElement.from_affine(A_fin, b_phys, invert=False, kind=_kind_lin)])
+        inv_chain = TransformChain([TransformElement.from_affine(A_fin, b_phys, invert=True, kind=_kind_lin)])
     if return_warped:
-        from .transforms import apply_transforms as _apply_transforms
-        warped_mov_out = _apply_transforms(fixed=fixed, moving=moving, transformlist=[final_tx_path], interpolator='linear', device=str(device_obj))
+        warped_mov_out = _apply_transforms(
+            fixed=fixed,
+            moving=moving,
+            transformlist=fwd_tx_out if write_transforms else fwd_chain,
+            interpolator='linear',
+            device=str(device_obj),
+        )
     else:
         warped_mov_out = None
     final_loss_raw = last_loss.get(winner.name, float('nan'))
@@ -2496,9 +2580,12 @@ def _run_pytorch_affine_solver(fixed: ants.ANTsImage, moving: ants.ANTsImage, in
     elapsed = time.time() - t0
     return {
         'warpedmovout': warped_mov_out,
-        'fwdtransforms': [final_tx_path],
-        'invtransforms': [final_tx_path],
+        'fwdtransforms': fwd_tx_out,
+        'invtransforms': inv_tx_out,
         'whichtoinvert_inv': [True],
+        'fwd_chain': fwd_chain,
+        'inv_chain': inv_chain,
+        'affine_matrix': (A_fin, b_phys),
         'runtime_seconds': elapsed,
         'time': elapsed,
         'init_candidate': winner.name,
@@ -2860,6 +2947,7 @@ def _robust_affine_impl(
     reg_iterations: list = None,
     setting: str = 'default',
     return_warped: bool = True,
+    write_transforms: bool = True,
     **kwargs
 ) -> dict:
     """
@@ -2973,6 +3061,10 @@ def _robust_affine_impl(
         ``'final_loss'``, ``'candidates_scored'``, ``'status'`` (PyTorch solver);
         ``'winner'``, ``'candidates'`` (tournament).
     """
+    _fixed_target = None
+    if getattr(fixed, '_is_syntx_fixed_target', False):
+        _fixed_target = fixed
+        fixed = _fixed_target.image
     require_finite_images(fixed=fixed, moving=moving)
     setting = check_setting(setting)
     for _k in ('valid_margin_slices', 'translation_scan_steps'):
@@ -3003,17 +3095,24 @@ def _robust_affine_impl(
         fixed = _cap_anisotropic_working_image(fixed, 1.0)
         moving = _cap_anisotropic_working_image(moving, 1.0)
         _preuploaded_input_zyx = None
+        _fixed_target = None
 
     def _finalize_result(res: dict) -> dict:
+        from .transforms import TransformChain
+        if 'fwd_chain' not in res and res.get('fwdtransforms'):
+            res['fwd_chain'] = TransformChain.from_paths(res['fwdtransforms'])
+        if 'inv_chain' not in res and res.get('invtransforms'):
+            res['inv_chain'] = TransformChain.from_paths(res['invtransforms'], res.get('whichtoinvert_inv', [True]))
         if not return_warped:
             res['warpedmovout'] = None
             res['warpedfixout'] = fixed_native
         elif is_large_submm_ct and (fixed is not fixed_native or moving is not moving_native):
             from .transforms import apply_transforms as _apply_transforms
+            _tx_apply = res['fwdtransforms'] if res.get('fwdtransforms') else res['fwd_chain']
             warped_mov = _apply_transforms(
                 fixed=fixed_native,
                 moving=moving_native,
-                transformlist=res['fwdtransforms'],
+                transformlist=_tx_apply,
                 interpolator='linear'
             )
             res['warpedmovout'] = warped_mov
@@ -3080,19 +3179,34 @@ def _robust_affine_impl(
 
     # 1. Mode: 'com_only'
     if mode in ['com_only', 'translation_only']:
-        com_f = compute_center_of_mass(fixed, weighted=True)
+        from .transforms import TransformChain, TransformElement, apply_transforms as _apply_transforms
+        com_f = _fixed_target.affine_support['com_f'] if _fixed_target is not None else compute_center_of_mass(fixed, weighted=True)
         com_m = compute_center_of_mass(moving, weighted=True)
         t_com = com_m - com_f
-        tx_path, temp_dir = create_translation_transform(fixed, moving, t_com)
+        eye_d = np.eye(dim, dtype=np.float64)
+        if write_transforms:
+            tx_path, temp_dir = create_translation_transform(fixed, moving, t_com)
+            fwd_tx_c = [tx_path]
+            fwd_ch_c = TransformChain.from_paths([tx_path])
+            inv_ch_c = TransformChain.from_paths([tx_path], [True])
+        else:
+            fwd_tx_c = []
+            fwd_ch_c = TransformChain([TransformElement.from_affine(eye_d, t_com, invert=False, kind='rigid')])
+            inv_ch_c = TransformChain([TransformElement.from_affine(eye_d, t_com, invert=True, kind='rigid')])
         if return_warped:
-            from .transforms import apply_transforms as _apply_transforms
-            warped_mov = _apply_transforms(fixed=fixed_native, moving=moving_native, transformlist=[tx_path])
+            warped_mov = _apply_transforms(
+                fixed=fixed_native,
+                moving=moving_native,
+                transformlist=fwd_tx_c if write_transforms else fwd_ch_c,
+            )
         else:
             warped_mov = None
         return {
-            'fwdtransforms': [tx_path],
-            'invtransforms': [tx_path],
+            'fwdtransforms': fwd_tx_c,
+            'invtransforms': fwd_tx_c,
             'whichtoinvert_inv': [True],
+            'fwd_chain': fwd_ch_c,
+            'inv_chain': inv_ch_c,
             'warpedmovout': warped_mov,
             'warpedfixout': fixed_native,
             'time': time.time() - t0,
@@ -3125,7 +3239,9 @@ def _robust_affine_impl(
                                               seed=seed, enable_landmarks=enable_landmarks, lambda_shear=lambda_shear,
                                               lambda_scale=lambda_scale, cluster_threshold=cluster_threshold,
                                               wide_angles=wide_angles, levels=levels, iterations=iterations, dof=dof,
-                                              return_warped=return_warped, _preuploaded_input_zyx=_preuploaded_input_zyx, **kwargs))
+                                              return_warped=return_warped, write_transforms=write_transforms,
+                                              _preuploaded_input_zyx=_preuploaded_input_zyx,
+                                              _fixed_target=_fixed_target, **kwargs))
         except Exception as e:
             # No silent fallback: a solver failure is the caller's information, whatever the mode.
             # The ANTs path is reachable only by asking for it (mode='ants' / 'ants_fast').

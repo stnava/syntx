@@ -211,7 +211,7 @@ def _linear_map_of(tx, dim):
 _NONLINEAR_TYPE_HINTS = ('Displacement', 'BSpline', 'Velocity', 'Kernel', 'Composite')
 
 
-def parse_ants_affine(tx_list, dim, allow_nonlinear=False):
+def parse_ants_affine(tx_list, dim, allow_nonlinear=False, return_float64=False):
     """
     Read ANTs / ITK linear transforms into one physical map ``y = M_phys @ x + t_phys``.
 
@@ -251,9 +251,13 @@ def parse_ants_affine(tx_list, dim, allow_nonlinear=False):
     """
     import ants
 
+    from ..transforms import TransformChain, TransformElement, _LINEAR as _TX_LINEAR, _resolve_element_linear
+
     if tx_list is None:
         return None, None
-    if not isinstance(tx_list, (list, tuple)):
+    if isinstance(tx_list, TransformChain):
+        tx_list = tx_list.elements
+    elif not isinstance(tx_list, (list, tuple)):
         tx_list = [tx_list]
     if len(tx_list) == 0:
         return None, None
@@ -262,6 +266,19 @@ def parse_ants_affine(tx_list, dim, allow_nonlinear=False):
 
     for tx_item in reversed(list(tx_list)):         # last item is applied first
         if isinstance(tx_item, str) and tx_item.lower() == 'identity':
+            continue
+        if isinstance(tx_item, TransformElement):
+            if tx_item.kind == 'identity':
+                continue
+            if tx_item.kind not in _TX_LINEAR:
+                if allow_nonlinear:
+                    return None, None
+                raise ValueError(f"transform {tx_item.path!r} ({tx_item.kind}) is not a linear transform; pass linear transforms only")
+            M, t = _resolve_element_linear(tx_item)
+            if int(M.shape[0]) != dim:
+                raise ValueError(f"transform {tx_item.path!r} has dimension {M.shape[0]}, expected {dim}")
+            t_composed = M @ t_composed + t
+            M_composed = M @ M_composed
             continue
         if isinstance(tx_item, str):
             if not os.path.exists(tx_item):
@@ -298,6 +315,8 @@ def parse_ants_affine(tx_list, dim, allow_nonlinear=False):
         t_composed = M @ t_composed + t
         M_composed = M @ M_composed
 
+    if return_float64:
+        return np.asarray(M_composed, dtype=np.float64), np.asarray(t_composed, dtype=np.float64)
     M_phys = torch.from_numpy(M_composed).to(torch.float32)
     t_phys = torch.from_numpy(t_composed).to(torch.float32)
     return M_phys, t_phys

@@ -15,6 +15,7 @@ minimum Jacobian determinants of ~3e-4 -- see docs/DOCSTRING_AUDIT.md).
 """
 
 import math
+import os
 import tempfile
 import time as _time
 from typing import Union, Sequence, Tuple, List, Optional, Any, Dict
@@ -786,7 +787,7 @@ class GeodesicShootingModel(nn.Module):
         """
         unknown = sorted(set(kwargs) - {'max_step_norm', 'adam_eps_rel', 'weight_decay', 'momentum',
                                         'smoothing_sigmas', 'seed', 'mattes_bins', 'convergence_slope',
-                                        'initial_grid'})
+                                        'initial_grid', 'sync_free'})
         if unknown:
             raise TypeError(f"GeodesicShootingModel.fit() got unexpected keyword(s) {unknown}")
         self.stop = stop = LossSlopeStop(slope_threshold=kwargs.get('convergence_slope', DEFAULT_SLOPE_THRESHOLD))   # shared stop rule
@@ -955,7 +956,7 @@ class GeodesicShootingModel(nn.Module):
                         torch.where(improved, self.velocity_0_inv.detach(), best_v0_inv, out=best_v0_inv)
 
                 optimizer.step()
-                if (ep + 1) % 5 == 0 or ep == epochs - 1:   # one batched device sync per 5 epochs + level end
+                if not bool(kwargs.get('sync_free', False)) and ((ep + 1) % 5 == 0 or ep == epochs - 1):   # one batched device sync per 5 epochs + level end
                     ep_loss, best_lv_now = [
                         float(v) for v in torch.stack([loss_t.to(best_level_loss_t.dtype), best_level_loss_t]).tolist()
                     ]
@@ -1061,6 +1062,8 @@ def syngs_registration(
     bootstrap_mode='none',
     seed=42,
     convergence_slope=DEFAULT_SLOPE_THRESHOLD,
+    return_warped=True,
+    write_transforms=True,
     initial_warp=None,
     initial_inverse_warp=None,
     **kwargs
@@ -1149,6 +1152,10 @@ def syngs_registration(
         ``'model'`` (the fitted ``GeodesicShootingModel``), ``'provenance'``.
     """
     t_start = _time.time()
+    _fixed_target = None
+    if getattr(fixed, '_is_syntx_fixed_target', False):
+        _fixed_target = fixed
+        fixed = _fixed_target.image
     require_finite_images(fixed=fixed, moving=moving)
     _allowed = {'regularizer', 'transport_mode', 'solver', 'symmetric', 'inverse_identity_weight',
                 'bootstrap_orig_weight', 'bootstrap_jitter_scale', 'spline_distance', 'mesh_size',
@@ -1157,7 +1164,7 @@ def syngs_registration(
                 'fast_smooth', 'affine_iterations', 'aff_metric', 'aff_sampling', 'iterations',
                 'compose_polish_tol', 'compose_polish_steps',
                 'digital_diffeomorphism', 'digital_diffeomorphism_floor',
-                'digital_diffeomorphism_steps'} | (REGULARIZER_EXTRA_KEYS - {'alpha'})
+                'digital_diffeomorphism_steps', 'sync_free', 'outprefix'} | (REGULARIZER_EXTRA_KEYS - {'alpha'})
     if reg_iterations is None:
         reg_iterations = iterations
     if reg_iterations is None and 'iterations' in kwargs:
@@ -1250,14 +1257,22 @@ def syngs_registration(
 
     # Extract initial transform & optional dense initial warp (Single Interpolation Policy)
     from .core.initial_warp import compose_initial_and_residual_warps, resolve_initial_transform_and_warp
+    outprefix = kwargs.pop('outprefix', None)
+    _do_write_tx = bool(write_transforms or outprefix is not None)
     raw_init_tx = initial_transform
     if initial_transform is None and initial_warp is None:
         from .robust_affine import robust_affine
         aff_res = robust_affine(
-            fixed, moving, dof=affine_dof, mode=affine_mode, seed=affine_seed,
-            verbose=verbose, return_warped=False,
+            _fixed_target if _fixed_target is not None else fixed,
+            moving,
+            dof=affine_dof,
+            mode=affine_mode,
+            seed=affine_seed,
+            verbose=verbose,
+            return_warped=False,
+            write_transforms=_do_write_tx,
         )
-        raw_init_tx = aff_res['fwdtransforms']
+        raw_init_tx = aff_res['fwdtransforms'] if _do_write_tx else aff_res['fwd_chain']
 
     resolved_init = resolve_initial_transform_and_warp(
         fixed,
@@ -1453,14 +1468,20 @@ def syngs_registration(
 
                 def _load_syngs_phi1_map():
                     with torch.no_grad():
+                        if fwd_img is not None and inv_img is not None:
+                            f_m = disp_itk_to_tensor(fwd_img)
+                            i_m = disp_itk_to_tensor(inv_img)
+                        else:
+                            f_m = fwd_disp_el.disp_tensor_zyx()
+                            i_m = inv_disp_el.disp_tensor_zyx()
                         return calculate_inverse_identity_error(
-                            disp_itk_to_tensor(fwd_img),
-                            disp_itk_to_tensor(inv_img),
+                            f_m,
+                            i_m,
                             spacing=spacing,
                             origin=origin,
                             direction=direction,
                             return_error_map=True,
-                        )['error_map']
+                        )['error_map'].cpu()
 
                 _phi1_dict = _LazyKeyDict(
                     {
@@ -1670,70 +1691,133 @@ def syngs_registration(
     else:
         raise ValueError(f"Unknown backend: {backend}")
 
-    # Export displacement fields using standardized ITK components via syntx.spatial
-    from .transforms import _cache_disp_image_and_field, _write_ants_images_fast, apply_transforms as _apply_transforms
-    _apply_dev = str(device_str) if backend.lower() == 'pytorch' else None
-    fwd_img = disp_tensor_to_itk(fwd_disp, fixed)
-    inv_img = disp_tensor_to_itk(inv_disp, fixed)
-
-    fwd_file = tempfile.NamedTemporaryFile(suffix='_syngs_fwd_Warp.nii.gz', delete=False).name
-    inv_file = tempfile.NamedTemporaryFile(suffix='_syngs_inv_Warp.nii.gz', delete=False).name
-
-    # Export initial momentum vector fields (v_0 at t=0)
-    v0_inv_disp = model.velocity_0_inv if (getattr(model, 'symmetric', False) and getattr(model, 'velocity_0_inv', None) is not None) else -model.velocity_0_fwd
-    fwd_mom_img = disp_tensor_to_itk(model.velocity_0_fwd, fixed)
-    inv_mom_img = disp_tensor_to_itk(v0_inv_disp, fixed)
-
-    fwd_mom_file = tempfile.NamedTemporaryFile(suffix='_syngs_fwd_Momentum.nii.gz', delete=False).name
-    inv_mom_file = tempfile.NamedTemporaryFile(suffix='_syngs_inv_Momentum.nii.gz', delete=False).name
-    _write_ants_images_fast(
-        [
-            (fwd_img, fwd_file),
-            (inv_img, inv_file),
-            (fwd_mom_img, fwd_mom_file),
-            (inv_mom_img, inv_mom_file),
-        ],
-        compresslevel=1,
+    # Export displacement fields using standardized ITK components via syntx.spatial (or keep GPU-resident)
+    from .transforms import (
+        TransformChain,
+        TransformElement,
+        _cache_disp_image_and_field,
+        _write_ants_images_fast,
+        apply_transforms as _apply_transforms,
     )
-    _cache_disp_image_and_field(fwd_file, fwd_img, _apply_dev, disp_tensor=fwd_disp)
-    _cache_disp_image_and_field(inv_file, inv_img, _apply_dev, disp_tensor=inv_disp)
-    del fwd_disp, inv_disp
+    _apply_dev = str(device_str) if backend.lower() == 'pytorch' else None
+    fwd_img = None
+    inv_img = None
+    fwd_mom_img = None
+    inv_mom_img = None
+    fwd_mom_file = None
+    inv_mom_file = None
+    fwd_disp_el = None
+    inv_disp_el = None
+    fwd_transforms = []
+    inv_transforms = []
+    whichtoinvert_inv = []
 
-    # Export affine transform & build single-interpolation transform lists
     if resolved_init.has_initial_warp:
-        if resolved_init.has_linear_affine:
-            affine_file = tempfile.NamedTemporaryFile(suffix='.mat', delete=False).name
-            export_ants_affine_transform(resolved_init.M_phys, resolved_init.t_phys, dim=dim, filename=affine_file)
-            fwd_transforms = [fwd_file, affine_file]
-            inv_transforms = [affine_file, inv_file]
-            whichtoinvert_inv = [True, False]
+        has_lin_exp = bool(resolved_init.has_linear_affine)
+        M_exp = resolved_init.M_phys if has_lin_exp else None
+        t_exp = resolved_init.t_phys if has_lin_exp else None
+    else:
+        has_lin_exp = True
+        M_exp, t_exp = grid_to_physical_affine(T_grid, fixed, moving)
+
+    has_def_exp = bool(sum(reg_iterations) > 0 or resolved_init.has_initial_warp)
+
+    if _do_write_tx:
+        fwd_img = disp_tensor_to_itk(fwd_disp, fixed)
+        inv_img = disp_tensor_to_itk(inv_disp, fixed)
+        v0_inv_disp = model.velocity_0_inv if (getattr(model, 'symmetric', False) and getattr(model, 'velocity_0_inv', None) is not None) else -model.velocity_0_fwd
+        fwd_mom_img = disp_tensor_to_itk(model.velocity_0_fwd, fixed)
+        inv_mom_img = disp_tensor_to_itk(v0_inv_disp, fixed)
+        if outprefix is not None:
+            os.makedirs(os.path.dirname(str(outprefix)) or '.', exist_ok=True)
+            fwd_file = f"{outprefix}1Warp.nii.gz"
+            inv_file = f"{outprefix}1InverseWarp.nii.gz"
+            fwd_mom_file = f"{outprefix}1FwdMomentum.nii.gz"
+            inv_mom_file = f"{outprefix}1InvMomentum.nii.gz"
+            affine_file = f"{outprefix}0GenericAffine.mat" if has_lin_exp else None
+            comp_lvl = 4
+        else:
+            fwd_file = tempfile.NamedTemporaryFile(suffix='_syngs_fwd_Warp.nii.gz', delete=False).name
+            inv_file = tempfile.NamedTemporaryFile(suffix='_syngs_inv_Warp.nii.gz', delete=False).name
+            fwd_mom_file = tempfile.NamedTemporaryFile(suffix='_syngs_fwd_Momentum.nii.gz', delete=False).name
+            inv_mom_file = tempfile.NamedTemporaryFile(suffix='_syngs_inv_Momentum.nii.gz', delete=False).name
+            affine_file = tempfile.NamedTemporaryFile(suffix='.mat', delete=False).name if has_lin_exp else None
+            comp_lvl = 1
+        _write_ants_images_fast(
+            [
+                (fwd_img, fwd_file),
+                (inv_img, inv_file),
+                (fwd_mom_img, fwd_mom_file),
+                (inv_mom_img, inv_mom_file),
+            ],
+            compresslevel=comp_lvl,
+        )
+        _cache_disp_image_and_field(fwd_file, fwd_img, _apply_dev, disp_tensor=fwd_disp)
+        _cache_disp_image_and_field(inv_file, inv_img, _apply_dev, disp_tensor=inv_disp)
+        if affine_file is not None:
+            export_ants_affine_transform(M_exp, t_exp, dim=dim, filename=affine_file)
+            if resolved_init.has_initial_warp:
+                fwd_transforms = [fwd_file, affine_file]
+                inv_transforms = [affine_file, inv_file]
+                whichtoinvert_inv = [True, False]
+            elif sum(reg_iterations) > 0:
+                fwd_transforms = [fwd_file, affine_file] + init_tx_list
+                inv_transforms = init_tx_list + [affine_file, inv_file]
+                whichtoinvert_inv = [True] * len(init_tx_list) + [True, False]
+            else:
+                fwd_transforms = [affine_file] + init_tx_list
+                inv_transforms = init_tx_list + [affine_file]
+                whichtoinvert_inv = [True] * (len(init_tx_list) + 1)
         else:
             fwd_transforms = [fwd_file]
             inv_transforms = [inv_file]
             whichtoinvert_inv = [False]
+        fwd_chain = TransformChain.from_paths(fwd_transforms)
+        inv_chain = TransformChain.from_paths(inv_transforms, whichtoinvert_inv)
     else:
-        M_phys, t_phys = grid_to_physical_affine(T_grid, fixed, moving)
-        affine_file = tempfile.NamedTemporaryFile(suffix='.mat', delete=False).name
-        tx_fwd, tx_inv = export_ants_affine_transform(M_phys, t_phys, dim=dim, filename=affine_file)
-
-        if sum(reg_iterations) > 0:
-            fwd_transforms = [fwd_file, affine_file] + init_tx_list
-            inv_transforms = init_tx_list + [affine_file, inv_file]
-            whichtoinvert_inv = [True] * len(init_tx_list) + [True, False]
+        if has_def_exp:
+            fwd_disp_el = TransformElement.from_disp_tensor(fwd_disp, fixed, kind="displacement")
+            inv_disp_el = TransformElement.from_disp_tensor(inv_disp, fixed, kind="inverse_displacement")
+        tail_fwd = TransformChain.from_paths(init_tx_list).elements if init_tx_list else []
+        tail_inv = TransformChain.from_paths(init_tx_list, [True] * len(init_tx_list)).elements if init_tx_list else []
+        if has_lin_exp:
+            aff_fwd_el = TransformElement.from_affine(M_exp, t_exp, invert=False)
+            aff_inv_el = TransformElement.from_affine(M_exp, t_exp, invert=True)
+            if resolved_init.has_initial_warp:
+                fwd_chain = TransformChain([fwd_disp_el, aff_fwd_el])
+                inv_chain = TransformChain([aff_inv_el, inv_disp_el])
+                whichtoinvert_inv = [True, False]
+            elif sum(reg_iterations) > 0:
+                fwd_chain = TransformChain([fwd_disp_el, aff_fwd_el, *tail_fwd])
+                inv_chain = TransformChain([*tail_inv, aff_inv_el, inv_disp_el])
+                whichtoinvert_inv = [True] * len(init_tx_list) + [True, False]
+            else:
+                fwd_chain = TransformChain([aff_fwd_el, *tail_fwd])
+                inv_chain = TransformChain([*tail_inv, aff_inv_el])
+                whichtoinvert_inv = [True] * (len(init_tx_list) + 1)
         else:
-            fwd_transforms = [affine_file] + init_tx_list
-            inv_transforms = init_tx_list + [affine_file]
-            whichtoinvert_inv = [True] * (len(init_tx_list) + 1)
+            fwd_chain = TransformChain([fwd_disp_el]) if fwd_disp_el is not None else TransformChain([])
+            inv_chain = TransformChain([inv_disp_el]) if inv_disp_el is not None else TransformChain([])
+            whichtoinvert_inv = [False] if fwd_disp_el is not None else []
+    del fwd_disp, inv_disp
 
-    # Apply single-interpolation composite transforms
-    from .transforms import apply_transforms as _apply_transforms
-    warpedmovout = _apply_transforms(
-        fixed=fixed, moving=moving, transformlist=fwd_transforms, device=_apply_dev
-    )
-    warpedfixout = _apply_transforms(
-        fixed=moving, moving=fixed, transformlist=inv_transforms,
-        whichtoinvert=whichtoinvert_inv, device=_apply_dev,
-    )
+    # Apply single-interpolation composite transforms when return_warped=True
+    warpedmovout = None
+    warpedfixout = None
+    if return_warped:
+        warpedmovout = _apply_transforms(
+            fixed=fixed,
+            moving=moving,
+            transformlist=fwd_transforms if _do_write_tx else fwd_chain,
+            device=_apply_dev,
+        )
+        warpedfixout = _apply_transforms(
+            fixed=moving,
+            moving=fixed,
+            transformlist=inv_transforms if _do_write_tx else inv_chain,
+            whichtoinvert=whichtoinvert_inv if _do_write_tx else None,
+            device=_apply_dev,
+        )
 
     fit_time = _time.time() - t_start
 
@@ -1750,6 +1834,8 @@ def syngs_registration(
         'fwdtransforms': fwd_transforms,
         'invtransforms': inv_transforms,
         'whichtoinvert_inv': whichtoinvert_inv,
+        'fwd_chain': fwd_chain,
+        'inv_chain': inv_chain,
         'fwd_deformation': fwd_img,
         'inv_deformation': inv_img,
         'fwd_momentum': fwd_mom_img,

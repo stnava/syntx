@@ -173,31 +173,48 @@ _separable_1d_filter = separable_1d_filter
 class _Conv1x1AffineGrid(torch.autograd.Function):
     """Memory-lean closed-form evaluation of ``clamp(coords, -1, 1) @ M^T + t`` using 1x1
     ``F.conv1d`` on MPS (avoiding tall-skinny MPS GEMM slowdown and 144 MB ``affine_grid_cf``
-    storage) and direct matmul on CPU/CUDA, saving ``M`` and the ``[-1, 1]`` clamp mask for backward.
+    storage) and direct matmul on CPU/CUDA, supporting both single ``(dim, dim)`` and batched
+    ``(B, dim, dim)`` affines while saving ``M`` and the ``[-1, 1]`` clamp mask for backward.
     """
 
     @staticmethod
     def forward(ctx, coords: torch.Tensor, M: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
         in_bounds = (coords >= -1.0) & (coords <= 1.0)
         ctx.save_for_backward(M, in_bounds)
-        dim = M.shape[0]
         c = coords.clamp(-1.0, 1.0)
+        if M.ndim == 2:
+            dim = int(M.shape[0])
+            if coords.device.type == 'mps':
+                cf = c.view(1, -1, dim).transpose(1, 2).contiguous()
+                out_cf = F.conv1d(cf, M.view(dim, dim, 1), t.view(dim))
+                return out_cf.transpose(1, 2).contiguous().view_as(coords)
+            return torch.addmm(t.view(1, dim), c.reshape(-1, dim), M.t()).view_as(coords)
+        b_sz, dim = int(M.shape[0]), int(M.shape[1])
         if coords.device.type == 'mps':
-            cf = c.view(1, -1, dim).transpose(1, 2).contiguous()
-            out_cf = F.conv1d(cf, M.view(dim, dim, 1), t.view(dim))
-            return out_cf.transpose(1, 2).contiguous().view_as(coords)
-        return torch.addmm(t.view(1, dim), c.reshape(-1, dim), M.t()).view_as(coords)
+            cf = c.view(b_sz, -1, dim).transpose(1, 2).contiguous().view(1, b_sz * dim, -1)
+            out_cf = F.conv1d(cf, M.reshape(b_sz * dim, dim, 1), t.reshape(b_sz * dim), groups=b_sz)
+            return out_cf.view(b_sz, dim, -1).transpose(1, 2).contiguous().view_as(coords)
+        return (torch.bmm(c.reshape(b_sz, -1, dim), M.transpose(1, 2)) + t.unsqueeze(1)).view_as(coords)
 
     @staticmethod
     def backward(ctx, go: torch.Tensor):
         M, in_bounds = ctx.saved_tensors
-        dim = M.shape[0]
+        if M.ndim == 2:
+            dim = int(M.shape[0])
+            if go.device.type == 'mps':
+                go_cf = go.reshape(1, -1, dim).transpose(1, 2).contiguous()
+                gin_cf = F.conv1d(go_cf, M.t().contiguous().view(dim, dim, 1))
+                gin = gin_cf.transpose(1, 2).contiguous().view_as(go)
+            else:
+                gin = (go.reshape(-1, dim) @ M).view_as(go)
+            return gin * in_bounds.to(gin.dtype), None, None
+        b_sz, dim = int(M.shape[0]), int(M.shape[1])
         if go.device.type == 'mps':
-            go_cf = go.reshape(1, -1, dim).transpose(1, 2).contiguous()
-            gin_cf = F.conv1d(go_cf, M.t().contiguous().view(dim, dim, 1))
-            gin = gin_cf.transpose(1, 2).contiguous().view_as(go)
+            go_cf = go.reshape(b_sz, -1, dim).transpose(1, 2).contiguous().view(1, b_sz * dim, -1)
+            gin_cf = F.conv1d(go_cf, M.transpose(1, 2).contiguous().reshape(b_sz * dim, dim, 1), groups=b_sz)
+            gin = gin_cf.view(b_sz, dim, -1).transpose(1, 2).contiguous().view_as(go)
         else:
-            gin = (go.reshape(-1, dim) @ M).view_as(go)
+            gin = torch.bmm(go.reshape(b_sz, -1, dim), M).view_as(go)
         return gin * in_bounds.to(gin.dtype), None, None
 
 
@@ -275,12 +292,17 @@ class GreedyRegistrationModel(nn.Module):
         digital_diffeomorphism_floor: float = 0.05,
         digital_diffeomorphism_steps: int = 25,
         metric_chunks: int = 1,
+        amp: bool = False,
+        sync_free: bool = False,
     ):
         super().__init__()
         self.digital_diffeomorphism = bool(digital_diffeomorphism)
         self.digital_diffeomorphism_floor = float(digital_diffeomorphism_floor)
         self.digital_diffeomorphism_steps = int(digital_diffeomorphism_steps)
-        self.stop = LossSlopeStop(slope_threshold=convergence_slope)   # the shared deformable stopping rule (core.convergence)
+        self.amp = bool(amp)
+        self.sync_free = bool(sync_free)
+        eff_slope = None if self.sync_free else convergence_slope
+        self.stop = LossSlopeStop(slope_threshold=eff_slope)   # the shared deformable stopping rule (core.convergence)
         self.convergence = []
         self.dim = dim
         if restrict_transformation is not None:
@@ -378,6 +400,7 @@ class GreedyRegistrationModel(nn.Module):
         moving_origin: Optional[Sequence[float]] = None,
         moving_direction: Optional[Any] = None,
         initial_warp: Optional[torch.Tensor] = None,
+        _precomputed_fixed_pyramid: Optional[Tuple[List[Any], List[Any]]] = None,
     ) -> torch.Tensor:
         """
         Multi-scale optimisation of the field. ``fixed_tensor`` / ``moving_tensor``:
@@ -425,11 +448,16 @@ class GreedyRegistrationModel(nn.Module):
         dir_m = _parse_direction(moving_direction, dim, "GreedyRegistrationModel.fit") if moving_direction is not None else dir_f
 
         # the central pyramid: each image on its own grid, the warp lives on the FIXED level grid
-        fixed_lv = build_pyramid(fixed_tensor, sp_f, scales, 'deformable', origin=orig_f, direction=dir_f)
+        if _precomputed_fixed_pyramid is not None:
+            fixed_lv, cached_lncc_list = _precomputed_fixed_pyramid
+        else:
+            fixed_lv = build_pyramid(fixed_tensor, sp_f, scales, 'deformable', origin=orig_f, direction=dir_f)
+            cached_lncc_list = None
         moving_lv = build_pyramid(moving_tensor, sp_m, scales, 'deformable', origin=orig_m, direction=dir_m, reference_spacing=sp_f)
         mask_lv = build_pyramid(fixed_mask_tensor, sp_f, scales, 'deformable', origin=orig_f, direction=dir_f) if fixed_mask_tensor is not None else None
 
         # Initialize displacement field u at the coarsest scale
+        batch_sz = int(moving_tensor.shape[0])
         init_size = list(fixed_lv[0].shape)
         if initial_warp is not None:
             iw = initial_warp.to(device=self.device, dtype=torch.float32)
@@ -437,9 +465,11 @@ class GreedyRegistrationModel(nn.Module):
                 iw = iw.unsqueeze(0)
             if iw.ndim != dim + 2 or iw.shape[-1] != dim:
                 raise ValueError(
-                    f"initial_warp must have shape (1, *spatial, {dim}) or (*spatial, {dim}), "
+                    f"initial_warp must have shape (B, *spatial, {dim}) or (*spatial, {dim}), "
                     f"got {tuple(initial_warp.shape)}"
                 )
+            if int(iw.shape[0]) == 1 and batch_sz > 1:
+                iw = iw.expand(batch_sz, *iw.shape[1:]).contiguous()
             if list(iw.shape[1:-1]) != init_size:
                 warp = resize_field(iw, init_size, mode=mode)
             else:
@@ -450,7 +480,7 @@ class GreedyRegistrationModel(nn.Module):
                 ).view(1, *([1] * dim), dim)
                 warp = warp * restr_init
         else:
-            warp = torch.zeros((1, *init_size, dim), dtype=torch.float32, device=self.device)
+            warp = torch.zeros((batch_sz, *init_size, dim), dtype=torch.float32, device=self.device)
         from .core.optimizers import FieldStepOptimizer
         from .core.regularizers import build_level_regularizer
         step_opt = FieldStepOptimizer(
@@ -466,6 +496,12 @@ class GreedyRegistrationModel(nn.Module):
 
         self.loss_history = []
         self.stop.records.clear()
+        dev_str_fit = self.device.type if isinstance(self.device, torch.device) else torch.device(str(self.device)).type
+        # On CUDA, bfloat16 grid_sample accelerates all batch sizes; on Apple MPS, bfloat16 5-D grid_sample
+        # accelerates multi-subject batches (B >= 2, bandwidth-bound) while B == 1 is faster in native float32.
+        use_amp_bf16 = bool(
+            self.amp and (dev_str_fit == 'cuda' or (dev_str_fit == 'mps' and batch_sz >= 2))
+        )
 
         for level_idx, (scale, n_iters) in enumerate(zip(scales, iterations)):
             if n_iters <= 0:
@@ -475,6 +511,7 @@ class GreedyRegistrationModel(nn.Module):
             size_down = list(fixed_lv[level_idx].shape)
             fi_down = fixed_lv[level_idx].tensor
             mi_down = moving_lv[level_idx].tensor
+            mi_down_eval = mi_down.to(torch.bfloat16) if use_amp_bf16 else mi_down
             mask_down = mask_lv[level_idx].tensor if mask_lv is not None else None
 
             # Interpolate warp and optimizer state to current scale via centralized resize_field
@@ -484,15 +521,21 @@ class GreedyRegistrationModel(nn.Module):
 
             grid_shape = [1, 1, *size_down]
             id_grid = F.affine_grid(torch.eye(dim, dim + 1, device=self.device)[None], grid_shape, align_corners=True)
-            M_theta = self.theta[0, :, :dim].contiguous()
-            t_theta_flat = self.theta[0, :, dim].contiguous()
-            is_identity_theta = bool(
-                torch.allclose(
-                    self.theta[0],
-                    torch.eye(dim, dim + 1, device=self.device, dtype=self.theta.dtype),
-                    atol=1e-7,
+            if int(self.theta.shape[0]) == 1:
+                M_theta = self.theta[0, :, :dim].contiguous()
+                t_theta_flat = self.theta[0, :, dim].contiguous()
+                is_identity_theta = bool(
+                    not self.sync_free
+                    and torch.allclose(
+                        self.theta[0],
+                        torch.eye(dim, dim + 1, device=self.device, dtype=self.theta.dtype),
+                        atol=1e-7,
+                    )
                 )
-            )
+            else:
+                M_theta = self.theta[:, :, :dim].contiguous()
+                t_theta_flat = self.theta[:, :, dim].contiguous()
+                is_identity_theta = False
             restr_mask = (
                 torch.tensor(self.restrict_transformation, device=self.device, dtype=warp.dtype).view(1, *([1] * dim), dim)
                 if self.restrict_transformation is not None
@@ -505,7 +548,10 @@ class GreedyRegistrationModel(nn.Module):
                 bool(getattr(self.loss_fn, '_is_default_greedy_lncc', False))
                 and int(fi_down[0, 0].numel()) <= 16_777_216
             )
-            if use_fast_lncc:
+            if use_fast_lncc and cached_lncc_list is not None and cached_lncc_list[level_idx] is not None:
+                ws_lvl, _lncc_M_c, _lncc_safe_J_var = cached_lncc_list[level_idx]
+                _lncc_j_valid = ((_lncc_safe_J_var > 1e-6 + 1e-12) & (mask_down > 0.5)) if mask_down is not None else None
+            elif use_fast_lncc:
                 ws_lvl = min(int(self.window_size), int(min(size_down)))
                 if ws_lvl % 2 == 0:
                     ws_lvl = max(1, ws_lvl - 1)
@@ -582,14 +628,28 @@ class GreedyRegistrationModel(nn.Module):
 
             def _sobolev_fallback_fn(raw_u, ra_alpha, _sp=fixed_lv[level_idx].spacing):
                 from .core.smoothing import apply_sobolev_green_operator
-                return apply_sobolev_green_operator(
-                    raw_u.squeeze(0),
-                    fluid_sigma=ra_alpha,
-                    alpha=ra_alpha,
-                    spacing=_sp,
-                ).unsqueeze(0)
+                if int(raw_u.shape[0]) == 1:
+                    return apply_sobolev_green_operator(
+                        raw_u.squeeze(0),
+                        fluid_sigma=ra_alpha,
+                        alpha=ra_alpha,
+                        spacing=_sp,
+                    ).unsqueeze(0)
+                return torch.stack(
+                    [
+                        apply_sobolev_green_operator(
+                            raw_u[b],
+                            fluid_sigma=ra_alpha,
+                            alpha=ra_alpha,
+                            spacing=_sp,
+                        )
+                        for b in range(int(raw_u.shape[0]))
+                    ],
+                    dim=0,
+                )
 
             _stop_pending: List[Tuple[int, torch.Tensor]] = []
+            _track_stop = bool(self.stop.enabled and batch_sz == 1)
             for it in range(n_iters):
                 warp_param = warp.detach().requires_grad_(True)
 
@@ -599,7 +659,12 @@ class GreedyRegistrationModel(nn.Module):
                     sample_grid = torch.clamp(id_grid + warp_param, -1.0, 1.0)
                 else:
                     sample_grid = _Conv1x1AffineGrid.apply(id_grid + warp_param, M_theta, t_theta_flat)
-                moved = F.grid_sample(mi_down, sample_grid, mode='bilinear', padding_mode='zeros', align_corners=True)
+                if use_amp_bf16:
+                    moved = F.grid_sample(
+                        mi_down_eval, sample_grid.to(torch.bfloat16), mode='bilinear', padding_mode='zeros', align_corners=True
+                    )
+                else:
+                    moved = F.grid_sample(mi_down_eval, sample_grid, mode='bilinear', padding_mode='zeros', align_corners=True)
 
                 if use_fast_lncc:
                     moved_f = moved.float() if moved.dtype in (torch.float16, torch.bfloat16) else moved
@@ -618,15 +683,27 @@ class GreedyRegistrationModel(nn.Module):
                         cc_metric = torch.clamp(IJ_cov / (torch.sqrt(safe_I_var * _lncc_safe_J_var) + 1e-6), min=-1.0, max=1.0)
                     if mask_down is not None:
                         active_mask_f = ((I_var > 1e-6) & _lncc_j_valid).to(moved_f.dtype)
-                        loss = -torch.sum(cc_metric * active_mask_f) / (torch.sum(active_mask_f) + 1e-8)
+                        if batch_sz == 1:
+                            loss = -torch.sum(cc_metric * active_mask_f) / (torch.sum(active_mask_f) + 1e-8)
+                        else:
+                            num_b = (cc_metric * active_mask_f).flatten(1).sum(dim=1)
+                            den_b = active_mask_f.flatten(1).sum(dim=1) + 1e-8
+                            loss = -torch.sum(num_b / den_b)
                     else:
-                        loss = -torch.mean(cc_metric)
+                        loss = -torch.mean(cc_metric) if batch_sz == 1 else -cc_metric.flatten(1).mean(dim=1).sum()
                     del I_var, IJ_cov, safe_I_var, cc_metric, moved_f
                 else:
-                    loss = self.loss_fn(moved, fi_down, mask=mask_down)
+                    moved_eval = moved.float() if moved.dtype in (torch.float16, torch.bfloat16) else moved
+                    if batch_sz == 1:
+                        loss = self.loss_fn(moved_eval, fi_down, mask=mask_down)
+                    else:
+                        loss = torch.stack(
+                            [self.loss_fn(moved_eval[b : b + 1], fi_down, mask=mask_down) for b in range(batch_sz)]
+                        ).sum()
 
                 loss_t = loss.detach()
-                self.loss_history.append(loss_t)
+                if not self.sync_free:
+                    self.loss_history.append(loss_t)
                 loss.backward()
 
                 grad = warp_param.grad.detach()
@@ -664,10 +741,10 @@ class GreedyRegistrationModel(nn.Module):
                 if verbose and (it % 25 == 0 or it == n_iters - 1):
                     print(f"  [greedy] Level {level_idx} (scale {scale}) Iter {it+1}/{n_iters} | Loss: {loss_t.item():.4f}")
 
-                # Buffer loss samples every 5 iterations and only transfer/test once the window is full
-                if (it + 1) % 5 == 0:
+                # Buffer loss samples every 5 iterations only when early-stopping is enabled
+                if _track_stop and (it + 1) % 5 == 0:
                     _stop_pending.append((it, loss_t))
-                    if self.stop.enabled and (len(self.stop._losses) + len(_stop_pending)) >= self.stop.window:
+                    if (len(self.stop._losses) + len(_stop_pending)) >= self.stop.window:
                         _vals = torch.stack([t for _, t in _stop_pending]).tolist()
                         _converged_now = False
                         for (_it_p, _), _v_p in zip(_stop_pending, _vals):
@@ -677,12 +754,12 @@ class GreedyRegistrationModel(nn.Module):
                         _stop_pending.clear()
                         if _converged_now:
                             break
-            if _stop_pending:
+            if _track_stop and _stop_pending:
                 _vals = torch.stack([t for _, t in _stop_pending]).tolist()
                 for (_it_p, _), _v_p in zip(_stop_pending, _vals):
                     self.stop.update(_it_p, float(_v_p))
                 _stop_pending.clear()
-            del _lncc_M_c, _lncc_safe_J_var, _lncc_j_valid
+            del _lncc_M_c, _lncc_safe_J_var, _lncc_j_valid, mi_down_eval
             self.stop.end_level(it + 1)
 
             # Optional in-loop per-scale Anderson fixed-point projection
@@ -755,6 +832,10 @@ def greedy_registration(
     cfl_momentum: float = 0.1875,
     regularizer: str = 'navier',
     sobolev_alpha: Optional[float] = 2.625,
+    return_warped: bool = True,
+    write_transforms: bool = True,
+    amp: bool = False,
+    sync_free: bool = False,
     **kwargs: Any
 ) -> Dict[str, Any]:
     """
@@ -858,9 +939,16 @@ def greedy_registration(
         ``'affine_transform'`` : resolved initial affine transform path or None.
     """
     t0_total = time.time()
+    _fixed_target = None
+    if getattr(fixed, '_is_syntx_fixed_target', False):
+        _fixed_target = fixed
+        fixed = _fixed_target.image
     require_finite_images(fixed=fixed, moving=moving)
     dim = fixed.dimension
     torch_device = auto_detect_device(backend='pytorch', requested_device=device)
+    _do_write_tx = bool(write_transforms or outprefix is not None)
+    _return_warped_tensor = bool(kwargs.pop('_return_warped_tensor', False))
+    _return_disp_tensor = bool(kwargs.pop('_return_disp_tensor', False))
 
     # 1. Setup multi-resolution schedule
     if reg_iterations is None:
@@ -889,13 +977,23 @@ def greedy_registration(
 
     # 2. Intensity Normalization & Single-Pass Device Upload
     from .benchmark.evaluate import normalize_intensity
-    fi_norm = normalize_intensity(fixed)
-    mi_norm = normalize_intensity(moving)
-
     dim_sp = fixed.dimension
     rev_sp = tuple(range(dim_sp - 1, -1, -1))
-    fi_t = torch.from_numpy(np.ascontiguousarray(fi_norm.numpy(), dtype=np.float32)).to(device=torch_device, dtype=torch.float32).permute(*rev_sp).contiguous().unsqueeze(0).unsqueeze(0)
-    mi_t = torch.from_numpy(np.ascontiguousarray(mi_norm.numpy(), dtype=np.float32)).to(device=torch_device, dtype=torch.float32).permute(*rev_sp).contiguous().unsqueeze(0).unsqueeze(0)
+    _dev_obj = torch.device(torch_device)
+    if _fixed_target is not None:
+        fi_norm = _fixed_target.norm_image
+        if _fixed_target.tensor_zyx.device.type == _dev_obj.type and (
+            (_fixed_target.tensor_zyx.device.index or 0) == (_dev_obj.index or 0) if _dev_obj.type != 'cpu' else True
+        ):
+            fi_t = _fixed_target.tensor_zyx
+        else:
+            fi_t = _fixed_target.tensor_zyx.to(device=_dev_obj, dtype=torch.float32)
+            _fixed_target = None
+    else:
+        fi_norm = normalize_intensity(fixed)
+        fi_t = torch.from_numpy(np.ascontiguousarray(fi_norm.numpy(), dtype=np.float32)).to(device=_dev_obj, dtype=torch.float32).permute(*rev_sp).contiguous().unsqueeze(0).unsqueeze(0)
+    mi_norm = normalize_intensity(moving)
+    mi_t = torch.from_numpy(np.ascontiguousarray(mi_norm.numpy(), dtype=np.float32)).to(device=_dev_obj, dtype=torch.float32).permute(*rev_sp).contiguous().unsqueeze(0).unsqueeze(0)
 
     # 3. Initial Affine Alignment & Optional Dense Initial Warp
     t0_aff = time.time()
@@ -903,18 +1001,19 @@ def greedy_registration(
     if initial_transform is None and initial_warp is None:
         if verbose:
             print("[greedy] Running syntx.robust_affine(mode='auto')...")
-        _pre_pair = (fi_t, mi_t) if int(np.prod(fixed.shape)) <= 16_777_216 else None
+        _pre_pair = (fi_t, mi_t) if (_fixed_target is None and int(np.prod(fixed.shape)) <= 16_777_216) else None
         reg_aff = robust_affine(
-            fi_norm,
+            _fixed_target if _fixed_target is not None else fi_norm,
             mi_norm,
             mode=affine_mode,
             verbose=False,
             device=torch_device,
             return_warped=False,
+            write_transforms=_do_write_tx,
             _preuploaded_input_zyx=_pre_pair,
         )
         del _pre_pair
-        raw_init_tx = reg_aff['fwdtransforms'][0]
+        raw_init_tx = reg_aff['fwdtransforms'][0] if _do_write_tx else reg_aff['fwd_chain']
     t1_aff = time.time() - t0_aff
 
     resolved_init = resolve_initial_transform_and_warp(
@@ -1045,10 +1144,22 @@ def greedy_registration(
         digital_diffeomorphism_floor=digital_diffeomorphism_floor,
         digital_diffeomorphism_steps=digital_diffeomorphism_steps,
         metric_chunks=metric_chunks_val,
+        amp=amp,
+        sync_free=sync_free,
     )
 
     model.has_initial_warp = resolved_init.has_initial_warp
     model.initial_warp_kind = resolved_init.initial_warp_kind
+
+    _pre_pyr = (
+        _fixed_target.get_deformable_pyramid(
+            scales=scales,
+            window_size=model.window_size,
+            use_fast_lncc=bool(getattr(model.loss_fn, '_is_default_greedy_lncc', False)),
+        )
+        if _fixed_target is not None
+        else None
+    )
 
     t0_opt = time.time()
     warp = model.fit(
@@ -1066,6 +1177,7 @@ def greedy_registration(
         moving_origin=tuple(float(x) for x in moving.origin),
         moving_direction=np.array(moving.direction, dtype=np.float64),
         initial_warp=init_warp_t,
+        _precomputed_fixed_pyramid=_pre_pyr,
     )
     t1_opt = time.time() - t0_opt
 
@@ -1107,7 +1219,17 @@ def greedy_registration(
             with torch.no_grad():
                 disp_t = disp_t * restr_t_zyx
 
+    from .transforms import (
+        ContinuousField as _ContinuousField,
+        TransformChain,
+        TransformElement,
+        _cache_disp_image_and_field,
+        _write_ants_images_fast,
+        apply_transforms as _apply_transforms,
+    )
+
     # Optional physical inverse displacement field
+    disp_img = None
     inv_disp_img = None
     inv_disp_t = None
     inv_err_dict = {}
@@ -1161,8 +1283,9 @@ def greedy_registration(
         if restr_t_zyx is not None:
             with torch.no_grad():
                 inv_disp_t = inv_disp_t * restr_t_zyx
-        disp_img = disp_tensor_to_itk(disp_t, fixed)
-        inv_disp_img = disp_tensor_to_itk(inv_disp_t, fixed)
+        if _do_write_tx:
+            disp_img = disp_tensor_to_itk(disp_t, fixed)
+            inv_disp_img = disp_tensor_to_itk(inv_disp_t, fixed)
         with torch.no_grad():
             from .core.inverse import _LazyKeyDict, calculate_inverse_identity_error
             if disp_t.device.type != 'cpu':
@@ -1175,16 +1298,31 @@ def greedy_registration(
                     return_error_map=False,
                 )
 
-                def _load_greedy_error_map():
-                    with torch.no_grad():
-                        return calculate_inverse_identity_error(
-                            disp_itk_to_tensor(disp_img),
-                            disp_itk_to_tensor(inv_disp_img),
-                            spacing=fixed.spacing,
-                            origin=fixed.origin,
-                            direction=fixed.direction,
-                            return_error_map=True,
-                        )['error_map']
+                if _do_write_tx:
+                    def _load_greedy_error_map():
+                        with torch.no_grad():
+                            return calculate_inverse_identity_error(
+                                disp_itk_to_tensor(disp_img),
+                                disp_itk_to_tensor(inv_disp_img),
+                                spacing=fixed.spacing,
+                                origin=fixed.origin,
+                                direction=fixed.direction,
+                                return_error_map=True,
+                            )['error_map']
+                else:
+                    _fwd_ref_t = disp_t
+                    _inv_ref_t = inv_disp_t
+
+                    def _load_greedy_error_map():
+                        with torch.no_grad():
+                            return calculate_inverse_identity_error(
+                                _fwd_ref_t,
+                                _inv_ref_t,
+                                spacing=fixed.spacing,
+                                origin=fixed.origin,
+                                direction=fixed.direction,
+                                return_error_map=True,
+                            )['error_map'].cpu()
 
                 _ice_calc = _LazyKeyDict(_ice_calc, lazy_loaders={'error_map': _load_greedy_error_map})
             else:
@@ -1198,64 +1336,96 @@ def greedy_registration(
                 )
             inv_err_dict = {'phi_1': _ice_calc}
         t1_inv = time.time() - t0_inv
-    else:
+    elif _do_write_tx:
         disp_img = disp_tensor_to_itk(disp_t, fixed)
 
-    # Affine transform handling
-    affine_file = None
-    if aff_tx is not None:
-        if outprefix is not None:
-            affine_file = f"{outprefix}0GenericAffine.mat"
-            export_ants_affine_transform(M_phys, t_phys, dim=dim, filename=affine_file)
-        elif isinstance(aff_tx, str) and os.path.exists(aff_tx):
-            affine_file = aff_tx
-        elif isinstance(aff_tx, list) and len(aff_tx) == 1 and isinstance(aff_tx[0], str) and os.path.exists(aff_tx[0]):
-            affine_file = aff_tx[0]
-        else:
-            affine_file = tempfile.NamedTemporaryFile(suffix='.mat', delete=False).name
-            export_ants_affine_transform(M_phys, t_phys, dim=dim, filename=affine_file)
-
-    # File output paths & fast parallel gzip write + device displacement cache
-    from .transforms import (
-        _cache_disp_image_and_field,
-        _write_ants_images_fast,
-        apply_transforms as _apply_transforms,
-    )
     _apply_dev = str(torch_device)
     _compress_lvl = 4 if outprefix is not None else 1
-
-    if outprefix is not None:
-        os.makedirs(os.path.dirname(outprefix) or '.', exist_ok=True)
-        fwd_file = f"{outprefix}1Warp.nii.gz"
-    else:
-        fwd_file = tempfile.NamedTemporaryFile(suffix='_fwd_warp.nii.gz', delete=False).name
-
+    fwd_transforms: List[str] = []
+    inv_transforms: List[str] = []
+    whichtoinvert_inv: List[bool] = []
+    affine_file = None
     inv_file = None
-    if return_inverse and inv_disp_img is not None:
+
+    if _do_write_tx:
+        if aff_tx is not None:
+            if outprefix is not None:
+                affine_file = f"{outprefix}0GenericAffine.mat"
+                export_ants_affine_transform(M_phys, t_phys, dim=dim, filename=affine_file)
+            elif isinstance(aff_tx, str) and os.path.exists(aff_tx):
+                affine_file = aff_tx
+            elif isinstance(aff_tx, list) and len(aff_tx) == 1 and isinstance(aff_tx[0], str) and os.path.exists(aff_tx[0]):
+                affine_file = aff_tx[0]
+            else:
+                affine_file = tempfile.NamedTemporaryFile(suffix='.mat', delete=False).name
+                export_ants_affine_transform(M_phys, t_phys, dim=dim, filename=affine_file)
+
         if outprefix is not None:
-            inv_file = f"{outprefix}1InverseWarp.nii.gz"
+            os.makedirs(os.path.dirname(outprefix) or '.', exist_ok=True)
+            fwd_file = f"{outprefix}1Warp.nii.gz"
         else:
-            inv_file = tempfile.NamedTemporaryFile(suffix='_inv_warp.nii.gz', delete=False).name
-        _write_ants_images_fast([(disp_img, fwd_file), (inv_disp_img, inv_file)], compresslevel=_compress_lvl)
-        _cache_disp_image_and_field(fwd_file, disp_img, _apply_dev, disp_tensor=disp_t)
-        _cache_disp_image_and_field(inv_file, inv_disp_img, _apply_dev, disp_tensor=inv_disp_t)
+            fwd_file = tempfile.NamedTemporaryFile(suffix='_fwd_warp.nii.gz', delete=False).name
+
+        if return_inverse and inv_disp_img is not None:
+            if outprefix is not None:
+                inv_file = f"{outprefix}1InverseWarp.nii.gz"
+            else:
+                inv_file = tempfile.NamedTemporaryFile(suffix='_inv_warp.nii.gz', delete=False).name
+            _write_ants_images_fast([(disp_img, fwd_file), (inv_disp_img, inv_file)], compresslevel=_compress_lvl)
+            _cache_disp_image_and_field(fwd_file, disp_img, _apply_dev, disp_tensor=disp_t)
+            _cache_disp_image_and_field(inv_file, inv_disp_img, _apply_dev, disp_tensor=inv_disp_t)
+        else:
+            _write_ants_images_fast([(disp_img, fwd_file)], compresslevel=_compress_lvl)
+            _cache_disp_image_and_field(fwd_file, disp_img, _apply_dev, disp_tensor=disp_t)
+
+        if affine_file is not None:
+            if isinstance(aff_tx, list) and len(aff_tx) > 1 and outprefix is None and all(isinstance(x, str) for x in aff_tx):
+                fwd_transforms = [fwd_file] + aff_tx
+            else:
+                fwd_transforms = [fwd_file, affine_file]
+        else:
+            fwd_transforms = [fwd_file]
+
+        if return_inverse and inv_disp_img is not None and inv_file is not None:
+            if affine_file is not None:
+                if isinstance(aff_tx, list) and len(aff_tx) > 1 and outprefix is None and all(isinstance(x, str) for x in aff_tx):
+                    inv_transforms = aff_tx + [inv_file]
+                    whichtoinvert_inv = [True] * len(aff_tx) + [False]
+                else:
+                    inv_transforms = [affine_file, inv_file]
+                    whichtoinvert_inv = [True, False]
+            else:
+                inv_transforms = [inv_file]
+                whichtoinvert_inv = [False]
+        fwd_chain = TransformChain.from_paths(fwd_transforms)
+        inv_chain = TransformChain.from_paths(inv_transforms, whichtoinvert_inv) if inv_transforms else TransformChain([])
     else:
-        _write_ants_images_fast([(disp_img, fwd_file)], compresslevel=_compress_lvl)
-        _cache_disp_image_and_field(fwd_file, disp_img, _apply_dev, disp_tensor=disp_t)
+        fwd_disp_el = TransformElement.from_disp_tensor(disp_t, fixed, kind="displacement")
+        if resolved_init.has_linear_affine:
+            aff_fwd_el = TransformElement.from_affine(M_phys, t_phys, invert=False)
+            fwd_chain = TransformChain([fwd_disp_el, aff_fwd_el])
+            aff_tx = TransformChain([aff_fwd_el])
+        else:
+            fwd_chain = TransformChain([fwd_disp_el])
+        if return_inverse and inv_disp_t is not None:
+            inv_disp_el = TransformElement.from_disp_tensor(inv_disp_t, fixed, kind="inverse_displacement")
+            if resolved_init.has_linear_affine:
+                aff_inv_el = TransformElement.from_affine(M_phys, t_phys, invert=True)
+                inv_chain = TransformChain([aff_inv_el, inv_disp_el])
+                whichtoinvert_inv = [True, False]
+            else:
+                inv_chain = TransformChain([inv_disp_el])
+                whichtoinvert_inv = [False]
+        else:
+            inv_chain = TransformChain([])
+
+    saved_disp_t = disp_t if _return_disp_tensor else None
     del disp_t, inv_disp_t
 
-    if affine_file is not None:
-        if isinstance(aff_tx, list) and len(aff_tx) > 1 and outprefix is None:
-            fwd_transforms = [fwd_file] + aff_tx
-        else:
-            fwd_transforms = [fwd_file, affine_file]
-    else:
-        fwd_transforms = [fwd_file]
-
     # 8. Warped Moving Image Output (Single Interpolation directly on native moving image)
-    from .transforms import ContinuousField as _ContinuousField
     _can_wrap_cf = (
-        _apply_dev is not None
+        (return_warped or _return_warped_tensor)
+        and _apply_dev is not None
         and not hasattr(ants.apply_transforms, "_mock_name")
         and hasattr(ants, "is_image")
         and ants.is_image(fixed)
@@ -1263,44 +1433,60 @@ def greedy_registration(
         and len(fixed.shape) == 3
         and len(moving.shape) == 3
     )
-    _mov_cf = (
-        _ContinuousField.from_tensor(
-            mi_t,
-            spatial_shape=moving.shape,
-            origin=moving.origin,
-            spacing=moving.spacing,
-            direction=moving.direction,
-            is_vector=False,
+    warpedmovout = None
+    warpedmovout_tensor = None
+    if return_warped or _return_warped_tensor:
+        _mov_cf = (
+            _ContinuousField.from_tensor(
+                mi_t,
+                spatial_shape=moving.shape,
+                origin=moving.origin,
+                spacing=moving.spacing,
+                direction=moving.direction,
+                is_vector=False,
+            )
+            if (_can_wrap_cf and is_unclipped_unit_image(moving))
+            else None
         )
-        if (_can_wrap_cf and is_unclipped_unit_image(moving))
-        else None
-    )
-    warpedmovout = _apply_transforms(
-        fixed=fixed,
-        moving=moving,
-        transformlist=fwd_transforms,
-        interpolator=interpolator,
-        device=_apply_dev,
-        _moving_field=_mov_cf,
-    )
-    del _mov_cf, mi_t
-
-    # 9. Optional Physical Inverse Transform Export
-    inv_transforms = []
-    whichtoinvert_inv = []
-    warpedfixout = None
-    if return_inverse and inv_disp_img is not None and inv_file is not None:
-        if affine_file is not None:
-            if isinstance(aff_tx, list) and len(aff_tx) > 1 and outprefix is None:
-                inv_transforms = aff_tx + [inv_file]
-                whichtoinvert_inv = [True] * len(aff_tx) + [False]
-            else:
-                inv_transforms = [affine_file, inv_file]
-                whichtoinvert_inv = [True, False]
+        _fwd_apply = fwd_transforms if _do_write_tx else fwd_chain
+        if _return_warped_tensor:
+            warpedmovout_tensor = _apply_transforms(
+                fixed=fixed,
+                moving=moving,
+                transformlist=_fwd_apply,
+                interpolator=interpolator,
+                device=_apply_dev,
+                _moving_field=_mov_cf,
+                return_tensor=True,
+            )
+            if return_warped:
+                rev_sp = tuple(range(warpedmovout_tensor.ndim - 3, -1, -1))
+                arr_w = (
+                    warpedmovout_tensor[0, 0]
+                    .permute(*rev_sp)
+                    .contiguous()
+                    .detach()
+                    .cpu()
+                    .numpy()
+                    .astype(np.float32, copy=False)
+                )
+                warpedmovout = fixed.new_image_like(arr_w)
         else:
-            inv_transforms = [inv_file]
-            whichtoinvert_inv = [False]
+            warpedmovout = _apply_transforms(
+                fixed=fixed,
+                moving=moving,
+                transformlist=_fwd_apply,
+                interpolator=interpolator,
+                device=_apply_dev,
+                _moving_field=_mov_cf,
+            )
+        del _mov_cf
+    del mi_t
 
+    # 9. Optional Physical Inverse Warped Fixed Image
+    warpedfixout = None
+    if return_warped and return_inverse and (inv_transforms or len(inv_chain) > 0):
+        _fix_is_unit = _fixed_target.is_unclipped_unit if _fixed_target is not None else is_unclipped_unit_image(fixed)
         _fix_cf = (
             _ContinuousField.from_tensor(
                 fi_t,
@@ -1310,18 +1496,28 @@ def greedy_registration(
                 direction=fixed.direction,
                 is_vector=False,
             )
-            if (_can_wrap_cf and is_unclipped_unit_image(fixed))
+            if (_can_wrap_cf and _fix_is_unit)
             else None
         )
-        warpedfixout = _apply_transforms(
-            fixed=moving,
-            moving=fixed,
-            transformlist=inv_transforms,
-            whichtoinvert=whichtoinvert_inv,
-            interpolator=interpolator,
-            device=_apply_dev,
-            _moving_field=_fix_cf,
-        )
+        if _do_write_tx:
+            warpedfixout = _apply_transforms(
+                fixed=moving,
+                moving=fixed,
+                transformlist=inv_transforms,
+                whichtoinvert=whichtoinvert_inv,
+                interpolator=interpolator,
+                device=_apply_dev,
+                _moving_field=_fix_cf,
+            )
+        else:
+            warpedfixout = _apply_transforms(
+                fixed=moving,
+                moving=fixed,
+                transformlist=inv_chain,
+                interpolator=interpolator,
+                device=_apply_dev,
+                _moving_field=_fix_cf,
+            )
         del _fix_cf
     del fi_t
 
@@ -1347,6 +1543,9 @@ def greedy_registration(
         'anderson_steps': anderson_steps if (anderson or return_inverse) else 0,
         'anderson_freq': anderson_freq if anderson else 'none',
         'return_inverse': return_inverse,
+        'amp': bool(amp),
+        'sync_free': bool(sync_free),
+        'write_transforms': bool(_do_write_tx),
         'digital_diffeomorphism': digital_diffeomorphism,
         'has_initial_warp': resolved_init.has_initial_warp,
         'initial_warp_kind': resolved_init.initial_warp_kind,
@@ -1360,26 +1559,28 @@ def greedy_registration(
     if verbose:
         print(f"[greedy] Complete in {total_runtime:.2f}s (Affine: {t1_aff:.2f}s, Deformable: {t1_opt:.2f}s, Inverse: {t1_inv:.2f}s)")
 
-    cleanup_gpu(torch_device)
+    if _fixed_target is None and not _return_warped_tensor and not _return_disp_tensor:
+        cleanup_gpu(torch_device)
 
-    return {
+    out_res: Dict[str, Any] = {
         'warpedmovout': warpedmovout,
         'warpedfixout': warpedfixout,
         'fwdtransforms': fwd_transforms,
         'invtransforms': inv_transforms,
         'whichtoinvert_inv': whichtoinvert_inv,
+        'fwd_chain': fwd_chain,
+        'inv_chain': inv_chain,
         'model': model,
         'convergence': model.stop.summary(),
         'provenance': provenance,
         'inverse_identity_errors': inv_err_dict,
-        # Whatever affine `initial_transform` actually resolved to internally -- a file path
-        # from syntx.robust_affine (initial_transform=None), the caller's own supplied
-        # transform(s) echoed back, or None (initial_transform was False/'identity', no
-        # affine). Exposed so callers (e.g. syntx.build_template) can cache and reuse a
-        # freshly-computed affine across repeated calls against a slowly-changing fixed
-        # image, instead of re-running robust_affine's search every time.
         'affine_transform': aff_tx,
     }
+    if _return_warped_tensor:
+        out_res['warpedmovout_tensor'] = warpedmovout_tensor
+    if _return_disp_tensor:
+        out_res['disp_tensor_zyx'] = saved_disp_t
+    return out_res
 
 
 # Aliases

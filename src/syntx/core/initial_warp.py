@@ -61,7 +61,11 @@ class ResolvedInitialWarp:
 
 
 def is_displacement_field_item(item: Any, dim: int) -> bool:
-    """Return True if ``item`` is a dense ITK displacement field (ANTsImage or NIfTI path)."""
+    """Return True if ``item`` is a dense ITK displacement field (ANTsImage, TransformElement, or NIfTI path)."""
+    from ..transforms import TransformElement
+
+    if isinstance(item, TransformElement):
+        return item.kind in ("displacement", "inverse_displacement")
     if hasattr(item, "numpy") and hasattr(item, "spacing"):
         return int(getattr(item, "components", 1)) == dim
     if isinstance(item, (str, os.PathLike)):
@@ -140,6 +144,33 @@ def _warp_to_norm_and_phys(
             dtype=torch.float32,
         )
         return u0_norm, u0_phys
+
+    from ..transforms import TransformElement
+
+    if isinstance(warp_source, TransformElement):
+        if warp_source.field is not None:
+            same_grid_el = (
+                tuple(warp_source.field.spatial_shape) == tuple(fixed.shape[:dim])
+                and np.allclose(np.asarray(warp_source.field.spacing[:dim]), np.asarray(fixed.spacing[:dim]), atol=1e-4)
+                and np.allclose(np.asarray(warp_source.field.origin[:dim]), np.asarray(fixed.origin[:dim]), atol=1e-4)
+                and np.allclose(
+                    np.asarray(warp_source.field.direction)[:dim, :dim],
+                    np.asarray(fixed.direction)[:dim, :dim],
+                    atol=1e-4,
+                )
+            )
+            if same_grid_el:
+                u0_phys = warp_source.disp_tensor_zyx(device=torch_device)
+                u0_norm = physical_to_normalized_disp(
+                    u0_phys,
+                    fixed_zyx,
+                    fixed.spacing,
+                    fixed.direction,
+                    device=torch_device,
+                    dtype=torch.float32,
+                )
+                return u0_norm, u0_phys
+        warp_source = warp_source.to_ants_image()
 
     if isinstance(warp_source, (str, os.PathLike)):
         warp_path = str(warp_source)
@@ -276,7 +307,14 @@ def resolve_initial_transform_and_warp(
     ):
         aff_tx = None
     elif initial_transform is not None:
-        tx_list = list(initial_transform) if isinstance(initial_transform, (list, tuple)) else [initial_transform]
+        from ..transforms import TransformChain
+
+        if isinstance(initial_transform, TransformChain):
+            tx_list = list(initial_transform.elements)
+        elif isinstance(initial_transform, (list, tuple)):
+            tx_list = list(initial_transform)
+        else:
+            tx_list = [initial_transform]
         M_check, _ = parse_ants_affine(tx_list, dim, allow_nonlinear=True)
         if M_check is not None:
             aff_tx = tx_list
@@ -309,9 +347,7 @@ def resolve_initial_transform_and_warp(
             )
 
     if aff_tx is not None:
-        M_t, t_t = parse_ants_affine(aff_tx, dim, allow_nonlinear=False)
-        M_phys = M_t.detach().cpu().numpy().astype(np.float64)
-        t_phys = t_t.detach().cpu().numpy().astype(np.float64)
+        M_phys, t_phys = parse_ants_affine(aff_tx, dim, allow_nonlinear=False, return_float64=True)
         has_linear_affine = True
     else:
         M_phys = np.eye(dim, dtype=np.float64)

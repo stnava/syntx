@@ -637,20 +637,22 @@ def _evaluate_mindboggle_pair_impl(
     fwd_tx = res_reg["fwdtransforms"]
     inv_tx = res_reg["invtransforms"]
     which_inv = res_reg.get("whichtoinvert_inv", [True, False])
+    eval_fwd = res_reg["fwd_chain"] if (not fwd_tx and res_reg.get("fwd_chain") is not None) else fwd_tx
+    eval_inv = res_reg["inv_chain"] if (not inv_tx and res_reg.get("inv_chain") is not None) else inv_tx
 
-    if (inv_tx is None or len(inv_tx) == 0) or (
+    if (eval_inv is None or len(eval_inv) == 0) or (
         "greedy" in model_lower
         or "fireants" in model_lower
         or model_lower in ("voxelmorph_pretrained", "voxelmorph_polished", "voxelmorph_pretrained_polished", "voxelmorph_svf", "voxelmorph_multiscale")
     ):
         df_fixed, _, _ = compute_bidirectional_dice(
-            fl, ml, fi, mi, fwd_tx, [], []
+            fl, ml, fi, mi, eval_fwd, [], []
         )
         dice_sym = df_fixed
         df_moving = float("nan")
     else:
         df_fixed, df_moving, dice_sym = compute_bidirectional_dice(
-            fl, ml, fi, mi, fwd_tx, inv_tx, which_inv
+            fl, ml, fi, mi, eval_fwd, eval_inv, which_inv
         )
 
     fwd_warp_file = next((x for x in fwd_tx if isinstance(x, str) and x.endswith(".nii.gz")), None)

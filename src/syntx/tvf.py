@@ -142,7 +142,7 @@ _TVF_FIT_KWARGS = frozenset({
     'fast_smooth', 'grad_step', 'initial_grid', 'mattes_bins', 'max_step_norm', 'max_velocity_downsample',
     'mesh_size', 'multipoint_loss', 'multipoint_schedule', 'num_bins', 'optimizer',
     'optimizer_type', 'regularizer', 'smooth_every_n', 'smooth_pyramid', 'smoothing_sigmas',
-    'solver', 'spline_distance', 'spline_order', 'temporal_weight', 'total_alpha', 'trust',
+    'solver', 'spline_distance', 'spline_order', 'sync_free', 'temporal_weight', 'total_alpha', 'trust',
     'trust_coefficient', 'use_analytical_gradients',
 }) | REGULARIZER_EXTRA_KEYS
 _TVF_INIT_KWARGS = frozenset({
@@ -2006,7 +2006,7 @@ class TVFModel(nn.Module):
                             vel_data.mul_(scales)
 
                 # Logging and convergence checking (every 5 epochs: single batched device->host sync)
-                if epoch % 5 == 0 or epoch == epochs - 1:
+                if not bool(kwargs.get('sync_free', False)) and (epoch % 5 == 0 or epoch == epochs - 1):
                     loss_val, best_loss_val = [float(v) for v in torch.stack([loss_t.to(dtype), best_level_loss_t]).tolist()]
                     check_loss_collapse(loss_val, best_loss_val, f"syntx.tvf level {level}")
                     recent_losses.append(loss_val)
@@ -2176,6 +2176,8 @@ TVF_ADVANCED_OPTIONS = {
     'digital_diffeomorphism': 'end-of-registration sparse L_inf digital diffeomorphism projection on exported warps (default True; pass False to opt out)',
     'digital_diffeomorphism_floor': 'discrete central-difference Jacobian determinant floor for digital_diffeomorphism (default 0.05)',
     'digital_diffeomorphism_steps': 'max active-set iterations for digital_diffeomorphism (default compose_polish_steps)',
+    'sync_free': 'suppress per-epoch stopping/collapse host syncs inside TVFModel.fit (default False)',
+    'outprefix': 'optional file prefix for exported transform files',
 }
 
 
@@ -2218,6 +2220,8 @@ def tvf_registration(
     backend='pytorch',
     device=None,
     verbose=False,
+    return_warped=True,
+    write_transforms=True,
     initial_warp=None,
     initial_inverse_warp=None,
     **advanced,
@@ -2331,11 +2335,16 @@ def tvf_registration(
     'whichtoinvert_inv', 'model', 'inverse_identity_error_map', 'inverse_identity_errors',
     'provenance'.
     """
+    import os
     import tempfile
     import time as _time
     import ants
 
     t_start = _time.time()
+    _fixed_target = None
+    if getattr(fixed, '_is_syntx_fixed_target', False):
+        _fixed_target = fixed
+        fixed = _fixed_target.image
     require_finite_images(fixed=fixed, moving=moving)
     fixed_primary = fixed[0] if isinstance(fixed, (list, tuple)) else fixed
     moving_primary = moving[0] if isinstance(moving, (list, tuple)) else moving
@@ -2455,14 +2464,22 @@ def tvf_registration(
         resolve_initial_transform_and_warp,
     )
 
+    outprefix = advanced.pop('outprefix', None)
+    _do_write_tx = bool(write_transforms or outprefix is not None)
     raw_init_tx = initial_transform
     if initial_transform is None and initial_warp is None:
         from .robust_affine import robust_affine
         reg_aff = robust_affine(
-            fixed_primary, moving_primary, dof=affine_dof, mode=affine_mode, seed=affine_seed,
-            verbose=verbose, return_warped=False,
+            _fixed_target if _fixed_target is not None else fixed_primary,
+            moving_primary,
+            dof=affine_dof,
+            mode=affine_mode,
+            seed=affine_seed,
+            verbose=verbose,
+            return_warped=False,
+            write_transforms=_do_write_tx,
         )
-        raw_init_tx = reg_aff['fwdtransforms']
+        raw_init_tx = reg_aff['fwdtransforms'] if _do_write_tx else reg_aff['fwd_chain']
 
     _init_dev_tvf = device if backend.lower() == 'pytorch' else None
     resolved_init = resolve_initial_transform_and_warp(
@@ -2520,10 +2537,22 @@ def tvf_registration(
         device = auto_detect_device(backend='pytorch', requested_device=device)
         device_str = str(device)
 
-        from .core.pipeline import is_unclipped_unit_image
-        I_tensor, J_tensor = normalize_and_tensorize(
-            fixed, moving, winsorize_quantiles=winsor, backend='pytorch', device=device
-        )
+        from .core.pipeline import _same_device, is_unclipped_unit_image
+        if (
+            _fixed_target is not None
+            and not isinstance(fixed, (list, tuple))
+            and not isinstance(moving, (list, tuple))
+            and winsor is None
+            and _same_device(_fixed_target.tensor_zyx.device, torch.device(device))
+        ):
+            _, J_tensor = normalize_and_tensorize(
+                fixed, moving, winsorize_quantiles=winsor, backend='pytorch', device=device
+            )
+            I_tensor = _fixed_target.tensor_zyx
+        else:
+            I_tensor, J_tensor = normalize_and_tensorize(
+                fixed, moving, winsorize_quantiles=winsor, backend='pytorch', device=device
+            )
         _tvf_fix_unit_t = (
             I_tensor[:, :1]
             if (int(np.prod(grid_shape_zyx)) <= 16_777_216 and len(fixed_primary.shape) == 3 and is_unclipped_unit_image(fixed_primary))
@@ -2679,14 +2708,20 @@ def tvf_registration(
 
                 def _load_tvf_phi1_map():
                     with torch.no_grad():
+                        if fwd_img is not None and inv_img is not None:
+                            f_m = disp_itk_to_tensor(fwd_img)
+                            i_m = disp_itk_to_tensor(inv_img)
+                        else:
+                            f_m = fwd_disp_el.disp_tensor_zyx()
+                            i_m = inv_disp_el.disp_tensor_zyx()
                         return calculate_inverse_identity_error(
-                            disp_itk_to_tensor(fwd_img),
-                            disp_itk_to_tensor(inv_img),
+                            f_m,
+                            i_m,
                             spacing=spacing,
                             origin=origin,
                             direction=direction,
                             return_error_map=True,
-                        )['error_map']
+                        )['error_map'].cpu()
 
                 inv_err_dict = _LazyKeyDict(inv_err_dict, lazy_loaders={'error_map': _load_tvf_phi1_map})
             else:
@@ -2884,25 +2919,52 @@ def tvf_registration(
 
     else:
         raise ValueError(f"Unknown backend: {backend}")
-    from .transforms import _cache_disp_image_and_field, _write_ants_images_fast, apply_transforms as _apply_transforms
+    from .transforms import (
+        TransformChain,
+        TransformElement,
+        _cache_disp_image_and_field,
+        _write_ants_images_fast,
+        apply_transforms as _apply_transforms,
+    )
     _apply_dev = str(device) if backend.lower() == 'pytorch' else None
-    fwd_img = disp_tensor_to_itk(fwd_disp, fixed_primary)
-    inv_img = disp_tensor_to_itk(inv_disp, fixed_primary)
+    fwd_img = None
+    inv_img = None
+    fwd_disp_el = None
+    inv_disp_el = None
+    fwd_transforms = []
+    inv_transforms = []
+    whichtoinvert_inv = []
 
-    fwd_file = tempfile.NamedTemporaryFile(suffix='_tvf_fwd_Warp.nii.gz', delete=False).name
-    inv_file = tempfile.NamedTemporaryFile(suffix='_tvf_inv_Warp.nii.gz', delete=False).name
-    _write_ants_images_fast([(fwd_img, fwd_file), (inv_img, inv_file)], compresslevel=1)
-    _cache_disp_image_and_field(fwd_file, fwd_img, _apply_dev, disp_tensor=fwd_disp)
-    _cache_disp_image_and_field(inv_file, inv_img, _apply_dev, disp_tensor=inv_disp)
-    del fwd_disp, inv_disp
-
-    # Export physical affine transform using standardized ITK layout
-    # Note: affine_file already incorporates initial_transform (absorbed during initialization)
     if resolved_init.has_initial_warp:
-        if resolved_init.has_linear_affine:
-            affine_file = tempfile.NamedTemporaryFile(suffix='.mat', delete=False).name
-            export_ants_affine_transform(resolved_init.M_phys, resolved_init.t_phys, dim=dim, filename=affine_file)
-            if sum(reg_iterations) > 0 or resolved_init.has_initial_warp:
+        has_lin_exp = bool(resolved_init.has_linear_affine)
+        M_exp = resolved_init.M_phys if has_lin_exp else None
+        t_exp = resolved_init.t_phys if has_lin_exp else None
+    else:
+        has_lin_exp = True
+        M_exp, t_exp = grid_to_physical_affine(T_grid, fixed_primary, moving_primary)
+
+    has_def_exp = bool(sum(reg_iterations) > 0 or resolved_init.has_initial_warp)
+
+    if _do_write_tx:
+        fwd_img = disp_tensor_to_itk(fwd_disp, fixed_primary)
+        inv_img = disp_tensor_to_itk(inv_disp, fixed_primary)
+        if outprefix is not None:
+            os.makedirs(os.path.dirname(str(outprefix)) or '.', exist_ok=True)
+            fwd_file = f"{outprefix}1Warp.nii.gz"
+            inv_file = f"{outprefix}1InverseWarp.nii.gz"
+            affine_file = f"{outprefix}0GenericAffine.mat" if has_lin_exp else None
+            comp_lvl = 4
+        else:
+            fwd_file = tempfile.NamedTemporaryFile(suffix='_tvf_fwd_Warp.nii.gz', delete=False).name
+            inv_file = tempfile.NamedTemporaryFile(suffix='_tvf_inv_Warp.nii.gz', delete=False).name
+            affine_file = tempfile.NamedTemporaryFile(suffix='.mat', delete=False).name if has_lin_exp else None
+            comp_lvl = 1
+        _write_ants_images_fast([(fwd_img, fwd_file), (inv_img, inv_file)], compresslevel=comp_lvl)
+        _cache_disp_image_and_field(fwd_file, fwd_img, _apply_dev, disp_tensor=fwd_disp)
+        _cache_disp_image_and_field(inv_file, inv_img, _apply_dev, disp_tensor=inv_disp)
+        if affine_file is not None:
+            export_ants_affine_transform(M_exp, t_exp, dim=dim, filename=affine_file)
+            if has_def_exp:
                 fwd_transforms = [fwd_file, affine_file]
                 inv_transforms = [affine_file, inv_file]
                 whichtoinvert_inv = [True, False]
@@ -2914,62 +2976,81 @@ def tvf_registration(
             fwd_transforms = [fwd_file]
             inv_transforms = [inv_file]
             whichtoinvert_inv = [False]
+        fwd_chain = TransformChain.from_paths(fwd_transforms)
+        inv_chain = TransformChain.from_paths(inv_transforms, whichtoinvert_inv)
     else:
-        M_phys, t_phys = grid_to_physical_affine(T_grid, fixed_primary, moving_primary)
-        affine_file = tempfile.NamedTemporaryFile(suffix='.mat', delete=False).name
-
-        tx_fwd, tx_inv = export_ants_affine_transform(M_phys, t_phys, dim=dim, filename=affine_file)
-
-        if sum(reg_iterations) > 0:
-            fwd_transforms = [fwd_file, affine_file]
-            inv_transforms = [affine_file, inv_file]
-            whichtoinvert_inv = [True, False]
+        if has_def_exp:
+            fwd_disp_el = TransformElement.from_disp_tensor(fwd_disp, fixed_primary, kind="displacement")
+            inv_disp_el = TransformElement.from_disp_tensor(inv_disp, fixed_primary, kind="inverse_displacement")
+        if has_lin_exp:
+            aff_fwd_el = TransformElement.from_affine(M_exp, t_exp, invert=False)
+            aff_inv_el = TransformElement.from_affine(M_exp, t_exp, invert=True)
+            if has_def_exp:
+                fwd_chain = TransformChain([fwd_disp_el, aff_fwd_el])
+                inv_chain = TransformChain([aff_inv_el, inv_disp_el])
+                whichtoinvert_inv = [True, False]
+            else:
+                fwd_chain = TransformChain([aff_fwd_el])
+                inv_chain = TransformChain([aff_inv_el])
+                whichtoinvert_inv = [True]
         else:
-            fwd_transforms = [affine_file]
-            inv_transforms = [affine_file]
-            whichtoinvert_inv = [True]
+            fwd_chain = TransformChain([fwd_disp_el]) if fwd_disp_el is not None else TransformChain([])
+            inv_chain = TransformChain([inv_disp_el]) if inv_disp_el is not None else TransformChain([])
+            whichtoinvert_inv = [False] if fwd_disp_el is not None else []
+    del fwd_disp, inv_disp
 
-    # Generate warped output images (same as registration())
-    _tvf_mov_cf = None
-    _tvf_fix_cf = None
-    if (
-        _apply_dev is not None
-        and not hasattr(ants.apply_transforms, "_mock_name")
-        and hasattr(ants, "is_image")
-        and ants.is_image(fixed_primary)
-        and ants.is_image(moving_primary)
-        and len(fixed_primary.shape) == 3
-        and len(moving_primary.shape) == 3
-    ):
-        from .transforms import ContinuousField as _ContinuousField
-        _cf_dev = torch.device(_apply_dev)
-        if '_tvf_mov_unit_t' in locals() and _tvf_mov_unit_t is not None and _tvf_mov_unit_t.device.type == _cf_dev.type and (_tvf_mov_unit_t.device.index or 0) == (_cf_dev.index or 0):
-            _tvf_mov_cf = _ContinuousField.from_tensor(
-                _tvf_mov_unit_t,
-                spatial_shape=moving_primary.shape,
-                origin=moving_primary.origin,
-                spacing=moving_primary.spacing,
-                direction=moving_primary.direction,
-                is_vector=False,
-            )
-        if '_tvf_fix_unit_t' in locals() and _tvf_fix_unit_t is not None and _tvf_fix_unit_t.device.type == _cf_dev.type and (_tvf_fix_unit_t.device.index or 0) == (_cf_dev.index or 0):
-            _tvf_fix_cf = _ContinuousField.from_tensor(
-                _tvf_fix_unit_t,
-                spatial_shape=fixed_primary.shape,
-                origin=fixed_primary.origin,
-                spacing=fixed_primary.spacing,
-                direction=fixed_primary.direction,
-                is_vector=False,
-            )
-    warpedmovout = _apply_transforms(
-        fixed=fixed_primary, moving=moving_primary, transformlist=fwd_transforms, device=_apply_dev, _moving_field=_tvf_mov_cf
-    )
-    del _tvf_mov_cf
-    warpedfixout = _apply_transforms(
-        fixed=moving_primary, moving=fixed_primary, transformlist=inv_transforms,
-        whichtoinvert=whichtoinvert_inv, device=_apply_dev, _moving_field=_tvf_fix_cf,
-    )
-    del _tvf_fix_cf
+    # Generate warped output images when return_warped=True
+    warpedmovout = None
+    warpedfixout = None
+    if return_warped:
+        _tvf_mov_cf = None
+        _tvf_fix_cf = None
+        if (
+            _apply_dev is not None
+            and not hasattr(ants.apply_transforms, "_mock_name")
+            and hasattr(ants, "is_image")
+            and ants.is_image(fixed_primary)
+            and ants.is_image(moving_primary)
+            and len(fixed_primary.shape) == 3
+            and len(moving_primary.shape) == 3
+        ):
+            from .transforms import ContinuousField as _ContinuousField
+            _cf_dev = torch.device(_apply_dev)
+            if '_tvf_mov_unit_t' in locals() and _tvf_mov_unit_t is not None and _tvf_mov_unit_t.device.type == _cf_dev.type and (_tvf_mov_unit_t.device.index or 0) == (_cf_dev.index or 0):
+                _tvf_mov_cf = _ContinuousField.from_tensor(
+                    _tvf_mov_unit_t,
+                    spatial_shape=moving_primary.shape,
+                    origin=moving_primary.origin,
+                    spacing=moving_primary.spacing,
+                    direction=moving_primary.direction,
+                    is_vector=False,
+                )
+            if '_tvf_fix_unit_t' in locals() and _tvf_fix_unit_t is not None and _tvf_fix_unit_t.device.type == _cf_dev.type and (_tvf_fix_unit_t.device.index or 0) == (_cf_dev.index or 0):
+                _tvf_fix_cf = _ContinuousField.from_tensor(
+                    _tvf_fix_unit_t,
+                    spatial_shape=fixed_primary.shape,
+                    origin=fixed_primary.origin,
+                    spacing=fixed_primary.spacing,
+                    direction=fixed_primary.direction,
+                    is_vector=False,
+                )
+        warpedmovout = _apply_transforms(
+            fixed=fixed_primary,
+            moving=moving_primary,
+            transformlist=fwd_transforms if _do_write_tx else fwd_chain,
+            device=_apply_dev,
+            _moving_field=_tvf_mov_cf,
+        )
+        del _tvf_mov_cf
+        warpedfixout = _apply_transforms(
+            fixed=moving_primary,
+            moving=fixed_primary,
+            transformlist=inv_transforms if _do_write_tx else inv_chain,
+            whichtoinvert=whichtoinvert_inv if _do_write_tx else None,
+            device=_apply_dev,
+            _moving_field=_tvf_fix_cf,
+        )
+        del _tvf_fix_cf
     if '_tvf_mov_unit_t' in locals():
         del _tvf_mov_unit_t, _tvf_fix_unit_t
 
@@ -2987,6 +3068,8 @@ def tvf_registration(
             'fwdtransforms': fwd_transforms,
             'invtransforms': inv_transforms,
             'whichtoinvert_inv': whichtoinvert_inv,
+            'fwd_chain': fwd_chain,
+            'inv_chain': inv_chain,
             'model': model,
             'inverse_identity_errors': {'phi_1': inv_err_dict},
         },

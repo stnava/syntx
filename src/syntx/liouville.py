@@ -481,10 +481,23 @@ def liouville_determinant(result: Dict[str, Any], fixed, method: Optional[str] =
         else:
             details["measure"] = "finite difference of each half field"
     else:  # greedy
-        warp = next((x for x in result["fwdtransforms"] if isinstance(x, str) and x.endswith(".nii.gz")), None)
-        if warp is None:
-            raise ValueError("greedy result has no displacement field")
-        img = _create_jacobian_determinant_image(fixed, warp, do_log=False)
+        fwd_chain = result.get("fwd_chain")
+        mem_disp = None
+        if fwd_chain is not None and hasattr(fwd_chain, "elements"):
+            mem_disp = next(
+                (e for e in fwd_chain.elements if e.kind in ("displacement", "inverse_displacement")),
+                None,
+            )
+        if mem_disp is not None and (mem_disp.field is not None or mem_disp.disp_2d_yx is not None):
+            if fixed.dimension == 3 and mem_disp.field is not None and tuple(mem_disp.field.spatial_shape) == tuple(fixed.shape[:3]):
+                img = _create_jacobian_determinant_image(fixed, mem_disp, do_log=False)
+            else:
+                img = _create_jacobian_determinant_image(fixed, mem_disp.to_ants_image(), do_log=False)
+        else:
+            warp = next((x for x in result.get("fwdtransforms", []) if isinstance(x, str) and x.endswith((".nii.gz", ".nii"))), None)
+            if warp is None:
+                raise ValueError("greedy result has no displacement field")
+            img = _create_jacobian_determinant_image(fixed, warp, do_log=False)
         details["measure"] = "finite difference of the full field"
     return (img, details) if return_details else img
 

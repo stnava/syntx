@@ -242,12 +242,14 @@ def cleanup_gpu(device, backend='pytorch'):
     if backend == 'pytorch':
         import torch
         from .regularizers import clear_k_mesh_cache
+        from ..transforms import clear_transform_gpu_caches
         dev_str = str(device).lower() if device is not None else ''
         is_mps = 'mps' in dev_str
         is_cuda = 'cuda' in dev_str
         if not (is_mps or is_cuda):
             return
         clear_k_mesh_cache(max_voxels=16_777_216)
+        clear_transform_gpu_caches(max_voxels=16_777_216)
         if is_mps:
             alloc = torch.mps.current_allocated_memory() if hasattr(torch.mps, 'current_allocated_memory') else 0
             if alloc > 64 * 1024 * 1024:

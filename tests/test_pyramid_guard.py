@@ -62,6 +62,7 @@ ALLOW = {
     ("transforms.py", "ants_resample_to_target"): (4, "resample_image_to_target's ANTs fallbacks and the identity-chain resamples of TransformChain.apply and resample_series: geometry onto a target grid, not a pyramid level"),
     ("viz/figures.py", "zoom"): (1, "figure compositing: shape-match for display"),
     # ---- thin wrappers over the central pyramid (they call build_pyramid / plan_levels; they do not implement a level)
+    ("cohort.py", "def_pyramid_builder"): (1, "FixedTarget.get_deformable_pyramid: caches central build_pyramid levels and LNCC moments on FixedTarget"),
     ("motion_batched.py", "def_pyramid_builder"): (1, "get_pyramid_level: caches central build_pyramid levels per level"),
     ("syn_jax.py", "def_pyramid_builder"): (1, "pyramid_level_jax: wraps pyramid.build_pyramid_jax for one level"),
     # ---- not a pyramid: entropy

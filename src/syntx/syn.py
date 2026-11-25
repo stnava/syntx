@@ -1195,10 +1195,17 @@ class SyNTo(nn.Module):
             # Loss and best-state bookkeeping stay on the device; the host reads the loss history
             # every ``loss_sync_every`` epochs (and on the last one) in a single transfer. The
             # convergence and collapse tests therefore lag by at most ``loss_sync_every - 1`` epochs.
-            loss_sync_every = int(kwargs.get('loss_sync_every', getattr(self, 'loss_sync_every', 5)))
+            sync_free = bool(kwargs.get('sync_free', False))
+            loss_sync_every = (
+                max(int(curr_syn_epochs), 1)
+                if sync_free
+                else int(kwargs.get('loss_sync_every', getattr(self, 'loss_sync_every', 5)))
+            )
             if loss_sync_every < 1:
                 raise ValueError(f"loss_sync_every must be >= 1, got {loss_sync_every}")
-            _large_level = int(np.prod(curr_spatial)) > 16_777_216
+            _lvl_vox = int(np.prod(curr_spatial))
+            _large_level = _lvl_vox > 16_777_216
+            _seq_inv_level = _lvl_vox >= 4_194_304
             _lvl_inv_method = (
                 'fixed_point'
                 if (_large_level and str(self.inverse_method).lower() == 'anderson')
@@ -1208,30 +1215,47 @@ class SyNTo(nn.Module):
             _best_dev = 'cpu' if _large_level else warp_l2r.device
             best_warp_l2r = torch.zeros(warp_l2r.shape, device=_best_dev, dtype=warp_l2r.dtype)
             best_warp_r2l = torch.zeros(warp_r2l.shape, device=_best_dev, dtype=warp_r2l.dtype)
-            best_warp_l2r_inv = torch.zeros(warp_l2r_inv.shape, device=_best_dev, dtype=warp_l2r_inv.dtype)
-            best_warp_r2l_inv = torch.zeros(warp_r2l_inv.shape, device=_best_dev, dtype=warp_r2l_inv.dtype)
             have_best = False
             level_losses_host = []      # floats, filled at sync epochs
             self._inv_step_hint = {}    # Anderson iterations needed by the previous epoch, per call site
             metric_losses_dict = {}
 
             def _inverse_pair(fwd_l, fwd_r, init_l, init_r, key, X_phys_arg=None, use_tol=True):
-                """Invert two fields: batched (B=2) on standard grids, sequential B=1 fixed-point above 256^3."""
+                """Invert two fields: batched (B=2) on compact grids, sequential B=1 at >=4.19M voxels to halve peak VRAM."""
+                eff_tol = bool(use_tol and not sync_free)
+                eff_steps = (
+                    min(int(in_loop_inv_steps), 7 if level_idx == 0 else 4)
+                    if (sync_free and use_tol)
+                    else int(in_loop_inv_steps)
+                )
                 tol_kw = (dict(max_error_threshold=self.inv_tolerance, mean_error_threshold=self.inv_tolerance * 0.01)
-                          if use_tol else dict(max_error_threshold=-1.0, mean_error_threshold=-1.0))
-                if _large_level:
+                          if eff_tol else dict(max_error_threshold=-1.0, mean_error_threshold=-1.0))
+                if _seq_inv_level:
+                    _ci_seq = 4 if _large_level else 3
+                    stats_l = {}
+                    hint_l = self._inv_step_hint.get((key, 'l'))
                     out_l = update_inverse_field_nd(
                         fwd_l.detach(), init_l.detach(),
-                        steps=in_loop_inv_steps, method=_lvl_inv_method,
+                        steps=eff_steps, method=_lvl_inv_method,
                         spacing=curr_spacing_fixed, origin=fixed_origin, direction=fixed_direction,
-                        X_phys=X_phys_arg, check_interval=4, **tol_kw)
+                        X_phys=X_phys_arg,
+                        check_after=(hint_l if hint_l is not None else min(3, eff_steps)),
+                        check_interval=_ci_seq, stats=stats_l, **tol_kw)
                     del init_l
+                    if 'steps' in stats_l:
+                        self._inv_step_hint[(key, 'l')] = stats_l['steps']
+                    stats_r = {}
+                    hint_r = self._inv_step_hint.get((key, 'r'))
                     out_r = update_inverse_field_nd(
                         fwd_r.detach(), init_r.detach(),
-                        steps=in_loop_inv_steps, method=_lvl_inv_method,
+                        steps=eff_steps, method=_lvl_inv_method,
                         spacing=curr_spacing_fixed, origin=fixed_origin, direction=fixed_direction,
-                        X_phys=X_phys_arg, check_interval=4, **tol_kw)
+                        X_phys=X_phys_arg,
+                        check_after=(hint_r if hint_r is not None else min(3, eff_steps)),
+                        check_interval=_ci_seq, stats=stats_r, **tol_kw)
                     del init_r
+                    if 'steps' in stats_r:
+                        self._inv_step_hint[(key, 'r')] = stats_r['steps']
                     return out_l, out_r
                 stats = {}
                 fwd_pair = torch.cat([fwd_l.detach(), fwd_r.detach()])
@@ -1240,9 +1264,9 @@ class SyNTo(nn.Module):
                 hint = self._inv_step_hint.get(key)
                 out = update_inverse_field_nd(
                     fwd_pair, init_pair,
-                    steps=in_loop_inv_steps, method=self.inverse_method,
+                    steps=eff_steps, method=self.inverse_method,
                     spacing=curr_spacing_fixed, origin=fixed_origin, direction=fixed_direction, X_phys=X_phys_arg,
-                    check_after=(hint if hint is not None else min(3, in_loop_inv_steps)),
+                    check_after=(hint if hint is not None else min(3, eff_steps)),
                     check_interval=3, stats=stats, **tol_kw)
                 del fwd_pair, init_pair
                 if 'steps' in stats:
@@ -1264,20 +1288,36 @@ class SyNTo(nn.Module):
                 if in_loop_inv_steps <= 0:
                     return w_l_inv, w_r_inv
                 with torch.no_grad():
-                    if _large_level:
-                        from .core.digital_diffeomorphism import _d_rev_t_and_scale, _eval_dual_fd_det_min_scalar_slabbed
-                        _sp_rev_dd = list(reversed(curr_spacing_fixed))
-                        _dir_rev_dd = _dir_2d[::-1, ::-1].copy()
-                        _d_rev_t_dd = torch.tensor(_dir_rev_dd.T.copy(), device=w_l.device, dtype=w_l.dtype)
-                        _s_d_dd = float(np.linalg.det(np.linalg.inv(_dir_rev_dd)))
-                        min_l = _eval_dual_fd_det_min_scalar_slabbed(
-                            w_l.detach(), _sp_rev_dd, _d_rev_t_dd, _s_d_dd, False, True
-                        )
-                        min_r = _eval_dual_fd_det_min_scalar_slabbed(
-                            w_r.detach(), _sp_rev_dd, _d_rev_t_dd, _s_d_dd, False, True
-                        )
-                        min_jac_pair = torch.stack([min_l, min_r])
-                        del _d_rev_t_dd, min_l, min_r
+                    if _seq_inv_level:
+                        if _large_level:
+                            from .core.digital_diffeomorphism import _eval_dual_fd_det_min_scalar_slabbed
+                            _sp_rev_dd = list(reversed(curr_spacing_fixed))
+                            _dir_rev_dd = _dir_2d[::-1, ::-1].copy()
+                            _d_rev_t_dd = torch.tensor(_dir_rev_dd.T.copy(), device=w_l.device, dtype=w_l.dtype)
+                            _s_d_dd = float(np.linalg.det(np.linalg.inv(_dir_rev_dd)))
+                            min_l = _eval_dual_fd_det_min_scalar_slabbed(
+                                w_l.detach(), _sp_rev_dd, _d_rev_t_dd, _s_d_dd, False, True
+                            )
+                            min_r = _eval_dual_fd_det_min_scalar_slabbed(
+                                w_r.detach(), _sp_rev_dd, _d_rev_t_dd, _s_d_dd, False, True
+                            )
+                            min_jac_pair = torch.stack([min_l, min_r])
+                            del _d_rev_t_dd, min_l, min_r
+                        else:
+                            wl_d = w_l.detach()
+                            wl_d.is_physical = True
+                            min_l = compute_physical_jacobian_determinant(
+                                wl_d, direction=_dir_2d, spacing=curr_spacing_fixed
+                            ).amin()
+                            wr_d = w_r.detach()
+                            wr_d.is_physical = True
+                            min_r = compute_physical_jacobian_determinant(
+                                wr_d, direction=_dir_2d, spacing=curr_spacing_fixed
+                            ).amin()
+                            min_jac_pair = torch.stack([min_l, min_r])
+                            del wl_d, wr_d, min_l, min_r
+                        if sync_free:
+                            return w_l_inv, w_r_inv
                         fold_flags = (min_jac_pair <= cfl_proj_jac_floor).tolist()
                         modified = False
                         for w_b, w_b_inv, is_folded in (
@@ -1856,13 +1896,9 @@ class SyNTo(nn.Module):
                             if bool(improved.item()):
                                 best_warp_l2r.copy_(warp_l2r.detach())
                                 best_warp_r2l.copy_(warp_r2l.detach())
-                                best_warp_l2r_inv.copy_(warp_l2r_inv.detach())
-                                best_warp_r2l_inv.copy_(warp_r2l_inv.detach())
                         else:
                             torch.where(improved, warp_l2r.detach(), best_warp_l2r, out=best_warp_l2r)
                             torch.where(improved, warp_r2l.detach(), best_warp_r2l, out=best_warp_r2l)
-                            torch.where(improved, warp_l2r_inv.detach(), best_warp_l2r_inv, out=best_warp_l2r_inv)
-                            torch.where(improved, warp_r2l_inv.detach(), best_warp_r2l_inv, out=best_warp_r2l_inv)
                     have_best = True
 
                 del I_mid, J_mid, grad_I_mid_sampled, grad_J_mid_sampled, in_bounds_mask
@@ -2498,8 +2534,10 @@ class SyNTo(nn.Module):
                         with torch.no_grad():
                             warp_l2r.data.copy_(best_warp_l2r)
                             warp_r2l.data.copy_(best_warp_r2l)
-                            warp_l2r_inv = best_warp_l2r_inv.to(warp_l2r.device) if _large_level else best_warp_l2r_inv
-                            warp_r2l_inv = best_warp_r2l_inv.to(warp_r2l.device) if _large_level else best_warp_r2l_inv
+                            if self.inverse_steps > 0:
+                                warp_l2r_inv, warp_r2l_inv = _inverse_pair(
+                                    warp_l2r, warp_r2l, warp_l2r_inv, warp_r2l_inv, 'inv', X_phys_arg=X_phys, use_tol=True
+                                )
                 del final_loss_t
 
                 _polish_steps = int(kwargs.get('polish_inv_steps', 30))
@@ -2515,19 +2553,19 @@ class SyNTo(nn.Module):
                         if (_polish_steps > 0 or _lvl_pproj) else float(self.inv_tolerance)
                     )
                     with torch.no_grad():
-                        if _large_level:
+                        if _seq_inv_level:
                             warp_l2r_inv = update_inverse_field_nd(
                                 warp_l2r.detach(), warp_l2r_inv.detach(),
                                 steps=_p_steps, method=_lvl_inv_method,
                                 spacing=curr_spacing_fixed, origin=fixed_origin, direction=fixed_direction,
-                                X_phys=X_phys,
+                                X_phys=X_phys, check_interval=5,
                                 max_error_threshold=_p_tol, mean_error_threshold=_p_tol * 0.01,
                             )
                             warp_r2l_inv = update_inverse_field_nd(
                                 warp_r2l.detach(), warp_r2l_inv.detach(),
                                 steps=_p_steps, method=_lvl_inv_method,
                                 spacing=curr_spacing_fixed, origin=fixed_origin, direction=fixed_direction,
-                                X_phys=X_phys,
+                                X_phys=X_phys, check_interval=5,
                                 max_error_threshold=_p_tol, mean_error_threshold=_p_tol * 0.01,
                             )
                             if _lvl_pproj:
@@ -2535,7 +2573,7 @@ class SyNTo(nn.Module):
                                     warp_l2r_inv.detach(), warp_l2r.detach(),
                                     steps=_p_steps, method=_lvl_inv_method,
                                     spacing=curr_spacing_fixed, origin=fixed_origin, direction=fixed_direction,
-                                    X_phys=X_phys,
+                                    X_phys=X_phys, check_interval=5,
                                     max_error_threshold=_p_tol, mean_error_threshold=_p_tol * 0.01,
                                 )
                                 warp_l2r.data.copy_(_proj_l)
@@ -2544,7 +2582,7 @@ class SyNTo(nn.Module):
                                     warp_r2l_inv.detach(), warp_r2l.detach(),
                                     steps=_p_steps, method=_lvl_inv_method,
                                     spacing=curr_spacing_fixed, origin=fixed_origin, direction=fixed_direction,
-                                    X_phys=X_phys,
+                                    X_phys=X_phys, check_interval=5,
                                     max_error_threshold=_p_tol, mean_error_threshold=_p_tol * 0.01,
                                 )
                                 warp_r2l.data.copy_(_proj_r)
@@ -2553,14 +2591,14 @@ class SyNTo(nn.Module):
                                     warp_l2r.detach(), warp_l2r_inv.detach(),
                                     steps=_p_steps, method=_lvl_inv_method,
                                     spacing=curr_spacing_fixed, origin=fixed_origin, direction=fixed_direction,
-                                    X_phys=X_phys,
+                                    X_phys=X_phys, check_interval=5,
                                     max_error_threshold=_p_tol, mean_error_threshold=_p_tol * 0.01,
                                 )
                                 warp_r2l_inv = update_inverse_field_nd(
                                     warp_r2l.detach(), warp_r2l_inv.detach(),
                                     steps=_p_steps, method=_lvl_inv_method,
                                     spacing=curr_spacing_fixed, origin=fixed_origin, direction=fixed_direction,
-                                    X_phys=X_phys,
+                                    X_phys=X_phys, check_interval=5,
                                     max_error_threshold=_p_tol, mean_error_threshold=_p_tol * 0.01,
                                 )
                         else:
@@ -2597,7 +2635,7 @@ class SyNTo(nn.Module):
 
             warp_l2r.requires_grad_(False)
             warp_r2l.requires_grad_(False)
-            del best_warp_l2r, best_warp_r2l, best_warp_l2r_inv, best_warp_r2l_inv
+            del best_warp_l2r, best_warp_r2l
             del I_curr, J_curr, grad_I_curr_level, grad_J_curr_level, grad_I_vox_level, grad_J_vox_level
             del X_phys, b_mask, initial_grid_level
             I_pyr[level_idx] = None
@@ -2833,26 +2871,27 @@ class SyNTo(nn.Module):
                 coords_norm = physical_to_normalized_torch_cached(
                     phi_l2r_phys, comp_shape_t, comp_spacing_t, comp_origin_t, comp_direction_t
                 )
+                del phi_l2r_phys
                 disp_r2l_sampled = F.grid_sample(
                     torch.movedim(w_r2l, -1, 1), coords_norm, padding_mode='border', align_corners=True
                 ).movedim(1, -1)
                 del coords_norm
-                fwd_composed = phi_l2r_phys + disp_r2l_sampled - X_phys
-                del phi_l2r_phys, disp_r2l_sampled
+                fwd_composed = w_l2r_inv + disp_r2l_sampled
+                del disp_r2l_sampled
 
                 phi_r2l_phys = X_phys + w_r2l_inv
-                del w_r2l_inv
                 coords_norm_r = physical_to_normalized_torch_cached(
                     phi_r2l_phys, comp_shape_t, comp_spacing_t, comp_origin_t, comp_direction_t
                 )
+                del phi_r2l_phys
                 disp_l2r_sampled = F.grid_sample(
                     torch.movedim(w_l2r, -1, 1), coords_norm_r, padding_mode='border', align_corners=True
                 ).movedim(1, -1)
                 del coords_norm_r
-                algebraic_inv = phi_r2l_phys + disp_l2r_sampled - X_phys
-                del phi_r2l_phys, disp_l2r_sampled
+                algebraic_inv = w_r2l_inv + disp_l2r_sampled
+                del w_r2l_inv, disp_l2r_sampled
 
-                _early_offload = bool(offload_midpoints and math.prod(int(s) for s in target_grid_shape) > 16_777_216)
+                _early_offload = bool(offload_midpoints and math.prod(int(s) for s in target_grid_shape) >= 4_194_304)
                 if _early_offload:
                     w_l2r_inv = w_l2r_inv.cpu()
                     w_r2l = w_r2l.cpu()
@@ -3248,6 +3287,7 @@ SYN_ADVANCED_OPTIONS = frozenset({
     # Continuum mechanics regularizers
     'beta', 'gamma', 'poisson_ratio', 'darcy_permeability', 'bulk_modulus', 'num_iters', 'dilatation_weight', 'beltrami_dilation', 'mask',
     's', 'h3_envelope', 'sobolev_envelope', 'envelope_power',
+    'sync_free',
 })
 # set internally by registration() for fit()
 _SYN_INTERNAL_FIT_KEYS = frozenset({'init_M_phys', 'init_t_phys', 'fixed_spacing', 'fixed_origin',
@@ -3300,6 +3340,7 @@ def registration(
     midpoint_only=False,
     export_midpoint=True,
     return_warped=True,
+    write_transforms=True,
     initial_warp=None,
     initial_inverse_warp=None,
     **kwargs
@@ -3706,13 +3747,15 @@ def registration(
                     _aff_kwargs['_preuploaded_input_zyx'] = _pre_raw_zyx
                     if kwargs.get('device', None) is not None:
                         _aff_kwargs['device'] = kwargs['device']
+            _do_write_early = bool(write_transforms or kwargs.get('outprefix', None) is not None)
             aff_res = robust_affine(
                 fixed_primary, moving_primary,
                 dof=_affine_dof_resolved, mode=affine_mode, seed=affine_seed, verbose=verbose,
                 return_warped=False,
+                write_transforms=_do_write_early,
                 **_aff_kwargs
             )
-            raw_init_tx = aff_res['fwdtransforms']
+            raw_init_tx = aff_res['fwdtransforms'] if _do_write_early else aff_res['fwd_chain']
 
         _init_dev = kwargs.get('device', None) if backend == 'pytorch' else None
         resolved_init = resolve_initial_transform_and_warp(
@@ -3768,6 +3811,8 @@ def registration(
             initial_transform=initial_transform,
             initial_warp=initial_warp,
             initial_inverse_warp=initial_inverse_warp,
+            return_warped=return_warped,
+            write_transforms=write_transforms,
             verbose=verbose,
             device=kwargs.pop('device', None),
             restrict_transformation=restrict_transformation,
@@ -4084,10 +4129,17 @@ def registration(
     model.has_initial_warp = _has_init_warp
     model.initial_warp_kind = _init_warp_kind
 
-    # 4. Save displacement fields to temp files to match ANTs file-based transforms
-    from .transforms import _cache_disp_image_and_field, _write_ants_images_fast, apply_transforms as _apply_transforms
+    # 4. Save displacement fields to temp files to match ANTs file-based transforms (or keep GPU-resident when write_transforms=False)
+    from .transforms import (
+        TransformChain,
+        TransformElement,
+        _cache_disp_image_and_field,
+        _write_ants_images_fast,
+        apply_transforms as _apply_transforms,
+    )
     _apply_dev = str(device) if backend == 'pytorch' else None
     outprefix = kwargs.get('outprefix', None)
+    _do_write_tx = bool(write_transforms or outprefix is not None)
     _has_midpoint_warps = (
         sum(reg_iterations) > 0
         and hasattr(model, 'midpoint_warp_l2r')
@@ -4097,7 +4149,7 @@ def registration(
 
     fwd_file = None
     inv_file = None
-    if (sum(reg_iterations) > 0 or _has_init_warp) and not _skip_full_warps:
+    if _do_write_tx and (sum(reg_iterations) > 0 or _has_init_warp) and not _skip_full_warps:
         if outprefix is not None:
             os.makedirs(os.path.dirname(outprefix) or '.', exist_ok=True)
             fwd_file = f"{outprefix}1Warp.nii.gz"
@@ -4110,6 +4162,9 @@ def registration(
     
     affine_file = None
     affine_inv_file = None
+    has_resolved_linear = False
+    M_phys_export = None
+    t_phys_export = None
     
     total_fwd_deformable = None
     total_inv_deformable = None
@@ -4122,32 +4177,35 @@ def registration(
 
             if _has_init_warp:
                 if resolved_init.has_linear_affine:
-                    M_phys, t_phys = resolved_init.M_phys, resolved_init.t_phys
-                    if outprefix is not None:
-                        affine_file = f"{outprefix}0GenericAffine.mat"
-                        affine_inv_file = f"{outprefix}0GenericAffine_inv.mat"
-                    else:
-                        affine_file = tempfile.NamedTemporaryFile(suffix='.mat', delete=False).name
-                        affine_inv_file = tempfile.NamedTemporaryFile(suffix='.mat', delete=False).name
-                    tx_fwd, tx_inv = export_ants_affine_transform(M_phys, t_phys, dim=dim, filename=affine_file)
-                    ants.write_transform(tx_inv, affine_inv_file)
+                    M_phys_export, t_phys_export = resolved_init.M_phys, resolved_init.t_phys
+                    has_resolved_linear = True
+                    if _do_write_tx:
+                        if outprefix is not None:
+                            affine_file = f"{outprefix}0GenericAffine.mat"
+                            affine_inv_file = f"{outprefix}0GenericAffine_inv.mat"
+                        else:
+                            affine_file = tempfile.NamedTemporaryFile(suffix='.mat', delete=False).name
+                            affine_inv_file = tempfile.NamedTemporaryFile(suffix='.mat', delete=False).name
+                        tx_fwd, tx_inv = export_ants_affine_transform(M_phys_export, t_phys_export, dim=dim, filename=affine_file)
+                        ants.write_transform(tx_inv, affine_inv_file)
             elif hasattr(model, 'affine'):
                 # Convert internal grid affine to physical ITK AffineTransform
                 T_grid = model.affine.get_matrix().detach().cpu().numpy()
                 if verbose >= 2:
                     print(f"[pytorch] T_grid:\n", T_grid)
                 moving_target = fixed_primary if initial_grid is not None else moving_primary
-                M_phys, t_phys = grid_to_physical_affine(T_grid, fixed_primary, moving_target)
+                M_phys_export, t_phys_export = grid_to_physical_affine(T_grid, fixed_primary, moving_target)
+                has_resolved_linear = True
                 
-                # Save physical forward affine transform to file
-                if outprefix is not None:
-                    affine_file = f"{outprefix}0GenericAffine.mat"
-                    affine_inv_file = f"{outprefix}0GenericAffine_inv.mat"
-                else:
-                    affine_file = tempfile.NamedTemporaryFile(suffix='.mat', delete=False).name
-                    affine_inv_file = tempfile.NamedTemporaryFile(suffix='.mat', delete=False).name
-                tx_fwd, tx_inv = export_ants_affine_transform(M_phys, t_phys, dim=dim, filename=affine_file)
-                ants.write_transform(tx_inv, affine_inv_file)
+                if _do_write_tx:
+                    if outprefix is not None:
+                        affine_file = f"{outprefix}0GenericAffine.mat"
+                        affine_inv_file = f"{outprefix}0GenericAffine_inv.mat"
+                    else:
+                        affine_file = tempfile.NamedTemporaryFile(suffix='.mat', delete=False).name
+                        affine_inv_file = tempfile.NamedTemporaryFile(suffix='.mat', delete=False).name
+                    tx_fwd, tx_inv = export_ants_affine_transform(M_phys_export, t_phys_export, dim=dim, filename=affine_file)
+                    ants.write_transform(tx_inv, affine_inv_file)
     else:
         # For JAX:
         import jax
@@ -4160,35 +4218,40 @@ def registration(
         
         if _has_init_warp:
             if resolved_init.has_linear_affine:
-                M_phys, t_phys = resolved_init.M_phys, resolved_init.t_phys
-                if outprefix is not None:
-                    affine_file = f"{outprefix}0GenericAffine.mat"
-                    affine_inv_file = f"{outprefix}0GenericAffine_inv.mat"
-                else:
-                    affine_file = tempfile.NamedTemporaryFile(suffix='.mat', delete=False).name
-                    affine_inv_file = tempfile.NamedTemporaryFile(suffix='.mat', delete=False).name
-                tx_fwd, tx_inv = export_ants_affine_transform(M_phys, t_phys, dim=dim, filename=affine_file)
-                ants.write_transform(tx_inv, affine_inv_file)
+                M_phys_export, t_phys_export = resolved_init.M_phys, resolved_init.t_phys
+                has_resolved_linear = True
+                if _do_write_tx:
+                    if outprefix is not None:
+                        affine_file = f"{outprefix}0GenericAffine.mat"
+                        affine_inv_file = f"{outprefix}0GenericAffine_inv.mat"
+                    else:
+                        affine_file = tempfile.NamedTemporaryFile(suffix='.mat', delete=False).name
+                        affine_inv_file = tempfile.NamedTemporaryFile(suffix='.mat', delete=False).name
+                    tx_fwd, tx_inv = export_ants_affine_transform(M_phys_export, t_phys_export, dim=dim, filename=affine_file)
+                    ants.write_transform(tx_inv, affine_inv_file)
         elif hasattr(model, 'affine_params'):
             T_grid = get_affine_matrix_jax(model.affine_params, dim, model.transform_type)
             T_grid = np.array(T_grid)
             if verbose >= 2:
                 print(f"[jax] T_grid:\n", T_grid)
             moving_target = fixed_primary if initial_grid is not None else moving_primary
-            M_phys, t_phys = grid_to_physical_affine(T_grid, fixed_primary, moving_target)
+            M_phys_export, t_phys_export = grid_to_physical_affine(T_grid, fixed_primary, moving_target)
+            has_resolved_linear = True
             
-            # Save physical forward affine transform to file
-            if outprefix is not None:
-                affine_file = f"{outprefix}0GenericAffine.mat"
-                affine_inv_file = f"{outprefix}0GenericAffine_inv.mat"
-            else:
-                affine_file = tempfile.NamedTemporaryFile(suffix='.mat', delete=False).name
-                affine_inv_file = tempfile.NamedTemporaryFile(suffix='.mat', delete=False).name
-            tx_fwd, tx_inv = export_ants_affine_transform(M_phys, t_phys, dim=dim, filename=affine_file)
-            ants.write_transform(tx_inv, affine_inv_file)
+            if _do_write_tx:
+                if outprefix is not None:
+                    affine_file = f"{outprefix}0GenericAffine.mat"
+                    affine_inv_file = f"{outprefix}0GenericAffine_inv.mat"
+                else:
+                    affine_file = tempfile.NamedTemporaryFile(suffix='.mat', delete=False).name
+                    affine_inv_file = tempfile.NamedTemporaryFile(suffix='.mat', delete=False).name
+                tx_fwd, tx_inv = export_ants_affine_transform(M_phys_export, t_phys_export, dim=dim, filename=affine_file)
+                ants.write_transform(tx_inv, affine_inv_file)
 
     fwd_warp_image = None
     inv_warp_image = None
+    fwd_chain = TransformChain([])
+    inv_chain = TransformChain([])
     if (sum(reg_iterations) > 0 or _has_init_warp) and not _skip_full_warps:
         if _has_init_warp:
             if sum(reg_iterations) > 0 and total_fwd_deformable is not None:
@@ -4224,43 +4287,83 @@ def registration(
             total_fwd_deformable = np.zeros((1, *tensor_shape, dim), dtype=np.float32)
             total_inv_deformable = np.zeros((1, *tensor_shape, dim), dtype=np.float32)
 
-        fwd_img = disp_tensor_to_itk(total_fwd_deformable, fixed_primary)
-        inv_img = disp_tensor_to_itk(total_inv_deformable, fixed_primary)
+        if _do_write_tx:
+            fwd_img = disp_tensor_to_itk(total_fwd_deformable, fixed_primary)
+            inv_img = disp_tensor_to_itk(total_inv_deformable, fixed_primary)
 
-        _write_ants_images_fast(
-            [(fwd_img, fwd_file), (inv_img, inv_file)],
-            compresslevel=4 if outprefix is not None else 1,
-        )
-        _cache_disp_image_and_field(fwd_file, fwd_img, _apply_dev, disp_tensor=total_fwd_deformable)
-        _cache_disp_image_and_field(inv_file, inv_img, _apply_dev, disp_tensor=total_inv_deformable)
-        fwd_warp_image = fwd_img
-        inv_warp_image = inv_img
-        
-        if affine_file is not None and (initial_transform is None or init_M_phys is not None or _has_init_warp):
-            fwd_transforms = [fwd_file, affine_file]
-            inv_transforms = [affine_file, inv_file]
-            whichtoinvert_inv = [True, False]
-        elif initial_transform is not None and not _has_init_warp:
-            fwd_transforms = [fwd_file] + tx_list
-            inv_transforms = tx_list + [inv_file]
-            whichtoinvert_inv = [True] * len(tx_list) + [False]
-        else:
-            fwd_transforms = [fwd_file]
-            inv_transforms = [inv_file]
-            whichtoinvert_inv = [False]
-    else:
-        if affine_file is not None and (initial_transform is None or init_M_phys is not None):
-            fwd_transforms = [affine_file]
-            inv_transforms = [affine_file]
-            whichtoinvert_inv = [True]
-        elif initial_transform is not None:
-            fwd_transforms = list(tx_list)
-            inv_transforms = list(tx_list)
-            whichtoinvert_inv = [True] * len(tx_list)
+            _write_ants_images_fast(
+                [(fwd_img, fwd_file), (inv_img, inv_file)],
+                compresslevel=4 if outprefix is not None else 1,
+            )
+            _cache_disp_image_and_field(fwd_file, fwd_img, _apply_dev, disp_tensor=total_fwd_deformable)
+            _cache_disp_image_and_field(inv_file, inv_img, _apply_dev, disp_tensor=total_inv_deformable)
+            fwd_warp_image = fwd_img
+            inv_warp_image = inv_img
+            
+            if affine_file is not None and (initial_transform is None or init_M_phys is not None or _has_init_warp):
+                fwd_transforms = [fwd_file, affine_file]
+                inv_transforms = [affine_file, inv_file]
+                whichtoinvert_inv = [True, False]
+            elif initial_transform is not None and not _has_init_warp:
+                fwd_transforms = [fwd_file] + tx_list
+                inv_transforms = tx_list + [inv_file]
+                whichtoinvert_inv = [True] * len(tx_list) + [False]
+            else:
+                fwd_transforms = [fwd_file]
+                inv_transforms = [inv_file]
+                whichtoinvert_inv = [False]
+            fwd_chain = TransformChain.from_paths(fwd_transforms)
+            inv_chain = TransformChain.from_paths(inv_transforms, whichtoinvert_inv)
         else:
             fwd_transforms = []
             inv_transforms = []
-            whichtoinvert_inv = []
+            fwd_disp_el = TransformElement.from_disp_tensor(total_fwd_deformable, fixed_primary, kind="displacement")
+            inv_disp_el = TransformElement.from_disp_tensor(total_inv_deformable, fixed_primary, kind="inverse_displacement")
+            if has_resolved_linear and (initial_transform is None or init_M_phys is not None or _has_init_warp):
+                aff_fwd_el = TransformElement.from_affine(M_phys_export, t_phys_export, invert=False)
+                aff_inv_el = TransformElement.from_affine(M_phys_export, t_phys_export, invert=True)
+                fwd_chain = TransformChain([fwd_disp_el, aff_fwd_el])
+                inv_chain = TransformChain([aff_inv_el, inv_disp_el])
+                whichtoinvert_inv = [True, False]
+            elif initial_transform is not None and not _has_init_warp and tx_list:
+                tail_fwd = TransformChain.from_paths(tx_list)
+                tail_inv = TransformChain.from_paths(tx_list, [True] * len(tx_list))
+                fwd_chain = TransformChain([fwd_disp_el, *tail_fwd.elements])
+                inv_chain = TransformChain([*tail_inv.elements, inv_disp_el])
+                whichtoinvert_inv = [True] * len(tx_list) + [False]
+            else:
+                fwd_chain = TransformChain([fwd_disp_el])
+                inv_chain = TransformChain([inv_disp_el])
+                whichtoinvert_inv = [False]
+    else:
+        if _do_write_tx:
+            if affine_file is not None and (initial_transform is None or init_M_phys is not None):
+                fwd_transforms = [affine_file]
+                inv_transforms = [affine_file]
+                whichtoinvert_inv = [True]
+            elif initial_transform is not None:
+                fwd_transforms = list(tx_list)
+                inv_transforms = list(tx_list)
+                whichtoinvert_inv = [True] * len(tx_list)
+            else:
+                fwd_transforms = []
+                inv_transforms = []
+                whichtoinvert_inv = []
+            fwd_chain = TransformChain.from_paths(fwd_transforms)
+            inv_chain = TransformChain.from_paths(inv_transforms, whichtoinvert_inv)
+        else:
+            fwd_transforms = []
+            inv_transforms = []
+            if has_resolved_linear and (initial_transform is None or init_M_phys is not None):
+                fwd_chain = TransformChain([TransformElement.from_affine(M_phys_export, t_phys_export, invert=False)])
+                inv_chain = TransformChain([TransformElement.from_affine(M_phys_export, t_phys_export, invert=True)])
+                whichtoinvert_inv = [True]
+            elif initial_transform is not None and tx_list:
+                fwd_chain = TransformChain.from_paths(tx_list)
+                inv_chain = TransformChain.from_paths(tx_list, [True] * len(tx_list))
+                whichtoinvert_inv = [True] * len(tx_list)
+            else:
+                whichtoinvert_inv = []
     
     inverse_identity_errors = {}
     if not midpoint_only and _has_init_warp and total_fwd_deformable is not None and total_inv_deformable is not None:
@@ -4374,7 +4477,24 @@ def registration(
             del w_l2r, w_l2r_inv, w_r2l, w_r2l_inv
         
     # 6. Apply transforms to generate warped output images
-    _need_midpoint_export = bool(_has_midpoint_warps and (export_midpoint or midpoint_only))
+    _need_midpoint_export = bool(_has_midpoint_warps and ((export_midpoint and _do_write_tx) or midpoint_only))
+    if (
+        not _need_midpoint_export
+        and _has_midpoint_warps
+        and backend == 'pytorch'
+        and int(np.prod(fixed_primary.shape)) >= 4_194_304
+    ):
+        import torch
+        if model.midpoint_warp_l2r.device.type != 'cpu':
+            model.midpoint_warp_l2r = torch.nn.Parameter(
+                model.midpoint_warp_l2r.detach().cpu(), requires_grad=False
+            )
+            model.midpoint_warp_l2r.is_physical = True
+        if model.midpoint_warp_r2l.device.type != 'cpu':
+            model.midpoint_warp_r2l = torch.nn.Parameter(
+                model.midpoint_warp_r2l.detach().cpu(), requires_grad=False
+            )
+            model.midpoint_warp_r2l.is_physical = True
     _can_wrap_cf = (
         bool(return_warped)
         and not _skip_full_warps
@@ -4406,8 +4526,9 @@ def registration(
             _mov_cf = _ContinuousField(moving_primary, device=_cf_dev, dtype=torch.float32)
 
     if return_warped and not _skip_full_warps:
+        _fwd_tx_apply = fwd_transforms if _do_write_tx else fwd_chain
         warpedmovout = _apply_transforms(
-            fixed=fixed_primary, moving=moving_primary, transformlist=fwd_transforms, device=_apply_dev, _moving_field=_mov_cf
+            fixed=fixed_primary, moving=moving_primary, transformlist=_fwd_tx_apply, device=_apply_dev, _moving_field=_mov_cf
         )
         if not _need_midpoint_export:
             del _mov_cf
@@ -4424,10 +4545,16 @@ def registration(
                 )
             elif _can_reuse_cf:
                 _fix_cf = _ContinuousField(fixed_primary, device=_cf_dev, dtype=torch.float32)
-        warpedfixout = _apply_transforms(
-            fixed=moving_primary, moving=fixed_primary, transformlist=inv_transforms,
-            whichtoinvert=whichtoinvert_inv, device=_apply_dev, _moving_field=_fix_cf,
-        )
+        if _do_write_tx:
+            warpedfixout = _apply_transforms(
+                fixed=moving_primary, moving=fixed_primary, transformlist=inv_transforms,
+                whichtoinvert=whichtoinvert_inv, device=_apply_dev, _moving_field=_fix_cf,
+            )
+        else:
+            warpedfixout = _apply_transforms(
+                fixed=moving_primary, moving=fixed_primary, transformlist=inv_chain,
+                device=_apply_dev, _moving_field=_fix_cf,
+            )
         if not _need_midpoint_export:
             del _fix_cf
             _fix_cf = None
@@ -4481,6 +4608,14 @@ def registration(
                 midpoint_moving = _apply_transforms(
                     fixed=fixed_primary, moving=moving_primary, transformlist=[inv_midpoint_warp, affine_file], device=_apply_dev, _moving_field=_mov_cf
                 )
+            elif not _do_write_tx and has_resolved_linear and (initial_transform is None or init_M_phys is not None):
+                _mid_mov_chain = TransformChain([
+                    TransformChain.from_paths([inv_midpoint_warp]).elements[0],
+                    TransformElement.from_affine(M_phys_export, t_phys_export, invert=False),
+                ])
+                midpoint_moving = _apply_transforms(
+                    fixed=fixed_primary, moving=moving_primary, transformlist=_mid_mov_chain, device=_apply_dev, _moving_field=_mov_cf
+                )
             elif initial_transform is not None:
                 midpoint_moving = _apply_transforms(
                     fixed=fixed_primary, moving=moving_primary, transformlist=[inv_midpoint_warp] + tx_list, device=_apply_dev, _moving_field=_mov_cf
@@ -4505,6 +4640,8 @@ def registration(
         'fwdtransforms': fwd_transforms,
         'invtransforms': inv_transforms,
         'whichtoinvert_inv': whichtoinvert_inv,
+        'fwd_chain': fwd_chain,
+        'inv_chain': inv_chain,
         'syn_losses': list(model.syn_losses) if hasattr(model, 'syn_losses') else [],
         'convergence': model.stop.summary() if hasattr(model, 'stop') else None,
         'affine_losses': list(model.affine_losses) if hasattr(model, 'affine_losses') else [],

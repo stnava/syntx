@@ -1313,11 +1313,9 @@ def _unfold_field_adaptive_smooth(
 
     for p_idx in range(max_passes):
         rem_defects = (det_min_cur < float(jac_floor)) | cur_ice_defects
-        if not bool(rem_defects.any().item()):
-            break
         rad_p = int(dilation_radius) + min(p_idx // 2, 1)
         act_mask = _dilate_mask_nd(rem_defects, rad_p) & dom_b
-        if not bool(act_mask.any().item()):
+        if not bool((rem_defects.any() & act_mask.any()).item()):
             break
 
         stencil = _build_sparse_dual_fd_stencil(
@@ -1325,13 +1323,15 @@ def _unfold_field_adaptive_smooth(
         )
         sten_flat = stencil["sten_flat"]
         sten_prev = det_min_cur.view(-1)[sten_flat].clone()
-        init_min_sten = float(sten_prev.amin().item()) if sten_prev.numel() > 0 else float("inf")
+        sten_min_t = (
+            sten_prev.amin() if sten_prev.numel() > 0 else det_min_cur.new_full((), float("inf"))
+        )
         if sten_flat.shape[0] < det_min_cur.numel():
             det_min_cur.view(-1)[sten_flat] = float("inf")
-            ext_min = float(det_min_cur.amin().item())
+            ext_min_u_t = det_min_cur.amin()
             det_min_cur.view(-1)[sten_flat] = sten_prev
         else:
-            ext_min = float("inf")
+            ext_min_u_t = det_min_cur.new_full((), float("inf"))
 
         u_base_pool = u_cur.reshape(-1, dim)[stencil["pool_flat"]].clone()
         row_bases = _precompute_sparse_row_bases(
@@ -1342,7 +1342,6 @@ def _unfold_field_adaptive_smooth(
             u_cur.reshape(-1, dim)[act_flat] - orig_flat[act_flat]
         ).contiguous()
 
-        init_v_ice = 0.0
         strict_ice_u = float(ice_tol) if ice_strict_tol is None else float(ice_strict_tol)
         if use_partner:
             ice_flat = act_flat
@@ -1357,7 +1356,9 @@ def _unfold_field_adaptive_smooth(
             )
             r0_p = (u_ice_base + py0_p) @ err_to_vox_mat
             n0_p = (torch.sqrt((r0_p * r0_p).sum(dim=-1) + 1e-12) - 1e-6) * iny0_p
-            init_v_ice = float(F.relu(n0_p - strict_ice_u).amax().item()) if n0_p.numel() > 0 else 0.0
+            init_vice_t = F.relu(n0_p - strict_ice_u).amax() if n0_p.numel() > 0 else det_min_cur.new_zeros(())
+        else:
+            init_vice_t = det_min_cur.new_zeros(())
 
         n_act = int(act_flat.shape[0])
         if int(steps) >= 8 and n_act > 40_000 and p_idx == 0:
@@ -1377,13 +1378,10 @@ def _unfold_field_adaptive_smooth(
         mem_scale = 0.15 if use_partner else 0.35
         anc_scale = 0.25 * float(anchor_weight)
 
-        init_min_tot = min(ext_min, init_min_sten)
-        ext_min_u_t = torch.tensor(ext_min, device=device, dtype=dtype)
-        best_min_t = torch.tensor(init_min_tot, device=device, dtype=dtype)
-        best_feas_t = torch.tensor(init_min_tot >= float(jac_floor), device=device, dtype=torch.bool)
-        best_vice_t = torch.tensor(
-            init_v_ice if (init_min_tot >= float(jac_floor)) else 1e9, device=device, dtype=dtype
-        )
+        init_min_tot_t = torch.minimum(ext_min_u_t, sten_min_t)
+        best_min_t = init_min_tot_t.clone()
+        best_feas_t = init_min_tot_t >= float(jac_floor)
+        best_vice_t = torch.where(best_feas_t, init_vice_t, det_min_cur.new_full((), 1e9))
         imp_t = torch.tensor(False, device=device, dtype=torch.bool)
         ever_done_u = torch.tensor(False, device=device, dtype=torch.bool)
         jac_fl_t = float(jac_floor)
@@ -1454,7 +1452,7 @@ def _unfold_field_adaptive_smooth(
                     best_min_t = torch.where(take, s_min_t, best_min_t)
                     imp_t = imp_t | take
                     ever_done_u = ever_done_u | done_u
-                    if (_it & 7) == 7 or _it == iters_p - 1:
+                    if (_it & 31) == 31 or _it == iters_p - 1:
                         if bool(ever_done_u.item()):
                             break
 
@@ -1504,7 +1502,7 @@ def _unfold_field_adaptive_smooth(
                 sched.step()
 
         moved_act = best_df.abs().amax(dim=-1) > 1e-7
-        if bool(imp_t.item()) and bool(moved_act.any().item()):
+        if bool((imp_t & moved_act.any()).item()):
             u_cur.view(-1, dim).index_add_(0, act_flat[moved_act], best_df[moved_act])
             ever_active.view(-1)[act_flat[moved_act]] = True
             steps_taken += 1
@@ -1518,7 +1516,7 @@ def _unfold_field_adaptive_smooth(
             )
             dmin_end = torch.minimum(d2_end, d4_end) if include_4th else d2_end
             det_min_cur.view(-1)[stencil["sten_flat"]] = dmin_end
-            cur_global_min = min(ext_min, float(dmin_end.amin().item()))
+            cur_min_t = torch.minimum(ext_min_u_t, dmin_end.amin())
             if use_partner:
                 u_ice_end = u_cur.reshape(-1, dim)[ice_flat]
                 yv_e = (X_ice + u_ice_end) @ A_to_vox + b_to_vox
@@ -1530,11 +1528,17 @@ def _unfold_field_adaptive_smooth(
                 n_e = (torch.sqrt((r_e * r_e).sum(dim=-1) + 1e-12) - 1e-6) * iny_e
                 still_ice = n_e > strict_ice_u
                 cur_ice_defects.zero_()
-                if bool(still_ice.any().item()):
+                _min_val, _has_ice_f = torch.stack(
+                    [cur_min_t, still_ice.any().to(cur_min_t.dtype)]
+                ).tolist()
+                cur_global_min = float(_min_val)
+                has_still_ice = float(_has_ice_f) > 0.5
+                if has_still_ice:
                     cur_ice_defects.view(-1)[ice_flat[still_ice]] = True
-                if cur_global_min >= float(jac_floor) and not bool(still_ice.any().item()):
+                if cur_global_min >= float(jac_floor) and not has_still_ice:
                     break
             else:
+                cur_global_min = float(cur_min_t.item())
                 if cur_global_min >= float(jac_floor):
                     break
         else:

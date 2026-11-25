@@ -49,7 +49,10 @@ def compute_bidirectional_dice(fl, ml, fi, mi, fwdtransforms, invtransforms, whi
         Mean Dice in fixed space, in moving space, and their average.
     """
     if whichtoinvert_inv is None:
-        whichtoinvert_inv = [True] + [False] * (len(invtransforms) - 1) if len(invtransforms) > 0 else []
+        if hasattr(invtransforms, 'whichtoinvert'):
+            whichtoinvert_inv = invtransforms.whichtoinvert()
+        else:
+            whichtoinvert_inv = [True] + [False] * (len(invtransforms) - 1) if len(invtransforms) > 0 else []
     # copies carrying the geometry of their images, for both directions (inputs untouched)
     fl, ml = fl.clone(), ml.clone()
     for lab, img in ((fl, fi), (ml, mi)):

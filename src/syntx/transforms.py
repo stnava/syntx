@@ -20,7 +20,7 @@ Provides drop-in Torch/MPS/CUDA implementations of the ANTsPy transform API:
 from __future__ import annotations
 
 from collections.abc import Iterable, Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field as dc_field, replace
 import os
 from typing import Any, Literal
 
@@ -244,11 +244,174 @@ class ContinuousField:
 # 2. Transform Elements & TransformChain
 # ==============================================================================
 
+_NEXT_MEM_TX_ID: int = 0
+
+
+def _alloc_mem_tx_id() -> int:
+    global _NEXT_MEM_TX_ID
+    _NEXT_MEM_TX_ID += 1
+    return _NEXT_MEM_TX_ID
+
+
 @dataclass(frozen=True)
 class TransformElement:
-    path: str
-    kind: Kind
+    path: str = "<memory>"
+    kind: Kind = "identity"
     invert: bool = False
+    matrix: np.ndarray | None = dc_field(default=None, repr=False, compare=False, hash=False)
+    offset: np.ndarray | None = dc_field(default=None, repr=False, compare=False, hash=False)
+    field: ContinuousField | None = dc_field(default=None, repr=False, compare=False, hash=False)
+    grad_field: ContinuousField | None = dc_field(default=None, repr=False, compare=False, hash=False)
+    disp_2d_yx: torch.Tensor | None = dc_field(default=None, repr=False, compare=False, hash=False)
+    ref_meta_2d: dict[str, Any] | None = dc_field(default=None, repr=False, compare=False, hash=False)
+    cache_token: int | None = dc_field(default=None, repr=False)
+
+    @classmethod
+    def from_affine(
+        cls,
+        M_phys: Any,
+        t_phys: Any,
+        *,
+        invert: bool = False,
+        kind: Kind = "affine",
+        path: str = "<memory>",
+    ) -> TransformElement:
+        """Construct an in-memory physical linear transform ``y = M_phys @ x + t_phys`` (or its inverse when ``invert=True``)."""
+        m_arr = (
+            M_phys.detach().cpu().numpy().astype(np.float64)
+            if isinstance(M_phys, torch.Tensor)
+            else np.asarray(M_phys, dtype=np.float64)
+        )
+        t_arr = (
+            t_phys.detach().cpu().numpy().astype(np.float64)
+            if isinstance(t_phys, torch.Tensor)
+            else np.asarray(t_phys, dtype=np.float64)
+        )
+        return cls(
+            path=str(path),
+            kind=kind,
+            invert=bool(invert),
+            matrix=m_arr,
+            offset=t_arr.reshape(-1),
+            cache_token=_alloc_mem_tx_id(),
+        )
+
+    @classmethod
+    def from_disp_tensor(
+        cls,
+        disp_zyx: Any,
+        reference: Any,
+        *,
+        kind: Kind = "displacement",
+        path: str = "<memory>",
+    ) -> TransformElement:
+        """Construct a GPU-resident displacement ``TransformElement`` from a ``(1, *spatial_zyx, dim)``
+        or ``(*spatial_zyx, dim)`` tensor in reversed ``(dz, dy, dx)`` physical mm layout on ``reference``'s grid,
+        performing zero host copies on 3-D volumes."""
+        t = (
+            disp_zyx.detach()
+            if isinstance(disp_zyx, torch.Tensor)
+            else torch.as_tensor(np.asarray(disp_zyx, dtype=np.float32))
+        )
+        dim = int(t.shape[-1])
+        if t.ndim == dim + 1:
+            t = t.unsqueeze(0)
+        if dim == 3:
+            tensor_cdhw = torch.flip(t, dims=[-1]).movedim(-1, 1).to(dtype=torch.float32).contiguous()
+            cf = ContinuousField.from_tensor(
+                tensor_cdhw,
+                spatial_shape=tuple(int(s) for s in reference.shape[:3]),
+                origin=tuple(float(x) for x in reference.origin[:3]),
+                spacing=tuple(float(x) for x in reference.spacing[:3]),
+                direction=np.asarray(reference.direction[:3, :3], dtype=np.float64),
+                is_vector=True,
+            )
+            return cls(
+                path=str(path),
+                kind=kind,
+                invert=False,
+                field=cf,
+                cache_token=_alloc_mem_tx_id(),
+            )
+        if dim == 2:
+            meta2 = {
+                "shape": tuple(int(s) for s in reference.shape[:2]),
+                "origin": tuple(float(x) for x in reference.origin[:2]),
+                "spacing": tuple(float(x) for x in reference.spacing[:2]),
+                "direction": np.asarray(reference.direction[:2, :2], dtype=np.float64),
+            }
+            return cls(
+                path=str(path),
+                kind=kind,
+                invert=False,
+                disp_2d_yx=t.to(dtype=torch.float32).contiguous(),
+                ref_meta_2d=meta2,
+                cache_token=_alloc_mem_tx_id(),
+            )
+        raise ValueError(f"TransformElement.from_disp_tensor supports 2D or 3D fields, got dim={dim}")
+
+    def is_in_memory(self) -> bool:
+        return self.matrix is not None or self.field is not None or self.disp_2d_yx is not None
+
+    def disp_tensor_zyx(self, device: Any | None = None) -> torch.Tensor:
+        """Return the ``(1, *spatial_zyx, dim)`` physical mm displacement tensor in ``(dz, dy, dx)`` component order."""
+        if self.field is not None:
+            t = torch.flip(self.field.tensor.movedim(1, -1), dims=[-1]).contiguous()
+            if device is not None:
+                t = t.to(device=device, dtype=torch.float32)
+            return t
+        if self.disp_2d_yx is not None:
+            t = self.disp_2d_yx
+            if device is not None:
+                t = t.to(device=device, dtype=torch.float32)
+            return t
+        import ants
+        from .spatial import disp_itk_to_tensor
+
+        disp_img = ants.image_read(self.path)
+        return disp_itk_to_tensor(disp_img, device=device)
+
+    def to_ants_image(self) -> Any:
+        """Materialize a displacement ``TransformElement`` into an ``ants.ANTsImage`` (`has_components=True`)."""
+        import ants
+        from .spatial import disp_tensor_to_itk
+
+        if self.field is not None:
+            arr_xyz = self.field.tensor[0].permute(3, 2, 1, 0).contiguous().detach().cpu().numpy().astype(np.float32, copy=False)
+            return ants.from_numpy(
+                arr_xyz,
+                origin=self.field.origin,
+                spacing=self.field.spacing,
+                direction=self.field.direction,
+                has_components=True,
+            )
+        if self.disp_2d_yx is not None and self.ref_meta_2d is not None:
+            ref2 = ants.from_numpy(
+                np.zeros(self.ref_meta_2d["shape"], dtype=np.float32),
+                origin=self.ref_meta_2d["origin"],
+                spacing=self.ref_meta_2d["spacing"],
+                direction=self.ref_meta_2d["direction"],
+            )
+            return disp_tensor_to_itk(self.disp_2d_yx, ref2)
+        return ants.image_read(self.path)
+
+    def to_ants_transform(self) -> Any:
+        """Materialize a linear ``TransformElement`` into an ``ants.ANTsTransform``."""
+        import ants
+
+        if self.matrix is not None and self.offset is not None:
+            m = np.asarray(self.matrix, dtype=np.float64)
+            b = np.asarray(self.offset, dtype=np.float64)
+            if self.invert:
+                m = np.linalg.inv(m)
+                b = -m @ b
+            dim = int(m.shape[0])
+            tx = ants.create_ants_transform(transform_type="AffineTransform", precision="float", dimension=dim)
+            tx.set_parameters(np.concatenate([m.ravel(), b]))
+            tx.set_fixed_parameters(np.zeros(dim, dtype=np.float64))
+            return tx
+        tx = ants.read_transform(self.path)
+        return tx.invert() if self.invert else tx
 
 
 def classify_transform(path: str) -> Kind:
@@ -272,12 +435,14 @@ def classify_transform(path: str) -> Kind:
 
 
 def _resolve_whichtoinvert(
-    tl: list[str],
+    tl: Sequence[Any],
     whichtoinvert: Iterable[bool] | None,
 ) -> list[bool]:
     """Match ANTsPy's default whichtoinvert convention: if whichtoinvert is None and
     transformlist is a 2-element ['.mat', warp], default to [True, False]; else [False]*len."""
     if whichtoinvert is None:
+        if all(isinstance(x, TransformElement) for x in tl):
+            return [bool(x.invert) for x in tl]
         if len(tl) == 2 and (".mat" in str(tl[0])) and (".mat" not in str(tl[1])) and str(tl[1]).lower() != "identity":
             return [True, False]
         return [False] * len(tl)
@@ -287,28 +452,60 @@ def _resolve_whichtoinvert(
     return inv
 
 
+def _resolve_element_linear(element: TransformElement) -> tuple[np.ndarray, np.ndarray]:
+    """Return ``(M, b)`` with ``y = M @ x + b`` for a linear ``TransformElement`` (in-memory or on disk)."""
+    if element.matrix is not None and element.offset is not None:
+        m = np.asarray(element.matrix, dtype=np.float64)
+        b = np.asarray(element.offset, dtype=np.float64)
+        if element.invert:
+            m_inv = np.linalg.inv(m)
+            return m_inv, -m_inv @ b
+        return m, b
+    return _read_itk_affine(element.path, invert=element.invert)
+
+
 @dataclass
 class TransformChain:
     """Ordered list of transforms in ANTs *application* order (first applied last, as ants.apply_transforms expects)."""
 
-    elements: list[TransformElement] = field(default_factory=list)
+    elements: list[TransformElement] = dc_field(default_factory=list)
 
     @classmethod
-    def from_paths(cls, paths: Iterable[str], whichtoinvert: Iterable[bool] | None = None) -> TransformChain:
-        paths_list = [str(p) for p in paths]
-        inv = [False] * len(paths_list) if whichtoinvert is None else [bool(x) for x in whichtoinvert]
-        if len(inv) != len(paths_list):
+    def from_paths(cls, paths: Iterable[Any], whichtoinvert: Iterable[bool] | None = None) -> TransformChain:
+        items = list(paths)
+        if not items:
+            return cls([])
+        inv = (
+            [bool(e.invert) if isinstance(e, TransformElement) else False for e in items]
+            if whichtoinvert is None
+            else [bool(x) for x in whichtoinvert]
+        )
+        if len(inv) != len(items):
             raise ValueError("whichtoinvert must match paths")
-        return cls([TransformElement(p, classify_transform(p), bool(i)) for p, i in zip(paths_list, inv, strict=True)])
+        elems: list[TransformElement] = []
+        for item, inv_flag in zip(items, inv, strict=True):
+            if isinstance(item, TransformElement):
+                elems.append(replace(item, invert=bool(inv_flag)) if item.invert != bool(inv_flag) else item)
+            else:
+                p = str(item)
+                elems.append(TransformElement(p, classify_transform(p), bool(inv_flag)))
+        return cls(elems)
 
     @classmethod
     def from_syntx(cls, result: dict[str, Any], direction: str = "fwd") -> TransformChain:
+        chain_key = "fwd_chain" if direction == "fwd" else "inv_chain"
+        mem_chain = result.get(chain_key)
+        if isinstance(mem_chain, cls):
+            return mem_chain
         key = "fwdtransforms" if direction == "fwd" else "invtransforms"
         inv = result.get("whichtoinvert_inv") if direction == "inv" else None
         return cls.from_paths(result.get(key, []), inv)
 
     def __len__(self) -> int:
         return len(self.elements)
+
+    def has_in_memory(self) -> bool:
+        return any(e.is_in_memory() for e in self.elements)
 
     def paths(self) -> list[str]:
         return [e.path for e in self.elements]
@@ -329,9 +526,54 @@ class TransformChain:
         """
         m = np.eye(3)
         for e in self.linear_elements():
-            a, _ = _read_itk_affine(e.path, invert=e.invert)
+            a, _ = _resolve_element_linear(e)
             m = a @ m
         return m
+
+    def save(self, outprefix: str, compresslevel: int = 4) -> list[str]:
+        """Materialize all elements of this chain to disk under ``outprefix`` and return their ANTs paths."""
+        import ants
+        import shutil
+        from .spatial import export_ants_affine_transform
+
+        os.makedirs(os.path.dirname(str(outprefix)) or ".", exist_ok=True)
+        saved_paths: list[str] = []
+        disp_jobs: list[tuple[Any, str]] = []
+        n_lin = sum(1 for e in self.elements if e.kind in _LINEAR)
+        n_disp = sum(1 for e in self.elements if e.kind in ("displacement", "inverse_displacement"))
+        lin_idx = 0
+        disp_idx = 0
+        for e in self.elements:
+            if e.kind == "identity":
+                continue
+            if e.kind in _LINEAR:
+                suffix = "0GenericAffine.mat" if n_lin == 1 else f"{lin_idx}GenericAffine.mat"
+                dst = f"{outprefix}{suffix}"
+                lin_idx += 1
+                if e.matrix is not None and e.offset is not None:
+                    dim = int(e.matrix.shape[0])
+                    export_ants_affine_transform(e.matrix, e.offset, dim=dim, filename=dst)
+                elif os.path.exists(e.path) and os.path.abspath(e.path) != os.path.abspath(dst):
+                    shutil.copyfile(e.path, dst)
+                elif not os.path.exists(e.path):
+                    tx = e.to_ants_transform()
+                    ants.write_transform(tx, dst)
+                saved_paths.append(dst)
+            else:
+                if e.kind == "inverse_displacement":
+                    suffix = "1InverseWarp.nii.gz" if n_disp == 1 else f"{disp_idx + 1}InverseWarp.nii.gz"
+                else:
+                    suffix = "1Warp.nii.gz" if n_disp == 1 else f"{disp_idx + 1}Warp.nii.gz"
+                dst = f"{outprefix}{suffix}"
+                disp_idx += 1
+                if e.field is not None or e.disp_2d_yx is not None:
+                    disp_jobs.append((e.to_ants_image(), dst))
+                elif os.path.exists(e.path) and os.path.abspath(e.path) != os.path.abspath(dst):
+                    shutil.copyfile(e.path, dst)
+                saved_paths.append(dst)
+        if disp_jobs:
+            _write_ants_images_fast(disp_jobs, compresslevel=compresslevel)
+        return saved_paths
 
     def apply(
         self,
@@ -342,8 +584,10 @@ class TransformChain:
         defaultvalue: float = 0.0,
         device: str | None = None,
         _moving_field: ContinuousField | None = None,
+        return_tensor: bool = False,
     ) -> Any:
         import ants
+        import tempfile
 
         if imagetype == 3 and len(image.shape) == 4 and len(reference.shape) == 3:
             return _apply_timeseries_4d(
@@ -356,8 +600,24 @@ class TransformChain:
             )
 
         def _ants_path():
-            # ANTsPy has no 'identity' transform name: drop the identity entries; a chain of nothing else is a plain resample
-            real = [(p_, inv) for p_, inv in zip(self.paths(), self.whichtoinvert()) if str(p_).lower() != "identity"]
+            if self.has_in_memory():
+                with tempfile.TemporaryDirectory(prefix="syntx_memchain_") as tmpd:
+                    disk_paths = self.save(os.path.join(tmpd, "tx_"), compresslevel=1)
+                    non_id_invs = [e.invert for e in self.elements if e.kind != "identity"]
+                    if disk_paths:
+                        return ants.apply_transforms(
+                            fixed=reference,
+                            moving=image,
+                            transformlist=disk_paths,
+                            whichtoinvert=non_id_invs,
+                            interpolator=interpolator,
+                            imagetype=imagetype,
+                            defaultvalue=defaultvalue,
+                        )
+                real = []
+            else:
+                # ANTsPy has no 'identity' transform name: drop the identity entries; a chain of nothing else is a plain resample
+                real = [(p_, inv) for p_, inv in zip(self.paths(), self.whichtoinvert()) if str(p_).lower() != "identity"]
             if not real:
                 return ants.resample_image_to_target(image, reference, interp_type=interpolator, imagetype=imagetype)
             return ants.apply_transforms(
@@ -371,7 +631,13 @@ class TransformChain:
             )
 
         if len(image.shape) != 3 or len(reference.shape) != 3:
-            return _ants_path()
+            out_img = _ants_path()
+            if return_tensor:
+                from .spatial import image_to_tensor
+
+                dev_t = torch.device(resolve_device(device, task="model"))
+                return image_to_tensor(out_img, device=dev_t, to_zyx=True)
+            return out_img
 
         interp_lower = interpolator.lower()
         if interp_lower in ("linear", "bilinear", "trilinear"):
@@ -383,7 +649,13 @@ class TransformChain:
         elif interp_lower == "bspline":
             mode = "bspline"
         else:
-            return _ants_path()
+            out_img = _ants_path()
+            if return_tensor:
+                from .spatial import image_to_tensor
+
+                dev_t = torch.device(resolve_device(device, task="model"))
+                return image_to_tensor(out_img, device=dev_t, to_zyx=True)
+            return out_img
 
         dev_str = resolve_device(device, task="model")
         dev = torch.device(dev_str)
@@ -411,10 +683,14 @@ class TransformChain:
         max_single_shot_vox = _MAX_GPU_CACHE_VOXELS * 4
         if str(dev) != "cpu" and mode != "bspline" and n_ref_vox > max_single_shot_vox:
             field = (
-            _moving_field
-            if (_moving_field is not None and _moving_field.device.type == dev.type and (_moving_field.device.index or 0) == (dev.index or 0))
-            else ContinuousField(image, device=dev, dtype=torch.float32)
-        )
+                _moving_field
+                if (
+                    _moving_field is not None
+                    and _moving_field.device.type == dev.type
+                    and ((_moving_field.device.index or 0) == (dev.index or 0) if dev.type != "cpu" else True)
+                )
+                else ContinuousField(image, device=dev, dtype=torch.float32)
+            )
             local_disp_cache: dict[tuple[str, float, str], ContinuousField] = {}
             arr_out = np.empty(ref_shape, dtype=np.float32)
             slab_x = max(1, max_single_shot_vox // max(1, int(ref_shape[1]) * int(ref_shape[2])))
@@ -435,6 +711,15 @@ class TransformChain:
             finally:
                 local_disp_cache.clear()
                 del local_disp_cache, field
+            if return_tensor:
+                return (
+                    torch.from_numpy(arr_out)
+                    .to(device=dev, dtype=torch.float32)
+                    .permute(2, 1, 0)
+                    .contiguous()
+                    .unsqueeze(0)
+                    .unsqueeze(0)
+                )
             return reference.new_image_like(arr_out)
 
         ref_sig = (
@@ -444,7 +729,14 @@ class TransformChain:
             tuple(float(x) for x in np.asarray(reference.direction)[:3, :3].ravel()),
         )
         chain_sig = tuple(
-            (e.path, e.kind, e.invert, os.path.getmtime(e.path) if os.path.exists(e.path) else 0.0)
+            (
+                e.path,
+                e.kind,
+                e.invert,
+                float(e.cache_token)
+                if e.cache_token is not None
+                else (os.path.getmtime(e.path) if os.path.exists(e.path) else 0.0),
+            )
             for e in self.elements
         )
         cache_key = (ref_sig, chain_sig, str(dev))
@@ -453,7 +745,7 @@ class TransformChain:
             pts_fixed = _reference_grid_points_lps(reference, dev)
             pts_moving = _map_points_to_moving_tensor(pts_fixed, self, dev)
             del pts_fixed
-            if str(dev) == "cpu" or pts_moving.shape[0] <= _MAX_GPU_CACHE_VOXELS:
+            if (not self.has_in_memory()) and (str(dev) == "cpu" or pts_moving.shape[0] <= _MAX_GPU_CACHE_VOXELS):
                 max_grid_entries = 4
                 while len(_MAPPED_GRID_CACHE) >= max_grid_entries:
                     _MAPPED_GRID_CACHE.pop(next(iter(_MAPPED_GRID_CACHE)))
@@ -461,11 +753,17 @@ class TransformChain:
 
         field = (
             _moving_field
-            if (_moving_field is not None and _moving_field.device.type == dev.type and (_moving_field.device.index or 0) == (dev.index or 0))
+            if (
+                _moving_field is not None
+                and _moving_field.device.type == dev.type
+                and ((_moving_field.device.index or 0) == (dev.index or 0) if dev.type != "cpu" else True)
+            )
             else ContinuousField(image, device=dev, dtype=torch.float32)
         )
         out = _sample_field_itk(field, pts_moving, mode=mode, defaultvalue=defaultvalue)
         del field, pts_moving
+        if return_tensor:
+            return out.reshape(ref_shape).permute(2, 1, 0).contiguous().unsqueeze(0).unsqueeze(0)
         arr_out = out.reshape(ref_shape).detach().cpu().numpy().astype(np.float32, copy=False)
         del out
         return reference.new_image_like(arr_out)
@@ -486,6 +784,37 @@ _DISP_GRAD_CACHE: dict[tuple[str, float, str], Any] = {}
 _DISP_IMG_CACHE: dict[tuple[str, int, int], Any] = {}
 _MAPPED_GRID_CACHE: dict[tuple[Any, ...], Any] = {}
 _BSPLINE_PREFILTER_CACHE: dict[tuple[int, str, torch.dtype], torch.Tensor] = {}
+
+
+def clear_transform_gpu_caches(max_voxels: int = 4_194_304) -> None:
+    """Evict cached GPU displacement fields, gradients, and mapped coordinate grids with ``>= max_voxels`` voxels."""
+    if max_voxels <= 0:
+        _DISP_FIELD_CACHE.clear()
+        _DISP_GRAD_CACHE.clear()
+        _MAPPED_GRID_CACHE.clear()
+        return
+    for k in [
+        k
+        for k, cf in list(_DISP_FIELD_CACHE.items())
+        if getattr(cf, "device", None) is not None
+        and cf.device.type != "cpu"
+        and int(np.prod(getattr(cf, "spatial_shape", (1,)))) >= max_voxels
+    ]:
+        _DISP_FIELD_CACHE.pop(k, None)
+    for k in [
+        k
+        for k, gf in list(_DISP_GRAD_CACHE.items())
+        if getattr(gf, "device", None) is not None
+        and gf.device.type != "cpu"
+        and int(np.prod(getattr(gf, "spatial_shape", (1,)))) >= max_voxels
+    ]:
+        _DISP_GRAD_CACHE.pop(k, None)
+    for k in [
+        k
+        for k, pts in list(_MAPPED_GRID_CACHE.items())
+        if isinstance(pts, torch.Tensor) and pts.device.type != "cpu" and int(pts.shape[0]) >= max_voxels
+    ]:
+        _MAPPED_GRID_CACHE.pop(k, None)
 
 
 def _write_ants_images_fast(
@@ -930,8 +1259,41 @@ def _fd4_axis_cdhw(x: torch.Tensor, ax: int) -> torch.Tensor:
     return d1.mul_(4.0).sub_(d2).mul_(1.0 / 3.0)
 
 
+def _build_grad_field_from_disp_field(field: ContinuousField, dev: torch.device) -> ContinuousField:
+    t = field.tensor[0]  # (3, Nz, Ny, Nx) in (ux, uy, uz) component order
+    _, nz, ny, nx = t.shape
+    du_didx = torch.empty((3, 3, nz, ny, nx), device=dev, dtype=torch.float32)
+    du_didx[:, 0] = _fd4_axis_cdhw(t, 3)
+    du_didx[:, 1] = _fd4_axis_cdhw(t, 2)
+    du_didx[:, 2] = _fd4_axis_cdhw(t, 1)
+    if nz >= 2:
+        du_didx[:, :, 0, :, :] = 0.0
+        du_didx[:, :, -1, :, :] = 0.0
+    if ny >= 2:
+        du_didx[:, :, :, 0, :] = 0.0
+        du_didx[:, :, :, -1, :] = 0.0
+    if nx >= 2:
+        du_didx[:, :, :, :, 0] = 0.0
+        du_didx[:, :, :, :, -1] = 0.0
+    d_mat = np.asarray(field.direction, dtype=np.float64)[:3, :3]
+    s_vec = np.asarray(field.spacing, dtype=np.float64)[:3]
+    ds_inv = np.linalg.inv(d_mat @ np.diag(s_vec)).astype(np.float32)
+    ds_inv_t = torch.as_tensor(ds_inv, device=dev, dtype=torch.float32)
+    # Contract derivative axis d: grad_phys[c, k, n] = sum_d ds_inv_T[k, d] * du_didx[c, d, n]
+    grad_cdhw = torch.matmul(ds_inv_t.T.unsqueeze(0), du_didx.view(3, 3, -1)).view(1, 9, nz, ny, nx)
+    del du_didx, ds_inv_t
+    return ContinuousField.from_tensor(
+        grad_cdhw,
+        spatial_shape=field.spatial_shape,
+        origin=field.origin,
+        spacing=field.spacing,
+        direction=field.direction,
+        is_vector=True,
+    )
+
+
 def _get_disp_and_grad_fields(
-    path: str,
+    path_or_element: str | TransformElement,
     device: Any,
     local_disp_grad_cache: dict[tuple[str, float, str], tuple[ContinuousField, ContinuousField]] | None = None,
 ) -> tuple[ContinuousField, ContinuousField]:
@@ -941,6 +1303,25 @@ def _get_disp_and_grad_fields(
     import ants
 
     dev = device if isinstance(device, torch.device) else torch.device(device)
+    if isinstance(path_or_element, TransformElement) and path_or_element.field is not None:
+        field = path_or_element.field
+        if field.device.type != dev.type or ((field.device.index or 0) != (dev.index or 0) if dev.type != "cpu" else False):
+            field = ContinuousField.from_tensor(
+                field.tensor.to(device=dev, dtype=torch.float32),
+                spatial_shape=field.spatial_shape,
+                origin=field.origin,
+                spacing=field.spacing,
+                direction=field.direction,
+                is_vector=field.is_vector,
+            )
+        grad_field = path_or_element.grad_field
+        if grad_field is None or grad_field.device.type != dev.type or (
+            (grad_field.device.index or 0) != (dev.index or 0) if dev.type != "cpu" else False
+        ):
+            grad_field = _build_grad_field_from_disp_field(field, dev)
+        return field, grad_field
+
+    path = path_or_element.path if isinstance(path_or_element, TransformElement) else str(path_or_element)
     mtime = os.path.getmtime(path) if os.path.exists(path) else 0.0
     key = (path, mtime, str(dev))
     if local_disp_grad_cache is not None and key in local_disp_grad_cache:
@@ -959,36 +1340,7 @@ def _get_disp_and_grad_fields(
         field = ContinuousField(disp_img, device=dev, dtype=torch.float32)
         del disp_img
     if grad_field is None:
-        t = field.tensor[0]  # (3, Nz, Ny, Nx) in (ux, uy, uz) component order
-        _, nz, ny, nx = t.shape
-        du_didx = torch.empty((3, 3, nz, ny, nx), device=dev, dtype=torch.float32)
-        du_didx[:, 0] = _fd4_axis_cdhw(t, 3)
-        du_didx[:, 1] = _fd4_axis_cdhw(t, 2)
-        du_didx[:, 2] = _fd4_axis_cdhw(t, 1)
-        if nz >= 2:
-            du_didx[:, :, 0, :, :] = 0.0
-            du_didx[:, :, -1, :, :] = 0.0
-        if ny >= 2:
-            du_didx[:, :, :, 0, :] = 0.0
-            du_didx[:, :, :, -1, :] = 0.0
-        if nx >= 2:
-            du_didx[:, :, :, :, 0] = 0.0
-            du_didx[:, :, :, :, -1] = 0.0
-        d_mat = np.asarray(field.direction, dtype=np.float64)[:3, :3]
-        s_vec = np.asarray(field.spacing, dtype=np.float64)[:3]
-        ds_inv = np.linalg.inv(d_mat @ np.diag(s_vec)).astype(np.float32)
-        ds_inv_t = torch.as_tensor(ds_inv, device=dev, dtype=torch.float32)
-        # Contract derivative axis d: grad_phys[c, k, n] = sum_d ds_inv_T[k, d] * du_didx[c, d, n]
-        grad_cdhw = torch.matmul(ds_inv_t.T.unsqueeze(0), du_didx.view(3, 3, -1)).view(1, 9, nz, ny, nx)
-        del du_didx, ds_inv_t
-        grad_field = ContinuousField.from_tensor(
-            grad_cdhw,
-            spatial_shape=field.spatial_shape,
-            origin=field.origin,
-            spacing=field.spacing,
-            direction=field.direction,
-            is_vector=True,
-        )
+        grad_field = _build_grad_field_from_disp_field(field, dev)
         n_vox = int(np.prod(field.spatial_shape))
         if str(dev) == "cpu" or n_vox <= _MAX_GPU_CACHE_VOXELS:
             max_disp_entries = 8 if str(dev) == "cpu" else 4
@@ -1012,48 +1364,63 @@ def _map_points_to_moving_tensor(
 ) -> torch.Tensor:
     import ants
 
-    pts = points_lps.to(device=device, dtype=torch.float32)
+    dev = device if isinstance(device, torch.device) else torch.device(device)
+    pts = points_lps.to(device=dev, dtype=torch.float32)
     if pts.numel() == 0:
         return pts
     for element in chain.elements:
         if element.kind == "identity":
             continue
         if element.kind in _LINEAR:
-            M, b = _read_itk_affine(element.path, invert=element.invert)
+            M, b = _resolve_element_linear(element)
             mb_t = torch.as_tensor(
                 np.vstack([M.T, b[None, :]]).astype(np.float32, copy=False),
                 dtype=torch.float32,
-                device=device,
+                device=dev,
             )
             pts = pts @ mb_t[:3] + mb_t[3]
             del mb_t
         else:
             if element.invert:
                 raise ValueError(f"{element.path}: a displacement field cannot be inverted on the fly")
-            mtime = os.path.getmtime(element.path) if os.path.exists(element.path) else 0.0
-            disp_key = (element.path, mtime, str(device))
-            field = _DISP_FIELD_CACHE.get(disp_key)
-            if field is None and local_disp_cache is not None:
-                field = local_disp_cache.get(disp_key)
-            if field is None:
-                disp_img = None
-                try:
-                    st = os.stat(element.path)
-                    disp_img = _DISP_IMG_CACHE.get((element.path, st.st_mtime_ns, st.st_size))
-                except OSError:
-                    pass
-                if disp_img is None:
-                    disp_img = ants.image_read(element.path)
-                n_vox = int(np.prod(disp_img.shape[:3]))
-                field = ContinuousField(disp_img, device=device, dtype=torch.float32)
-                del disp_img
-                if str(device) == "cpu" or n_vox <= _MAX_GPU_CACHE_VOXELS:
-                    max_disp_entries = 8 if str(device) == "cpu" else 4
-                    while len(_DISP_FIELD_CACHE) >= max_disp_entries:
-                        _DISP_FIELD_CACHE.pop(next(iter(_DISP_FIELD_CACHE)))
-                    _DISP_FIELD_CACHE[disp_key] = field
-                elif local_disp_cache is not None:
-                    local_disp_cache[disp_key] = field
+            if element.field is not None:
+                field = element.field
+                if field.device.type != dev.type or (
+                    (field.device.index or 0) != (dev.index or 0) if dev.type != "cpu" else False
+                ):
+                    field = ContinuousField.from_tensor(
+                        field.tensor.to(device=dev, dtype=torch.float32),
+                        spatial_shape=field.spatial_shape,
+                        origin=field.origin,
+                        spacing=field.spacing,
+                        direction=field.direction,
+                        is_vector=field.is_vector,
+                    )
+            else:
+                mtime = os.path.getmtime(element.path) if os.path.exists(element.path) else 0.0
+                disp_key = (element.path, mtime, str(dev))
+                field = _DISP_FIELD_CACHE.get(disp_key)
+                if field is None and local_disp_cache is not None:
+                    field = local_disp_cache.get(disp_key)
+                if field is None:
+                    disp_img = None
+                    try:
+                        st = os.stat(element.path)
+                        disp_img = _DISP_IMG_CACHE.get((element.path, st.st_mtime_ns, st.st_size))
+                    except OSError:
+                        pass
+                    if disp_img is None:
+                        disp_img = ants.image_read(element.path)
+                    n_vox = int(np.prod(disp_img.shape[:3]))
+                    field = ContinuousField(disp_img, device=dev, dtype=torch.float32)
+                    del disp_img
+                    if str(dev) == "cpu" or n_vox <= _MAX_GPU_CACHE_VOXELS:
+                        max_disp_entries = 8 if str(dev) == "cpu" else 4
+                        while len(_DISP_FIELD_CACHE) >= max_disp_entries:
+                            _DISP_FIELD_CACHE.pop(next(iter(_DISP_FIELD_CACHE)))
+                        _DISP_FIELD_CACHE[disp_key] = field
+                    elif local_disp_cache is not None:
+                        local_disp_cache[disp_key] = field
             u = _sample_field_itk(field, pts, mode="bilinear")
             del field
             if pts is points_lps:
@@ -1082,7 +1449,7 @@ def _map_points_and_inv_jacobian_tensor(
         if element.kind == "identity":
             continue
         if element.kind in _LINEAR:
-            M, b = _read_itk_affine(element.path, invert=element.invert)
+            M, b = _resolve_element_linear(element)
             M_inv = np.linalg.inv(M)
             M_t = torch.as_tensor(M, dtype=torch.float32, device=device)
             b_t = torch.as_tensor(b, dtype=torch.float32, device=device)
@@ -1093,7 +1460,7 @@ def _map_points_and_inv_jacobian_tensor(
             if element.invert:
                 raise ValueError(f"{element.path}: a displacement field cannot be inverted on the fly")
             field, grad_field = _get_disp_and_grad_fields(
-                element.path, device, local_disp_grad_cache=local_disp_grad_cache
+                element, device, local_disp_grad_cache=local_disp_grad_cache
             )
             g = _sample_field_itk(grad_field, pts, mode="nearest").view(-1, 3, 3)
             j_step = eye.unsqueeze(0) - g
@@ -1761,6 +2128,9 @@ def apply_transforms(
     import ants
 
     _moving_field = kwargs.pop("_moving_field", None)
+    return_tensor = bool(kwargs.pop("return_tensor", False))
+    if getattr(fixed, "_is_syntx_fixed_target", False):
+        fixed = fixed.image
     is_real_images = hasattr(ants, "is_image") and ants.is_image(fixed) and ants.is_image(moving)
     if hasattr(ants.apply_transforms, "_mock_name") or not is_real_images:
         tl_pass = transformlist.paths() if isinstance(transformlist, TransformChain) else transformlist
@@ -1784,27 +2154,61 @@ def apply_transforms(
         )
 
     if isinstance(transformlist, TransformChain):
-        chain = transformlist
+        if whichtoinvert is not None:
+            inv_list = [bool(x) for x in whichtoinvert]
+            if len(inv_list) != len(transformlist.elements):
+                raise ValueError("Transform list and inversion list must be the same length")
+            if inv_list != transformlist.whichtoinvert():
+                chain = TransformChain(
+                    [replace(e, invert=inv_b) for e, inv_b in zip(transformlist.elements, inv_list, strict=True)]
+                )
+            else:
+                chain = transformlist
+        else:
+            chain = transformlist
+    elif isinstance(transformlist, TransformElement):
+        inv_flags = _resolve_whichtoinvert([transformlist], whichtoinvert)
+        chain = TransformChain.from_paths([transformlist], inv_flags)
     else:
-        tl = [transformlist] if isinstance(transformlist, str) else [str(t) for t in transformlist]
-        inv_flags = _resolve_whichtoinvert(tl, whichtoinvert)
-        chain = TransformChain.from_paths(tl, inv_flags)
+        tl_raw = [transformlist] if isinstance(transformlist, str) else list(transformlist)
+        inv_flags = _resolve_whichtoinvert(tl_raw, whichtoinvert)
+        chain = TransformChain.from_paths(tl_raw, inv_flags)
 
     if compose is not None:
         if len(fixed.shape) != 3:
-            tfn_2d = ants.apply_transforms(
-                fixed=fixed,
-                moving=moving,
-                transformlist=chain.paths(),
-                interpolator=interpolator,
-                imagetype=imagetype,
-                whichtoinvert=chain.whichtoinvert(),
-                compose=compose,
-                defaultvalue=defaultvalue,
-                singleprecision=singleprecision,
-                verbose=verbose,
-                **kwargs,
-            )
+            if chain.has_in_memory():
+                import tempfile
+
+                with tempfile.TemporaryDirectory(prefix="syntx_memcomp_") as tmpd:
+                    disk_paths = chain.save(os.path.join(tmpd, "tx_"), compresslevel=1)
+                    non_id_invs = [e.invert for e in chain.elements if e.kind != "identity"]
+                    tfn_2d = ants.apply_transforms(
+                        fixed=fixed,
+                        moving=moving,
+                        transformlist=disk_paths,
+                        interpolator=interpolator,
+                        imagetype=imagetype,
+                        whichtoinvert=non_id_invs,
+                        compose=compose,
+                        defaultvalue=defaultvalue,
+                        singleprecision=singleprecision,
+                        verbose=verbose,
+                        **kwargs,
+                    )
+            else:
+                tfn_2d = ants.apply_transforms(
+                    fixed=fixed,
+                    moving=moving,
+                    transformlist=chain.paths(),
+                    interpolator=interpolator,
+                    imagetype=imagetype,
+                    whichtoinvert=chain.whichtoinvert(),
+                    compose=compose,
+                    defaultvalue=defaultvalue,
+                    singleprecision=singleprecision,
+                    verbose=verbose,
+                    **kwargs,
+                )
             if digital_diffeomorphism and isinstance(tfn_2d, str) and os.path.exists(tfn_2d):
                 from .core.digital_diffeomorphism import enforce_digital_diffeomorphism
 
@@ -1862,7 +2266,253 @@ def apply_transforms(
         defaultvalue=defaultvalue,
         device=device,
         _moving_field=_moving_field,
+        return_tensor=return_tensor,
     )
+
+
+def _resolve_chain_arg(
+    transformlist: Any,
+    whichtoinvert: Iterable[bool] | None = None,
+) -> TransformChain:
+    if isinstance(transformlist, TransformChain):
+        if whichtoinvert is not None:
+            inv_list = [bool(x) for x in whichtoinvert]
+            if len(inv_list) != len(transformlist.elements):
+                raise ValueError("Transform list and inversion list must be the same length")
+            if inv_list != transformlist.whichtoinvert():
+                return TransformChain(
+                    [replace(e, invert=inv_b) for e, inv_b in zip(transformlist.elements, inv_list, strict=True)]
+                )
+        return transformlist
+    if isinstance(transformlist, TransformElement):
+        inv_flags = _resolve_whichtoinvert([transformlist], whichtoinvert)
+        return TransformChain.from_paths([transformlist], inv_flags)
+    tl_raw = [transformlist] if isinstance(transformlist, str) else list(transformlist)
+    inv_flags = _resolve_whichtoinvert(tl_raw, whichtoinvert)
+    return TransformChain.from_paths(tl_raw, inv_flags)
+
+
+def batch_apply_transforms(
+    fixed: Any,
+    moving_list: Sequence[Any],
+    transformlist: Any,
+    interpolator: str = "linear",
+    imagetype: int = 0,
+    whichtoinvert: Any = None,
+    defaultvalue: float = 0.0,
+    device: str | None = None,
+    *,
+    return_tensors: bool = False,
+    max_channels_per_pass: int = 8,
+) -> list[Any]:
+    """Vectorized multi-map / multi-subject GPU resampling onto ``fixed``.
+
+    Supports two population-scale workflows with exact ITK physical-space and boundary parity:
+
+    1. **Multi-map per subject** (one ``TransformChain`` or transform list applied to ``M`` maps
+       in ``moving_list``, e.g. T1w, brain mask, cortical labels, 6-tissue posteriors, thickness):
+       evaluates ``_map_points_to_moving_tensor`` and ``physical_to_normalized`` **once**, packs
+       same-geometry 3-D scalar maps into ``(1, C, Z, Y, X)`` chunks, and executes a single
+       multi-channel ``F.grid_sample`` pass.
+    2. **Multi-subject cohort** (``transformlist`` is a sequence of ``B`` ``TransformChain``s /
+       transform lists matching ``len(moving_list) == B``): builds the fixed template physical
+       LPS coordinate grid **once** on GPU and streams all ``B`` subjects without disk I/O.
+    """
+    import ants
+
+    if getattr(fixed, "_is_syntx_fixed_target", False):
+        fixed = fixed.image
+    mov_seq = list(moving_list)
+    if not mov_seq:
+        return []
+
+    is_per_item_chains = (
+        not isinstance(transformlist, (str, TransformChain, TransformElement))
+        and isinstance(transformlist, Sequence)
+        and len(transformlist) == len(mov_seq)
+        and all(isinstance(x, (TransformChain, list, tuple)) for x in transformlist)
+    )
+
+    interp_lower = str(interpolator).lower()
+    if interp_lower in ("linear", "bilinear", "trilinear"):
+        mode = "bilinear"
+    elif interp_lower in ("nearestneighbor", "nearest"):
+        mode = "nearest"
+    else:
+        mode = "fallback"
+
+    can_fast_3d = (
+        imagetype == 0
+        and mode in ("bilinear", "nearest")
+        and not hasattr(ants.apply_transforms, "_mock_name")
+        and hasattr(ants, "is_image")
+        and ants.is_image(fixed)
+        and len(fixed.shape) == 3
+        and (int(fixed.shape[0]) * int(fixed.shape[1]) * int(fixed.shape[2])) <= (_MAX_GPU_CACHE_VOXELS * 4)
+    )
+
+    if is_per_item_chains:
+        wti_seq = (
+            list(whichtoinvert)
+            if (
+                whichtoinvert is not None
+                and isinstance(whichtoinvert, Sequence)
+                and len(whichtoinvert) == len(mov_seq)
+                and (len(mov_seq) == 0 or isinstance(whichtoinvert[0], (list, tuple, np.ndarray)))
+            )
+            else [whichtoinvert] * len(mov_seq)
+        )
+        if not can_fast_3d:
+            return [
+                apply_transforms(
+                    fixed=fixed,
+                    moving=m_img,
+                    transformlist=tx_i,
+                    interpolator=interpolator,
+                    imagetype=imagetype,
+                    whichtoinvert=wti_i,
+                    defaultvalue=defaultvalue,
+                    device=device,
+                    return_tensor=return_tensors,
+                )
+                for m_img, tx_i, wti_i in zip(mov_seq, transformlist, wti_seq)
+            ]
+
+        dev = torch.device(resolve_device(device, task="model"))
+        ref_shape = tuple(int(s) for s in fixed.shape[:3])
+        pts_fixed = _reference_grid_points_lps(fixed, dev)
+        results_b: list[Any] = []
+        for m_img, tx_i, wti_i in zip(mov_seq, transformlist, wti_seq):
+            if not (ants.is_image(m_img) and len(m_img.shape) == 3 and getattr(m_img, "components", 1) == 1):
+                results_b.append(
+                    apply_transforms(
+                        fixed=fixed,
+                        moving=m_img,
+                        transformlist=tx_i,
+                        interpolator=interpolator,
+                        imagetype=imagetype,
+                        whichtoinvert=wti_i,
+                        defaultvalue=defaultvalue,
+                        device=device,
+                        return_tensor=return_tensors,
+                    )
+                )
+                continue
+            ch_i = _resolve_chain_arg(tx_i, wti_i)
+            pts_mov_i = _map_points_to_moving_tensor(pts_fixed, ch_i, dev)
+            cf_i = ContinuousField(m_img, device=dev, dtype=torch.float32)
+            out_i = _sample_field_itk(cf_i, pts_mov_i, mode=mode, defaultvalue=defaultvalue)
+            del cf_i, pts_mov_i
+            if return_tensors:
+                results_b.append(out_i.reshape(ref_shape).permute(2, 1, 0).contiguous().unsqueeze(0).unsqueeze(0))
+            else:
+                arr_i = out_i.reshape(ref_shape).detach().cpu().numpy().astype(np.float32, copy=False)
+                results_b.append(fixed.new_image_like(arr_i))
+            del out_i
+        del pts_fixed
+        return results_b
+
+    chain = _resolve_chain_arg(transformlist, whichtoinvert)
+    if not can_fast_3d:
+        return [
+            chain.apply(
+                m_img,
+                fixed,
+                interpolator=interpolator,
+                imagetype=imagetype,
+                defaultvalue=defaultvalue,
+                device=device,
+                return_tensor=return_tensors,
+            )
+            for m_img in mov_seq
+        ]
+
+    dev = torch.device(resolve_device(device, task="model"))
+    ref_shape = tuple(int(s) for s in fixed.shape[:3])
+    pts_fixed = _reference_grid_points_lps(fixed, dev)
+    pts_moving = _map_points_to_moving_tensor(pts_fixed, chain, dev)
+    del pts_fixed
+
+    out_list: list[Any] = [None] * len(mov_seq)
+    geom_groups: dict[tuple[Any, ...], list[int]] = {}
+    for idx_m, m_img in enumerate(mov_seq):
+        if ants.is_image(m_img) and len(m_img.shape) == 3 and getattr(m_img, "components", 1) == 1:
+            g_key = (
+                tuple(int(s) for s in m_img.shape[:3]),
+                tuple(round(float(s), 6) for s in m_img.spacing[:3]),
+                tuple(round(float(o), 6) for o in m_img.origin[:3]),
+                tuple(round(float(d), 6) for d in np.asarray(m_img.direction)[:3, :3].ravel()),
+            )
+            geom_groups.setdefault(g_key, []).append(idx_m)
+        else:
+            out_list[idx_m] = chain.apply(
+                m_img,
+                fixed,
+                interpolator=interpolator,
+                imagetype=imagetype,
+                defaultvalue=defaultvalue,
+                device=device,
+                return_tensor=return_tensors,
+            )
+
+    flat_coords = pts_moving.view(-1, 3).to(device=dev, dtype=torch.float32)
+    del pts_moving
+    max_ch = max(1, int(max_channels_per_pass))
+
+    for grp_indices in geom_groups.values():
+        rep_img = mov_seq[grp_indices[0]]
+        mov_shape = tuple(int(s) for s in rep_img.shape[:3])
+        M_norm, b_norm = get_physical_to_normalized_affine(
+            shape=mov_shape,
+            spacing=tuple(float(x) for x in rep_img.spacing[:3]),
+            origin=tuple(float(x) for x in rep_img.origin[:3]),
+            direction=np.asarray(rep_img.direction, dtype=np.float64)[:3, :3],
+            device=dev,
+            dtype=torch.float32,
+        )
+        coords_norm = physical_to_normalized(flat_coords, M_norm, b_norm)
+        shape_t = torch.tensor(mov_shape, dtype=torch.float32, device=dev)
+        half_span = 0.5 * (shape_t - 1.0)
+        cidx = (coords_norm + 1.0) * half_span
+        inside = ((cidx >= -0.5 - 1e-5) & (cidx < (shape_t - 0.5) - 1e-5)).all(dim=-1)
+        if mode == "nearest":
+            cidx_nearest = torch.floor(cidx + 0.5 + 1e-5).clamp(min=torch.zeros_like(shape_t), max=shape_t - 1.0)
+            coords_use = cidx_nearest / half_span.clamp(min=1e-6) - 1.0
+            del cidx_nearest
+        else:
+            coords_use = coords_norm
+        del coords_norm, cidx
+        grid = coords_use.view(1, 1, 1, -1, 3)
+        del coords_use
+
+        for c_start in range(0, len(grp_indices), max_ch):
+            c_ids = grp_indices[c_start : c_start + max_ch]
+            ch_tensors = []
+            for idx_m in c_ids:
+                raw_m = np.ascontiguousarray(mov_seq[idx_m].numpy(), dtype=np.float32)
+                t_m = torch.from_numpy(raw_m).to(device=dev, dtype=torch.float32).permute(2, 1, 0).contiguous()
+                ch_tensors.append(t_m)
+            vol_pack = torch.stack(ch_tensors, dim=0).unsqueeze(0)  # (1, C, Z, Y, X)
+            del ch_tensors
+            sampled = F.grid_sample(
+                vol_pack, grid, mode=mode, padding_mode="border", align_corners=True
+            ).view(len(c_ids), -1)
+            del vol_pack
+            def_t = torch.full((), float(defaultvalue), dtype=torch.float32, device=dev)
+            sampled = torch.where(inside.unsqueeze(0), sampled, def_t)
+            for ci, idx_m in enumerate(c_ids):
+                s_c = sampled[ci].reshape(ref_shape)
+                if return_tensors:
+                    out_list[idx_m] = s_c.permute(2, 1, 0).contiguous().unsqueeze(0).unsqueeze(0)
+                else:
+                    out_list[idx_m] = fixed.new_image_like(
+                        s_c.detach().cpu().numpy().astype(np.float32, copy=False)
+                    )
+            del sampled
+        del grid, inside
+
+    del flat_coords
+    return out_list
 
 
 def resample_image_to_target(
@@ -2009,15 +2659,21 @@ def create_jacobian_determinant_image(
 
 def map_points_to_moving(
     points_lps: np.ndarray,
-    transformlist: str | Iterable[str] | TransformChain,
+    transformlist: str | Iterable[Any] | TransformChain | TransformElement,
     whichtoinvert: Iterable[bool] | None = None,
     device: str | None = None,
 ) -> np.ndarray:
     """Map fixed-space physical points (LPS mm) to moving-space points through an ANTs
     transform list, in torch."""
     if isinstance(transformlist, TransformChain):
-        chain = transformlist
-    elif isinstance(transformlist, str):
+        if whichtoinvert is not None:
+            inv_list = [bool(x) for x in whichtoinvert]
+            chain = TransformChain(
+                [replace(e, invert=inv_b) for e, inv_b in zip(transformlist.elements, inv_list, strict=True)]
+            )
+        else:
+            chain = transformlist
+    elif isinstance(transformlist, (str, TransformElement)):
         chain = TransformChain.from_paths([transformlist], whichtoinvert)
     else:
         chain = TransformChain.from_paths(list(transformlist), whichtoinvert)
@@ -2029,7 +2685,7 @@ def map_points_to_moving(
         for element in chain.elements:
             if element.kind == "identity":
                 continue
-            M, b = _read_itk_affine(element.path, invert=element.invert)
+            M, b = _resolve_element_linear(element)
             pts = pts @ M.T + b
         return pts
 
@@ -2042,7 +2698,7 @@ def map_points_to_moving(
 def apply_transforms_to_points(
     dim: int,
     points: Any,
-    transformlist: str | Iterable[str] | TransformChain,
+    transformlist: str | Iterable[Any] | TransformChain | TransformElement,
     whichtoinvert: Iterable[bool] | None = None,
     verbose: bool = False,
     device: str | None = None,
@@ -2060,19 +2716,33 @@ def apply_transforms_to_points(
         return ants.apply_transforms_to_points(dim, points, transformlist, whichtoinvert=whichtoinvert, verbose=verbose)
 
     if isinstance(transformlist, TransformChain):
-        tl = transformlist.paths()
-        inv_flags = transformlist.whichtoinvert() if whichtoinvert is None else _resolve_whichtoinvert(tl, whichtoinvert)
-    elif isinstance(transformlist, str):
-        tl = [transformlist]
-        inv_flags = _resolve_whichtoinvert(tl, whichtoinvert)
+        if whichtoinvert is None:
+            chain = transformlist
+        else:
+            inv_flags = _resolve_whichtoinvert(transformlist.elements, whichtoinvert)
+            chain = TransformChain(
+                [replace(e, invert=inv_b) for e, inv_b in zip(transformlist.elements, inv_flags, strict=True)]
+            )
+    elif isinstance(transformlist, (str, TransformElement)):
+        inv_flags = _resolve_whichtoinvert([transformlist], whichtoinvert)
+        chain = TransformChain.from_paths([transformlist], inv_flags)
     else:
-        tl = [str(t) for t in transformlist]
+        tl = list(transformlist)
         inv_flags = _resolve_whichtoinvert(tl, whichtoinvert)
+        chain = TransformChain.from_paths(tl, inv_flags)
 
     if dim != 3:
-        return ants.apply_transforms_to_points(dim, points, tl, whichtoinvert=inv_flags, verbose=verbose)
+        if chain.has_in_memory():
+            import tempfile
 
-    chain = TransformChain.from_paths(tl, inv_flags)
+            with tempfile.TemporaryDirectory(prefix="syntx_mempts_") as tmpd:
+                disk_paths = chain.save(os.path.join(tmpd, "tx_"), compresslevel=1)
+                non_id_invs = [e.invert for e in chain.elements if e.kind != "identity"]
+                return ants.apply_transforms_to_points(
+                    dim, points, disk_paths, whichtoinvert=non_id_invs, verbose=verbose
+                )
+        return ants.apply_transforms_to_points(dim, points, chain.paths(), whichtoinvert=chain.whichtoinvert(), verbose=verbose)
+
     if hasattr(points, "columns"):
         pts_xyz = np.asarray(points[["x", "y", "z"]].values, dtype=np.float64)
         mapped = map_points_to_moving(pts_xyz, chain, device=device)
@@ -2566,6 +3236,34 @@ def signed_jacobian_determinant(field_path_or_image: Any, reference: Any) -> Any
     """Signed ``det(I + grad u)`` of a displacement field on ``reference``'s grid (unclipped)."""
     import ants
 
+    if isinstance(field_path_or_image, TransformChain):
+        disp_elems = [e for e in field_path_or_image.elements if e.kind in ("displacement", "inverse_displacement")]
+        if not disp_elems:
+            raise ValueError("TransformChain contains no displacement field element")
+        field_path_or_image = disp_elems[0]
+
+    if isinstance(field_path_or_image, TransformElement) and field_path_or_image.field is not None:
+        field_path_or_image = field_path_or_image.field
+
+    if isinstance(field_path_or_image, ContinuousField):
+        if tuple(field_path_or_image.spatial_shape) != tuple(reference.shape):
+            raise ValueError(
+                f"field grid {tuple(field_path_or_image.spatial_shape)} differs from reference {tuple(reference.shape)}"
+            )
+        from .liouville import _fd_det_3d_zyx
+
+        disp_zyx = torch.flip(field_path_or_image.tensor.movedim(1, -1), dims=[-1]).contiguous()
+        if not bool(torch.isfinite(disp_zyx).all().item()):
+            raise ValueError("displacement field contains non-finite values")
+        det_zyx = _fd_det_3d_zyx(disp_zyx, reference, field_path_or_image.device)
+        if not bool(torch.isfinite(det_zyx).all().item()):
+            raise ValueError("Jacobian determinant contains non-finite values")
+        det_xyz = det_zyx.permute(2, 1, 0).contiguous().detach().cpu().numpy().astype(np.float32, copy=False)
+        return reference.new_image_like(det_xyz)
+
+    if isinstance(field_path_or_image, TransformElement):
+        field_path_or_image = field_path_or_image.path
+
     if isinstance(field_path_or_image, str):
         f = None
         try:
@@ -3052,6 +3750,8 @@ __all__ = [
     "classify_transform",
     "TransformChain",
     "apply_transforms",
+    "batch_apply_transforms",
+    "clear_transform_gpu_caches",
     "resample_image_to_target",
     "compose_displacement_fields",
     "create_jacobian_determinant_image",

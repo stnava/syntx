@@ -112,6 +112,20 @@ def _correlation(a: ants.ANTsImage, b: ants.ANTsImage) -> float:
     return _canonical_correlation(a, b)
 
 
+def _correlation_tensors(a_zyx, b_zyx) -> float:
+    """Device-native Pearson correlation between two matching ``(1, 1, *spatial_zyx)`` tensors."""
+    import torch
+
+    with torch.no_grad():
+        af = a_zyx.reshape(-1).to(torch.float32)
+        bf = b_zyx.reshape(-1).to(torch.float32)
+        ac = af - af.mean()
+        bc = bf - bf.mean()
+        denom = torch.sqrt(ac.square().sum() * bc.square().sum())
+        val = torch.where(denom > 1e-12, (ac * bc).sum() / denom.clamp(min=1e-12), torch.zeros_like(denom))
+        return float(val.item())
+
+
 def build_template(
     initial_template: Optional[ants.ANTsImage] = None,
     image_list: Optional[List[ants.ANTsImage]] = None,
@@ -131,6 +145,11 @@ def build_template(
     digital_diffeomorphism: bool = True,
     digital_diffeomorphism_floor: float = 0.05,
     digital_diffeomorphism_steps: int = 25,
+    batch_size: Union[int, str] = "auto",
+    write_transforms: bool = True,
+    return_warped: bool = True,
+    amp: bool = False,
+    sync_free: bool = False,
     **kwargs
 ) -> Dict[str, Any]:
     """Build an unbiased group template -- ``syntx.build_template`` (a port of
@@ -286,7 +305,8 @@ def build_template(
     last_warped: List[ants.ANTsImage] = [None] * n
     last_fwdtransforms: List[List[str]] = [[] for _ in range(n)]
     last_invtransforms: List[List[str]] = [[] for _ in range(n)]
-    image_affine: List[Optional[str]] = [None] * n    # each image's affine of the last full registration
+    last_fwd_chains: List[Any] = [None] * n
+    image_affine: List[Optional[Any]] = [None] * n    # each image's affine of the last full registration
     image_quality: List[Optional[float]] = [None] * n  # greedy only: correlation recorded when image_affine[k] was last (re)computed
 
     for it in range(iterations):
@@ -294,7 +314,9 @@ def build_template(
             print(f"[build_template] Iteration {it + 1}/{iterations}")
         affinelist = []
         wavg = None
+        wavg_zyx = None
         xavgNew = None
+        xavg_new_zyx = None
         L = 0
 
         # In multi-iteration template construction, global affine pre-alignment is established
@@ -313,128 +335,226 @@ def build_template(
                 "non-invertible field)."
             )
 
-        for k in range(len(image_list)):
-            if verbose:
-                print(f"  Registering subject {k + 1}/{len(image_list)} ...", end=" ", flush=True)
-            reg_kw = dict(kwargs)
-            if is_greedy:
-                # Greedy (one-directional) registration -- no affine/warp split, no inverse,
-                # since the template only needs each subject warped INTO template space to
-                # accumulate an average; nothing here ever needs to invert that map. Passing a
-                # previous iteration's composed displacement field back in as
-                # initial_transform (the SyN path's SyNOnly trick) isn't an option here: it
-                # hits a real limitation in greedy_registration's own affine-detection step
-                # (rejects a non-linear transform instead of treating it as an initial grid,
-                # despite its docstring) -- so instead, a genuinely LINEAR affine is cached
-                # and reused/adaptively re-verified across iterations below.
-                #
-                # Which affine to start from: iteration 0 (or affine_every_iteration=True)
-                # uses the caller-supplied initial_transforms[k] (default None -> full
-                # robust_affine search); later iterations reuse whatever affine ended up
-                # cached from the previous iteration for this image (None is a valid cached
-                # value -- it means "no affine needed", e.g. initial_transforms[k] was
-                # 'identity'/False, and is reapplied unchanged, not reinterpreted as "nothing
-                # cached yet") -- see affine_drop_tolerance below for when that cache gets
-                # invalidated and recomputed.
-                from .greedy import greedy_registration
+        is_final_iter = (it == iterations - 1)
+        need_subject_disk_files = (not is_greedy) or (output_dir is not None) or (is_final_iter and write_transforms)
+        need_subject_warped_imgs = (not is_greedy) or (output_dir is not None) or (is_final_iter and return_warped)
 
-                if it == 0 or affine_every_iteration:
-                    chosen_init = initial_transforms[k] if initial_transforms is not None else None
-                else:
-                    chosen_init = image_affine[k]
-                reg_kw["initial_transform"] = chosen_init
+        xavg_target = None
+        xavg_raw_zyx = None
+        use_batched_greedy = False
+        if is_greedy:
+            import torch
+            from .cohort import FixedTarget, _select_cohort_batch_size, batch_greedy
+            from .spatial import image_to_tensor
 
-                w1 = greedy_registration(
-                    xavg,
-                    image_list[k],
-                    outprefix=make_outprefix(it, k),
-                    verbose=verbose,
-                    **reg_kw
-                )
-                quality = _correlation(w1["warpedmovout"], xavg)
+            xavg_target = FixedTarget.from_image(xavg, device=kwargs.get("device", "auto"))
+            xavg_raw_zyx = image_to_tensor(xavg, device=xavg_target.device, to_zyx=True).to(torch.float32)
+            eff_b_tmpl = _select_cohort_batch_size(
+                batch_size, len(image_list), int(np.prod(xavg.shape)), stage="deformable"
+            )
+            use_batched_greedy = bool(xavg.dimension == 3 and len(image_list) > 1 and eff_b_tmpl > 1)
 
-                # Adaptive re-affine: a cached affine (anything other than iteration 0's own
-                # fresh computation) is only trusted as long as it still gives a comparable
-                # registration -- if quality has dropped meaningfully since it was (re)cached,
-                # recompute it from scratch for this image, this iteration, rather than
-                # silently continuing with a now-stale affine for the rest of the run.
-                used_cached_affine = not (it == 0 or affine_every_iteration)
-                if (
-                    used_cached_affine
-                    and affine_drop_tolerance is not None
-                    and image_quality[k] is not None
-                    and quality < image_quality[k] - affine_drop_tolerance
-                ):
-                    if verbose:
-                        print(f"\n  Subject {k + 1}: cached-affine quality dropped "
-                              f"({quality:.4f} < {image_quality[k]:.4f} - {affine_drop_tolerance}) "
-                              f"-- recomputing affine from scratch.", end=" ")
-                    reg_kw["initial_transform"] = None
+        if is_greedy and use_batched_greedy:
+            if it == 0 or affine_every_iteration:
+                chosen_inits = list(initial_transforms) if initial_transforms is not None else [None] * len(image_list)
+            else:
+                chosen_inits = list(image_affine)
+            op_list = [make_outprefix(it, k) for k in range(len(image_list))] if need_subject_disk_files else None
+            reg_kw_b = dict(kwargs)
+            batch_res = batch_greedy(
+                xavg_target,
+                image_list,
+                initial_transforms=chosen_inits,
+                batch_size=batch_size,
+                outprefixes=op_list,
+                write_transforms=need_subject_disk_files,
+                return_warped=need_subject_warped_imgs,
+                _return_warped_tensor=True,
+                _return_disp_tensor=True,
+                amp=amp,
+                sync_free=sync_free,
+                verbose=verbose,
+                **reg_kw_b,
+            )
+            qualities = [
+                _correlation_tensors(w_k["warpedmovout_tensor"], xavg_raw_zyx)
+                for w_k in batch_res
+            ]
+            used_cached_affine = not (it == 0 or affine_every_iteration)
+            if used_cached_affine and affine_drop_tolerance is not None:
+                redo_ids = [
+                    k
+                    for k in range(len(image_list))
+                    if image_quality[k] is not None and qualities[k] < image_quality[k] - affine_drop_tolerance
+                ]
+                if redo_ids:
+                    redo_ops = [make_outprefix(it, k) for k in redo_ids] if need_subject_disk_files else None
+                    redo_res = batch_greedy(
+                        xavg_target,
+                        [image_list[k] for k in redo_ids],
+                        initial_transforms=[None] * len(redo_ids),
+                        batch_size=batch_size,
+                        outprefixes=redo_ops,
+                        write_transforms=need_subject_disk_files,
+                        return_warped=need_subject_warped_imgs,
+                        _return_warped_tensor=True,
+                        _return_disp_tensor=True,
+                        amp=amp,
+                        sync_free=sync_free,
+                        verbose=verbose,
+                        **reg_kw_b,
+                    )
+                    for k, w_new in zip(redo_ids, redo_res):
+                        batch_res[k] = w_new
+                        qualities[k] = _correlation_tensors(w_new["warpedmovout_tensor"], xavg_raw_zyx)
+
+            for k, w1 in enumerate(batch_res):
+                image_affine[k] = w1["affine_transform"] if w1["affine_transform"] is not None else "identity"
+                image_quality[k] = qualities[k]
+                L = len(w1["fwdtransforms"])
+                last_warped[k] = w1["warpedmovout"]
+                last_fwdtransforms[k] = w1["fwdtransforms"]
+                last_invtransforms[k] = w1["invtransforms"]
+                last_fwd_chains[k] = w1.get("fwd_chain")
+                wk = float(weights[k])
+                with torch.no_grad():
+                    if k == 0:
+                        wavg_zyx = w1["disp_tensor_zyx"] * wk
+                        xavg_new_zyx = w1["warpedmovout_tensor"] * wk
+                    else:
+                        wavg_zyx.add_(w1["disp_tensor_zyx"], alpha=wk)
+                        xavg_new_zyx.add_(w1["warpedmovout_tensor"], alpha=wk)
+            del batch_res
+        else:
+            for k in range(len(image_list)):
+                if verbose:
+                    print(f"  Registering subject {k + 1}/{len(image_list)} ...", end=" ", flush=True)
+                reg_kw = dict(kwargs)
+                if is_greedy:
+                    from .greedy import greedy_registration
+
+                    if it == 0 or affine_every_iteration:
+                        chosen_init = initial_transforms[k] if initial_transforms is not None else None
+                    else:
+                        chosen_init = image_affine[k]
+                    reg_kw["initial_transform"] = chosen_init
+
+                    op_k = make_outprefix(it, k) if need_subject_disk_files else None
                     w1 = greedy_registration(
+                        xavg_target,
+                        image_list[k],
+                        outprefix=op_k,
+                        write_transforms=need_subject_disk_files,
+                        return_warped=need_subject_warped_imgs,
+                        _return_warped_tensor=True,
+                        _return_disp_tensor=True,
+                        amp=amp,
+                        sync_free=sync_free,
+                        verbose=verbose,
+                        **reg_kw
+                    )
+                    quality = _correlation_tensors(w1["warpedmovout_tensor"], xavg_raw_zyx)
+
+                    used_cached_affine = not (it == 0 or affine_every_iteration)
+                    if (
+                        used_cached_affine
+                        and affine_drop_tolerance is not None
+                        and image_quality[k] is not None
+                        and quality < image_quality[k] - affine_drop_tolerance
+                    ):
+                        if verbose:
+                            print(f"\n  Subject {k + 1}: cached-affine quality dropped "
+                                  f"({quality:.4f} < {image_quality[k]:.4f} - {affine_drop_tolerance}) "
+                                  f"-- recomputing affine from scratch.", end=" ")
+                        reg_kw["initial_transform"] = None
+                        w1 = greedy_registration(
+                            xavg_target,
+                            image_list[k],
+                            outprefix=op_k,
+                            write_transforms=need_subject_disk_files,
+                            return_warped=need_subject_warped_imgs,
+                            _return_warped_tensor=True,
+                            _return_disp_tensor=True,
+                            amp=amp,
+                            sync_free=sync_free,
+                            verbose=verbose,
+                            **reg_kw
+                        )
+                        quality = _correlation_tensors(w1["warpedmovout_tensor"], xavg_raw_zyx)
+
+                    image_affine[k] = w1["affine_transform"] if w1["affine_transform"] is not None else "identity"
+                    image_quality[k] = quality
+                elif backend == "ants":
+                    if iter_tot == "SyNOnly" and image_affine[k] is not None:
+                        reg_kw["initial_transform"] = image_affine[k]   # deformable only, from its affine
+                    w1 = ants.registration(
                         xavg,
                         image_list[k],
+                        type_of_transform=iter_tot,
+                        outprefix=make_outprefix(it, k),
+                        **reg_kw
+                    )
+                else:
+                    if iter_tot == "SyNOnly" and image_affine[k] is not None:
+                        reg_kw["initial_transform"] = image_affine[k]   # deformable only, from its affine
+                    from .syn import registration as syn_registration
+
+                    w1 = syn_registration(
+                        xavg,
+                        image_list[k],
+                        type_of_transform=iter_tot,
                         outprefix=make_outprefix(it, k),
                         verbose=verbose,
                         **reg_kw
                     )
-                    quality = _correlation(w1["warpedmovout"], xavg)
+                L = len(w1["fwdtransforms"])
+                if not is_greedy:
+                    if iter_tot != "SyNOnly":
+                        image_affine[k] = w1["fwdtransforms"][L - 1]
+                    affinelist.append(w1["fwdtransforms"][L - 1])
 
-                # Cache 'identity' rather than the raw None that greedy_registration returns
-                # for "no affine was used" -- None fed back in as initial_transform on the
-                # NEXT iteration means something different to greedy_registration itself
-                # (its own "nothing given, run robust_affine" default), which would silently
-                # turn a cheap identity-seeded image back into an expensive full-affine-search
-                # one every subsequent iteration. 'identity' unambiguously means "skip the
-                # affine step" on replay, matching what actually happened here.
-                image_affine[k] = w1["affine_transform"] if w1["affine_transform"] is not None else "identity"
-                image_quality[k] = quality
-            elif backend == "ants":
-                if iter_tot == "SyNOnly" and image_affine[k] is not None:
-                    reg_kw["initial_transform"] = image_affine[k]   # deformable only, from its affine
-                w1 = ants.registration(
-                    xavg,
-                    image_list[k],
-                    type_of_transform=iter_tot,
-                    outprefix=make_outprefix(it, k),
-                    **reg_kw
-                )
-            else:
-                if iter_tot == "SyNOnly" and image_affine[k] is not None:
-                    reg_kw["initial_transform"] = image_affine[k]   # deformable only, from its affine
-                from .syn import registration as syn_registration
+                last_warped[k] = w1["warpedmovout"]
+                last_fwdtransforms[k] = w1["fwdtransforms"]
+                last_invtransforms[k] = w1["invtransforms"]
+                last_fwd_chains[k] = w1.get("fwd_chain")
 
-                w1 = syn_registration(
-                    xavg,
-                    image_list[k],
-                    type_of_transform=iter_tot,
-                    outprefix=make_outprefix(it, k),
-                    verbose=verbose,
-                    **reg_kw
-                )
-            L = len(w1["fwdtransforms"])
-            if not is_greedy:
-                if iter_tot != "SyNOnly":
-                    image_affine[k] = w1["fwdtransforms"][L - 1]
-                affinelist.append(w1["fwdtransforms"][L - 1])
+                if is_greedy:
+                    import torch
 
-            last_warped[k] = w1["warpedmovout"]
-            last_fwdtransforms[k] = w1["fwdtransforms"]
-            last_invtransforms[k] = w1["invtransforms"]
+                    wk = float(weights[k])
+                    with torch.no_grad():
+                        if k == 0:
+                            wavg_zyx = w1["disp_tensor_zyx"] * wk
+                            xavg_new_zyx = w1["warpedmovout_tensor"] * wk
+                        else:
+                            wavg_zyx.add_(w1["disp_tensor_zyx"], alpha=wk)
+                            xavg_new_zyx.add_(w1["warpedmovout_tensor"], alpha=wk)
+                    del w1
+                else:
+                    has_field = L >= 2
+                    if has_field:
+                        from .transforms import _read_disp_image_cached
+                    if k == 0:
+                        if has_field:
+                            wavg = _read_disp_image_cached(w1["fwdtransforms"][0]) * weights[k]
+                        xavgNew = w1["warpedmovout"] * weights[k]
+                    else:
+                        if has_field:
+                            wavg = wavg + _read_disp_image_cached(w1["fwdtransforms"][0]) * weights[k]
+                        xavgNew = xavgNew + w1["warpedmovout"] * weights[k]
 
-            has_field = is_greedy or L >= 2
-            if has_field:
-                from .transforms import _read_disp_image_cached
-            if k == 0:
-                if has_field:
-                    wavg = _read_disp_image_cached(w1["fwdtransforms"][0]) * weights[k]
-                xavgNew = w1["warpedmovout"] * weights[k]
-            else:
-                if has_field:
-                    wavg = wavg + _read_disp_image_cached(w1["fwdtransforms"][0]) * weights[k]
-                xavgNew = xavgNew + w1["warpedmovout"] * weights[k]
+                if verbose:
+                    print("done")
 
-            if verbose:
-                print("done")
+        if is_greedy:
+            from .spatial import disp_tensor_to_itk
+
+            rev_sp_x = tuple(range(xavg.dimension - 1, -1, -1))
+            xavgNew = xavg.new_image_like(
+                xavg_new_zyx[0, 0].permute(*rev_sp_x).contiguous().detach().cpu().numpy().astype(np.float32, copy=False)
+            )
+            wavg = disp_tensor_to_itk(wavg_zyx, xavg)
+            del xavg_raw_zyx
 
         has_field = is_greedy or L >= 2
 
@@ -452,29 +572,42 @@ def build_template(
 
         xavg_pre = xavg.clone()
 
-        from .transforms import apply_transforms as _apply_transforms
+        from .transforms import TransformChain, TransformElement, apply_transforms as _apply_transforms
         if is_greedy:
-            if has_field and wavg is not None:
-                wavgScaled = wavg * ((-1.0) * gradient_step)
-                if digital_diffeomorphism:
-                    from .core.digital_diffeomorphism import enforce_digital_diffeomorphism
+            if has_field and wavg_zyx is not None:
+                import torch
 
-                    wavgScaled = enforce_digital_diffeomorphism(
-                        wavgScaled,
+                with torch.no_grad():
+                    wavg_scaled_zyx = wavg_zyx * ((-1.0) * float(gradient_step))
+                if digital_diffeomorphism:
+                    from .core.digital_diffeomorphism import enforce_digital_diffeomorphism_nd
+
+                    wavg_scaled_zyx = enforce_digital_diffeomorphism_nd(
+                        wavg_scaled_zyx,
+                        None,
+                        spacing=xavg.spacing,
+                        origin=xavg.origin,
+                        direction=xavg.direction,
                         jac_floor=float(digital_diffeomorphism_floor),
                         steps=int(digital_diffeomorphism_steps),
-                        device=kwargs.get("device"),
                     )
-                wavgfn = os.path.join(work_dir, f"avgWarp_{it}.nii.gz")
-                ants.image_write(wavgScaled, wavgfn)
+                if output_dir is not None:
+                    from .spatial import disp_tensor_to_itk
+
+                    wavgScaled = disp_tensor_to_itk(wavg_scaled_zyx, xavg)
+                    wavgfn = os.path.join(work_dir, f"avgWarp_{it}.nii.gz")
+                    ants.image_write(wavgScaled, wavgfn)
+                avg_chain = TransformChain([TransformElement.from_disp_tensor(wavg_scaled_zyx, xavg)])
                 xavg = _apply_transforms(
                     fixed=xavgNew,
                     moving=xavgNew,
-                    transformlist=[wavgfn],
-                    whichtoinvert=[0]
+                    transformlist=avg_chain,
+                    device=str(xavg_target.device),
                 )
+                del wavg_scaled_zyx, avg_chain
             else:
                 xavg = xavgNew
+            del wavg_zyx, xavg_new_zyx, xavg_target
         else:
             # Average affine
             if useNoRigid:
@@ -533,6 +666,17 @@ def build_template(
             print(f"  Template MAE change: {c_val:.6f}")
 
         if convergence_threshold > 0.0 and sr['l2_norm'] < convergence_threshold:
+            if is_greedy and not need_subject_disk_files:
+                for k_m in range(len(image_list)):
+                    if last_fwd_chains[k_m] is not None:
+                        if write_transforms:
+                            last_fwdtransforms[k_m] = last_fwd_chains[k_m].save(make_outprefix(it, k_m), compresslevel=1)
+                        if return_warped and last_warped[k_m] is None:
+                            last_warped[k_m] = _apply_transforms(
+                                fixed=xavg_pre,
+                                moving=image_list[k_m],
+                                transformlist=last_fwd_chains[k_m],
+                            )
             if verbose:
                 print(f"  Converged: shape residual {sr['l2_norm']:.6f} < threshold {convergence_threshold:.6f}")
             break
@@ -542,6 +686,7 @@ def build_template(
         "warped_images": last_warped,
         "fwdtransforms": last_fwdtransforms,
         "invtransforms": last_invtransforms,
+        "fwd_chains": last_fwd_chains,
         "convergence": convergence,
         "shape_residuals": shape_residuals,
         "n_iterations": len(shape_residuals),

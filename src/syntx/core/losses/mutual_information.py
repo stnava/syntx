@@ -210,6 +210,111 @@ class CanonicalMattesMIFunction(torch.autograd.Function):
         return grad_x, grad_y, None, None, None, None, None, None
 
 
+class BatchedMattesMIFunction(torch.autograd.Function):
+    """Batched 4-tap analytical Mattes Mutual Information for ``M`` moving sample vectors
+    ``x_batch`` ``(M, N)`` against one shared ``fixed_weights`` ``(N, num_bins)``, returning ``(M,)``."""
+
+    @staticmethod
+    def forward(
+        ctx,
+        x_batch: torch.Tensor,
+        fixed_weights: torch.Tensor,
+        num_bins: int = 32,
+        min_val: float = -1.0,
+        max_val: float = 1.0,
+        pad: float = 2.0,
+        chunk_size: int = 16384,
+    ):
+        M_sz, N = int(x_batch.shape[0]), int(x_batch.shape[1])
+        ctx.num_bins = num_bins
+        ctx.min_val = min_val
+        ctx.max_val = max_val
+        ctx.pad = pad
+        ctx.chunk_size = chunk_size
+        ctx.M_sz = M_sz
+        ctx.N = N
+        ctx.save_for_backward(x_batch, fixed_weights)
+
+        work_dtype = torch.float64 if x_batch.dtype == torch.float64 else torch.float32
+        H = torch.zeros((M_sz, num_bins, num_bins), device=x_batch.device, dtype=work_dtype)
+
+        dev_type = "cuda" if x_batch.is_cuda else ("mps" if x_batch.device.type == "mps" else "cpu")
+        with torch.amp.autocast(device_type=dev_type, enabled=False):
+            for start in range(0, N, chunk_size):
+                end = min(start + chunk_size, N)
+                C = end - start
+                xc = x_batch[:, start:end]
+                bx, wx, _ = get_4tap_splines(xc, num_bins, min_val, max_val, pad=pad)
+                mat_x = torch.zeros((M_sz, C, num_bins), device=x_batch.device, dtype=work_dtype)
+                mat_x.scatter_(2, bx, wx.to(work_dtype))
+                mat_y = fixed_weights[start:end].to(work_dtype)
+                H = H + torch.matmul(mat_x.transpose(1, 2), mat_y)
+
+            total_sum = H.sum(dim=(1, 2), keepdim=True) + 1e-12
+            pxy = H / total_sum
+            px = pxy.sum(dim=2, keepdim=True)
+            py = pxy.sum(dim=1, keepdim=True)
+            ratio = pxy / (px * py + 1e-12)
+            losses = -torch.sum(pxy * torch.log(torch.clamp(ratio, min=1e-12)), dim=(1, 2))
+
+        ctx.ratio = ratio
+        ctx.total_sum = total_sum
+        return losses if x_batch.dtype in (torch.float16, torch.bfloat16) else losses.to(x_batch.dtype)
+
+    @staticmethod
+    def backward(ctx, grad_output: torch.Tensor):
+        x_batch, fixed_weights = ctx.saved_tensors
+        num_bins = ctx.num_bins
+        min_val = ctx.min_val
+        max_val = ctx.max_val
+        pad = ctx.pad
+        chunk_size = ctx.chunk_size
+        M_sz = ctx.M_sz
+        N = ctx.N
+        ratio = ctx.ratio
+        total_sum = ctx.total_sum
+
+        if not ctx.needs_input_grad[0]:
+            return None, None, None, None, None, None, None
+
+        work_dtype = torch.float64 if x_batch.dtype == torch.float64 else torch.float32
+        M_mat = (-(1.0 + torch.log(torch.clamp(ratio, min=1e-12))) / total_sum) * grad_output.to(work_dtype).view(
+            M_sz, 1, 1
+        )
+        grad_x = torch.empty((M_sz, N), device=x_batch.device, dtype=x_batch.dtype)
+
+        dev_type = "cuda" if x_batch.is_cuda else ("mps" if x_batch.device.type == "mps" else "cpu")
+        with torch.amp.autocast(device_type=dev_type, enabled=False):
+            for start in range(0, N, chunk_size):
+                end = min(start + chunk_size, N)
+                C = end - start
+                xc = x_batch[:, start:end]
+                bx, _, dwx = get_4tap_splines(xc, num_bins, min_val, max_val, pad=pad)
+                dmat_x = torch.zeros((M_sz, C, num_bins), device=x_batch.device, dtype=work_dtype)
+                dmat_x.scatter_(2, bx, dwx.to(work_dtype))
+                mat_y = fixed_weights[start:end].to(work_dtype)
+                W_y_M = torch.matmul(M_mat, mat_y.t()).transpose(1, 2)
+                grad_x[:, start:end] = torch.sum(dmat_x * W_y_M, dim=2).to(x_batch.dtype)
+
+        return grad_x, None, None, None, None, None, None
+
+
+def batched_mattes_mi_loss_shared_fixed(
+    I_batch: torch.Tensor,
+    fixed_weights: torch.Tensor,
+    num_bins: int = 32,
+    fixed_range: tuple[float, float] = (0.0, 1.0),
+) -> torch.Tensor:
+    """Vectorized negative Mattes MI for ``(M, P)`` moving samples against precomputed
+    shared ``fixed_weights`` ``(P, num_bins)``, returning ``(M,)`` losses."""
+    if I_batch.dtype in (torch.float16, torch.bfloat16):
+        I_batch = I_batch.to(torch.float32)
+    min_i, max_i = float(fixed_range[0]), float(fixed_range[1])
+    x_scaled = (I_batch - min_i) / (max_i - min_i + 1e-8) * 2.0 - 1.0
+    chunk_sz = max(2048, min(16384, 65536 // max(1, int(I_batch.shape[0]))))
+    return BatchedMattesMIFunction.apply(x_scaled, fixed_weights, num_bins, -1.0, 1.0, 2.0, chunk_sz)
+
+
 def _parzen_joint_histogram(w_x: torch.Tensor, w_y: torch.Tensor, chunk: int = 4096) -> torch.Tensor:
     """
     Joint Parzen histogram H = w_x^T w_y accumulated as a batch of chunk-row blocks (torch.bmm).
