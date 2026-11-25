@@ -242,9 +242,8 @@ def diagnose_image(image: Union[ants.ANTsImage, torch.Tensor, np.ndarray], fast:
     else:
         tier2_status = None
         try:
-            from .classifier import DiagnosticClassifier3D, predict_diagnosis_deep
-            model = DiagnosticClassifier3D()
-            model.load_state_dict(torch.load(weights_path, map_location="cpu"))
+            from .classifier import get_cached_diagnostic_classifier, predict_diagnosis_deep
+            model = get_cached_diagnostic_classifier(weights_path, device=None)
             deep_res = predict_diagnosis_deep(model, image, device=None)
         except Exception as e:
             tier2_status = f"error: {type(e).__name__}: {e}"

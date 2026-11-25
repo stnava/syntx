@@ -563,3 +563,162 @@ def test_syn_navier_with_total_sigma_positive():
         assert res["warpedmovout"] is not None
         assert np.isfinite(res["warpedmovout"].numpy()).all()
 
+
+
+def test_syn_midpoint_preserves_disp_field_cache_and_reuses_moving_field():
+    """WP1: 4-slot GPU _DISP_FIELD_CACHE retains primary fwd/inv warps even when midpoint warps are cached."""
+    fi, mi = _synthetic_3d_pair((20, 22, 18))
+    dev = _accel_device()
+    _DISP_FIELD_CACHE.clear()
+    reg = syntx.syn(
+        fi,
+        mi,
+        affine_dof="none",
+        export_midpoint=True,
+        levels=[2, 1],
+        reg_iterations=[2, 2],
+        device=str(dev),
+    )
+    fwd_p = reg["fwdtransforms"][0]
+    inv_p = reg["invtransforms"][-1]
+    cached_paths = {k[0] for k in _DISP_FIELD_CACHE.keys()}
+    assert fwd_p in cached_paths
+    assert inv_p in cached_paths
+
+    # Downstream apply_transforms with _moving_field incurs 0 3D-volume H2D uploads
+    cf_mi = ContinuousField(mi, device=dev, dtype=torch.float32)
+    if dev.type != "cpu":
+        prof = DispatchTransferSyncCounter(dev.type)
+        with prof:
+            w_fast = syntx.apply_transforms(fixed=fi, moving=mi, transformlist=reg["fwdtransforms"], device=str(dev), _moving_field=cf_mi)
+        assert prof.h2d_bytes < 1024
+    else:
+        w_fast = syntx.apply_transforms(fixed=fi, moving=mi, transformlist=reg["fwdtransforms"], device=str(dev), _moving_field=cf_mi)
+    np.testing.assert_allclose(w_fast.numpy(), reg["warpedmovout"].numpy(), atol=1e-6)
+
+
+def test_inverse_fixed_step_zero_syncs_and_free_boundary():
+    """WP2: Negative thresholds (fixed-step mode) execute 0 host syncs; stationary_boundary=False preserves rim."""
+    from syntx.core.inverse import update_inverse_field_nd
+
+    dev = _accel_device()
+    direction = _oblique_direction()
+    # Constant translation field (non-zero on boundary faces)
+    u = torch.zeros(1, 14, 16, 14, 3, device=dev, dtype=torch.float32)
+    u[..., 0] = 0.8
+    u[..., 1] = -0.5
+
+    for method in ("anderson", "fixed_point"):
+        if dev.type != "cpu":
+            # Warm cache once so we isolate per-step loop syncs and H2D
+            _ = update_inverse_field_nd(
+                u, None, steps=2, method=method, spacing=(1.0, 1.0, 1.0), origin=(0.0, 0.0, 0.0), direction=direction,
+                max_error_threshold=-1.0, mean_error_threshold=-1.0, stationary_boundary=False,
+            )
+            prof = DispatchTransferSyncCounter(dev.type)
+            with prof:
+                inv_free = update_inverse_field_nd(
+                    u, None, steps=6, method=method, spacing=(1.0, 1.0, 1.0), origin=(0.0, 0.0, 0.0), direction=direction,
+                    max_error_threshold=-1.0, mean_error_threshold=-1.0, stationary_boundary=False,
+                )
+            assert prof.sync_count == 0
+            assert prof.h2d_count == 0
+        else:
+            inv_free = update_inverse_field_nd(
+                u, None, steps=6, method=method, spacing=(1.0, 1.0, 1.0), origin=(0.0, 0.0, 0.0), direction=direction,
+                max_error_threshold=-1.0, mean_error_threshold=-1.0, stationary_boundary=False,
+            )
+        # Boundary rim must hold ~(-0.8, +0.5, 0) rather than being zeroed
+        assert float(inv_free[0, 0, 8, 8, 0].item()) < -0.75
+        assert float(inv_free[0, 0, 8, 8, 1].item()) > 0.45
+
+
+def test_greedy_return_inverse_preserves_forward_warp_bitwise():
+    """WP2: return_inverse=True in syntx.greedy must leave forward warp and warpedmovout bitwise identical."""
+    fi, mi = _synthetic_3d_pair((22, 24, 20))
+    dev = _accel_device()
+    r_fwd = syntx.greedy(
+        fi, mi, initial_transform=False, scales=[2, 1], reg_iterations=[4, 3], return_inverse=False, device=str(dev)
+    )
+    r_inv = syntx.greedy(
+        fi, mi, initial_transform=False, scales=[2, 1], reg_iterations=[4, 3], return_inverse=True, device=str(dev)
+    )
+    w_fwd_only = ants.image_read(r_fwd["fwdtransforms"][0]).numpy()
+    w_with_inv = ants.image_read(r_inv["fwdtransforms"][0]).numpy()
+    np.testing.assert_array_equal(w_fwd_only, w_with_inv)
+    np.testing.assert_array_equal(r_fwd["warpedmovout"].numpy(), r_inv["warpedmovout"].numpy())
+    assert r_inv["inverse_identity_errors"]["phi_1"]["mean_error"] < 0.05
+
+
+def test_diagnostic_classifier_cache_eliminates_repeat_model_uploads():
+    """WP3: Cached DiagnosticClassifier3D avoids reloading 55 MiB ResNet weights on repeat calls."""
+    from syntx.classifier import get_cached_diagnostic_classifier, predict_diagnosis_deep
+
+    weights_path = os.path.join(os.path.dirname(syntx.__file__), "models", "diagnostic_resnet10_3d.pth")
+    if not os.path.exists(weights_path):
+        pytest.skip("diagnostic_resnet10_3d.pth not present")
+    fi, mi = _synthetic_3d_pair((44, 44, 44))
+    dev = _accel_device()
+    m1 = get_cached_diagnostic_classifier(weights_path, device=str(dev))
+    m2 = get_cached_diagnostic_classifier(weights_path, device=str(dev))
+    assert m1 is m2
+    if dev.type != "cpu":
+        prof = DispatchTransferSyncCounter(dev.type)
+        with prof:
+            out = predict_diagnosis_deep(m2, mi, device=str(dev))
+        # Only the 64^3 float32 input tensor (1.0 MiB) uploads, never 55 MiB of model weights
+        assert prof.h2d_bytes <= 2 * 1024 * 1024
+        assert prof.sync_count <= 2
+    else:
+        out = predict_diagnosis_deep(m2, mi, device=str(dev))
+    assert "modality" in out and "body_part" in out
+
+
+def test_point_sampler_at_pool_cpu_gather_bitwise_parity():
+    """WP4: PointSampler._at_pool CPU nearest-voxel gather matches F.grid_sample(nearest) bitwise with <1/10th H2D."""
+    from syntx.sampling import PointSampler
+
+    rng = np.random.RandomState(17)
+    arr = np.clip(rng.uniform(0.0, 5.0, size=(36, 40, 32)).astype(np.float32), 0.0, 5.0)
+    arr[:4] = 0.0
+    img = ants.from_numpy(arr, spacing=(1.1, 1.1, 1.3))
+    dev = _accel_device()
+    ps = PointSampler(img, seed=42, device=dev)
+    _ = ps.pool()
+    _ = ps._at_pool(arr)  # prime _pool_flat_idx_cpu once
+
+    field2 = rng.uniform(-1.0, 3.0, size=arr.shape).astype(np.float32)
+    if dev.type != "cpu":
+        prof = DispatchTransferSyncCounter(dev.type)
+        with prof:
+            w_fast = ps._at_pool(field2)
+        # Full 3D volume is 36*40*32*4 = 184,320 B; pool upload must be strictly smaller
+        assert prof.h2d_bytes <= ps.n_pool * 4 + 256
+    else:
+        w_fast = ps._at_pool(field2)
+
+    t_ref = torch.from_numpy(np.ascontiguousarray(np.transpose(field2, (2, 1, 0)))).to(dev)
+    sh_xyz = torch.tensor(list(img.shape), dtype=torch.float32, device=dev)
+    norm = 2.0 * ps.vox_xyz / (sh_xyz - 1.0).clamp_min(1.0) - 1.0
+    w_ref = torch.nn.functional.grid_sample(t_ref[None, None], norm.view(1, 1, 1, -1, 3), mode="nearest", align_corners=True).reshape(-1).clamp_min(0.0)
+    assert torch.equal(w_fast, w_ref)
+
+
+def test_motion_correction_batched_seed_and_restore_sync_budget():
+    """WP4: Batched seed search + sync-free _restore keeps motion_correction accurate with low sync count."""
+    fi, _ = _synthetic_3d_pair((36, 40, 36))
+    arr0 = fi.numpy()
+    vols = [arr0, np.roll(arr0, shift=1, axis=0), np.roll(arr0, shift=-1, axis=1)]
+    arr4d = np.stack(vols, axis=-1).astype(np.float32)
+    dir4 = np.eye(4, dtype=np.float64)
+    dir4[:3, :3] = fi.direction
+    img4d = ants.from_numpy(arr4d, origin=(*fi.origin, 0.0), spacing=(*fi.spacing, 2.0), direction=dir4)
+    dev = _accel_device()
+    if dev.type != "cpu":
+        prof = DispatchTransferSyncCounter(dev.type)
+        with prof:
+            mc = syntx.motion_correction(img4d, reference=0, type_of_transform="Rigid", device=str(dev))
+        assert prof.sync_count < 80
+    else:
+        mc = syntx.motion_correction(img4d, reference=0, type_of_transform="Rigid", device=str(dev))
+    assert mc.motion_corrected.shape == img4d.shape

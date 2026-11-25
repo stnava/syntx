@@ -149,15 +149,37 @@ _TVF_INIT_KWARGS = frozenset({
 })
 
 
+_TVF_NORM_META_CACHE: dict[tuple, tuple[torch.Tensor, torch.Tensor]] = {}
+
+
 def _compute_norm_affine_from_meta(shape_zyx, spacing_rev, origin_rev, direction_rev, device, dtype):
-    """Compute physical->normalized affine (M, b) from Python/NumPy metadata in float64 without GPU->CPU syncs."""
+    """Compute and cache physical->normalized affine (M, b) from Python/NumPy metadata in float64 without GPU->CPU syncs."""
+    dev_obj = device if isinstance(device, torch.device) else torch.device(device)
+    sh_tup = tuple(int(x) for x in shape_zyx)
+    sp_tup = tuple(float(x) for x in spacing_rev)
+    or_tup = tuple(float(x) for x in origin_rev)
+    dir_arr = np.asarray(direction_rev, dtype=np.float64)
+    key = (sh_tup, sp_tup, or_tup, dir_arr.tobytes(), str(dev_obj), dtype)
+    cached = _TVF_NORM_META_CACHE.get(key)
+    if cached is not None:
+        return cached
     M_cpu, b_cpu = get_physical_to_normalized_affine(
-        torch.tensor(list(shape_zyx), dtype=torch.float64),
-        torch.tensor(list(spacing_rev), dtype=torch.float64),
-        torch.tensor(list(origin_rev), dtype=torch.float64),
-        torch.as_tensor(np.asarray(direction_rev, dtype=np.float64), dtype=torch.float64),
+        torch.tensor(list(sh_tup), dtype=torch.float64),
+        torch.tensor(list(sp_tup), dtype=torch.float64),
+        torch.tensor(list(or_tup), dtype=torch.float64),
+        torch.as_tensor(dir_arr, dtype=torch.float64),
     )
-    return M_cpu.to(device=device, dtype=dtype), b_cpu.to(device=device, dtype=dtype)
+    np_dt = np.float64 if dtype == torch.float64 else (np.float16 if dtype == torch.float16 else np.float32)
+    packed = torch.as_tensor(
+        np.vstack([M_cpu.numpy(), b_cpu.numpy()[None, :]]).astype(np_dt, copy=False),
+        device=dev_obj,
+        dtype=dtype,
+    )
+    res = (packed[:-1], packed[-1])
+    if len(_TVF_NORM_META_CACHE) >= 64:
+        _TVF_NORM_META_CACHE.pop(next(iter(_TVF_NORM_META_CACHE)))
+    _TVF_NORM_META_CACHE[key] = res
+    return res
 
 
 def _compute_norm_affine_cpu(shape_t, spacing_t, origin_t, direction_t):
@@ -1008,9 +1030,9 @@ class TVFModel(nn.Module):
         )
         spacing_rev, origin_rev, direction_rev = reverse_metadata(curr_spacing, self.origin, self.direction)
         shape_t = torch.tensor(list(target_shape), device=device, dtype=dtype)
-        spacing_t = torch.tensor(spacing_rev, device=device, dtype=dtype)
-        origin_t = torch.tensor(origin_rev, device=device, dtype=dtype)
-        direction_t = torch.tensor(direction_rev, device=device, dtype=dtype)
+        spacing_t = torch.tensor(list(spacing_rev), device=device, dtype=dtype)
+        origin_t = torch.tensor(list(origin_rev), device=device, dtype=dtype)
+        direction_t = torch.tensor(np.asarray(direction_rev).tolist(), device=device, dtype=dtype)
         _cached_meta = (shape_t, spacing_t, origin_t, direction_t)
         norm_f = _compute_norm_affine_from_meta(target_shape, spacing_rev, origin_rev, direction_rev, device, dtype)
 
@@ -1026,8 +1048,8 @@ class TVFModel(nn.Module):
             T_grid_cpu, target_shape, curr_spacing, self.origin, self.direction,
             self.moving_shape, self.moving_spacing, self.moving_origin, self.moving_direction
         )
-        M_phys_zyx = M_phys_cpu.to(device=device, dtype=dtype)
-        t_phys_zyx = t_phys_cpu.to(device=device, dtype=dtype)
+        mt_packed = torch.cat([M_phys_cpu, t_phys_cpu.unsqueeze(0)], dim=0).to(device=device, dtype=dtype)
+        M_phys_zyx, t_phys_zyx = mt_packed[:-1], mt_packed[-1]
 
         phi_f_id_norm = physical_to_normalized_fast(phys_grid, *norm_f)
         fixed_id_w = grid_sample_nd(fixed_image, phi_f_id_norm, mode='bilinear', padding_mode='zeros')

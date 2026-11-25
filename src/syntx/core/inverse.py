@@ -717,6 +717,43 @@ def _solve_small_spd(A: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
     return (M[:, :, -1] * d_inv).unsqueeze(1)
 
 
+_INV_PHYS_META_CACHE: dict[tuple, tuple[torch.Tensor, ...]] = {}
+
+
+def _get_cached_phys_inv_meta(spatial, spacing, origin, direction, device, dtype):
+    dim = len(spatial)
+    dev_obj = device if isinstance(device, torch.device) else torch.device(device)
+    sh_tup = tuple(int(s) for s in spatial)
+    sp_rev = tuple(float(x) for x in reversed(spacing))
+    or_rev = tuple(float(x) for x in reversed(origin))
+    dir_arr = np.asarray(direction, dtype=np.float64)
+    if dir_arr.ndim == 1:
+        dir_arr = dir_arr.reshape(dim, dim)
+    dir_rev = dir_arr[::-1, ::-1].copy()
+    key = (sh_tup, sp_rev, or_rev, dir_rev.tobytes(), str(dev_obj), dtype)
+    cached = _INV_PHYS_META_CACHE.get(key)
+    if cached is not None:
+        return cached
+    np_dt = np.float64 if dtype == torch.float64 else (np.float16 if dtype == torch.float16 else np.float32)
+    packed = torch.as_tensor(
+        np.vstack([
+            np.asarray(sh_tup, dtype=np_dt)[None, :],
+            np.asarray(sp_rev, dtype=np_dt)[None, :],
+            np.asarray(or_rev, dtype=np_dt)[None, :],
+            dir_rev.astype(np_dt, copy=False),
+        ]),
+        device=dev_obj,
+        dtype=dtype,
+    )
+    shape_t, spacing_t, origin_t, direction_t = packed[0], packed[1], packed[2], packed[3:]
+    M_norm, b_norm = get_physical_to_normalized_affine(shape_t, spacing_t, origin_t, direction_t)
+    res = (shape_t, spacing_t, origin_t, direction_t, M_norm, b_norm)
+    if len(_INV_PHYS_META_CACHE) >= 64:
+        _INV_PHYS_META_CACHE.pop(next(iter(_INV_PHYS_META_CACHE)))
+    _INV_PHYS_META_CACHE[key] = res
+    return res
+
+
 def update_inverse_field_nd_anderson(
     W_disp: torch.Tensor,
     W_inv_disp: torch.Tensor = None,
@@ -731,6 +768,7 @@ def update_inverse_field_nd_anderson(
     X_phys=None,
     check_interval: int = 1,
     check_after: int | None = None,
+    stationary_boundary: bool = True,
     stats: dict | None = None,
 ) -> torch.Tensor:
     """
@@ -781,24 +819,16 @@ def update_inverse_field_nd_anderson(
     if use_physical:
         if X_phys is None:
             X_phys = get_physical_grid_torch(spatial, spacing, origin, direction, device=device, dtype=dtype)
-        boundary_mask = get_boundary_mask(spatial, device, dtype)
-        spacing_rev = tuple(reversed(spacing))
-        origin_rev = tuple(reversed(origin))
-        dir_arr = np.asarray(direction)
-        if dir_arr.ndim == 1:
-            dir_arr = dir_arr.reshape(dim, dim)
-        direction_rev = dir_arr[::-1, ::-1].copy()
-        spacing_t = torch.tensor(spacing_rev, device=device, dtype=dtype)
-        shape_t = torch.tensor(list(spatial), device=device, dtype=dtype)
-        origin_t = torch.tensor(origin_rev, device=device, dtype=dtype)
-        direction_t = torch.tensor(direction_rev, device=device, dtype=dtype)
-        M_norm, b_norm = get_physical_to_normalized_affine(shape_t, spacing_t, origin_t, direction_t)
+        boundary_mask = get_boundary_mask(spatial, device, dtype) if stationary_boundary else None
+        _, spacing_t, _, _, M_norm, b_norm = _get_cached_phys_inv_meta(
+            spatial, spacing, origin, direction, device, dtype
+        )
         W_disp_cf = torch.movedim(W_disp, -1, 1)
     else:
         grids = [torch.linspace(-1, 1, size, device=device, dtype=dtype) for size in spatial]
         meshgrid = torch.meshgrid(*grids, indexing='ij')
         identity = torch.stack(list(reversed(meshgrid)), dim=-1).unsqueeze(0).expand(B, *([-1] * (dim + 1)))
-        boundary_mask = get_boundary_mask(spatial, device, dtype)
+        boundary_mask = get_boundary_mask(spatial, device, dtype) if stationary_boundary else None
         voxel_scale = torch.tensor(
             [float((s - 1) / 2.0) for s in reversed(spatial)],
             device=device, dtype=dtype
@@ -808,7 +838,8 @@ def update_inverse_field_nd_anderson(
     bshape = (B,) + (1,) * (W_disp.dim() - 1)
     ones_b = torch.ones(bshape, device=device, dtype=dtype)
 
-    need_mean = math.isfinite(float(mean_error_threshold))
+    can_converge = (float(max_error_threshold) >= 0.0 and float(mean_error_threshold) >= 0.0)
+    need_mean = can_converge and math.isfinite(float(mean_error_threshold))
 
     def _eval_fp_residual(v_curr, compute_mean: bool = True):
         if use_physical:
@@ -855,7 +886,8 @@ def update_inverse_field_nd_anderson(
         if smoothing_sigma > 0.0:
             v_new = separable_gaussian_filter(v_new, smoothing_sigma)     # sigma in voxels
 
-        v_new.mul_(boundary_mask)
+        if boundary_mask is not None:
+            v_new.mul_(boundary_mask)
         return v_new
 
     v_k = -W_disp.clone() if W_inv_disp is None else W_inv_disp.clone()
@@ -870,25 +902,26 @@ def update_inverse_field_nd_anderson(
     mps_large_field = (device.type == 'mps' and v_k.numel() >= 16_777_216)
 
     for iteration in range(steps):
-        checks_on = (check_interval is not None and check_interval > 0)
-        if first_check is None:
+        checks_on = can_converge and (check_interval is not None and check_interval > 0)
+        if not can_converge:
+            should_check = False
+        elif first_check is None:
             should_check = checks_on and ((iteration + 1) % check_interval == 0 or iteration == steps - 1)
         else:
             should_check = (iteration + 1 == first_check
                             or (checks_on and iteration + 1 > first_check
                                 and (iteration + 1 - first_check) % check_interval == 0)
                             or iteration == steps - 1)
-        err_buf, s_norm_buf, max_err, mean_err, residual_fp = _eval_fp_residual(v_k, compute_mean=True)
-        conv_now = (max_err <= max_error_threshold) if mean_err is None else (
-            (max_err <= max_error_threshold) & (mean_err <= mean_error_threshold)
-        )
-        conv_step = torch.where(conv_now & ~done, torch.full_like(conv_step, iteration), conv_step)
-        done_next = done | conv_now
+        err_buf, s_norm_buf, max_err, mean_err, residual_fp = _eval_fp_residual(v_k, compute_mean=can_converge)
+        if can_converge:
+            conv_now = (max_err <= max_error_threshold) if mean_err is None else (
+                (max_err <= max_error_threshold) & (mean_err <= mean_error_threshold)
+            )
+            conv_step = torch.where(conv_now & ~done, torch.full_like(conv_step, iteration), conv_step)
+            done_next = done | conv_now
+        else:
+            done_next = done
 
-        # Check convergence before building the fixed-point candidate or Anderson history:
-        # when every element in the batch has already met the thresholds at ``v_k`` (idempotent
-        # on feasible fields: ``steps_taken == 0`` when the initial guess already satisfies the
-        # thresholds), leave ``v_k`` untouched and skip candidate tensor construction.
         if should_check:
             flag = torch.stack([done_next.all().to(torch.int64), conv_step.max()]).tolist()   # one sync
             if flag[0]:
@@ -915,7 +948,7 @@ def update_inverse_field_nd_anderson(
         if m_k < 2:
             # ``g_k`` is stored in ``G_history``; keep ``v_k`` on disjoint storage so later
             # in-place ``out=v_k`` updates never mutate ``G_history[0]``.
-            if B == 1 and should_check:
+            if B == 1 and (should_check or not can_converge):
                 v_k.copy_(g_k)
             else:
                 torch.where(done_next.reshape(bshape), v_k, g_k, out=v_k)
@@ -955,7 +988,8 @@ def update_inverse_field_nd_anderson(
 
             v_candidate = v_new_flat.reshape(W_disp.shape)
             del v_new_flat
-            v_candidate.mul_(boundary_mask)
+            if boundary_mask is not None:
+                v_candidate.mul_(boundary_mask)
 
             if use_physical:
                 coords_phys_c = X_phys + v_candidate
@@ -986,7 +1020,7 @@ def update_inverse_field_nd_anderson(
             # keeps ``v_k`` intact (idempotent); when ``B == 1`` and ``should_check`` ran above,
             # ``done_next`` is guaranteed False so ``v_candidate`` (disjoint from ``G_history``)
             # transfers directly into ``v_k`` without copying.
-            if B == 1 and should_check:
+            if B == 1 and (should_check or not can_converge):
                 v_k = v_candidate
             else:
                 torch.where(done_next.reshape(bshape), v_k, v_candidate, out=v_k)
@@ -1098,6 +1132,7 @@ def update_inverse_field_nd(
         return torch.movedim(res, -1, 1) if channels_first else res
 
     effective_check_interval = kwargs.get('check_interval', check_interval)
+    stationary_boundary = bool(kwargs.get('stationary_boundary', True))
     if method == 'anderson':
         res = update_inverse_field_nd_anderson(
             W_disp, W_inv_disp, steps=steps,
@@ -1105,7 +1140,7 @@ def update_inverse_field_nd(
             mean_error_threshold=mean_error_threshold, spacing=spacing,
             origin=origin, direction=direction, X_phys=X_phys,
             check_interval=effective_check_interval,
-            check_after=check_after, stats=stats,
+            check_after=check_after, stationary_boundary=stationary_boundary, stats=stats,
         )
         return torch.movedim(res, -1, 1) if channels_first else res
 
@@ -1124,23 +1159,15 @@ def update_inverse_field_nd(
     if use_physical:
         if X_phys is None:
             X_phys = get_physical_grid_torch(spatial, spacing, origin, direction, device=device, dtype=dtype)
-        boundary_mask = get_boundary_mask(spatial, device, dtype)
-        spacing_rev = tuple(reversed(spacing))
-        origin_rev = tuple(reversed(origin))
-        dir_arr = np.asarray(direction)
-        if dir_arr.ndim == 1:
-            dir_arr = dir_arr.reshape(dim, dim)
-        direction_rev = dir_arr[::-1, ::-1].copy()
-        spacing_t = torch.tensor(spacing_rev, device=device, dtype=dtype)
-        shape_t = torch.tensor(list(spatial), device=device, dtype=dtype)
-        origin_t = torch.tensor(origin_rev, device=device, dtype=dtype)
-        direction_t = torch.tensor(direction_rev, device=device, dtype=dtype)
-        M_norm, b_norm = get_physical_to_normalized_affine(shape_t, spacing_t, origin_t, direction_t)
+        boundary_mask = get_boundary_mask(spatial, device, dtype) if stationary_boundary else None
+        _, spacing_t, _, _, M_norm, b_norm = _get_cached_phys_inv_meta(
+            spatial, spacing, origin, direction, device, dtype
+        )
     else:
         grids = [torch.linspace(-1, 1, size, device=device, dtype=dtype) for size in spatial]
         meshgrid = torch.meshgrid(*grids, indexing='ij')
         identity = torch.stack(list(reversed(meshgrid)), dim=-1).unsqueeze(0).expand(B, *([-1] * (dim + 1)))
-        boundary_mask = get_boundary_mask(spatial, device, dtype)
+        boundary_mask = get_boundary_mask(spatial, device, dtype) if stationary_boundary else None
         voxel_scale = torch.tensor(
             [float((s - 1) / 2.0) for s in reversed(spatial)],
             device=device, dtype=dtype
@@ -1156,10 +1183,13 @@ def update_inverse_field_nd(
     steps_taken = steps
     converged = False
     mps_large_field = (device.type == 'mps' and v_k.numel() >= 16_777_216)
+    can_converge = (float(max_error_threshold) >= 0.0 and float(mean_error_threshold) >= 0.0)
 
     for iteration in range(steps):
-        checks_on = (effective_check_interval is not None and effective_check_interval > 0)
-        if first_check is None:
+        checks_on = can_converge and (effective_check_interval is not None and effective_check_interval > 0)
+        if not can_converge:
+            should_check = False
+        elif first_check is None:
             should_check = checks_on and (
                 (iteration + 1) % effective_check_interval == 0 or iteration == steps - 1
             )
@@ -1189,10 +1219,13 @@ def update_inverse_field_nd(
             scaled_norm = _scaled_sq_sum(error, voxel_scale, divide=False).sqrt_()
 
         max_err = _batch_reduce_amax(scaled_norm)
-        mean_err = _batch_reduce_mean(scaled_norm)
-        conv_now = (max_err <= max_error_threshold) & (mean_err <= mean_error_threshold)
-        conv_step = torch.where(conv_now & ~done, torch.full_like(conv_step, iteration), conv_step)
-        done_next = done | conv_now
+        if can_converge:
+            mean_err = _batch_reduce_mean(scaled_norm)
+            conv_now = (max_err <= max_error_threshold) & (mean_err <= mean_error_threshold)
+            conv_step = torch.where(conv_now & ~done, torch.full_like(conv_step, iteration), conv_step)
+            done_next = done | conv_now
+        else:
+            done_next = done
 
         if should_check:
             flag = torch.stack([done_next.all().to(torch.int64), conv_step.max()]).tolist()
@@ -1219,9 +1252,10 @@ def update_inverse_field_nd(
 
         if smoothing_sigma > 0.0:
             g_k = separable_gaussian_filter(g_k, smoothing_sigma)
-        g_k.mul_(boundary_mask)
+        if boundary_mask is not None:
+            g_k.mul_(boundary_mask)
 
-        if B == 1 and should_check:
+        if B == 1 and (should_check or not can_converge):
             v_k.copy_(g_k)
         else:
             torch.where(done_next.reshape(bshape), v_k, g_k, out=v_k)
@@ -1339,19 +1373,13 @@ def calculate_inverse_identity_error(W_disp: torch.Tensor, W_inv_disp: torch.Ten
     X_phys = get_physical_grid_torch(spatial, spacing, origin, direction, device=device, dtype=dtype)
     coords_phys = X_phys + W_inv_disp
     del X_phys
-    
-    spacing_rev = tuple(reversed(spacing))
-    origin_rev = tuple(reversed(origin))
-    direction_rev = np.asarray(direction)[::-1, ::-1].copy()
-    
-    shape_t = torch.tensor(spatial, device=device, dtype=dtype)
-    spacing_t = torch.tensor(spacing_rev, device=device, dtype=dtype)
-    origin_t = torch.tensor(origin_rev, device=device, dtype=dtype)
-    direction_t = torch.tensor(direction_rev, device=device, dtype=dtype)
-    
-    coords_norm = physical_to_normalized_torch_cached(coords_phys, shape_t, spacing_t, origin_t, direction_t)
+
+    _, _, _, _, M_norm, b_norm = _get_cached_phys_inv_meta(
+        spatial, spacing, origin, direction, device, dtype
+    )
+    coords_norm = physical_to_normalized_fast(coords_phys, M_norm, b_norm)
     del coords_phys
-    
+
     forward_at_inv = compose_grids(W_disp, coords_norm)
     valid_mask = ((coords_norm >= -1) & (coords_norm <= 1)).all(dim=-1)
     del coords_norm
@@ -1368,9 +1396,14 @@ def calculate_inverse_identity_error(W_disp: torch.Tensor, W_inv_disp: torch.Ten
     del forward_at_inv
     error_norm.masked_fill_(~valid_mask, 0.0)
     if valid_mask.device.type == 'mps':
-        n_valid = max(float(_batch_reduce_sum(valid_mask.to(dtype)).item()), 1.0)
-        err_sum = float(_batch_reduce_sum(error_norm).item())
-        err_max = float(_batch_reduce_amax(error_norm).item())
+        stats_3 = torch.stack([
+            _batch_reduce_sum(valid_mask.to(dtype))[0],
+            _batch_reduce_sum(error_norm)[0],
+            _batch_reduce_amax(error_norm)[0],
+        ]).tolist()
+        n_valid = max(float(stats_3[0]), 1.0)
+        err_sum = float(stats_3[1])
+        err_max = float(stats_3[2])
     else:
         n_valid = max(float(valid_mask.sum(dtype=torch.int64).item()), 1.0)
         err_sum = float(error_norm.sum(dtype=torch.float64).item())

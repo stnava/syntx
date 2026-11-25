@@ -1081,7 +1081,25 @@ def greedy_registration(
         else:
             restr_t_zyx = None
 
-    # Optional physical inverse and/or digital_diffeomorphism projection
+    # Unidirectional digital_diffeomorphism projection on disp_t first so return_inverse=True
+    # never alters the forward displacement field or introduces artificial Dirichlet rim cliffs.
+    if digital_diffeomorphism and (sum(reg_iterations) > 0 or init_warp_t is not None):
+        from .core.digital_diffeomorphism import enforce_digital_diffeomorphism_nd
+        disp_t = enforce_digital_diffeomorphism_nd(
+            disp_t,
+            None,
+            spacing=fixed.spacing,
+            origin=fixed.origin,
+            direction=fixed.direction,
+            jac_floor=digital_diffeomorphism_floor,
+            steps=digital_diffeomorphism_steps,
+            stationary_boundary=False,
+        )
+        if restr_t_zyx is not None:
+            with torch.no_grad():
+                disp_t = disp_t * restr_t_zyx
+
+    # Optional physical inverse displacement field
     inv_disp_img = None
     inv_disp_t = None
     inv_err_dict = {}
@@ -1103,6 +1121,9 @@ def greedy_registration(
                 spacing=fixed.spacing,
                 origin=fixed.origin,
                 direction=fixed.direction,
+                check_after=min(3, inv_steps),
+                check_interval=4,
+                stationary_boundary=False,
             )
         else:
             inv_disp_t = update_inverse_field_nd_anderson(
@@ -1113,23 +1134,24 @@ def greedy_registration(
                 spacing=fixed.spacing,
                 origin=fixed.origin,
                 direction=fixed.direction,
+                check_after=min(3, inv_steps),
+                check_interval=4,
+                stationary_boundary=False,
             )
         if digital_diffeomorphism and (sum(reg_iterations) > 0 or init_warp_t is not None):
             from .core.digital_diffeomorphism import enforce_digital_diffeomorphism_nd
-            disp_t, inv_disp_t = enforce_digital_diffeomorphism_nd(
-                disp_t,
+            inv_disp_t = enforce_digital_diffeomorphism_nd(
                 inv_disp_t,
+                None,
                 spacing=fixed.spacing,
                 origin=fixed.origin,
                 direction=fixed.direction,
-                ice_tol=0.30,
                 jac_floor=digital_diffeomorphism_floor,
                 steps=digital_diffeomorphism_steps,
-                stationary_boundary=(padding_mode == 'border'),
+                stationary_boundary=False,
             )
         if restr_t_zyx is not None:
             with torch.no_grad():
-                disp_t = disp_t * restr_t_zyx
                 inv_disp_t = inv_disp_t * restr_t_zyx
         with torch.no_grad():
             from .core.inverse import calculate_inverse_identity_error
@@ -1143,21 +1165,6 @@ def greedy_registration(
         inv_disp_img = disp_tensor_to_itk(inv_disp_t, fixed)
         t1_inv = time.time() - t0_inv
     else:
-        if digital_diffeomorphism and (sum(reg_iterations) > 0 or init_warp_t is not None):
-            from .core.digital_diffeomorphism import enforce_digital_diffeomorphism_nd
-            disp_t = enforce_digital_diffeomorphism_nd(
-                disp_t,
-                None,
-                spacing=fixed.spacing,
-                origin=fixed.origin,
-                direction=fixed.direction,
-                jac_floor=digital_diffeomorphism_floor,
-                steps=digital_diffeomorphism_steps,
-                stationary_boundary=(padding_mode == 'border'),
-            )
-            if restr_t_zyx is not None:
-                with torch.no_grad():
-                    disp_t = disp_t * restr_t_zyx
         disp_img = disp_tensor_to_itk(disp_t, fixed)
 
     # Affine transform handling

@@ -323,6 +323,7 @@ class TransformChain:
         imagetype: int = 0,
         defaultvalue: float = 0.0,
         device: str | None = None,
+        _moving_field: ContinuousField | None = None,
     ) -> Any:
         import ants
 
@@ -391,7 +392,7 @@ class TransformChain:
         n_ref_vox = int(ref_shape[0]) * int(ref_shape[1]) * int(ref_shape[2])
         max_single_shot_vox = _MAX_GPU_CACHE_VOXELS * 4
         if str(dev) != "cpu" and mode != "bspline" and n_ref_vox > max_single_shot_vox:
-            field = ContinuousField(image, device=dev, dtype=torch.float32)
+            field = _moving_field if (_moving_field is not None and _moving_field.device == dev) else ContinuousField(image, device=dev, dtype=torch.float32)
             local_disp_cache: dict[tuple[str, float, str], ContinuousField] = {}
             arr_out = np.empty(ref_shape, dtype=np.float32)
             slab_x = max(1, max_single_shot_vox // max(1, int(ref_shape[1]) * int(ref_shape[2])))
@@ -431,12 +432,12 @@ class TransformChain:
             pts_moving = _map_points_to_moving_tensor(pts_fixed, self, dev)
             del pts_fixed
             if str(dev) == "cpu" or pts_moving.shape[0] <= _MAX_GPU_CACHE_VOXELS:
-                max_grid_entries = 4 if str(dev) == "cpu" else 2
+                max_grid_entries = 4
                 while len(_MAPPED_GRID_CACHE) >= max_grid_entries:
                     _MAPPED_GRID_CACHE.pop(next(iter(_MAPPED_GRID_CACHE)))
                 _MAPPED_GRID_CACHE[cache_key] = pts_moving
 
-        field = ContinuousField(image, device=dev, dtype=torch.float32)
+        field = _moving_field if (_moving_field is not None and _moving_field.device == dev) else ContinuousField(image, device=dev, dtype=torch.float32)
         out = _sample_field_itk(field, pts_moving, mode=mode, defaultvalue=defaultvalue)
         del field, pts_moving
         arr_out = out.reshape(ref_shape).detach().cpu().numpy().astype(np.float32, copy=False)
@@ -607,7 +608,7 @@ def _cache_disp_image_and_field(
                 )
             else:
                 field = ContinuousField(disp_img, device=dev, dtype=torch.float32)
-            max_disp_entries = 8 if str(dev) == "cpu" else 2
+            max_disp_entries = 8 if str(dev) == "cpu" else 4
             while len(_DISP_FIELD_CACHE) >= max_disp_entries:
                 _DISP_FIELD_CACHE.pop(next(iter(_DISP_FIELD_CACHE)))
             _DISP_FIELD_CACHE[disp_key] = field
@@ -833,10 +834,12 @@ def _reference_grid_points_lps(
     reference: Any, device: Any, x_slice: tuple[int, int] | None = None
 ) -> torch.Tensor:
     shape = tuple(int(s) for s in reference.shape[:3])
-    spacing = torch.as_tensor(reference.spacing[:3], dtype=torch.float32, device=device)
-    origin = torch.as_tensor(reference.origin[:3], dtype=torch.float32, device=device)
-    direction = torch.as_tensor(np.asarray(reference.direction)[:3, :3], dtype=torch.float32, device=device)
-    m_idx_to_phys = direction * spacing.unsqueeze(0)
+    m_idx_np = np.asarray(reference.direction, dtype=np.float64)[:3, :3] * np.asarray(reference.spacing, dtype=np.float64)[:3][None, :]
+    mo_t = torch.as_tensor(
+        np.vstack([m_idx_np.T, np.asarray(reference.origin, dtype=np.float64)[:3][None, :]]).astype(np.float32, copy=False),
+        dtype=torch.float32,
+        device=device,
+    )
     if x_slice is None:
         gx = torch.arange(shape[0], dtype=torch.float32, device=device)
     else:
@@ -846,8 +849,8 @@ def _reference_grid_points_lps(
     ii, jj, kk = torch.meshgrid(gx, gy, gz, indexing="ij")
     idx = torch.stack((ii.reshape(-1), jj.reshape(-1), kk.reshape(-1)), dim=-1)
     del ii, jj, kk
-    out = idx @ m_idx_to_phys.T + origin
-    del idx
+    out = idx @ mo_t[:3] + mo_t[3]
+    del idx, mo_t
     return out
 
 
@@ -948,7 +951,7 @@ def _get_disp_and_grad_fields(
         )
         n_vox = int(np.prod(field.spatial_shape))
         if str(dev) == "cpu" or n_vox <= _MAX_GPU_CACHE_VOXELS:
-            max_disp_entries = 8 if str(dev) == "cpu" else 2
+            max_disp_entries = 8 if str(dev) == "cpu" else 4
             if key not in _DISP_FIELD_CACHE:
                 while len(_DISP_FIELD_CACHE) >= max_disp_entries:
                     _DISP_FIELD_CACHE.pop(next(iter(_DISP_FIELD_CACHE)))
@@ -977,9 +980,13 @@ def _map_points_to_moving_tensor(
             continue
         if element.kind in _LINEAR:
             M, b = _read_itk_affine(element.path, invert=element.invert)
-            M_t = torch.as_tensor(M, dtype=torch.float32, device=device)
-            b_t = torch.as_tensor(b, dtype=torch.float32, device=device)
-            pts = pts @ M_t.T + b_t
+            mb_t = torch.as_tensor(
+                np.vstack([M.T, b[None, :]]).astype(np.float32, copy=False),
+                dtype=torch.float32,
+                device=device,
+            )
+            pts = pts @ mb_t[:3] + mb_t[3]
+            del mb_t
         else:
             if element.invert:
                 raise ValueError(f"{element.path}: a displacement field cannot be inverted on the fly")
@@ -1001,7 +1008,7 @@ def _map_points_to_moving_tensor(
                 field = ContinuousField(disp_img, device=device, dtype=torch.float32)
                 del disp_img
                 if str(device) == "cpu" or n_vox <= _MAX_GPU_CACHE_VOXELS:
-                    max_disp_entries = 8 if str(device) == "cpu" else 2
+                    max_disp_entries = 8 if str(device) == "cpu" else 4
                     while len(_DISP_FIELD_CACHE) >= max_disp_entries:
                         _DISP_FIELD_CACHE.pop(next(iter(_DISP_FIELD_CACHE)))
                     _DISP_FIELD_CACHE[disp_key] = field
@@ -1167,8 +1174,12 @@ def _apply_vector_3d(
     slab_vox_cap = int(max_slab_voxels) if max_slab_voxels is not None else (_MAX_GPU_CACHE_VOXELS * 2)
 
     field = ContinuousField(image, device=dev, dtype=torch.float32)
-    d_fix = torch.as_tensor(np.asarray(reference.direction)[:3, :3], dtype=torch.float32, device=dev)
-    d_mov = torch.as_tensor(np.asarray(image.direction)[:3, :3], dtype=torch.float32, device=dev)
+    d_both = torch.as_tensor(
+        np.stack([np.asarray(reference.direction)[:3, :3], np.asarray(image.direction)[:3, :3]], axis=0).astype(np.float32, copy=False),
+        dtype=torch.float32,
+        device=dev,
+    )
+    d_fix, d_mov = d_both[0], d_both[1]
 
     if str(dev) != "cpu" and mode != "bspline" and n_ref_vox > slab_vox_cap:
         local_dg_cache: dict[tuple[str, float, str], tuple[ContinuousField, ContinuousField]] = {}
@@ -1709,6 +1720,7 @@ def apply_transforms(
     """
     import ants
 
+    _moving_field = kwargs.pop("_moving_field", None)
     is_real_images = hasattr(ants, "is_image") and ants.is_image(fixed) and ants.is_image(moving)
     if hasattr(ants.apply_transforms, "_mock_name") or not is_real_images:
         tl_pass = transformlist.paths() if isinstance(transformlist, TransformChain) else transformlist
@@ -1809,6 +1821,7 @@ def apply_transforms(
         imagetype=imagetype,
         defaultvalue=defaultvalue,
         device=device,
+        _moving_field=_moving_field,
     )
 
 

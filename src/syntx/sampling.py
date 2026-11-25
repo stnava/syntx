@@ -414,6 +414,7 @@ class PointSampler:
         self.min_points = int(min_points)
         self.n_pool = 0
         self.vox_xyz: Optional[torch.Tensor] = None
+        self._pool_flat_idx_cpu: Optional[np.ndarray] = None
         self._weights_cache: dict = {}
 
     def pool(self) -> dict:
@@ -429,6 +430,8 @@ class PointSampler:
         shape = tuple(int(s) for s in self.reference.shape)
         vox = torch.stack(torch.unravel_index(sel, shape), dim=-1).to(torch.float32)
         self.vox_xyz = jitter_within_voxel(vox, torch.tensor(shape, dtype=torch.float32, device=self.device), self.generator)
+        self._pool_flat_idx_cpu = None
+        self._weights_cache.clear()
         return {"vox_xyz": self.vox_xyz, "phys": self.to_physical(self.vox_xyz)}
 
     def weights(self, sigma_mm: Optional[float] = None, use_sample_mask: bool = True) -> torch.Tensor:
@@ -474,12 +477,17 @@ class PointSampler:
         """The field's value in each pool point's OWN voxel (nearest; the jitter keeps a point within +-0.5 voxel of its
         voxel centre). Bilinear interpolation would mix in the zeros of neighbouring voxels outside the region and
         under-weight every point near the region's edge (uniform strategy: 0.43-1.0 instead of 1)."""
-        t = torch.from_numpy(np.ascontiguousarray(np.transpose(field_np, (2, 1, 0)))).to(self.device)
-        shape_xyz = torch.tensor(list(self.reference.shape), dtype=torch.float32, device=self.device)
-        norm = 2.0 * self.vox_xyz / (shape_xyz - 1.0).clamp_min(1.0) - 1.0
-        out = torch.nn.functional.grid_sample(t[None, None], norm.view(1, 1, 1, -1, 3), mode="nearest",
-                                              align_corners=True).reshape(-1)
-        return out.clamp_min(0.0)
+        if self._pool_flat_idx_cpu is None:
+            shape = tuple(int(s) for s in self.reference.shape)
+            ijk = torch.round(self.vox_xyz).to(torch.int64).clamp(min=0)
+            for d_ax, sz in enumerate(shape):
+                ijk[:, d_ax].clamp_(max=sz - 1)
+            flat = ijk[:, 0]
+            for d_ax in range(1, len(shape)):
+                flat = flat * int(shape[d_ax]) + ijk[:, d_ax]
+            self._pool_flat_idx_cpu = flat.cpu().numpy()
+        vals_np = np.maximum(np.ascontiguousarray(field_np, dtype=np.float32).reshape(-1)[self._pool_flat_idx_cpu], 0.0)
+        return torch.from_numpy(vals_np).to(self.device)
 
     def eval_points(self, fraction: float, n_available: int, minimum: int = 500) -> int:
         """Points one metric evaluation draws: ``fraction`` of ``n_available`` (at least ``minimum``), never more than
@@ -497,9 +505,9 @@ class PointSampler:
     def to_physical(self, vox_xyz: torch.Tensor) -> torch.Tensor:
         ref = self.reference
         f32 = dict(dtype=torch.float32, device=vox_xyz.device)
-        sp = torch.tensor(ref.spacing, **f32)
-        orig = torch.tensor(ref.origin, **f32)
-        dirm = torch.tensor(np.asarray(ref.direction), **f32)
+        sp = torch.tensor(list(ref.spacing), **f32)
+        orig = torch.tensor(list(ref.origin), **f32)
+        dirm = torch.tensor(np.asarray(ref.direction).tolist(), **f32)
         return orig + (vox_xyz * sp) @ dirm.t()
 
     def provenance(self) -> dict:

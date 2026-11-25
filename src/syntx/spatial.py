@@ -881,23 +881,43 @@ def physical_to_grid_affine(M_phys, t_phys, fixed_img, moving_img):
 # ═══════════════════════════════════════════════════════════════════════════════
 
 
+_PHYS_GRID_META_CACHE: dict[tuple, tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = {}
+
+
 def _get_physical_grid_torch_yfirst(
     shape, spacing, origin, direction, device="cpu", dtype=torch.float32
 ):
     """Physical point of every voxel, ``(index * spacing) @ direction.T + origin``, with all
     inputs and the output components in the same (tensor) order; shape (1, *shape, dim)."""
     dim = len(shape)
-    grids = [torch.arange(s, device=device, dtype=dtype) for s in shape]
+    dev_obj = device if isinstance(device, torch.device) else torch.device(device)
+    sp_tup = tuple(float(x) for x in spacing)
+    or_tup = tuple(float(x) for x in origin)
+    dir_arr = np.asarray(direction, dtype=np.float64).reshape(dim, dim)
+    meta_key = (sp_tup, or_tup, dir_arr.tobytes(), str(dev_obj), dtype)
+    meta = _PHYS_GRID_META_CACHE.get(meta_key)
+    if meta is None:
+        np_dt = np.float64 if dtype == torch.float64 else (np.float16 if dtype == torch.float16 else np.float32)
+        packed = torch.as_tensor(
+            np.vstack([np.asarray(sp_tup, dtype=np_dt)[None, :], np.asarray(or_tup, dtype=np_dt)[None, :], dir_arr.T.astype(np_dt)]),
+            device=dev_obj,
+            dtype=dtype,
+        )
+        meta = (packed[0], packed[1], packed[2:])
+        if len(_PHYS_GRID_META_CACHE) >= 64:
+            _PHYS_GRID_META_CACHE.pop(next(iter(_PHYS_GRID_META_CACHE)))
+        _PHYS_GRID_META_CACHE[meta_key] = meta
+    spacing_t, origin_t, direction_t_T = meta
+
+    grids = [torch.arange(s, device=dev_obj, dtype=dtype) for s in shape]
     meshgrid = torch.meshgrid(*grids, indexing="ij")
     idxs = torch.stack(meshgrid, dim=-1)
-    spacing_t = torch.tensor(spacing, device=device, dtype=dtype)
-    origin_t = torch.tensor(origin, device=device, dtype=dtype)
-    direction_t = torch.tensor(direction, device=device, dtype=dtype)
-
+    del grids, meshgrid
     scaled = idxs * spacing_t
-    flat_scaled = scaled.view(-1, dim)
-    flat_phys = flat_scaled @ direction_t.t() + origin_t
-    return flat_phys.view(*shape, dim).unsqueeze(0)
+    del idxs
+    flat_phys = scaled.view(-1, dim) @ direction_t_T + origin_t
+    del scaled
+    return flat_phys.view(1, *shape, dim)
 
 
 def get_physical_grid_torch(
@@ -1159,39 +1179,40 @@ def get_physical_to_normalized_affine(shape_t, spacing_t, origin_t, direction_t)
     return M_norm, b_norm
 
 
+_PHYS_TO_NORM_XYZ_CACHE: dict[tuple, tuple[torch.Tensor, torch.Tensor]] = {}
+
+
 def get_physical_to_normalized_affine_xyz(
     shape, spacing, origin, direction, device="cpu", dtype=torch.float32
 ):
     """``get_physical_to_normalized_affine`` for ANTs (x, y, z)-ordered inputs and points.
 
     Computed in float64, then cast. Works for 2-D as well as 3-D.
-
-    Parameters
-    ----------
-    shape, spacing, origin : sequence, length dim
-        ANTs order (Nx, Ny[, Nz]), (sx, sy[, sz]), (ox, oy[, oz]).
-    direction : array-like (dim, dim)
-        As ``ANTsImage.direction`` reports it (not reversed).
-    device : str or torch.device
-        Target PyTorch device for the returned tensors.
-    dtype : torch.dtype
-        Target dtype for the returned tensors.
-
-    Returns
-    -------
-    Tuple[torch.Tensor, torch.Tensor]
-        M (dim, dim) and b (dim,) such that, for physical points ``x_phys`` in (x, y, z)
-        order, ``x_phys @ M + b`` gives ``grid_sample`` coordinates in (x, y, z) order.
     """
-    shape_t = torch.as_tensor(np.asarray(shape)[::-1].copy(), dtype=torch.float64)
-    spacing_t = torch.as_tensor(np.asarray(spacing)[::-1].copy(), dtype=torch.float64)
-    origin_t = torch.as_tensor(np.asarray(origin)[::-1].copy(), dtype=torch.float64)
-    direction_t = torch.as_tensor(
-        np.asarray(direction)[::-1, ::-1].copy(), dtype=torch.float64
-    )
-    M, b = get_physical_to_normalized_affine(shape_t, spacing_t, origin_t, direction_t)
-    M = torch.flip(M, dims=[0])
-    return M.to(device=device, dtype=dtype), b.to(device=device, dtype=dtype)
+    dev_obj = device if isinstance(device, torch.device) else torch.device(device)
+    sh_tup = tuple(int(x) for x in shape)
+    sp_tup = tuple(float(x) for x in spacing)
+    or_tup = tuple(float(x) for x in origin)
+    dir_arr = np.asarray(direction, dtype=np.float64)
+    cache_key = (sh_tup, sp_tup, or_tup, dir_arr.tobytes(), str(dev_obj), dtype)
+    cached = _PHYS_TO_NORM_XYZ_CACHE.get(cache_key)
+    if cached is not None:
+        return cached
+
+    dim = len(sh_tup)
+    dir_mat = dir_arr.reshape(dim, dim)[::-1, ::-1]
+    scale_rev = 2.0 / (np.asarray(sp_tup, dtype=np.float64)[::-1] * (np.asarray(sh_tup, dtype=np.float64)[::-1] - 1.0))
+    m_rev = np.linalg.inv(dir_mat).T * scale_rev[None, :]
+    b_rev = -(np.asarray(or_tup, dtype=np.float64)[::-1] @ m_rev) - 1.0
+    m_xyz = m_rev[::-1, ::-1].copy()
+    b_xyz = b_rev[::-1].copy()
+    np_dt = np.float64 if dtype == torch.float64 else (np.float16 if dtype == torch.float16 else np.float32)
+    packed = torch.as_tensor(np.vstack([m_xyz, b_xyz[None, :]]).astype(np_dt, copy=False), device=dev_obj, dtype=dtype)
+    res = (packed[:-1], packed[-1])
+    if len(_PHYS_TO_NORM_XYZ_CACHE) >= 64:
+        _PHYS_TO_NORM_XYZ_CACHE.pop(next(iter(_PHYS_TO_NORM_XYZ_CACHE)))
+    _PHYS_TO_NORM_XYZ_CACHE[cache_key] = res
+    return res
 
 
 def lps_to_ras(coords):

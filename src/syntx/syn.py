@@ -1217,30 +1217,32 @@ class SyNTo(nn.Module):
             def _inverse_pair(fwd_l, fwd_r, init_l, init_r, key, X_phys_arg=None, use_tol=True):
                 """Invert two fields: batched (B=2) on standard grids, sequential B=1 fixed-point above 256^3."""
                 tol_kw = (dict(max_error_threshold=self.inv_tolerance, mean_error_threshold=self.inv_tolerance * 0.01)
-                          if use_tol else {})
+                          if use_tol else dict(max_error_threshold=-1.0, mean_error_threshold=-1.0))
                 if _large_level:
                     out_l = update_inverse_field_nd(
                         fwd_l.detach(), init_l.detach(),
                         steps=in_loop_inv_steps, method=_lvl_inv_method,
                         spacing=curr_spacing_fixed, origin=fixed_origin, direction=fixed_direction,
-                        X_phys=X_phys_arg, **tol_kw)
+                        X_phys=X_phys_arg, check_interval=4, **tol_kw)
                     del init_l
                     out_r = update_inverse_field_nd(
                         fwd_r.detach(), init_r.detach(),
                         steps=in_loop_inv_steps, method=_lvl_inv_method,
                         spacing=curr_spacing_fixed, origin=fixed_origin, direction=fixed_direction,
-                        X_phys=X_phys_arg, **tol_kw)
+                        X_phys=X_phys_arg, check_interval=4, **tol_kw)
                     del init_r
                     return out_l, out_r
                 stats = {}
                 fwd_pair = torch.cat([fwd_l.detach(), fwd_r.detach()])
                 init_pair = torch.cat([init_l.detach(), init_r.detach()])
                 del init_l, init_r
+                hint = self._inv_step_hint.get(key)
                 out = update_inverse_field_nd(
                     fwd_pair, init_pair,
                     steps=in_loop_inv_steps, method=self.inverse_method,
                     spacing=curr_spacing_fixed, origin=fixed_origin, direction=fixed_direction, X_phys=X_phys_arg,
-                    check_after=self._inv_step_hint.get(key), stats=stats, **tol_kw)
+                    check_after=(hint if hint is not None else min(3, in_loop_inv_steps)),
+                    check_interval=3, stats=stats, **tol_kw)
                 del fwd_pair, init_pair
                 if 'steps' in stats:
                     self._inv_step_hint[key] = stats['steps']
@@ -2567,7 +2569,7 @@ class SyNTo(nn.Module):
                                 _fwd_p, _init_p,
                                 steps=_p_steps, method=self.inverse_method,
                                 spacing=curr_spacing_fixed, origin=fixed_origin, direction=fixed_direction,
-                                X_phys=X_phys,
+                                X_phys=X_phys, check_interval=5,
                                 max_error_threshold=_p_tol, mean_error_threshold=_p_tol * 0.01,
                             )
                             if _lvl_pproj:
@@ -2575,7 +2577,7 @@ class SyNTo(nn.Module):
                                     _out_p, _fwd_p,
                                     steps=_p_steps, method=self.inverse_method,
                                     spacing=curr_spacing_fixed, origin=fixed_origin, direction=fixed_direction,
-                                    X_phys=X_phys,
+                                    X_phys=X_phys, check_interval=5,
                                     max_error_threshold=_p_tol, mean_error_threshold=_p_tol * 0.01,
                                 )
                                 warp_l2r.data.copy_(_proj_p[0:1])
@@ -2584,7 +2586,7 @@ class SyNTo(nn.Module):
                                     _proj_p, _out_p,
                                     steps=_p_steps, method=self.inverse_method,
                                     spacing=curr_spacing_fixed, origin=fixed_origin, direction=fixed_direction,
-                                    X_phys=X_phys,
+                                    X_phys=X_phys, check_interval=5,
                                     max_error_threshold=_p_tol, mean_error_threshold=_p_tol * 0.01,
                                 )
                                 del _proj_p
@@ -4265,9 +4267,37 @@ def registration(
             del w_l2r, w_l2r_inv, w_r2l, w_r2l_inv
         
     # 6. Apply transforms to generate warped output images
+    _need_midpoint_export = bool(_has_midpoint_warps and (export_midpoint or midpoint_only))
+    _can_reuse_cf = (
+        bool(return_warped)
+        and _need_midpoint_export
+        and not _skip_full_warps
+        and _apply_dev is not None
+        and not hasattr(ants.apply_transforms, "_mock_name")
+        and hasattr(ants, "is_image")
+        and ants.is_image(fixed_primary)
+        and ants.is_image(moving_primary)
+        and len(fixed_primary.shape) == 3
+        and len(moving_primary.shape) == 3
+    )
+    _fix_cf = None
+    _mov_cf = None
+    if _can_reuse_cf:
+        import torch
+        from .transforms import ContinuousField as _ContinuousField
+        _cf_dev = torch.device(_apply_dev)
+        _mov_cf = _ContinuousField(moving_primary, device=_cf_dev, dtype=torch.float32)
+
     if return_warped and not _skip_full_warps:
-        warpedmovout = _apply_transforms(fixed=fixed_primary, moving=moving_primary, transformlist=fwd_transforms, device=_apply_dev)
-        warpedfixout = _apply_transforms(fixed=moving_primary, moving=fixed_primary, transformlist=inv_transforms, whichtoinvert=whichtoinvert_inv, device=_apply_dev)
+        warpedmovout = _apply_transforms(
+            fixed=fixed_primary, moving=moving_primary, transformlist=fwd_transforms, device=_apply_dev, _moving_field=_mov_cf
+        )
+        if _can_reuse_cf:
+            _fix_cf = _ContinuousField(fixed_primary, device=_cf_dev, dtype=torch.float32)
+        warpedfixout = _apply_transforms(
+            fixed=moving_primary, moving=fixed_primary, transformlist=inv_transforms,
+            whichtoinvert=whichtoinvert_inv, device=_apply_dev, _moving_field=_fix_cf,
+        )
     else:
         warpedmovout = None
         warpedfixout = None
@@ -4279,7 +4309,7 @@ def registration(
     midpoint_fixed = None
     midpoint_moving = None
 
-    if _has_midpoint_warps and (export_midpoint or midpoint_only):
+    if _need_midpoint_export:
         fwd_mid_file = tempfile.NamedTemporaryFile(suffix='.nii.gz', delete=False).name
         inv_mid_file = tempfile.NamedTemporaryFile(suffix='.nii.gz', delete=False).name
 
@@ -4296,13 +4326,24 @@ def registration(
         inv_midpoint_image = inv_mid_img
 
         if return_warped:
-            midpoint_fixed = _apply_transforms(fixed=fixed_primary, moving=fixed_primary, transformlist=[fwd_midpoint_warp], device=_apply_dev)
+            midpoint_fixed = _apply_transforms(
+                fixed=fixed_primary, moving=fixed_primary, transformlist=[fwd_midpoint_warp], device=_apply_dev, _moving_field=_fix_cf
+            )
+            del _fix_cf
+            _fix_cf = None
             if affine_file is not None and (initial_transform is None or init_M_phys is not None):
-                midpoint_moving = _apply_transforms(fixed=fixed_primary, moving=moving_primary, transformlist=[inv_midpoint_warp, affine_file], device=_apply_dev)
+                midpoint_moving = _apply_transforms(
+                    fixed=fixed_primary, moving=moving_primary, transformlist=[inv_midpoint_warp, affine_file], device=_apply_dev, _moving_field=_mov_cf
+                )
             elif initial_transform is not None:
-                midpoint_moving = _apply_transforms(fixed=fixed_primary, moving=moving_primary, transformlist=[inv_midpoint_warp] + tx_list, device=_apply_dev)
+                midpoint_moving = _apply_transforms(
+                    fixed=fixed_primary, moving=moving_primary, transformlist=[inv_midpoint_warp] + tx_list, device=_apply_dev, _moving_field=_mov_cf
+                )
             else:
-                midpoint_moving = _apply_transforms(fixed=fixed_primary, moving=moving_primary, transformlist=[inv_midpoint_warp], device=_apply_dev)
+                midpoint_moving = _apply_transforms(
+                    fixed=fixed_primary, moving=moving_primary, transformlist=[inv_midpoint_warp], device=_apply_dev, _moving_field=_mov_cf
+                )
+    del _fix_cf, _mov_cf
 
     ret_dict = {'model': model,
         'warpedmovout': warpedmovout,

@@ -2056,12 +2056,23 @@ def _run_pytorch_affine_solver(fixed: ants.ANTsImage, moving: ants.ANTsImage, in
     if cands:
         with torch.no_grad():
             cand_probe = _make_path(cands[0][1], cands[0][2], '_cand_probe')
+            B_stack = torch.as_tensor(
+                np.stack([np.asarray(B, dtype=np.float32) for _, B, _ in cands], axis=0),
+                dtype=torch.float32,
+                device=device_obj,
+            )
+            t_stack = torch.as_tensor(
+                np.stack([np.asarray(tt, dtype=np.float32) for _, _, tt in cands], axis=0),
+                dtype=torch.float32,
+                device=device_obj,
+            )
             cand_losses = []
-            for name, B, tt in cands:
-                cand_probe.B = torch.as_tensor(B, dtype=torch.float32, device=device_obj)
-                cand_probe.t = torch.as_tensor(tt, dtype=torch.float32, device=device_obj)
+            for idx_c in range(len(cands)):
+                cand_probe.B = B_stack[idx_c]
+                cand_probe.t = t_stack[idx_c]
                 cand_losses.append(objective(cand_probe, 'rigid', coarse, full=True, sampling=1.0))
             cand_vals = torch.stack(cand_losses).tolist()
+            del B_stack, t_stack
         scored = [
             (float(sv), name, B, tt)
             for sv, (name, B, tt) in zip(cand_vals, cands)
@@ -2142,31 +2153,33 @@ def _run_pytorch_affine_solver(fixed: ants.ANTsImage, moving: ants.ANTsImage, in
             return (pts @ A.t() + (p.t + C_phys - A @ C_phys)).unsqueeze(0)
 
     def _path_axes(p, dof, level):
-        pts = _check_pts_for_level(level)
-        rel_sq = (pts - C_phys).pow(2)
+        e = pyr[level]
+        scales_cached = e.get('_axes_scales')
+        if scales_cached is None:
+            pts = _check_pts_for_level(level)
+            rel_sq = (pts - C_phys).pow(2)
+            col_ms = rel_sq.mean(dim=0)
+            if dim == 3:
+                rot_ms = torch.stack([col_ms[1] + col_ms[2], col_ms[0] + col_ms[2], col_ms[0] + col_ms[1]])
+                sc_vals = [float(v) for v in torch.cat([rot_ms.sqrt(), col_ms.sqrt()]).tolist()]
+                scales_cached = (sc_vals[:3], sc_vals[3:])
+            else:
+                rot_ms = (col_ms[0] + col_ms[1]).unsqueeze(0)
+                sc_vals = [float(v) for v in torch.cat([rot_ms.sqrt(), col_ms.sqrt()]).tolist()]
+                scales_cached = (sc_vals[:1], sc_vals[1:])
+            e['_axes_scales'] = scales_cached
+        r_sc, c_sc = scales_cached
         ax = [ParamAxis(p.t, (j,), 1.0) for j in range(dim)]
         if dim == 3:
-            col_ms = rel_sq.mean(dim=0)
-            rot_ms = torch.stack([col_ms[1] + col_ms[2], col_ms[0] + col_ms[2], col_ms[0] + col_ms[1]])
+            ax += [ParamAxis(p.omega, (j,), r_sc[j]) for j in range(3)]
             if dof == 'affine':
-                sc_vals = torch.cat([rot_ms.sqrt(), col_ms.sqrt()]).tolist()
-                r_sc, c_sc = sc_vals[:3], sc_vals[3:]
-                ax += [ParamAxis(p.omega, (j,), float(r_sc[j])) for j in range(3)]
-                ax += [ParamAxis(p.scale, (j,), float(c_sc[j])) for j in range(3)]
-                ax += [ParamAxis(p.shear, (j,), float(c_sc[c])) for j, c in enumerate((1, 2, 2))]
-            else:
-                r_sc = rot_ms.sqrt().tolist()
-                ax += [ParamAxis(p.omega, (j,), float(r_sc[j])) for j in range(3)]
+                ax += [ParamAxis(p.scale, (j,), c_sc[j]) for j in range(3)]
+                ax += [ParamAxis(p.shear, (j,), c_sc[c]) for j, c in enumerate((1, 2, 2))]
             return ax
-        col_ms = rel_sq.mean(dim=0)
-        rot_ms = (col_ms[0] + col_ms[1]).unsqueeze(0)
+        ax += [ParamAxis(p.omega, (0,), r_sc[0])]
         if dof == 'affine':
-            sc_vals = torch.cat([rot_ms.sqrt(), col_ms.sqrt()]).tolist()
-            ax += [ParamAxis(p.omega, (0,), float(sc_vals[0]))]
-            ax += [ParamAxis(p.scale, (j,), float(sc_vals[1 + j])) for j in range(2)]
-            ax += [ParamAxis(p.shear, (0,), float(sc_vals[2]))]
-        else:
-            ax += [ParamAxis(p.omega, (0,), float(rot_ms.sqrt().item()))]
+            ax += [ParamAxis(p.scale, (j,), c_sc[j]) for j in range(2)]
+            ax += [ParamAxis(p.shear, (0,), c_sc[1])]
         return ax
 
     def _run_converging_path(p, dof, level, optimizer, iters, step, lr, eta_frac, eta_min, closure_loss):
@@ -2297,7 +2310,7 @@ def _run_pytorch_affine_solver(fixed: ants.ANTsImage, moving: ants.ANTsImage, in
                         cap = (done - last_check) * cur * scale * (lr[0] + lr[1] * pt_radius)    # farthest the points could have moved (mm)
                         last_check = done
                         newly = tracker.update(_path_points(p, dof, level), capacity=cap)
-                        if judged or it == iters - 1:
+                        if judged:
                             flags_ad = torch.stack([newly.any(), tracker.active.any()]).tolist()
                             if flags_ad[0]:
                                 pr = probe_manifold(closure_loss, _path_axes(p, dof, level), stage_voxel, probe_vox=0.5)
@@ -2315,11 +2328,21 @@ def _run_pytorch_affine_solver(fixed: ants.ANTsImage, moving: ants.ANTsImage, in
                 scale *= 0.5
             with torch.no_grad():
                 end_ld = closure_loss().detach().to(torch.float32)
-                end_vals = torch.stack([have_best_stage.to(torch.float32), best_stage_loss_t, end_ld]).tolist()
+                end_vals = torch.stack([
+                    have_best_stage.to(torch.float32),
+                    best_stage_loss_t,
+                    end_ld,
+                    tracker.active.any().to(torch.float32),
+                    tracker.last_step[0].to(torch.float32),
+                ]).tolist()
                 if end_vals[0] > 0.5 and (not math.isfinite(end_vals[2]) or end_vals[1] < end_vals[2]):
                     for n, v in best_stage_state.items():
                         getattr(p, n).copy_(v)
                     last_loss[p.name] = best_stage_loss_t
+            fin_sync = [end_vals[3], end_vals[4]]
+            return {'stage': f"{optimizer}@L{level}", 'level': int(level), 'path': p.name, 'iterations': int(done), 'blocks': int(blocks),
+                    'tol_mm': tracker.tol, 'probe_rejections': int(rejected), 'converged': not (fin_sync[0] > 0.5), 'fixed_block': (not judged), 'final_step_mm': float(fin_sync[1]),
+                    'seconds': round(time.time() - t_stage, 2)}
         fin_sync = torch.stack([tracker.active.any().to(torch.float32), tracker.last_step[0].to(torch.float32)]).tolist()
         return {'stage': f"{optimizer}@L{level}", 'level': int(level), 'path': p.name, 'iterations': int(done), 'blocks': int(blocks),
                 'tol_mm': tracker.tol, 'probe_rejections': int(rejected), 'converged': not (fin_sync[0] > 0.5), 'fixed_block': (not judged), 'final_step_mm': float(fin_sync[1]),
@@ -2364,12 +2387,22 @@ def _run_pytorch_affine_solver(fixed: ants.ANTsImage, moving: ants.ANTsImage, in
             base_starts = [('CT_Tomo_Scaled', t_tomo_base), ('CT_Tomo_Rigid', ct_tomo['c_anchor_m'] - ct_tomo['c_anchor_f'])] + base_starts
         check_losses = [objective(winner, coarse_dof, coarse, full=True, sampling=1.0)]
         base_probe = _make_path(np.eye(dim), np.zeros(dim), '_base_probe')
-        for b_name, b_t in base_starts:
-            B_b = A_tomo_base if b_name == 'CT_Tomo_Scaled' else np.eye(dim)
-            base_probe.B = torch.as_tensor(B_b, dtype=torch.float32, device=device_obj)
-            base_probe.t = torch.as_tensor(b_t, dtype=torch.float32, device=device_obj)
+        B_base_stack = torch.as_tensor(
+            np.stack([np.asarray(A_tomo_base if b_name == 'CT_Tomo_Scaled' else np.eye(dim), dtype=np.float32) for b_name, _ in base_starts], axis=0),
+            dtype=torch.float32,
+            device=device_obj,
+        )
+        t_base_stack = torch.as_tensor(
+            np.stack([np.asarray(b_t, dtype=np.float32) for _, b_t in base_starts], axis=0),
+            dtype=torch.float32,
+            device=device_obj,
+        )
+        for idx_b in range(len(base_starts)):
+            base_probe.B = B_base_stack[idx_b]
+            base_probe.t = t_base_stack[idx_b]
             check_losses.append(objective(base_probe, coarse_dof, coarse, full=True, sampling=1.0))
         check_vals = torch.stack(check_losses).tolist()
+        del B_base_stack, t_base_stack
         final_coarse = float(check_vals[0])
         baselines = {b_name: float(val) for (b_name, _), val in zip(base_starts, check_vals[1:])}
     best_baseline = min(baselines.values())

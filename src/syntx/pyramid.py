@@ -352,6 +352,10 @@ def _geometry(dim, origin, direction):
     return o, tuple(tuple(float(x) for x in row) for row in d)
 
 
+_PREBUILD_WARP_CONST_CACHE: dict[tuple, tuple[torch.Tensor, ...]] = {}
+_PYRAMID_AXIS_WEIGHT_CACHE: dict[tuple, torch.Tensor] = {}
+
+
 def prebuild_warp(origin, direction, native_spacing, f, off, shape_zyx, device=None, dtype=torch.float32):
     """Closure ``y_phys (..., dim) -> normalised grid_sample coordinates`` (``align_corners=True``) of a working tensor of shape
     ``shape_zyx`` whose index j sits at full-resolution continuous index ``j f + off`` on the native grid
@@ -359,10 +363,33 @@ def prebuild_warp(origin, direction, native_spacing, f, off, shape_zyx, device=N
     ``j = (y_vox - off) / f``; ``2 j / (shape_xyz - 1) - 1``. The constants (the matrix inverse, the tensors) are built ONCE here,
     so a solver that calls it thousands of times pays only the arithmetic (building them per call was a 44 percent slowdown)."""
     dim = len(f)
-    t = lambda x: torch.as_tensor(np.asarray(x, dtype=np.float64), dtype=dtype, device=device)
-    dir_inv_t = t(np.linalg.inv(np.asarray(direction, dtype=np.float64).reshape(dim, dim)).T)
-    o, sp, ff, oo = t(origin), t(native_spacing), t(f), t(off)
-    den = t(np.asarray(shape_zyx[::-1], dtype=np.float64) - 1.0)
+    dev_obj = torch.device("cpu") if device is None else (device if isinstance(device, torch.device) else torch.device(device))
+    o_tup = tuple(float(x) for x in origin)
+    sp_tup = tuple(float(x) for x in native_spacing)
+    f_tup = tuple(float(x) for x in f)
+    off_tup = tuple(float(x) for x in off)
+    sh_tup = tuple(int(x) for x in shape_zyx)
+    dir_arr = np.asarray(direction, dtype=np.float64).reshape(dim, dim)
+    cache_key = (o_tup, sp_tup, f_tup, off_tup, sh_tup, dir_arr.tobytes(), str(dev_obj), dtype)
+    consts = _PREBUILD_WARP_CONST_CACHE.get(cache_key)
+    if consts is None:
+        dir_inv_t_np = np.linalg.inv(dir_arr).T
+        den_np = np.asarray(sh_tup[::-1], dtype=np.float64) - 1.0
+        rows_np = np.vstack([
+            dir_inv_t_np,
+            np.asarray(o_tup, dtype=np.float64)[None, :],
+            np.asarray(sp_tup, dtype=np.float64)[None, :],
+            np.asarray(f_tup, dtype=np.float64)[None, :],
+            np.asarray(off_tup, dtype=np.float64)[None, :],
+            den_np[None, :],
+        ])
+        np_dt = np.float64 if dtype == torch.float64 else (np.float16 if dtype == torch.float16 else np.float32)
+        packed = torch.as_tensor(rows_np.astype(np_dt, copy=False), dtype=dtype, device=dev_obj)
+        consts = (packed[:dim], packed[dim], packed[dim + 1], packed[dim + 2], packed[dim + 3], packed[dim + 4])
+        if len(_PREBUILD_WARP_CONST_CACHE) >= 128:
+            _PREBUILD_WARP_CONST_CACHE.pop(next(iter(_PREBUILD_WARP_CONST_CACHE)))
+        _PREBUILD_WARP_CONST_CACHE[cache_key] = consts
+    dir_inv_t, o, sp, ff, oo, den = consts
 
     def warp(y_phys):
         y_vox = (y_phys - o) @ dir_inv_t / sp
@@ -432,12 +459,22 @@ def _apply_torch(x: torch.Tensor, plan: LevelPlan) -> torch.Tensor:
     if plan.is_identity:
         return x
     out = x
+    dev_str = str(out.device)
+    dt = out.dtype
     for ax, (md, f, off, n_old, n_new) in enumerate(zip(plan.modes_xyz[::-1], plan.f_xyz[::-1], plan.off_xyz[::-1],
                                                         plan.native_shape_zyx, plan.shape_zyx), start=2):
         if md == 'identity':
             continue
-        W = torch.as_tensor(axis_weights(md, n_old, n_new, f, off), dtype=out.dtype, device=out.device)
-        out = torch.movedim(torch.movedim(out, ax, -1) @ W.t(), -1, ax)
+        w_key = (md, int(n_old), int(n_new), round(float(f), 8), round(float(off), 8), dev_str, dt)
+        w_t = _PYRAMID_AXIS_WEIGHT_CACHE.get(w_key)
+        if w_t is None:
+            np_dt = np.float64 if dt == torch.float64 else (np.float16 if dt == torch.float16 else np.float32)
+            w_np_t = np.ascontiguousarray(axis_weights(md, n_old, n_new, f, off).T, dtype=np_dt)
+            w_t = torch.as_tensor(w_np_t, dtype=dt, device=out.device)
+            if len(_PYRAMID_AXIS_WEIGHT_CACHE) >= 256:
+                _PYRAMID_AXIS_WEIGHT_CACHE.pop(next(iter(_PYRAMID_AXIS_WEIGHT_CACHE)))
+            _PYRAMID_AXIS_WEIGHT_CACHE[w_key] = w_t
+        out = torch.movedim(torch.movedim(out, ax, -1) @ w_t, -1, ax)
     return out.contiguous()
 
 

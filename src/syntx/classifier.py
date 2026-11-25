@@ -165,6 +165,32 @@ def preprocess_volume_for_classifier(
     return t
 
 
+_DIAG_CLASSIFIER_CACHE: Dict[tuple, DiagnosticClassifier3D] = {}
+
+
+def get_cached_diagnostic_classifier(
+    weights_path: str,
+    device: Optional[str] = None,
+) -> DiagnosticClassifier3D:
+    """Load and cache an eval-mode ``DiagnosticClassifier3D`` on ``device`` keyed by ``(path, mtime, device)``."""
+    from .device import resolve_device
+
+    dev_str = resolve_device(device, task="model")
+    mtime = os.path.getmtime(weights_path) if os.path.exists(weights_path) else 0.0
+    key = (os.path.abspath(weights_path), mtime, str(dev_str))
+    cached = _DIAG_CLASSIFIER_CACHE.get(key)
+    if cached is not None:
+        return cached
+    model = DiagnosticClassifier3D()
+    model.load_state_dict(torch.load(weights_path, map_location="cpu"))
+    model = model.to(dev_str)
+    model.eval()
+    if len(_DIAG_CLASSIFIER_CACHE) >= 4:
+        _DIAG_CLASSIFIER_CACHE.pop(next(iter(_DIAG_CLASSIFIER_CACHE)))
+    _DIAG_CLASSIFIER_CACHE[key] = model
+    return model
+
+
 def predict_diagnosis_deep(
     model: DiagnosticClassifier3D,
     image: Union[ants.ANTsImage, torch.Tensor, np.ndarray],
@@ -172,36 +198,27 @@ def predict_diagnosis_deep(
 ) -> Dict[str, Union[str, float, Dict[str, float]]]:
     """
     Classify one volume with ``model`` (no gradient, eval mode).
-
-    Parameters
-    ----------
-    model : DiagnosticClassifier3D
-        Moved to ``device`` and put in eval mode (side effect on the caller's object).
-    image : ANTsImage, torch.Tensor or numpy.ndarray
-        Preprocessed with ``preprocess_volume_for_classifier`` defaults (64^3, channel 0).
-    device : str, optional
-        Torch device; None / 'auto' -> ``syntx.device.resolve_device`` (cuda > mps > cpu).
-
-    Returns
-    -------
-    dict
-        ``body_part`` / ``modality`` : str, arg-max classes; ``anatomy_confidence`` /
-        ``modality_confidence`` : float, their softmax probabilities; ``confidence`` : float,
-        the mean of the two; ``anatomy_probabilities`` / ``modality_probabilities`` : dict
-        class -> probability; ``source`` : "deep_resnet10_tier2".
     """
     from .device import resolve_device
 
     device = resolve_device(device, task="model")
-    model = model.to(device)
-    model.eval()
+    target_dev = torch.device(device)
+    first_param = next(model.parameters(), None)
+    if first_param is None or first_param.device != target_dev:
+        model = model.to(target_dev)
+    if model.training:
+        model.eval()
 
-    tensor = preprocess_volume_for_classifier(image).to(device)
+    tensor = preprocess_volume_for_classifier(image).to(target_dev)
 
     with torch.no_grad():
         logits_anat, logits_mod = model(tensor)
-        prob_anat = F.softmax(logits_anat, dim=1)[0].cpu().numpy()
-        prob_mod = F.softmax(logits_mod, dim=1)[0].cpu().numpy()
+        n_anat = len(ANATOMY_CLASSES)
+        probs_all = torch.cat(
+            [F.softmax(logits_anat, dim=1)[0], F.softmax(logits_mod, dim=1)[0]], dim=0
+        ).tolist()
+        prob_anat = probs_all[:n_anat]
+        prob_mod = probs_all[n_anat:]
 
     pred_anat_idx = int(np.argmax(prob_anat))
     pred_mod_idx = int(np.argmax(prob_mod))

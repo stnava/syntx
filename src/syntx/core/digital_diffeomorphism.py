@@ -147,10 +147,17 @@ def _det_from_rows_nd(rows: list[torch.Tensor], s_D: float) -> torch.Tensor:
 def _d_rev_t_and_scale(D_rev_inv: torch.Tensor) -> tuple[torch.Tensor, float]:
     """Invert tiny ``(dim, dim)`` ``D_rev_inv`` on CPU in float64 to obtain ``D_rev.T`` and
     ``s_D = det(D_rev_inv)`` so ``det(diff.T @ D_rev_inv + I) == s_D * det(D_rev.T + diff)``."""
+    cached = getattr(D_rev_inv, "_cached_d_rev_t_scale", None)
+    if cached is not None and cached[0] == D_rev_inv._version:
+        return cached[1], cached[2]
     d_inv_np = D_rev_inv.detach().cpu().numpy().astype(np.float64)
     d_rev_np = np.linalg.inv(d_inv_np)
     s_D = float(np.linalg.det(d_inv_np))
     D_rev_T = torch.as_tensor(d_rev_np.T.copy(), device=D_rev_inv.device, dtype=D_rev_inv.dtype)
+    try:
+        D_rev_inv._cached_d_rev_t_scale = (D_rev_inv._version, D_rev_T, s_D)
+    except AttributeError:
+        pass
     return D_rev_T, s_D
 
 
@@ -2518,12 +2525,21 @@ def enforce_digital_diffeomorphism_nd(
 
         D_inv_np = np.linalg.inv(direction_rev)
         sp_rev_np = np.asarray(spacing_rev, dtype=np.float64)
-        right_mat = torch.tensor(
-            np.diag(1.0 / sp_rev_np) @ D_inv_np, device=device, dtype=dtype
+        np_dt = np.float64 if dtype == torch.float64 else (np.float16 if dtype == torch.float16 else np.float32)
+        d_inv_cast64 = D_inv_np.astype(np_dt).astype(np.float64)
+        d_rev_t_from_cast = np.linalg.inv(d_inv_cast64).T.copy()
+        s_d_from_cast = float(np.linalg.det(d_inv_cast64))
+        mats_4 = torch.as_tensor(
+            np.stack(
+                [np.diag(1.0 / sp_rev_np) @ D_inv_np, D_inv_np, direction_rev.T.copy(), d_rev_t_from_cast],
+                axis=0,
+            ).astype(np_dt, copy=False),
+            device=device,
+            dtype=dtype,
         )
-        D_rev_inv = torch.tensor(D_inv_np, device=device, dtype=dtype)
-        D_rev_T = torch.tensor(direction_rev.T.copy(), device=device, dtype=dtype)
+        right_mat, D_rev_inv, D_rev_T, D_rev_T_cast = mats_4[0], mats_4[1], mats_4[2], mats_4[3]
         s_D = float(np.linalg.det(D_inv_np))
+        D_rev_inv._cached_d_rev_t_scale = (D_rev_inv._version, D_rev_T_cast, s_d_from_cast)
         err_to_vox_mat = right_mat.T
         steps_fd = spacing_rev
         mean_sp = float(np.mean(spacing_rev))
@@ -2532,6 +2548,7 @@ def enforce_digital_diffeomorphism_nd(
         D_rev_inv = torch.eye(dim, device=device, dtype=dtype)
         D_rev_T = D_rev_inv
         s_D = 1.0
+        D_rev_inv._cached_d_rev_t_scale = (D_rev_inv._version, D_rev_T, s_D)
         err_to_vox_scale = torch.tensor(
             [float(max(s - 1, 1) / 2.0) for s in reversed(spatial)], device=device, dtype=dtype
         )
@@ -2610,12 +2627,11 @@ def enforce_digital_diffeomorphism_nd(
             right_mat = torch.tensor((p_flip @ np.diag(k_vec)).T, device=device, dtype=dtype)
 
     def _has_nonzero_boundary(w_t: torch.Tensor) -> bool:
+        face_flags = []
         for ax in range(dim):
-            if bool((w_t.select(ax + 1, 0) != 0.0).any().item()) or bool(
-                (w_t.select(ax + 1, spatial[ax] - 1) != 0.0).any().item()
-            ):
-                return True
-        return False
+            face_flags.append((w_t.select(ax + 1, 0) != 0.0).any())
+            face_flags.append((w_t.select(ax + 1, spatial[ax] - 1) != 0.0).any())
+        return bool(torch.stack(face_flags).any().item())
 
     def _eval_chord_errors_vox(u_f: torch.Tensor, u_i: torch.Tensor):
         u_f_cf = torch.movedim(u_f, -1, 1)
@@ -2835,11 +2851,13 @@ def enforce_digital_diffeomorphism_nd(
 
         # Step 1 (Coupled Joint Symmetric Shrinking-Shell Projection on (df, di) from iteration 0,
         # unfolding u_f and u_i together while keeping inverse chord coupling active throughout):
-        need_joint = (
-            bool((det_min_f < float(jac_floor)).any().item())
-            or bool((det_min_i < float(jac_floor)).any().item())
-            or bool((dom_b & (n_if > float(ice_tol))).any().item())
-            or bool((fold_shell & (n_fi > float(ice_tol))).any().item())
+        need_joint = bool(
+            torch.stack([
+                (det_min_f < float(jac_floor)).any(),
+                (det_min_i < float(jac_floor)).any(),
+                (dom_b & (n_if > float(ice_tol))).any(),
+                (fold_shell & (n_fi > float(ice_tol))).any(),
+            ]).any().item()
         )
         if need_joint:
             (
