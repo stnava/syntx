@@ -1,10 +1,19 @@
 # Tracking Summary
-current phase: v6.47.0 (`R55`: runtime-compiled Metal shader backend `core/kernels.py` — `91x` 8-corner `genericLabel`, zero-autograd 1-sided/2-sided LNCC & Mattes MI, zero-atomic Register-Parzen MI, fused Jacobian & `m=5` Anderson step; `batch_syn`, `batch_mattes_mi`, `batch_cc`, `batch_cc2`, `batch_correlation`, `batch_jacobian`, `batch_tbm`; continuation `build_template`; `hybrid_greedy` & `hybrid_syn`)
-next WP: all-GPU Blast Cohort Tensor-Based Morphometry (TBM) study (`24`-subject `ExpArt + FPA` custom Navier `SyN` template + `N = 296` session GPU `batch_tbm`)
+current phase: v6.48.0 (`R56`: lossless physical-space background cropping `syntx.crop_background` with scalar, per-axis, or per-face `margin` in `'voxels'` or `'mm'`, `divisor` pyramid/FFT grid rounding, `companions` co-cropping, and `allow_pad` boundary cushion; `R55` runtime-compiled Metal shader backend `core/kernels.py` & `batch_tbm`)
+next WP: all-GPU Blast Cohort Tensor-Based Morphometry (TBM) + `pysimlr` / `antsxviz` study (`24`-subject `ExpArt + FPA` custom Navier `SyN` template + `N = 295` session GPU `batch_syn` + `63` longitudinal `breacher` pairs)
 blockers: none
-active work: none
+active work: all-GPU Blast Cohort Navier `SyN` TBM + `pysimlr` / `antsxviz` study (`scratch/blast_tbm/`)
 device: Apple Silicon MPS / CPU (macOS arm64)
 last updated: 2026-11-25
+
+---
+
+## R56 (Lossless Physical-Space Background Cropping `syntx.crop_background`; v6.48.0, 2026-11-25)
+- **General Physical-Space Background Cropping (`src/syntx/spatial.py`, `src/syntx/__init__.py`, `tests/test_crop_background.py`)**:
+  - Added public `syntx.crop_background(image, margin=24, *, mask=None, threshold=0.0, margin_unit="voxels", divisor=1, companions=None, allow_pad=True, pad_value=0.0, return_info=False)` supporting 2-D, 3-D, multi-component (`has_components=True`), and 4-D time-series `ANTsImage` inputs.
+  - Controls crop tightness independently along each spatial axis via scalar `margin`, per-axis sequences `(m_x, m_y[, m_z])`, or explicit per-face `(low, high)` pairs in `'voxels'` or `'mm'`, with optional per-axis `divisor` grid rounding for multi-resolution pyramids and spectral FFT regularizers.
+  - Preserves foreground voxel values bitwise (zero resampling/interpolation) and updates ITK physical `origin` via $\mathbf{o}_{\text{new}} = \mathbf{o}_{\text{old}} + \mathbf{D}(\mathbf{s} \odot \mathbf{i}_{\text{start}})$ (`0.0 mm` LPS coordinate drift verified under oblique $\mathrm{SO}(3)$ direction matrices), cutting 1 mm whole-brain template/subject registration grids by `~40.7%` (`208x240x256 -> 184x224x184` with $\ge 24$ empty boundary voxels per face; single-subject Navier `SyN` runtime `~70 s -> 39.45 s` at `0.5637` vs `0.5641` 62-region DKT Dice).
+  - **Verification**: `python3 -m antsxqc.lint src/syntx` -> `0 finding(s)`; full `pytest tests/ -q` (`2,756 passed, 399 skipped, 0 failed`).
 
 ---
 

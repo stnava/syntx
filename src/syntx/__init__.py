@@ -101,7 +101,12 @@ from .syngs_jax import (
     momentum_to_deformation_jax,
 )
 from . import spatial
-from .spatial import deformation_gradient, polar_rotation_field, polar_rotation_field_torch
+from .spatial import (
+    crop_background,
+    deformation_gradient,
+    polar_rotation_field,
+    polar_rotation_field_torch,
+)
 from . import phase_encode
 from .phase_encode import (
     PhaseEncode,
@@ -386,7 +391,7 @@ from .liouville import liouville_determinant, determinant_summary
 syngs = syngs_registration
 affine_benchmark = evaluate_affine_benchmark
 
-__version__ = "6.47.0"
+__version__ = "6.48.0"
 
 
 
@@ -626,6 +631,7 @@ __all__ = [
     "infer_slice_axis",
     "gaussian_temporal_average",
     "smooth_all_frames",
+    "crop_background",
     "deformation_gradient",
     "polar_rotation_field",
     "polar_rotation_field_torch",

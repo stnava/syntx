@@ -2479,3 +2479,314 @@ def safe_whichtoinvert(transformlist: list, invert_flags: list) -> list:
     if k < n:
         return list(invert_flags) + [False] * (n - k)
     return list(invert_flags[:n])
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Lossless Physical-Space Background Cropping
+# ═══════════════════════════════════════════════════════════════════════════════
+
+
+def _parse_axis_margins_vox(
+    margin,
+    spacing: np.ndarray,
+    spatial_dim: int,
+    margin_unit: str,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Resolve ``margin`` into integer ``(pad_lo_min, pad_hi_min)`` of shape ``(spatial_dim,)``."""
+    unit = str(margin_unit).strip().lower()
+    if unit not in ("voxels", "voxel", "vox", "mm", "millimeters", "millimetres"):
+        raise ValueError(f"margin_unit must be 'voxels' or 'mm', got {margin_unit!r}")
+    is_mm = unit in ("mm", "millimeters", "millimetres")
+
+    if np.isscalar(margin):
+        val = float(margin)
+        if not np.isfinite(val) or val < 0.0:
+            raise ValueError(f"margin must be finite and >= 0, got {margin!r}")
+        lo_raw = np.full(spatial_dim, val, dtype=np.float64)
+        hi_raw = np.full(spatial_dim, val, dtype=np.float64)
+    else:
+        seq = list(margin)
+        if len(seq) != spatial_dim:
+            raise ValueError(
+                f"margin sequence length {len(seq)} must match spatial dimension {spatial_dim}"
+            )
+        lo_list: list[float] = []
+        hi_list: list[float] = []
+        for ax_i, item in enumerate(seq):
+            if np.isscalar(item):
+                v = float(item)
+                if not np.isfinite(v) or v < 0.0:
+                    raise ValueError(f"margin[{ax_i}] must be finite and >= 0, got {item!r}")
+                lo_list.append(v)
+                hi_list.append(v)
+            else:
+                pair = list(item)
+                if len(pair) != 2:
+                    raise ValueError(
+                        f"per-axis margin pair at axis {ax_i} must have length 2 (lo, hi), got {item!r}"
+                    )
+                v_lo, v_hi = float(pair[0]), float(pair[1])
+                if not (np.isfinite(v_lo) and np.isfinite(v_hi)) or v_lo < 0.0 or v_hi < 0.0:
+                    raise ValueError(
+                        f"margin[{ax_i}]=(lo, hi) must be finite and >= 0, got {item!r}"
+                    )
+                lo_list.append(v_lo)
+                hi_list.append(v_hi)
+        lo_raw = np.asarray(lo_list, dtype=np.float64)
+        hi_raw = np.asarray(hi_list, dtype=np.float64)
+
+    if is_mm:
+        sp = np.maximum(np.asarray(spacing[:spatial_dim], dtype=np.float64), 1e-8)
+        lo_vox = np.ceil(lo_raw / sp - 1e-12).astype(np.int64)
+        hi_vox = np.ceil(hi_raw / sp - 1e-12).astype(np.int64)
+    else:
+        lo_vox = np.ceil(lo_raw - 1e-12).astype(np.int64)
+        hi_vox = np.ceil(hi_raw - 1e-12).astype(np.int64)
+    return lo_vox, hi_vox
+
+
+def _parse_axis_divisors(divisor, spatial_dim: int) -> np.ndarray:
+    """Resolve ``divisor`` into positive integer array of shape ``(spatial_dim,)``."""
+    if np.isscalar(divisor):
+        d = int(divisor)
+        if d < 1 or float(divisor) != float(d):
+            raise ValueError(f"divisor must be a positive integer, got {divisor!r}")
+        return np.full(spatial_dim, d, dtype=np.int64)
+    seq = [int(x) for x in divisor]
+    if len(seq) != spatial_dim or any(d < 1 for d in seq):
+        raise ValueError(
+            f"divisor sequence must have {spatial_dim} positive integers, got {divisor!r}"
+        )
+    return np.asarray(seq, dtype=np.int64)
+
+
+def _slice_pad_ants_image(
+    im,
+    spatial_dim: int,
+    idx_start: np.ndarray,
+    new_spatial_shape: np.ndarray,
+    pad_value: float,
+):
+    """Apply integer shift ``idx_start`` and ``new_spatial_shape`` to ``im`` with exact ITK origin update."""
+    if ants is None or not isinstance(im, ants.ANTsImage):
+        raise TypeError(f"Expected ants.ANTsImage, got {type(im).__name__}")
+
+    old_arr = im.numpy()
+    sh_old = np.asarray(im.shape[:spatial_dim], dtype=np.int64)
+    has_comp = bool(getattr(im, "has_components", False))
+    trailing_shape = old_arr.shape[spatial_dim:]
+
+    full_new_shape = tuple(int(v) for v in new_spatial_shape) + tuple(int(v) for v in trailing_shape)
+    if float(pad_value) == 0.0:
+        new_arr = np.zeros(full_new_shape, dtype=old_arr.dtype)
+    else:
+        new_arr = np.full(full_new_shape, pad_value, dtype=old_arr.dtype)
+
+    src_lo = np.maximum(0, idx_start)
+    src_hi = np.minimum(sh_old, idx_start + new_spatial_shape)
+    dst_lo = src_lo - idx_start
+    dst_hi = src_hi - idx_start
+
+    if np.all(src_hi > src_lo):
+        src_slices = tuple(slice(int(src_lo[d]), int(src_hi[d])) for d in range(spatial_dim))
+        dst_slices = tuple(slice(int(dst_lo[d]), int(dst_hi[d])) for d in range(spatial_dim))
+        if trailing_shape:
+            src_slices = src_slices + (Ellipsis,)
+            dst_slices = dst_slices + (Ellipsis,)
+        new_arr[dst_slices] = old_arr[src_slices]
+
+    full_dim = int(im.dimension)
+    orig_full = np.asarray(im.origin, dtype=np.float64).copy()
+    sp_full = np.asarray(im.spacing, dtype=np.float64).copy()
+    dir_full = np.asarray(im.direction, dtype=np.float64).reshape(full_dim, full_dim).copy()
+
+    orig_full[:spatial_dim] = orig_full[:spatial_dim] + dir_full[:spatial_dim, :spatial_dim] @ (
+        sp_full[:spatial_dim] * idx_start.astype(np.float64)
+    )
+
+    return ants.from_numpy(
+        new_arr,
+        origin=tuple(float(v) for v in orig_full),
+        spacing=tuple(float(v) for v in sp_full),
+        direction=dir_full,
+        has_components=has_comp,
+    )
+
+
+def crop_background(
+    image,
+    margin=24,
+    *,
+    mask=None,
+    threshold: float = 0.0,
+    margin_unit: str = "voxels",
+    divisor=1,
+    companions=None,
+    allow_pad: bool = True,
+    pad_value: float = 0.0,
+    return_info: bool = False,
+):
+    """Losslessly crop (and optionally pad) empty background around an ``ANTsImage``'s foreground.
+
+    Controls crop tightness independently along each spatial axis via ``margin`` while strictly
+    preserving pixel values (zero interpolation or resampling) and updating the ITK physical
+    ``origin`` by ``origin_new = origin_old + direction @ (spacing * idx_start)`` so every
+    foreground voxel retains its exact physical LPS coordinate to machine precision.
+
+    Parameters
+    ----------
+    image : ants.ANTsImage
+        2-D, 3-D, multi-component, or 4-D time-series ``ANTsImage`` defining the foreground
+        bounding box (unless ``mask`` is given). For 4-D images (`dimension == 4`), spatial axes
+        ``0..2`` are cropped while the 4th (time) axis is preserved intact.
+    margin : int, float, sequence of length ``dim``, or sequence of ``(lo, hi)`` pairs, default 24
+        Minimum empty background margin to retain along each spatial axis:
+
+        - **Scalar** (e.g. ``24`` or ``0``): symmetric minimum margin on every spatial axis.
+        - **Per-axis sequence** (e.g. ``(16, 24, 32)``): axis-specific symmetric tightness for
+          ``(x, y[, z])``.
+        - **Per-face pairs** (e.g. ``((12, 12), (24, 24), (16, 32))``): explicit ``(low, high)``
+          index margins per spatial axis.
+    mask : ants.ANTsImage or ndarray, optional
+        Explicit foreground mask (`mask > 0`) on the same spatial grid as ``image``. When omitted,
+        foreground is defined by ``|image| > threshold``.
+    threshold : float, default 0.0
+        Foreground magnitude threshold (`|image| > threshold`) used when ``mask is None``.
+    margin_unit : {'voxels', 'mm'}, default 'voxels'
+        Units for ``margin``. When ``'mm'``, physical margins are converted per axis via
+        ``ceil(margin_mm / spacing)``.
+    divisor : int or sequence of int, default 1
+        Round each cropped spatial dimension up to an exact multiple of ``divisor`` (e.g. ``8``
+        for multi-resolution `[4, 2, 1]` pyramids and fast FFT regularizers), distributing extra
+        voxels symmetrically across ``(pad_lo, pad_hi)`` without ever dropping below ``margin``.
+    companions : sequence of ants.ANTsImage, optional
+        Additional ``ANTsImage`` objects on the same spatial grid shape (e.g. masks, parcellations,
+        displacement fields, or co-gridded batch volumes) to crop with the exact same integer
+        index window, updating each companion's physical ``origin`` from its own header.
+    allow_pad : bool, default True
+        When ``True``, faces whose existing background margin is narrower than ``margin`` are
+        padded with ``pad_value`` (and ``origin`` shifted accordingly) so every face has at least
+        ``margin`` empty voxels. When ``False``, the window is clamped to ``[0, image.shape)``.
+    pad_value : float, default 0.0
+        Fill value used when ``allow_pad=True`` extends past the input array boundary.
+    return_info : bool, default False
+        When ``True``, append a provenance dictionary (`old_shape`, `new_shape`, `bbox_lo`,
+        `bbox_hi`, `span`, `pad_lo`, `pad_hi`, `idx_start`, `old_origin`, `new_origin`,
+        `voxel_ratio`) to the return value.
+
+    Returns
+    -------
+    cropped : ants.ANTsImage
+        When ``companions is None`` and ``return_info=False``.
+    (cropped, info) : tuple
+        When ``companions is None`` and ``return_info=True``.
+    (cropped, cropped_companions) : tuple
+        When ``companions is not None`` and ``return_info=False``.
+    (cropped, cropped_companions, info) : tuple
+        When ``companions is not None`` and ``return_info=True``.
+    """
+    if ants is None or not isinstance(image, ants.ANTsImage):
+        raise TypeError(f"image must be an ants.ANTsImage, got {type(image).__name__}")
+
+    full_dim = int(image.dimension)
+    if full_dim < 2 or full_dim > 4:
+        raise ValueError(f"crop_background supports 2-D, 3-D, or 4-D ANTsImages, got dimension={full_dim}")
+    spatial_dim = 3 if full_dim == 4 else full_dim
+    sh_old = np.asarray(image.shape[:spatial_dim], dtype=np.int64)
+
+    if mask is not None:
+        if isinstance(mask, ants.ANTsImage):
+            if tuple(mask.shape[:spatial_dim]) != tuple(sh_old.tolist()):
+                raise ValueError(
+                    f"mask spatial shape {mask.shape[:spatial_dim]} != image spatial shape {tuple(sh_old.tolist())}"
+                )
+            m_arr = mask.numpy()
+        else:
+            m_arr = np.asarray(_to_numpy(mask))
+            if m_arr.shape[:spatial_dim] != tuple(sh_old.tolist()):
+                raise ValueError(
+                    f"mask spatial shape {m_arr.shape[:spatial_dim]} != image spatial shape {tuple(sh_old.tolist())}"
+                )
+        fg = m_arr > 0
+    else:
+        thr = float(threshold)
+        if not np.isfinite(thr) or thr < 0.0:
+            raise ValueError(f"threshold must be finite and >= 0, got {threshold!r}")
+        fg = np.abs(image.numpy()) > thr
+
+    while fg.ndim > spatial_dim:
+        fg = np.any(fg, axis=-1)
+
+    coords = np.argwhere(fg)
+    if coords.size == 0:
+        raise ValueError("crop_background: foreground mask is empty (no voxels above threshold).")
+
+    lo = coords.min(axis=0).astype(np.int64)
+    hi = coords.max(axis=0).astype(np.int64)
+    span = hi - lo + 1
+
+    sp_vec = np.asarray(image.spacing[:spatial_dim], dtype=np.float64)
+    pad_lo_min, pad_hi_min = _parse_axis_margins_vox(margin, sp_vec, spatial_dim, margin_unit)
+    div_vec = _parse_axis_divisors(divisor, spatial_dim)
+
+    if allow_pad:
+        raw_dim = span + pad_lo_min + pad_hi_min
+        new_shape = ((raw_dim + div_vec - 1) // div_vec) * div_vec
+        slack = new_shape - raw_dim
+        pad_lo = pad_lo_min + (slack // 2)
+        pad_hi = pad_hi_min + (slack - (slack // 2))
+        idx_start = lo - pad_lo
+    else:
+        idx_start = np.maximum(0, lo - pad_lo_min)
+        idx_end = np.minimum(sh_old, hi + 1 + pad_hi_min)
+        raw_dim = idx_end - idx_start
+        # Expand inside [0, sh_old] toward multiples of div_vec when room exists
+        target_dim = np.minimum(sh_old, ((raw_dim + div_vec - 1) // div_vec) * div_vec)
+        grow = target_dim - raw_dim
+        grow_lo = np.minimum(idx_start, grow // 2)
+        idx_start = idx_start - grow_lo
+        rem_grow = grow - grow_lo
+        grow_hi = np.minimum(sh_old - idx_end, rem_grow)
+        idx_end = idx_end + grow_hi
+        new_shape = idx_end - idx_start
+        pad_lo = lo - idx_start
+        pad_hi = idx_end - 1 - hi
+
+    cropped_main = _slice_pad_ants_image(image, spatial_dim, idx_start, new_shape, pad_value)
+
+    cropped_comps = None
+    if companions is not None:
+        cropped_comps = []
+        for c_idx, comp in enumerate(companions):
+            if not isinstance(comp, ants.ANTsImage):
+                raise TypeError(f"companions[{c_idx}] must be an ants.ANTsImage, got {type(comp).__name__}")
+            if tuple(comp.shape[:spatial_dim]) != tuple(sh_old.tolist()):
+                raise ValueError(
+                    f"companions[{c_idx}] spatial shape {comp.shape[:spatial_dim]} != "
+                    f"image spatial shape {tuple(sh_old.tolist())}"
+                )
+            cropped_comps.append(_slice_pad_ants_image(comp, spatial_dim, idx_start, new_shape, pad_value))
+
+    info = {
+        "old_shape": tuple(int(v) for v in sh_old),
+        "new_shape": tuple(int(v) for v in new_shape),
+        "bbox_lo": tuple(int(v) for v in lo),
+        "bbox_hi": tuple(int(v) for v in hi),
+        "span": tuple(int(v) for v in span),
+        "pad_lo": tuple(int(v) for v in pad_lo),
+        "pad_hi": tuple(int(v) for v in pad_hi),
+        "idx_start": tuple(int(v) for v in idx_start),
+        "old_origin": tuple(float(v) for v in image.origin[:spatial_dim]),
+        "new_origin": tuple(float(v) for v in cropped_main.origin[:spatial_dim]),
+        "margin_unit": str(margin_unit),
+        "divisor": tuple(int(v) for v in div_vec),
+        "voxel_ratio": float(np.prod(new_shape)) / max(1.0, float(np.prod(sh_old))),
+    }
+
+    if companions is not None and return_info:
+        return cropped_main, cropped_comps, info
+    if companions is not None:
+        return cropped_main, cropped_comps
+    if return_info:
+        return cropped_main, info
+    return cropped_main
