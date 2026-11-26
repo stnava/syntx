@@ -2688,10 +2688,13 @@ def batch_syn(
                     wli_i = warp_l2r_inv[bi : bi + 1]
                     wri_i = warp_r2l_inv[bi : bi + 1]
                     if tuple(wl_i.shape[1:-1]) != full_shape_zyx:
-                        wl_i = resize_field(wl_i, list(full_shape_zyx), mode="trilinear")
-                        wr_i = resize_field(wr_i, list(full_shape_zyx), mode="trilinear")
-                        wli_i = resize_field(wli_i, list(full_shape_zyx), mode="trilinear")
-                        wri_i = resize_field(wri_i, list(full_shape_zyx), mode="trilinear")
+                        w4 = resize_field(
+                            torch.cat([wl_i, wr_i, wli_i, wri_i], dim=0),
+                            list(full_shape_zyx),
+                            mode="trilinear",
+                        )
+                        wl_i, wr_i, wli_i, wri_i = w4[0:1], w4[1:2], w4[2:3], w4[3:4]
+                        del w4
                     else:
                         wl_i = wl_i.clone()
                         wr_i = wr_i.clone()
@@ -2741,21 +2744,23 @@ def batch_syn(
                         wli_i = apply_physical_restriction_zyx(wli_i, parsed_restr, inplace=True)
                         wri_i = apply_physical_restriction_zyx(wri_i, parsed_restr, inplace=True)
 
-                    cn_fwd = physical_to_normalized_torch_cached(
-                        X_phys_full + wli_i, c_shape_t, c_sp_t, c_org_t, c_dir_t
+                    cn_pair = physical_to_normalized_torch_cached(
+                        torch.cat([X_phys_full + wli_i, X_phys_full + wri_i], dim=0),
+                        c_shape_t,
+                        c_sp_t,
+                        c_org_t,
+                        c_dir_t,
                     )
-                    fwd_comp = wli_i + F.grid_sample(
-                        wr_i.movedim(-1, 1), cn_fwd, padding_mode="border", align_corners=True
+                    sampled_pair = F.grid_sample(
+                        torch.cat([wr_i, wl_i], dim=0).movedim(-1, 1),
+                        cn_pair,
+                        padding_mode="border",
+                        align_corners=True,
                     ).movedim(1, -1)
-                    del cn_fwd
-
-                    cn_inv = physical_to_normalized_torch_cached(
-                        X_phys_full + wri_i, c_shape_t, c_sp_t, c_org_t, c_dir_t
-                    )
-                    inv_comp = wri_i + F.grid_sample(
-                        wl_i.movedim(-1, 1), cn_inv, padding_mode="border", align_corners=True
-                    ).movedim(1, -1)
-                    del cn_inv, wri_i
+                    del cn_pair
+                    fwd_comp = wli_i + sampled_pair[0:1]
+                    inv_comp = wri_i + sampled_pair[1:2]
+                    del sampled_pair, wri_i
 
                     if b_mask_full is not None:
                         fwd_comp.mul_(b_mask_full)

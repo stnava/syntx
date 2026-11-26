@@ -1,10 +1,24 @@
 # Tracking Summary
-current phase: v6.49.0 (`R57`: exact 1-D oblique EPI phase-encoding directional vector projection $\mathbf{u} \leftarrow (\mathbf{u} \cdot \mathbf{v}_{\text{PE}})\mathbf{v}_{\text{PE}}$ across `phase_encode`, `syn`, `greedy`, `batch_syn`, `batch_greedy`, and `dewarp`, plus unified `syntx.viz.render_registration_qc` 4/6/8-panel registration QC renderer replacing `render_standard_4panel`; `R56` `syntx.crop_background`; `R55` runtime-compiled Metal shader backend & `batch_tbm`)
-next WP: cross-sectional Blast Cohort Tensor-Based Morphometry (TBM) + `pysimlr` / `antsxviz` study (`scratch/blast_tbm/`) and extraction to `antsxbrainmapping` / `antsxbrainmappingprivate`
+current phase: v6.50.0 (`R58`: compact-ID & pooled `r_search=0` `joint_label_fusion` + multi-parcellation `joint_label_fusion_multi` (`9.77 GiB -> 302 MiB` VRAM, `1.74x` multi-atlas solve reuse), sparse CSR `roi_mean_timeseries` + `roi_mean_from_masked_timeseries` (`99.9 ms` on 532-ROI BOLD, `0.00e+00` diff) & `15.9 ms` 142k-column `correlation_matrix_wide_from_timeseries`, single-copy 4-D `motion_correction` DVARS, and batched `batch_syn` half-warp composition; `R57` oblique EPI 1-D vector projection & unified `render_registration_qc`)
+next WP: downstream cross-repo efficiency rollout (`antstorch` -> `antsxstructural` -> `antsxfunctional` -> `antsxbrainmapping`)
 blockers: none
-active work: cross-sectional Blast Cohort Navier `SyN` TBM + `pysimlr` / `antsxviz` study (`scratch/blast_tbm/`)
+active work: cross-repo efficiency rollout (`R58` complete)
 device: Apple Silicon MPS / CPU (macOS arm64)
 last updated: 2026-11-26
+
+---
+
+## R58 (Compact-ID & Pooled `joint_label_fusion` / `joint_label_fusion_multi`, Vectorized `syntx.tabulate` Timeseries & Connectome Tabulation, Single-Copy 4-D `motion_correction` DVARS, and Fused `batch_syn` Composition; v6.50.0, 2026-11-26)
+- **Compact Class-ID Remapping, Exact `r_search=0` Box-Pooled Voting, Batched `G_ij` Moments, and `joint_label_fusion_multi` (`src/syntx/{joint_label_fusion,__init__}.py`, `tests/test_joint_label_fusion.py`)**:
+  - Added `_remap_labels_compact` mapping sparse label domains (e.g., FreeSurfer/DKT `1002..2035`) to dense `0..C-1` indices (preserving `0` at index `0` and smallest-label tie-breaking), cutting `P` from `(M, 2036)` (`9.77 GiB` VRAM at `M=1.2M` voxels) to `(M, 63)` (**`302 MiB` VRAM, `-96.9%` / `32.3x` reduction**) and emitting `probability_images` strictly for present candidate classes + background `0`.
+  - Replaced the `(2*rad+1)^3 * K = 3,000`-step scatter loop at `r_search=0` with exact channel-chunked `_box_sum_chunked(W_full, rad)` + `K`-step unique-row accumulation (`125x` fewer voting ops, `100%` deterministic), and batched pairwise `G_ij` (`mode="joint"`) and LNCC (`mode="patch"`) `_box_sum` evaluations in 32-channel chunks (`300 -> 10` pool launches at `K=24`).
+  - Added public `syntx.joint_label_fusion_multi(target_image, atlas_images, atlas_labels_dict, ...)` computing patch search and Wang/LNCC solve-set weights `w_X` **once** on the union dilated disagreement mask across arbitrary parcellation dictionaries (`tissue`, `cit168`, `dkt`, `leaf`), verified **`bitwise_exact=True`** against per-parcellation `joint_label_fusion` (`18.78 -> 10.79 s` = `1.74x` faster on CPU `K=24` 4-parcellation `96x112x96` benchmark).
+- **Zero-Copy Sparse CSR `roi_mean_timeseries`, `roi_mean_from_masked_timeseries`, and Vectorized Upper-Triangle Connectome Wide Tabulation (`src/syntx/tabulate.py`, `tests/test_tabulate.py`)**:
+  - Replaced the per-ROI boolean-mask loop in `roi_mean_timeseries` with zero-copy `ANTsImage.view()` + single-pass `O(V_fg * T)` `scipy.sparse.csr_matrix` projection (`1,154 -> 332.4 ms` on `96x96x60x488` 532-ROI Yeo BOLD), and added `roi_mean_from_masked_timeseries(flat_timeseries, mask, roi_label_image)` operating directly on `(T, V_mask)` arrays without materializing a `1.1 GiB` 4-D `ANTsImage` (**`99.9 ms`, `11.6x` faster, `0.00e+00` max diff**).
+  - Vectorized `correlation_matrix_wide_from_timeseries` via `np.triu_indices` + 2-D `float64` array DataFrame construction (**`15.9 ms`** on 532-ROI / `141,778`-column connectome wide tables).
+- **4-D `motion_correction` Copy Deduplication & Fused `batch_syn` Composition (`src/syntx/{motion,cohort}.py`)**:
+  - Eliminated redundant 4-D `.numpy()` array copies during pre/post DVARS and temporal-variance reporting in `motion_correction`, and fused per-subject `B=4` `resize_field` + `B=2` `(fwd_comp, inv_comp)` `F.grid_sample` evaluations in `batch_syn`.
+- **Verification**: `python3 -m antsxqc.lint src/syntx` -> `0 finding(s)` (no `.antsxqc-allow`); `pytest` across `test_joint_label_fusion.py`, `test_tabulate.py`, `test_motion.py`, `test_population_gpu_cohort.py`, and all implementation/pyramid/phase-encode/device guard suites (`109 passed, 6 skipped, 0 failed`).
 
 ---
 

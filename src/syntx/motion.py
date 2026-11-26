@@ -1387,28 +1387,27 @@ def motion_correction(
 
     fd_primary = fd_jenkinson if fd_method.lower() == "jenkinson" else fd_power
 
-    # 9. Calculate DVARS (pre and post), normalized by a reference intensity so DVARS is
-    # comparable across subjects/acquisitions with very different raw intensity scales
-    # (see calculate_dvars' reference_intensity docstring).
+    # 9. Calculate DVARS (pre and post) & temporal variance metrics from single 4-D array views,
+    # avoiding four redundant 1+ GiB `.numpy()` copies on long BOLD / DWI series.
     if dvars_reference_intensity is None:
         ref_arr = ref_img.numpy()
         ref_fg = ref_arr[ref_arr > 0]
         dvars_reference_intensity = float(np.mean(ref_fg)) if ref_fg.size > 0 else None
 
-    dvars_pre = calculate_dvars(image, mask=mask, reference_intensity=dvars_reference_intensity)
-    dvars_post = calculate_dvars(motion_corrected, mask=mask, reference_intensity=dvars_reference_intensity)
-
-    # 10. Temporal variance metrics
     img_arr = image.numpy()
     corr_arr = motion_corrected.numpy()
 
     if mask is not None:
         mask_arr = mask.numpy() > 0 if isinstance(mask, ants.ANTsImage) else np.asarray(mask) > 0
+        dvars_pre = calculate_dvars(img_arr, mask=mask_arr, reference_intensity=dvars_reference_intensity)
+        dvars_post = calculate_dvars(corr_arr, mask=mask_arr, reference_intensity=dvars_reference_intensity)
     else:
         mean_v = np.mean(img_arr, axis=-1)
         mask_arr = mean_v > (0.05 * np.max(mean_v))
         if not np.any(mask_arr):
             mask_arr = np.ones(img_arr.shape[:-1], dtype=bool)
+        dvars_pre = calculate_dvars(img_arr, mask=mask_arr, reference_intensity=dvars_reference_intensity)
+        dvars_post = calculate_dvars(corr_arr, mask=None, reference_intensity=dvars_reference_intensity)
 
     var_pre = float(np.mean(np.var(img_arr[mask_arr], axis=-1)))
     var_post = float(np.mean(np.var(corr_arr[mask_arr], axis=-1)))

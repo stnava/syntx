@@ -208,7 +208,7 @@ from .hybrid import (
     hybrid_greedy,
     hybrid_syn,
 )
-from .joint_label_fusion import joint_label_fusion
+from .joint_label_fusion import joint_label_fusion, joint_label_fusion_multi
 
 from .surface import (
     compute_surface_classes,
@@ -390,7 +390,7 @@ from .liouville import liouville_determinant, determinant_summary
 syngs = syngs_registration
 affine_benchmark = evaluate_affine_benchmark
 
-__version__ = "6.49.0"
+__version__ = "6.50.0"
 
 
 
@@ -658,6 +658,7 @@ __all__ = [
     "enforce_digital_diffeomorphism_nd",
     "pullback_digital_diffeomorphism_to_halves",
     "joint_label_fusion",
+    "joint_label_fusion_multi",
     "frames",
     "VECTOR_FRAME",
     "bvecs_to_image_frame",

@@ -415,3 +415,53 @@ def test_tied_votes_are_deterministic_and_go_to_the_smaller_label(mode):
     b = syntx.joint_label_fusion(target, atlases, labels, solver="lu", skip_consensus=False, **kw)["segmentation"].numpy()
     assert np.array_equal(a, b)
     assert a[6:10, 6:10].max() == 0  # tie -> smaller label (background)
+
+
+def test_sparse_freesurfer_dkt_ids_compact_remap_and_multi_fusion():
+    """Sparse labels (e.g. FreeSurfer DKT 1002..2035) must map compactly without O(M * max_id) bloat,
+    and joint_label_fusion_multi must match per-parcellation joint_label_fusion identically."""
+    rng = np.random.default_rng(17)
+    shape = (28, 28, 28)
+    base_dkt = np.zeros(shape, dtype=np.uint32)
+    base_dkt[6:14, 6:22, 6:22] = 1002
+    base_dkt[14:22, 6:22, 6:22] = 2035
+
+    base_tis = np.zeros(shape, dtype=np.uint32)
+    base_tis[6:22, 6:22, 6:22] = 2
+
+    t_np = (15.0 + 45.0 * (base_dkt == 1002) + 85.0 * (base_dkt == 2035) + rng.normal(0, 2.5, shape)).astype(np.float32)
+    target = ants.from_numpy(t_np, spacing=(1.0, 1.0, 1.0))
+
+    atlases, dkt_labels, tis_labels = [], [], []
+    for _ in range(5):
+        shift = tuple(int(v) for v in rng.integers(-1, 2, size=3))
+        ld = np.roll(base_dkt, shift, axis=(0, 1, 2))
+        lt = np.roll(base_tis, shift, axis=(0, 1, 2))
+        a_np = (15.0 + 45.0 * (ld == 1002) + 85.0 * (ld == 2035) + rng.normal(0, 2.5, shape)).astype(np.float32)
+        atlases.append(ants.from_numpy(a_np, spacing=(1.0, 1.0, 1.0)))
+        dkt_labels.append(ants.from_numpy(ld, spacing=(1.0, 1.0, 1.0)))
+        tis_labels.append(ants.from_numpy(lt, spacing=(1.0, 1.0, 1.0)))
+
+    single_dkt = syntx.joint_label_fusion(
+        target, atlases, dkt_labels, mode="joint", rad=2, device="cpu", return_probabilities=True
+    )
+    assert set(single_dkt["probability_images"].keys()) == {0, 1002, 2035}
+    prob_sum = sum(p.numpy() for p in single_dkt["probability_images"].values())
+    assert np.allclose(prob_sum, 1.0, atol=1e-5)
+
+    single_tis = syntx.joint_label_fusion(
+        target, atlases, tis_labels, mode="joint", rad=2, device="cpu", return_probabilities=False
+    )
+    multi = syntx.joint_label_fusion_multi(
+        target,
+        atlases,
+        {"dkt": dkt_labels, "tissue": tis_labels},
+        mode="joint",
+        rad=2,
+        device="cpu",
+        return_probabilities=False,
+    )
+    assert np.array_equal(multi["dkt"]["segmentation"].numpy(), single_dkt["segmentation"].numpy())
+    assert np.array_equal(multi["tissue"]["segmentation"].numpy(), single_tis["segmentation"].numpy())
+    assert np.array_equal(multi["dkt"]["consensus_envelope"].numpy(), single_dkt["consensus_envelope"].numpy())
+

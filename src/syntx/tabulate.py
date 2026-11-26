@@ -382,20 +382,108 @@ def correlation_matrix_wide_from_timeseries(
     n_rois = len(roi_ids)
     corr = correlation_matrix(timeseries, device=device)
 
-    roi_pairs = list(itertools.combinations(range(n_rois), 2))
-    cor_values = [corr[a, b] for a, b in roi_pairs]
+    iu_a, iu_b = np.triu_indices(n_rois, k=1)
+    vals_2d = np.ascontiguousarray(corr[iu_a, iu_b][None, :], dtype=np.float64)
     lookup = label_df_to_lookup(label_names)
+    roi_tokens = [f"{prefix}{lookup.get(int(rid), f'Label{int(rid)}')}" for rid in roi_ids]
+    names_raw = [lookup.get(int(rid), f"Label{int(rid)}") for rid in roi_ids]
+    col_names = [f"{roi_tokens[a]}_{names_raw[b]}" for a, b in zip(iu_a.tolist(), iu_b.tolist())]
+    return pd.DataFrame(vals_2d, columns=col_names, copy=False)
 
-    def _fmt(rid: int) -> str:
-        return lookup.get(int(rid), f"Label{int(rid)}")
 
-    col_names = [f"{_fmt(int(roi_ids[a]))}_{_fmt(int(roi_ids[b]))}" for a, b in roi_pairs]
-    df_wide = pd.DataFrame([cor_values], columns=col_names)
-    return df_wide.add_prefix(prefix)
+def _project_voxel_timeseries_to_rois(
+    fg_ts: np.ndarray,
+    fg_lbl: np.ndarray,
+) -> tuple[np.ndarray, list[int]]:
+    """Project ``(n_fg_voxels, n_timepoints)`` array onto sorted positive integer ROI IDs."""
+    from scipy.sparse import csr_matrix
+
+    n_t = int(fg_ts.shape[1])
+    if fg_lbl.size == 0:
+        return np.zeros((n_t, 0), dtype=np.float64), []
+    u_pos, inv = np.unique(fg_lbl, return_inverse=True)
+    roi_ids = [int(v) for v in u_pos]
+    n_rois = len(roi_ids)
+    n_fg = int(fg_lbl.shape[0])
+    counts = np.bincount(inv, minlength=n_rois).astype(np.float64)
+    work_dtype = np.float32 if fg_ts.dtype == np.float32 else np.float64
+    ts_work = np.ascontiguousarray(fg_ts, dtype=work_dtype)
+    proj = csr_matrix(
+        (np.ones(n_fg, dtype=work_dtype), (inv, np.arange(n_fg, dtype=np.int64))),
+        shape=(n_rois, n_fg),
+    )
+    sums = proj.dot(ts_work).astype(np.float64)
+    mean_roi = np.ascontiguousarray((sums / counts[:, None]).T, dtype=np.float64)
+    return mean_roi, roi_ids
+
+
+def _as_readonly_array(img_or_arr: Any) -> np.ndarray:
+    """Return a zero-copy NumPy view of an ``ANTsImage`` (via ``.view()``) or array."""
+    if hasattr(img_or_arr, "view") and callable(img_or_arr.view) and hasattr(img_or_arr, "spacing"):
+        return img_or_arr.view()
+    if hasattr(img_or_arr, "numpy") and callable(img_or_arr.numpy):
+        return img_or_arr.numpy()
+    return np.asarray(img_or_arr)
+
+
+def roi_mean_from_masked_timeseries(
+    flat_timeseries: np.ndarray,
+    mask: Any,
+    roi_label_image: Any,
+) -> tuple[np.ndarray, list[int]]:
+    """Extract ``(mean_roi, roi_ids)`` directly from a ``(n_timepoints, n_mask_voxels)`` masked array.
+
+    Avoids materializing a multi-gigabyte 4-D ``ANTsImage`` when the caller already holds the
+    brain-masked ``(T, V_mask)`` time-series matrix (e.g. ``antsxfunctional.rsfmri``). Voxels with
+    ``roi_label > 0`` outside ``mask`` (if any) have zero signal in a brain-masked residual volume;
+    pass ``roi_label_image`` already masked to ``mask`` (standard in ``rsfmri``/``TaskfMRI``) for
+    exact equivalence with :func:`roi_mean_timeseries` on the zero-filled 4-D volume.
+    """
+    mask_arr = _as_readonly_array(mask) > 0
+    label_arr = _as_readonly_array(roi_label_image)
+    if mask_arr.shape != label_arr.shape:
+        raise ValueError(
+            f"roi_mean_from_masked_timeseries: label grid {label_arr.shape} != mask grid {mask_arr.shape}"
+        )
+    if not np.array_equal(label_arr, np.floor(label_arr)):
+        values = np.unique(label_arr)
+        raise ValueError(
+            "roi_mean_from_masked_timeseries: labels must be integer-valued "
+            f"(got e.g. {values[values != np.round(values)][:3].tolist()})"
+        )
+    ts_tv = np.asarray(flat_timeseries)
+    n_t, n_m = int(ts_tv.shape[0]), int(ts_tv.shape[1])
+    lbl_in_mask = label_arr[mask_arr]
+    if lbl_in_mask.shape[0] != n_m:
+        raise ValueError(
+            f"roi_mean_from_masked_timeseries: flat_timeseries has {n_m} columns, mask has {lbl_in_mask.shape[0]}"
+        )
+    pos_in_mask = lbl_in_mask > 0
+    if not np.any(pos_in_mask):
+        return np.zeros((n_t, 0), dtype=np.float64), []
+
+    # Check if any positive ROI voxel lies outside `mask_arr` (if so, its signal is 0 in a masked 4-D image,
+    # so denominator is total voxel count of that ROI in `label_arr`, while numerator sums over `mask_arr`).
+    fg_lbl_in_mask = lbl_in_mask[pos_in_mask].astype(np.int64, copy=False)
+    fg_ts_vt = ts_tv[:, pos_in_mask].T
+    mean_in_mask, roi_ids = _project_voxel_timeseries_to_rois(fg_ts_vt, fg_lbl_in_mask)
+    outside_pos = (label_arr > 0) & (~mask_arr)
+    if np.any(outside_pos):
+        all_pos_lbl = label_arr[label_arr > 0].astype(np.int64, copy=False)
+        u_all, cnt_all = np.unique(all_pos_lbl, return_counts=True)
+        u_in, cnt_in = np.unique(fg_lbl_in_mask, return_counts=True)
+        in_map = dict(zip(u_in.tolist(), range(len(u_in))))
+        out_full = np.zeros((n_t, len(u_all)), dtype=np.float64)
+        for j, (lid, c_tot) in enumerate(zip(u_all.tolist(), cnt_all.tolist())):
+            if lid in in_map:
+                idx_in = in_map[lid]
+                out_full[:, j] = mean_in_mask[:, idx_in] * (float(cnt_in[idx_in]) / float(c_tot))
+        return out_full, [int(v) for v in u_all]
+    return mean_in_mask, roi_ids
 
 
 def roi_mean_timeseries(timeseries_image: Any, roi_label_image: Any) -> tuple[np.ndarray, list[int]]:
-    """Mean signal over each ROI at every time point (plain boolean masking of the arrays).
+    """Mean signal over each ROI at every time point (vectorized O(V_fg * T) sparse projection).
 
     Parameters
     ----------
@@ -411,8 +499,8 @@ def roi_mean_timeseries(timeseries_image: Any, roi_label_image: Any) -> tuple[np
     (mean_roi, roi_ids) : (np.ndarray of shape (n_timepoints, n_rois), list of int)
         ``roi_ids`` are the sorted positive label values; ``mean_roi`` is float64.
     """
-    ts_arr = timeseries_image.numpy()
-    label_arr = roi_label_image.numpy()
+    ts_arr = _as_readonly_array(timeseries_image)
+    label_arr = _as_readonly_array(roi_label_image)
     if ts_arr.shape[:3] != label_arr.shape:
         raise ValueError(f"roi_mean_timeseries: label grid {label_arr.shape} does not match the "
                          f"timeseries grid {ts_arr.shape[:3]}")
@@ -421,19 +509,19 @@ def roi_mean_timeseries(timeseries_image: Any, roi_label_image: Any) -> tuple[np
         if not np.allclose(a, b, atol=1e-4):
             raise ValueError(f"roi_mean_timeseries: label {name} {tuple(b)} does not match the "
                              f"timeseries grid {tuple(a)}")
-    values = np.unique(label_arr)
-    if not np.all(values == np.round(values)):
+    if not np.array_equal(label_arr, np.floor(label_arr)):
+        values = np.unique(label_arr)
         raise ValueError("roi_mean_timeseries: labels must be integer-valued "
                          f"(got e.g. {values[values != np.round(values)][:3].tolist()})")
-    roi_ids = sorted(int(v) for v in values if v > 0)
 
-    n_t = ts_arr.shape[-1]
-    mean_roi = np.zeros((n_t, len(roi_ids)), dtype=np.float64)
-    for i, label in enumerate(roi_ids):
-        mask = label_arr == label
-        mean_roi[:, i] = ts_arr[mask, :].mean(axis=0)
+    n_t = int(ts_arr.shape[-1])
+    fg_mask = label_arr > 0
+    if not np.any(fg_mask):
+        return np.zeros((n_t, 0), dtype=np.float64), []
 
-    return mean_roi, roi_ids
+    fg_lbl = label_arr[fg_mask].astype(np.int64, copy=False)
+    fg_ts = ts_arr[fg_mask, :]
+    return _project_voxel_timeseries_to_rois(fg_ts, fg_lbl)
 
 
 def correlation_matrix_wide_from_image(

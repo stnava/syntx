@@ -36,7 +36,7 @@ from __future__ import annotations
 import itertools
 import time
 import warnings
-from typing import Any, Literal, Sequence
+from typing import Any, Literal, Mapping, Sequence
 
 import ants
 import numpy as np
@@ -77,18 +77,20 @@ def _search_offsets(r_search: int, dim: int) -> list:
                   key=lambda o: (sum(c * c for c in o), o))
 
 
-def _search_best_patch(target_t, atlases_ext, labels_ext, offsets, margin, rad, sub_shape, roi, dev):
-    """Per atlas and voxel, pick the offset with the minimum patch SSD and return its intensity/label.
+def _box_sum_chunked(x: torch.Tensor, rad: int, max_channels: int = 32) -> torch.Tensor:
+    """Channel-chunked ``_box_sum`` for ``(1, C, *spatial)`` tensors so MPS/CUDA pool kernels stay bounded."""
+    c_tot = int(x.shape[1])
+    if c_tot <= max_channels:
+        return _box_sum(x, rad)
+    parts = [_box_sum(x[:, s : s + max_channels], rad) for s in range(0, c_tot, max_channels)]
+    return torch.cat(parts, dim=1)
 
-    ``atlases_ext`` / ``labels_ext`` are ``(1, 1, *(sub_shape + 2*margin))`` tensors; ``target_t``
-    is ``(1, 1, *sub_shape)``. A candidate replaces the incumbent only on strictly smaller SSD and
-    offsets are visited in the order of ``offsets`` (zero first), so ties keep the smallest
-    displacement and the result is deterministic. Returns, per atlas, the selected intensity,
-    label and offset index (into ``offsets``), plus the fraction of ``roi`` voxels moved.
-    """
+
+def _search_best_patch_offsets(target_t, atlases_ext, offsets, margin, rad, sub_shape, roi, dev):
+    """Per atlas and voxel, pick the offset with the minimum patch SSD and return ``(sel_a, sel_o, fracs)``."""
     roi_t = torch.from_numpy(np.ascontiguousarray(roi)).to(dev)
-    sel_a, sel_l, sel_o, moved_counts_t = [], [], [], [roi_t.sum()]
-    for A, L in zip(atlases_ext, labels_ext):
+    sel_a, sel_o, moved_counts_t = [], [], [roi_t.sum()]
+    for A in atlases_ext:
         best = None
         for oi, off in enumerate(offsets):
             sl = (slice(None), slice(None)) + tuple(
@@ -97,21 +99,47 @@ def _search_best_patch(target_t, atlases_ext, labels_ext, offsets, margin, rad, 
             a = A[sl].contiguous()
             ssd = _box_sum((a - target_t) ** 2, rad)  # patch SSD (sum; the 1/|patch| factor is common)
             if best is None:
-                best, a_sel, l_sel = ssd, a, L[sl].contiguous()
+                best, a_sel = ssd, a
                 o_sel = torch.zeros_like(ssd, dtype=torch.long)
                 continue
             upd = ssd < best
             best = torch.where(upd, ssd, best)
             a_sel = torch.where(upd, a, a_sel)
-            l_sel = torch.where(upd, L[sl].contiguous(), l_sel)
             o_sel = torch.where(upd, torch.full_like(o_sel, oi), o_sel)
         sel_a.append(a_sel)
-        sel_l.append(l_sel)
         sel_o.append(o_sel)
         moved_counts_t.append(((o_sel[0, 0] != 0) & roi_t).sum())
     moved_vals = torch.stack(moved_counts_t).tolist()
     n_roi = max(int(moved_vals[0]), 1)
     fracs = [float(v) / n_roi for v in moved_vals[1:]]
+    return sel_a, sel_o, fracs
+
+
+def _gather_selected_labels(labels_ext, off_ids, offsets, sub_shape, margin, dev):
+    """Gather centre-selected labels ``L_i(n + s_i(n))`` on ``sub_shape`` from ``labels_ext`` and ``off_ids``."""
+    dim = len(sub_shape)
+    ext_shape = [n + 2 * margin for n in sub_shape]
+    st = [int(np.prod(ext_shape[d + 1:])) for d in range(dim)]
+    N = int(np.prod(sub_shape))
+    rem = torch.arange(N, dtype=torch.long, device=dev)
+    base_all = torch.zeros_like(rem)
+    for d in range(dim - 1, -1, -1):
+        base_all = base_all + (rem % sub_shape[d] + margin) * st[d]
+        rem = rem // sub_shape[d]
+    shift_t = torch.tensor([int(sum(o * s for o, s in zip(off, st))) for off in offsets], dtype=torch.long, device=dev)
+    sel_l = []
+    for L, O in zip(labels_ext, off_ids):
+        idx = base_all + shift_t[O.reshape(-1)]
+        sel_l.append(L.reshape(-1)[idx].reshape(1, 1, *sub_shape))
+    return sel_l
+
+
+def _search_best_patch(target_t, atlases_ext, labels_ext, offsets, margin, rad, sub_shape, roi, dev):
+    """Per atlas and voxel, pick the offset with the minimum patch SSD and return its intensity/label."""
+    sel_a, sel_o, fracs = _search_best_patch_offsets(
+        target_t, atlases_ext, offsets, margin, rad, sub_shape, roi, dev
+    )
+    sel_l = _gather_selected_labels(labels_ext, sel_o, offsets, sub_shape, margin, dev)
     return sel_a, sel_l, sel_o, fracs
 
 
@@ -308,6 +336,514 @@ def _gather_weights(target_ext, atlases_ext, off_ids, offsets, didx, sub_shape, 
     return out
 
 
+def _remap_labels_compact(labels_seq: Sequence[torch.Tensor], dev: torch.device) -> tuple[torch.Tensor, list[torch.Tensor]]:
+    """Map arbitrary non-negative integer labels to compact ``0..C-1`` indices (with ``0`` always at index ``0``).
+
+    Eliminates ``O(M * max_label)`` VRAM blow-up on sparse label tables such as FreeSurfer/DKT
+    (``1002..2035`` -> ``63`` classes instead of ``2036``, reducing ``P`` from ~9.8 GiB to ~300 MiB).
+    """
+    u_labels = torch.unique(torch.cat([l.reshape(-1) for l in labels_seq]), sorted=True)
+    if u_labels.numel() > 0 and int(u_labels[0].item()) < 0:
+        raise ValueError(f"atlas_labels must be non-negative integers, got min={int(u_labels[0].item())}")
+    if u_labels.numel() == 0 or int(u_labels[0].item()) != 0:
+        u_labels = torch.cat([torch.zeros(1, dtype=torch.long, device=dev), u_labels])
+    max_lbl = int(u_labels[-1].item())
+    num_compact = int(u_labels.numel())
+    if max_lbl == num_compact - 1:
+        return u_labels, list(labels_seq)
+    if max_lbl <= 1_000_000:
+        lut = torch.zeros(max_lbl + 1, dtype=torch.long, device=dev)
+        lut[u_labels] = torch.arange(num_compact, dtype=torch.long, device=dev)
+        return u_labels, [lut[l] for l in labels_seq]
+    return u_labels, [torch.searchsorted(u_labels, l) for l in labels_seq]
+
+
+def _compute_weights_on_solve_set(
+    target_t: torch.Tensor,
+    atlases_t: list[torch.Tensor],
+    target_ext: torch.Tensor | None,
+    atlases_ext: list[torch.Tensor] | None,
+    off_ids: list[torch.Tensor],
+    offsets: list[tuple[int, ...]],
+    xidx: torch.Tensor,
+    sub_shape: tuple[int, ...],
+    margin: int,
+    rad: int,
+    r_search: int,
+    mode: str,
+    beta: float,
+    rho: float,
+    solver: str,
+    nonnegative: bool,
+    patch_norm: bool,
+    stats: dict[str, int],
+    dev: torch.device,
+) -> torch.Tensor:
+    """Compute ``(MX, K)`` patch or Wang JLF weights on ``xidx``."""
+    K = len(atlases_t)
+    dim = len(sub_shape)
+    N = int(np.prod(sub_shape))
+    MX = int(xidx.numel())
+    kernel_vol = float((2 * rad + 1) ** dim)
+    flat = lambda x: x[0, 0].reshape(-1)  # noqa: E731
+
+    if r_search > 0:
+        return _gather_weights(
+            target_ext, atlases_ext, off_ids, offsets, xidx, sub_shape, margin, rad,
+            mode, beta, rho, solver, nonnegative, stats, dev, patch_norm,
+        )
+    if mode == "patch":
+        t_sum = _box_sum(target_t, rad)
+        t2_sum = _box_sum(target_t * target_t, rad)
+        t_var = torch.clamp(t2_sum - t_sum * t_sum / kernel_vol, min=1e-4)
+        A_cat = torch.cat(atlases_t, dim=1)  # (1, K, *sub_shape)
+        p_sum = _box_sum_chunked(A_cat, rad)
+        p2_sum = _box_sum_chunked(A_cat * A_cat, rad)
+        tp_sum = _box_sum_chunked(target_t * A_cat, rad)
+        del A_cat
+        cross = tp_sum - p_sum * t_sum / kernel_vol
+        p_var = torch.clamp(p2_sum - p_sum * p_sum / kernel_vol, min=1e-4)
+        ncc = torch.clamp(cross / (torch.sqrt(t_var * p_var) + 1e-4), min=0.0)
+        ncc_X = ncc.reshape(K, N)[:, xidx].T.contiguous()
+        return _patch_weights(ncc_X, beta)
+    if patch_norm:
+        S_t, S_tt = _box_sum(target_t, rad), _box_sum(target_t * target_t, rad)
+        C_tt = S_tt - S_t * S_t / kernel_vol
+        s_t = torch.sqrt(torch.clamp_min(C_tt, _VAR_FLOOR))
+        A_cat = torch.cat(atlases_t, dim=1)
+        S_a = _box_sum_chunked(A_cat, rad)
+        C_aa = _box_sum_chunked(A_cat * A_cat, rad) - S_a * S_a / kernel_vol
+        s_a = torch.sqrt(torch.clamp_min(C_aa, _VAR_FLOOR))
+        r_t_all = ((_box_sum_chunked(A_cat * target_t, rad) - S_a * S_t / kernel_vol) / (s_a * s_t)).reshape(K, N)[:, xidx]
+        r_tt = flat(C_tt / (s_t * s_t))[xidx]
+        G = torch.empty((MX, K, K), dtype=torch.float32, device=dev)
+        pairs = [(i, j) for i in range(K) for j in range(i, K)]
+        for ps in range(0, len(pairs), 32):
+            pchunk = pairs[ps : ps + 32]
+            ii = [p[0] for p in pchunk]
+            jj = [p[1] for p in pchunk]
+            prod = A_cat[:, ii] * A_cat[:, jj]
+            r_ij_c = ((_box_sum(prod, rad) - S_a[:, ii] * S_a[:, jj] / kernel_vol) / (s_a[:, ii] * s_a[:, jj])).reshape(len(pchunk), N)[:, xidx]
+            del prod
+            for ci, (i, j) in enumerate(pchunk):
+                g = r_ij_c[ci] - r_t_all[i] - r_t_all[j] + r_tt
+                G[:, i, j] = g
+                if i != j:
+                    G[:, j, i] = g
+        del A_cat
+        return _wang_weights(G, beta, rho, solver, nonnegative, stats)
+
+    absd = torch.cat([(A - target_t).abs() for A in atlases_t], dim=1)  # (1, K, *sub_shape)
+    G = torch.empty((MX, K, K), dtype=torch.float32, device=dev)
+    pairs = [(i, j) for i in range(K) for j in range(i, K)]
+    for ps in range(0, len(pairs), 32):
+        pchunk = pairs[ps : ps + 32]
+        ii = [p[0] for p in pchunk]
+        jj = [p[1] for p in pchunk]
+        prod = absd[:, ii] * absd[:, jj]
+        g_chunk = (_box_sum(prod, rad) / kernel_vol).reshape(len(pchunk), N)[:, xidx]
+        del prod
+        for ci, (i, j) in enumerate(pchunk):
+            G[:, i, j] = g_chunk[ci]
+            if i != j:
+                G[:, j, i] = g_chunk[ci]
+    del absd
+    p_eff = flat(_box_sum(torch.ones_like(target_t), rad))[xidx]  # in-image voxels per patch
+    return _wang_weights(G, beta, rho, solver, nonnegative, stats, p_eff=p_eff)
+
+
+def _vote_parcellation(
+    labels_ext_p: list[torch.Tensor],
+    labels_sel_p: list[torch.Tensor],
+    didx: torch.Tensor,
+    lmin_orig: torch.Tensor,
+    W_full: torch.Tensor | None,
+    W_pooled_full: torch.Tensor | None,
+    off_ids: list[torch.Tensor],
+    offsets: list[tuple[int, ...]],
+    sub_shape: tuple[int, ...],
+    margin: int,
+    rad: int,
+    r_search: int,
+    return_probabilities: bool,
+    shape: tuple[int, ...],
+    slicer: tuple[slice, ...],
+    target_image: ants.ANTsImage,
+    dev: torch.device,
+) -> tuple[ants.ANTsImage, ants.ANTsImage, dict[int, ants.ANTsImage]]:
+    """Vote one parcellation from shared ``W_full`` (or ``W_pooled_full`` when ``r_search == 0``)."""
+    K = len(labels_ext_p)
+    dim = len(sub_shape)
+    N = int(np.prod(sub_shape))
+    M = int(didx.numel())
+
+    u_labels, labels_ext_dense = _remap_labels_compact(labels_ext_p, dev)
+    num_classes = int(u_labels.numel())
+    seg_flat = lmin_orig.clone()
+    P = None
+
+    if M > 0:
+        P = torch.zeros((M, num_classes), dtype=torch.float32, device=dev)
+        rows = torch.arange(M, device=dev)
+        if r_search == 0:
+            # Exact identity at zero search offset: L_i(n) is independent of patch centre x = n + delta,
+            # so sum_{delta in [-rad, rad]^d} W_i(n + delta) * 1[L_i(n)=c] = (_box_sum(W_i, rad)[n]) * 1[L_i(n)=c].
+            # Row-indexed accumulation over K atlases has strictly unique rows per step -> 100% deterministic.
+            assert W_pooled_full is not None
+            for i in range(K):
+                lab_i_d = labels_ext_dense[i].reshape(-1)[didx]
+                P[rows, lab_i_d] += W_pooled_full[i, didx]
+        else:
+            assert W_full is not None
+            ext_shape = [n + 2 * margin for n in sub_shape]
+            st = [int(np.prod(ext_shape[d + 1:])) for d in range(dim)]
+            rem, base = didx, torch.zeros_like(didx)
+            for d in range(dim - 1, -1, -1):
+                base = base + (rem % sub_shape[d] + margin) * st[d]
+                rem = rem // sub_shape[d]
+            shift_flat = [int(sum(o * s for o, s in zip(off, st))) for off in offsets]
+            sub_st = [int(np.prod(sub_shape[d + 1:])) for d in range(dim)]
+            coords, rem = [], didx
+            for d in range(dim - 1, -1, -1):
+                coords.insert(0, rem % sub_shape[d])
+                rem = rem // sub_shape[d]
+            shift_t = torch.tensor(shift_flat, dtype=torch.long, device=dev)
+            off_flat = [o[0, 0].reshape(-1) for o in off_ids]
+            lab_flat = [l[0, 0].reshape(-1) for l in labels_ext_dense]
+            for delta in itertools.product(range(-rad, rad + 1), repeat=dim):
+                xf = torch.zeros_like(didx)
+                valid = torch.ones_like(didx, dtype=torch.bool)
+                for d in range(dim):
+                    xc = coords[d] + delta[d]
+                    valid &= (xc >= 0) & (xc < sub_shape[d])
+                    xf = xf + xc.clamp(0, sub_shape[d] - 1) * sub_st[d]
+                for i in range(K):
+                    w = W_full[i][xf] * valid
+                    P[rows, lab_flat[i][base + shift_t[off_flat[i][xf]]]] += w
+
+        P = P / torch.clamp_min(P.sum(dim=1, keepdim=True), 1e-12)
+        # Ties go to the smallest compact class index, which equals the smallest original label since u_labels is sorted.
+        top = P.max(dim=1, keepdim=True).values
+        cls = torch.arange(num_classes, device=dev).unsqueeze(0)
+        best_dense = torch.where(P >= top - _TIE_TOL, cls, num_classes).amin(dim=1)
+        seg_flat[didx] = u_labels[best_dense]
+
+    env_flat = (lmin_orig != 0)
+    if M > 0:
+        # u_labels[0] is guaranteed to be 0 (background).
+        env_flat[didx] = (1.0 - P[:, 0]) > 0.05
+
+    final_crop = seg_flat.reshape(sub_shape).cpu().numpy().astype(np.uint32)
+    env_crop = env_flat.reshape(sub_shape).cpu().numpy().astype(np.uint32)
+    u_labels_cpu = u_labels.cpu().numpy().tolist()
+
+    prob_crop_np = None
+    if return_probabilities:
+        lmin_dense = torch.searchsorted(u_labels, lmin_orig)
+        prob = torch.zeros((num_classes, N), dtype=torch.float32, device=dev)
+        prob.scatter_(0, lmin_dense.unsqueeze(0), 1.0)
+        if M > 0:
+            prob[:, didx] = P.T
+        prob_crop_np = prob.reshape(num_classes, *sub_shape).cpu().numpy()
+        del prob
+
+    final_arr = np.zeros(shape, dtype=np.uint32)
+    final_arr[slicer] = final_crop
+    env_arr = np.zeros(shape, dtype=np.uint32)
+    env_arr[slicer] = env_crop
+
+    seg_img = ants.from_numpy(
+        final_arr,
+        origin=target_image.origin,
+        spacing=target_image.spacing,
+        direction=target_image.direction,
+    )
+    env_img = ants.from_numpy(
+        env_arr,
+        origin=target_image.origin,
+        spacing=target_image.spacing,
+        direction=target_image.direction,
+    )
+
+    prob_images: dict[int, ants.ANTsImage] = {}
+    if return_probabilities and prob_crop_np is not None:
+        for c, orig_lbl in enumerate(u_labels_cpu):
+            lbl_int = int(orig_lbl)
+            p_full = np.zeros(shape, dtype=np.float32) if lbl_int != 0 else np.ones(shape, dtype=np.float32)
+            p_full[slicer] = prob_crop_np[c]
+            prob_images[lbl_int] = ants.from_numpy(
+                p_full,
+                origin=target_image.origin,
+                spacing=target_image.spacing,
+                direction=target_image.direction,
+            )
+
+    return seg_img, env_img, prob_images
+
+
+def joint_label_fusion_multi(
+    target_image: ants.ANTsImage,
+    atlas_images: Sequence[ants.ANTsImage],
+    atlas_labels_dict: Mapping[str, Sequence[ants.ANTsImage]],
+    mask: ants.ANTsImage | None = None,
+    rad: int = 2,
+    beta: float | None = None,
+    rho: float | None = None,
+    mode: Literal["patch", "joint"] = "joint",
+    nonnegative: bool = True,
+    device: str | None = None,
+    verbose: bool = False,
+    r_search: int = 0,
+    skip_consensus: bool = True,
+    solver: Literal["cholesky", "lu"] = "cholesky",
+    return_probabilities: bool = False,
+    patch_norm: bool = False,
+) -> dict[str, dict[str, Any]]:
+    """Fuse multiple parcellations simultaneously on one ``(target_image, atlas_images)`` cohort.
+
+    Intensity patch search and Wang/LNCC solve-set weights depend purely on ``target_image`` and
+    ``atlas_images`` (not on the label values). Computing ``w_X`` once on the union dilated
+    disagreement mask across all parcellations in ``atlas_labels_dict`` yields bitwise-identical
+    segmentations to calling :func:`joint_label_fusion` separately per parcellation while
+    eliminating ``(P - 1)x`` redundant image uploads, patch searches, and Cholesky solves.
+    """
+    t0_start = time.perf_counter()
+    if isinstance(r_search, bool) or not isinstance(r_search, (int, np.integer)) or r_search < 0:
+        raise ValueError(f"r_search must be a non-negative integer, got {r_search!r}")
+    r_search = int(r_search)
+    if mode not in ("patch", "joint"):
+        raise ValueError(f"mode must be 'patch' or 'joint', got {mode!r}")
+    if solver not in ("cholesky", "lu"):
+        raise ValueError(f"solver must be 'cholesky' or 'lu', got {solver!r}")
+    if not atlas_labels_dict:
+        raise ValueError("atlas_labels_dict must be non-empty")
+    beta = (4.0 if mode == "joint" else 2.0) if beta is None else float(beta)
+    rho = 0.01 if rho is None else float(rho)
+    K = len(atlas_images)
+    if K == 0:
+        raise ValueError("atlas_images must be non-empty")
+    for p_name, lbl_seq in atlas_labels_dict.items():
+        if len(lbl_seq) != K:
+            raise ValueError(
+                f"atlas_images ({K}) and atlas_labels_dict[{p_name!r}] ({len(lbl_seq)}) must have equal non-zero length"
+            )
+
+    target_arr = target_image.numpy()
+    shape = target_arr.shape
+
+    if mask is not None:
+        roi_mask = mask.numpy() > 0.5
+    else:
+        roi_mask = np.zeros(shape, dtype=bool)
+        for lbl_seq in atlas_labels_dict.values():
+            for lbl in lbl_seq:
+                roi_mask |= (lbl.numpy() > 0.5)
+
+    dev_name = auto_detect_device(requested_device=device)
+    info_common = {"mode": mode, "r_search": r_search, "device": dev_name, "solver": solver, "beta": beta, "rho": rho}
+    if not roi_mask.any():
+        out_empty: dict[str, dict[str, Any]] = {}
+        for p_name in atlas_labels_dict:
+            zero_img = target_image.new_image_like(np.zeros(shape, dtype=np.uint32))
+            probs = (
+                {0: target_image.new_image_like(np.ones(shape, dtype=np.float32))}
+                if return_probabilities
+                else {}
+            )
+            out_empty[p_name] = {
+                "segmentation": zero_img,
+                "probability_images": probs,
+                "consensus_envelope": zero_img.clone(),
+                "timing_s": 0.0,
+                "stage_timings_s": {"search": 0.0, "weights": 0.0, "vote": 0.0},
+                "frac_shifted": None,
+                "disagreement_fraction": 0.0,
+                "cholesky_failed": 0,
+                **info_common,
+            }
+        return out_empty
+
+    pad = rad + 2
+    idx = np.where(roi_mask)
+    dim = len(shape)
+    slicer = tuple(
+        slice(max(0, int(idx[d].min()) - pad), min(shape[d], int(idx[d].max()) + pad + 1))
+        for d in range(dim)
+    )
+
+    margin = (r_search + rad) if r_search > 0 else 0
+    if margin == 0:
+        def _crop(arr):
+            return arr[slicer]
+    else:
+        ext_idx = [
+            np.clip(np.arange(slicer[d].start - margin, slicer[d].stop + margin), 0, shape[d] - 1)
+            for d in range(dim)
+        ]
+
+        def _crop(arr):
+            return arr[np.ix_(*ext_idx)]
+
+    target_crop = target_arr[slicer]
+    sub_shape = target_crop.shape
+    N = int(np.prod(sub_shape))
+
+    dev = torch.device(dev_name)
+    to_f = lambda a: torch.from_numpy(np.ascontiguousarray(a)).unsqueeze(0).unsqueeze(0).to(dtype=torch.float32, device=dev)  # noqa: E731
+    target_t = to_f(target_crop)
+    atlases_t = [to_f(_crop(img.numpy())) for img in atlas_images]
+    labels_ext_by_p: dict[str, list[torch.Tensor]] = {
+        p_name: [
+            torch.from_numpy(np.ascontiguousarray(_crop(lbl.numpy()))).unsqueeze(0).unsqueeze(0).to(dtype=torch.long, device=dev)
+            for lbl in lbl_seq
+        ]
+        for p_name, lbl_seq in atlas_labels_dict.items()
+    }
+
+    _sync(dev)
+    t_a = time.perf_counter()
+    frac_shifted = None
+    target_ext = None
+    atlases_ext = None
+    if r_search > 0:
+        offsets = _search_offsets(r_search, dim)
+        atlases_ext, target_ext = atlases_t, to_f(_crop(target_arr))
+        atlases_t, off_ids, frac_shifted = _search_best_patch_offsets(
+            target_t, atlases_ext, offsets, margin, rad, sub_shape, roi_mask[slicer], dev
+        )
+        labels_sel_by_p = {
+            p_name: _gather_selected_labels(l_ext, off_ids, offsets, sub_shape, margin, dev)
+            for p_name, l_ext in labels_ext_by_p.items()
+        }
+    else:
+        offsets = [(0,) * dim]
+        off_ids = [torch.zeros((1, 1, *sub_shape), dtype=torch.long, device=dev) for _ in range(K)]
+        labels_sel_by_p = labels_ext_by_p
+    _sync(dev)
+    t_search = time.perf_counter() - t_a
+
+    t_a = time.perf_counter()
+    didx_by_p: dict[str, torch.Tensor] = {}
+    lmin_by_p: dict[str, torch.Tensor] = {}
+    dis_frac_by_p: dict[str, float] = {}
+    dis_union = torch.zeros(N, dtype=torch.bool, device=dev)
+
+    for p_name, l_sel in labels_sel_by_p.items():
+        lab_stack = torch.cat([l[0, 0].reshape(1, -1) for l in l_sel], dim=0)
+        lmin = lab_stack.amin(dim=0)
+        if skip_consensus:
+            dis_p = lmin != lab_stack.amax(dim=0)
+        else:
+            dis_p = torch.ones_like(lmin, dtype=torch.bool)
+        didx_p = dis_p.nonzero().squeeze(1)
+        didx_by_p[p_name] = didx_p
+        lmin_by_p[p_name] = lmin
+        dis_frac_by_p[p_name] = float(didx_p.numel()) / float(N)
+        dis_union |= dis_p
+
+    M_union = int(dis_union.sum().item())
+    if M_union > 0:
+        xmask = _box_sum(dis_union.reshape(1, 1, *sub_shape).to(torch.float32), rad) > 0.5
+        xidx = xmask.reshape(-1).nonzero().squeeze(1)
+    else:
+        xidx = torch.empty(0, dtype=torch.long, device=dev)
+
+    stats = {"cholesky_failed": 0}
+    w_X = None
+    if M_union > 0:
+        w_X = _compute_weights_on_solve_set(
+            target_t=target_t,
+            atlases_t=atlases_t,
+            target_ext=target_ext,
+            atlases_ext=atlases_ext,
+            off_ids=off_ids,
+            offsets=offsets,
+            xidx=xidx,
+            sub_shape=sub_shape,
+            margin=margin,
+            rad=rad,
+            r_search=r_search,
+            mode=mode,
+            beta=beta,
+            rho=rho,
+            solver=solver,
+            nonnegative=nonnegative,
+            patch_norm=patch_norm,
+            stats=stats,
+            dev=dev,
+        )
+    del target_ext, atlases_ext, target_t, atlases_t
+    _sync(dev)
+    t_weights = time.perf_counter() - t_a
+
+    # Shared weight field (and pre-pooled box-summed weights when r_search == 0) across all parcellations
+    W_full = None
+    W_pooled_full = None
+    t_pool_start = time.perf_counter()
+    if M_union > 0 and w_X is not None:
+        W_full = torch.zeros((K, N), dtype=torch.float32, device=dev)
+        W_full[:, xidx] = w_X.T
+        del w_X
+        if r_search == 0:
+            W_pooled_full = _box_sum_chunked(W_full.reshape(1, K, *sub_shape), rad).reshape(K, N)
+            del W_full
+            W_full = None
+    _sync(dev)
+    t_pool_shared = time.perf_counter() - t_pool_start
+
+    results: dict[str, dict[str, Any]] = {}
+    n_parc = max(len(atlas_labels_dict), 1)
+    for p_name in atlas_labels_dict:
+        t_v0 = time.perf_counter()
+        seg_img, env_img, prob_images = _vote_parcellation(
+            labels_ext_p=labels_ext_by_p[p_name],
+            labels_sel_p=labels_sel_by_p[p_name],
+            didx=didx_by_p[p_name],
+            lmin_orig=lmin_by_p[p_name],
+            W_full=W_full,
+            W_pooled_full=W_pooled_full,
+            off_ids=off_ids,
+            offsets=offsets,
+            sub_shape=sub_shape,
+            margin=margin,
+            rad=rad,
+            r_search=r_search,
+            return_probabilities=return_probabilities,
+            shape=shape,
+            slicer=slicer,
+            target_image=target_image,
+            dev=dev,
+        )
+        _sync(dev)
+        t_vote_p = (time.perf_counter() - t_v0) + (t_pool_shared / n_parc)
+        results[p_name] = {
+            "segmentation": seg_img,
+            "probability_images": prob_images,
+            "consensus_envelope": env_img,
+            "timing_s": 0.0,  # filled after loop
+            "stage_timings_s": {
+                "search": t_search / n_parc if len(atlas_labels_dict) > 1 else t_search,
+                "weights": t_weights / n_parc if len(atlas_labels_dict) > 1 else t_weights,
+                "vote": t_vote_p,
+            },
+            "frac_shifted": frac_shifted,
+            "disagreement_fraction": dis_frac_by_p[p_name],
+            "cholesky_failed": stats["cholesky_failed"],
+            **info_common,
+        }
+
+    del W_full, W_pooled_full
+    t_total = time.perf_counter() - t0_start
+    for p_name in results:
+        results[p_name]["timing_s"] = float(t_total)
+    if verbose:
+        print(
+            f"[syntx.joint_label_fusion] Mode={mode}, K={K}, P={len(atlas_labels_dict)}, "
+            f"ROI={sub_shape}, device={dev_name}, Time={t_total:.2f}s"
+        )
+    return results
+
+
 def joint_label_fusion(
     target_image: ants.ANTsImage,
     atlas_images: Sequence[ants.ANTsImage],
@@ -369,23 +905,12 @@ def joint_label_fusion(
     solver : {"cholesky", "lu"}, default "cholesky"
         Batched linear solver for ``mode="joint"``.
     return_probabilities : bool, default True
-        Build the full per-class probability images. ``False`` skips them (large for many labels)
-        and returns only the segmentation and envelope.
+        Build the full per-class probability images (keyed by each candidate class ID present in
+        ``atlas_labels`` plus background ``0``). ``False`` skips them and returns only the
+        segmentation and envelope.
     patch_norm : bool, default False
         ``mode="joint"`` only: standardise each patch (zero mean, unit norm) before forming the
-        residuals. This removes the arbitrary-weights problem in featureless regions by construction
-        but discards gain/offset information; on the r-image validation it cost ~0.06 mean Dice, so
-        the default is raw ``|A - T|`` residuals with empirical-Bayes shrinkage.
-
-    Notes
-    -----
-    Voting follows ANTs (Hongzhi's averaging scheme): every voxel pools the weights of all patches that
-    contain it, ``P_l(n) = sum_x sum_i W_i(x) 1[L_i(n + s_i(x)) = l]``, so label decisions are smoothed
-    over the patch. With ``skip_consensus`` the weights are solved only on the voxels whose own selected
-    votes disagree (D) dilated by ``rad``; the rest take their unanimous label. Without a search
-    (``r_search=0``) this equals the dense result exactly; with a search, a voxel whose own selected votes
-    are unanimous keeps that label even if neighbours' offsets would have voted differently there (an
-    approximation; ``skip_consensus=False`` is the exact dense reference).
+        residuals.
 
     Returns
     -------
@@ -401,296 +926,26 @@ def joint_label_fusion(
         - 'disagreement_fraction': fraction of the cropped ROI where atlases disagree.
         - 'cholesky_failed': voxels re-solved by LU after a Cholesky failure.
     """
-    t0_start = time.perf_counter()
-    if isinstance(r_search, bool) or not isinstance(r_search, (int, np.integer)) or r_search < 0:
-        raise ValueError(f"r_search must be a non-negative integer, got {r_search!r}")
-    r_search = int(r_search)
-    if mode not in ("patch", "joint"):
-        raise ValueError(f"mode must be 'patch' or 'joint', got {mode!r}")
-    if solver not in ("cholesky", "lu"):
-        raise ValueError(f"solver must be 'cholesky' or 'lu', got {solver!r}")
-    beta = (4.0 if mode == "joint" else 2.0) if beta is None else float(beta)
-    rho = 0.01 if rho is None else float(rho)
     K = len(atlas_images)
     if K == 0 or len(atlas_labels) != K:
-        raise ValueError(f"atlas_images ({len(atlas_images)}) and atlas_labels ({len(atlas_labels)}) must have equal non-zero length")
-
-    target_arr = target_image.numpy()
-    shape = target_arr.shape
-
-    # 1. Determine bounding box for localized execution
-    if mask is not None:
-        roi_mask = mask.numpy() > 0.5
-    else:
-        # Compute union of all non-zero atlas labels
-        roi_mask = np.zeros(shape, dtype=bool)
-        for lbl in atlas_labels:
-            roi_mask |= (lbl.numpy() > 0.5)
-
-    dev_name = auto_detect_device(requested_device=device)
-    info_common = {"mode": mode, "r_search": r_search, "device": dev_name, "solver": solver, "beta": beta, "rho": rho}
-    if not roi_mask.any():
-        # Fallback if no labels found
-        zero_img = target_image.new_image_like(np.zeros(shape, dtype=np.uint32))
-        return {
-            "segmentation": zero_img,
-            "probability_images": {0: target_image.new_image_like(np.ones(shape, dtype=np.float32))},
-            "consensus_envelope": zero_img,
-            "timing_s": 0.0,
-            "stage_timings_s": {"search": 0.0, "weights": 0.0, "vote": 0.0},
-            "frac_shifted": None,
-            "disagreement_fraction": 0.0,
-            "cholesky_failed": 0,
-            **info_common,
-        }
-
-    # Bounding box coordinates with padding = rad + 2
-    pad = rad + 2
-    idx = np.where(roi_mask)
-    dim = len(shape)
-    slicer = tuple(
-        slice(max(0, int(idx[d].min()) - pad), min(shape[d], int(idx[d].max()) + pad + 1))
-        for d in range(dim)
-    )
-
-    # Crop target and atlas subvolumes. With a search radius the crop is extended by
-    # ``margin = r_search + rad`` voxels per side (edge-clamped outside the image) so every shifted
-    # patch has data.
-    margin = (r_search + rad) if r_search > 0 else 0
-    if margin == 0:
-        def _crop(arr):
-            return arr[slicer]
-    else:
-        ext_idx = [
-            np.clip(np.arange(slicer[d].start - margin, slicer[d].stop + margin), 0, shape[d] - 1)
-            for d in range(dim)
-        ]
-
-        def _crop(arr):
-            return arr[np.ix_(*ext_idx)]
-
-    target_crop = target_arr[slicer]
-    sub_shape = target_crop.shape
-    N = int(np.prod(sub_shape))
-
-    # 2. Convert to PyTorch tensors
-    dev = torch.device(dev_name)
-    to_f = lambda a: torch.from_numpy(np.ascontiguousarray(a)).unsqueeze(0).unsqueeze(0).to(dtype=torch.float32, device=dev)  # noqa: E731
-    target_t = to_f(target_crop)
-    atlases_t = [to_f(_crop(img.numpy())) for img in atlas_images]
-    labels_t = [torch.from_numpy(np.ascontiguousarray(_crop(lbl.numpy()))).unsqueeze(0).unsqueeze(0).to(dtype=torch.long, device=dev) for lbl in atlas_labels]
-    kernel_vol = float((2 * rad + 1) ** dim)  # patch size, normalises box sums to patch means
-
-    # 2b. Per-voxel best-patch search (ANTs ``-s``). Without a search the offsets are the single zero offset.
-    _sync(dev)
-    t_a = time.perf_counter()
-    frac_shifted = None
-    labels_ext = labels_t  # (1, 1, *(sub_shape + 2*margin)) tensors; margin == 0 without a search
-    if r_search > 0:
-        offsets = _search_offsets(r_search, dim)
-        atlases_ext, target_ext = atlases_t, to_f(_crop(target_arr))
-        atlases_t, labels_t, off_ids, frac_shifted = _search_best_patch(
-            target_t, atlases_t, labels_t, offsets, margin, rad, sub_shape, roi_mask[slicer], dev
+        raise ValueError(
+            f"atlas_images ({len(atlas_images)}) and atlas_labels ({len(atlas_labels)}) must have equal non-zero length"
         )
-    else:
-        offsets = [(0,) * dim]
-        off_ids = [torch.zeros_like(l, dtype=torch.long) for l in labels_t]
-    _sync(dev)
-    t_search = time.perf_counter() - t_a
-
-    # 3. Disagreement set D: voxels whose own selected votes differ, so their label can depend on the
-    # weights. Solve set X = D dilated by the patch radius: the voxels whose weights reach a D voxel
-    # through the overlapping-patch average (every voxel pools the weights of all patches containing it).
-    t_a = time.perf_counter()
-    lab_stack = torch.cat([l[0, 0].reshape(1, -1) for l in labels_t], dim=0)  # (K, N), centre-selected labels
-    lmin = lab_stack.amin(dim=0)
-    if skip_consensus:
-        dis = lmin != lab_stack.amax(dim=0)
-    else:
-        dis = torch.ones_like(lmin, dtype=torch.bool)
-    didx = dis.nonzero().squeeze(1)  # (M,)
-    M = int(didx.numel())
-    disagreement_fraction = float(M) / float(N)
-    if M > 0:
-        xmask = _box_sum(dis.reshape(1, 1, *sub_shape).to(torch.float32), rad) > 0.5
-        xidx = xmask.reshape(-1).nonzero().squeeze(1)
-    else:
-        xidx = didx
-    MX = int(xidx.numel())
-    stats = {"cholesky_failed": 0}
-
-    # 4. Weights on the solve set, (MX, K)
-    w_X = None
-    if M > 0:
-        flat = lambda x: x[0, 0].reshape(-1)  # noqa: E731
-        if r_search > 0:
-            w_X = _gather_weights(target_ext, atlases_ext, off_ids, offsets, xidx, sub_shape, margin, rad,
-                                  mode, beta, rho, solver, nonnegative, stats, dev, patch_norm)
-            del target_ext
-        elif mode == "patch":
-            t_sum = _box_sum(target_t, rad)
-            t2_sum = _box_sum(target_t * target_t, rad)
-            t_var = torch.clamp(t2_sum - t_sum * t_sum / kernel_vol, min=1e-4)
-            ncc_X = []
-            for A in atlases_t:
-                p_sum = _box_sum(A, rad)
-                p2_sum = _box_sum(A * A, rad)
-                tp_sum = _box_sum(target_t * A, rad)
-                cross = tp_sum - p_sum * t_sum / kernel_vol
-                p_var = torch.clamp(p2_sum - p_sum * p_sum / kernel_vol, min=1e-4)
-                ncc = cross / (torch.sqrt(t_var * p_var) + 1e-4)
-                ncc_X.append(flat(torch.clamp(ncc, min=0.0))[xidx])
-            w_X = _patch_weights(torch.stack(ncc_X, dim=1), beta)
-        elif patch_norm:
-            # G_ij = r_ij - r_it - r_jt + r_tt: patch correlations of the standardised patches, i.e.
-            # mean-patch residual covariance of z_i - z_t, from box sums of first/second moments.
-            S_t, S_tt = _box_sum(target_t, rad), _box_sum(target_t * target_t, rad)
-            C_tt = S_tt - S_t * S_t / kernel_vol
-            s_t = torch.sqrt(torch.clamp_min(C_tt, _VAR_FLOOR))
-            S_a = [_box_sum(A, rad) for A in atlases_t]
-            s_a, r_t = [], []
-            for A, Sa in zip(atlases_t, S_a):
-                C_aa = _box_sum(A * A, rad) - Sa * Sa / kernel_vol
-                s_a.append(torch.sqrt(torch.clamp_min(C_aa, _VAR_FLOOR)))
-                r_t.append(flat((_box_sum(A * target_t, rad) - Sa * S_t / kernel_vol) / (s_a[-1] * s_t))[xidx])
-            r_tt = flat(C_tt / (s_t * s_t))[xidx]
-            G = torch.empty((MX, K, K), dtype=torch.float32, device=dev)
-            for i in range(K):
-                for j in range(i, K):
-                    if i == j:
-                        r_ij = flat((_box_sum(atlases_t[i] ** 2, rad) - S_a[i] ** 2 / kernel_vol) / (s_a[i] ** 2))[xidx]
-                    else:
-                        r_ij = flat((_box_sum(atlases_t[i] * atlases_t[j], rad) - S_a[i] * S_a[j] / kernel_vol)
-                                    / (s_a[i] * s_a[j]))[xidx]
-                    g = r_ij - r_t[i] - r_t[j] + r_tt
-                    G[:, i, j] = g
-                    if i != j:
-                        G[:, j, i] = g
-            w_X = _wang_weights(G, beta, rho, solver, nonnegative, stats)
-        else:
-            absd = [(A - target_t).abs() for A in atlases_t]
-            G = torch.empty((MX, K, K), dtype=torch.float32, device=dev)
-            for i in range(K):
-                for j in range(i, K):
-                    g_ij = flat(_box_sum(absd[i] * absd[j], rad) / kernel_vol)[xidx]
-                    G[:, i, j] = g_ij
-                    if i != j:
-                        G[:, j, i] = g_ij
-            del absd
-            p_eff = flat(_box_sum(torch.ones_like(target_t), rad))[xidx]  # in-image voxels per patch
-            w_X = _wang_weights(G, beta, rho, solver, nonnegative, stats, p_eff=p_eff)
-    if r_search > 0:
-        del atlases_ext
-    _sync(dev)
-    t_weights = time.perf_counter() - t_a
-
-    # 5. Voting with the overlapping-patch average (ANTs, Hongzhi's scheme): voxel n collects from every
-    # patch x that contains it the weight W_i(x) on the label of atlas i at n + s_i(x). Per (atlas,
-    # offset) that is a box sum of the weight field, so it is exact and deterministic. Unanimous voxels
-    # take their shared label (probability 1).
-    t_a = time.perf_counter()
-    num_classes = int(torch.stack([l.amax() for l in labels_ext]).amax().item()) + 1
-    seg_flat = lmin.clone()
-    P = None
-    if M > 0:
-        W_full = torch.zeros((K, N), dtype=torch.float32, device=dev)
-        W_full[:, xidx] = w_X.T
-        del w_X
-        ext_shape = [n + 2 * margin for n in sub_shape]
-        st = [int(np.prod(ext_shape[d + 1:])) for d in range(dim)]
-        rem, base = didx, torch.zeros_like(didx)
-        for d in range(dim - 1, -1, -1):
-            base = base + (rem % sub_shape[d] + margin) * st[d]
-            rem = rem // sub_shape[d]
-        shift_flat = [int(sum(o * s for o, s in zip(off, st))) for off in offsets]
-        sub_st = [int(np.prod(sub_shape[d + 1:])) for d in range(dim)]
-        coords, rem = [], didx
-        for d in range(dim - 1, -1, -1):
-            coords.insert(0, rem % sub_shape[d])
-            rem = rem // sub_shape[d]
-        shift_t = torch.tensor(shift_flat, dtype=torch.long, device=dev)
-        off_flat = [o[0, 0].reshape(-1) for o in off_ids]
-        lab_flat = [l[0, 0].reshape(-1) for l in labels_ext]
-        P = torch.zeros((M, num_classes), dtype=torch.float32, device=dev)
-        rows = torch.arange(M, device=dev)
-        for delta in itertools.product(range(-rad, rad + 1), repeat=dim):  # patches x = n + delta that contain n
-            xf = torch.zeros_like(didx)
-            valid = torch.ones_like(didx, dtype=torch.bool)
-            for d in range(dim):
-                xc = coords[d] + delta[d]
-                valid &= (xc >= 0) & (xc < sub_shape[d])
-                xf = xf + xc.clamp(0, sub_shape[d] - 1) * sub_st[d]
-            for i in range(K):
-                w = W_full[i][xf] * valid
-                P[rows, lab_flat[i][base + shift_t[off_flat[i][xf]]]] += w  # unique rows per call -> deterministic
-        del W_full
-        P = P / torch.clamp_min(P.sum(dim=1, keepdim=True), 1e-12)
-        # ties (e.g. 2-vs-2 votes under equal weights) go to the smallest label: float round-off must not decide
-        top = P.max(dim=1, keepdim=True).values
-        cls = torch.arange(num_classes, device=dev).unsqueeze(0)
-        seg_flat[didx] = torch.where(P >= top - _TIE_TOL, cls, num_classes).amin(dim=1)
-    env_flat = (lmin != 0)
-    if M > 0:
-        env_flat[didx] = (1.0 - P[:, 0]) > 0.05
-
-    final_crop = seg_flat.reshape(sub_shape).cpu().numpy().astype(np.uint32)
-    env_crop = env_flat.reshape(sub_shape).cpu().numpy().astype(np.uint32)
-    prob_crop_np = None
-    if return_probabilities:
-        prob = torch.zeros((num_classes, N), dtype=torch.float32, device=dev)
-        prob.scatter_(0, lmin.unsqueeze(0), 1.0)
-        if M > 0:
-            prob[:, didx] = P.T
-        prob_crop_np = prob.reshape(num_classes, *sub_shape).cpu().numpy()
-        del prob
-    _sync(dev)
-    t_vote = time.perf_counter() - t_a
-
-    # 6. Restore into full native image space
-    final_arr = np.zeros(shape, dtype=np.uint32)
-    final_arr[slicer] = final_crop
-    env_arr = np.zeros(shape, dtype=np.uint32)
-    env_arr[slicer] = env_crop
-
-    # Create ANTsImage objects matching target geometry
-    seg_img = ants.from_numpy(
-        final_arr,
-        origin=target_image.origin,
-        spacing=target_image.spacing,
-        direction=target_image.direction,
-    )
-    env_img = ants.from_numpy(
-        env_arr,
-        origin=target_image.origin,
-        spacing=target_image.spacing,
-        direction=target_image.direction,
-    )
-
-    prob_images = {}
-    if return_probabilities:
-        for c in range(num_classes):
-            p_full = np.zeros(shape, dtype=np.float32)
-            p_full[slicer] = prob_crop_np[c]
-            prob_images[c] = ants.from_numpy(
-                p_full,
-                origin=target_image.origin,
-                spacing=target_image.spacing,
-                direction=target_image.direction,
-            )
-
-    t_total = time.perf_counter() - t0_start
-    if verbose:
-        print(f"[syntx.joint_label_fusion] Mode={mode}, K={K}, ROI={sub_shape}, device={dev_name}, "
-              f"disagree={disagreement_fraction:.3f}, Time={t_total:.2f}s")
-
-    return {
-        "segmentation": seg_img,
-        "probability_images": prob_images,
-        "consensus_envelope": env_img,
-        "timing_s": float(t_total),
-        "stage_timings_s": {"search": t_search, "weights": t_weights, "vote": t_vote},
-        "frac_shifted": frac_shifted,
-        "disagreement_fraction": disagreement_fraction,
-        "cholesky_failed": stats["cholesky_failed"],
-        **info_common,
-    }
+    return joint_label_fusion_multi(
+        target_image=target_image,
+        atlas_images=atlas_images,
+        atlas_labels_dict={"_single": atlas_labels},
+        mask=mask,
+        rad=rad,
+        beta=beta,
+        rho=rho,
+        mode=mode,
+        nonnegative=nonnegative,
+        device=device,
+        verbose=verbose,
+        r_search=r_search,
+        skip_consensus=skip_consensus,
+        solver=solver,
+        return_probabilities=return_probabilities,
+        patch_norm=patch_norm,
+    )["_single"]

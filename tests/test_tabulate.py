@@ -263,3 +263,38 @@ def test_centralized_label_lookup_and_roi_summary_wide():
     assert r_row["FA_DKT_right_entorhinal"] == pytest.approx(20.0)
 
 
+def test_roi_mean_timeseries_sparse_labels_matches_boolean_loop():
+    ants = pytest.importorskip("ants")
+    from syntx.tabulate import roi_mean_timeseries
+
+    rng = np.random.default_rng(7)
+    shape = (12, 14, 10, 64)
+    ts_arr = rng.normal(loc=100.0, scale=15.0, size=shape).astype(np.float32)
+    lbl_arr = np.zeros(shape[:3], dtype=np.float32)
+    sparse_ids = [1002, 1005, 1024, 2002, 2035]
+    flat_lbl = lbl_arr.ravel()
+    chosen = rng.choice([0] + sparse_ids, size=flat_lbl.size, p=[0.6, 0.08, 0.08, 0.08, 0.08, 0.08])
+    lbl_arr = chosen.reshape(shape[:3]).astype(np.float32)
+
+    ts_img = ants.from_numpy(ts_arr, spacing=(2.0, 2.0, 2.0, 0.8))
+    lbl_img = ants.from_numpy(lbl_arr, spacing=(2.0, 2.0, 2.0))
+
+    mean_roi, roi_ids = roi_mean_timeseries(ts_img, lbl_img)
+    assert roi_ids == sparse_ids
+    ref = np.column_stack([ts_arr[lbl_arr == lid, :].mean(axis=0) for lid in sparse_ids])
+    assert np.allclose(mean_roi, ref, atol=1e-5, rtol=1e-5)
+
+    from syntx.tabulate import roi_mean_from_masked_timeseries
+
+    brain_mask = (lbl_arr > 0) | (rng.random(shape[:3]) < 0.2)
+    flat_masked = np.zeros_like(ts_arr)
+    flat_masked[brain_mask, :] = ts_arr[brain_mask, :]
+    ts_masked_img = ants.from_numpy(flat_masked, spacing=(2.0, 2.0, 2.0, 0.8))
+    ref_m, rids_m = roi_mean_timeseries(ts_masked_img, lbl_img)
+    fast_m, rids_fast = roi_mean_from_masked_timeseries(ts_arr[brain_mask, :].T, brain_mask, lbl_img)
+    assert rids_fast == rids_m
+    assert np.allclose(fast_m, ref_m, atol=1e-5, rtol=1e-5)
+
+
+
+
