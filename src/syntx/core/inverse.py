@@ -953,38 +953,49 @@ def update_inverse_field_nd_anderson(
             else:
                 torch.where(done_next.reshape(bshape), v_k, g_k, out=v_k)
         else:
-            n_cols = m_k - 1
-            r_newest = R_history[-1]
-            g_newest = G_history[-1]
-            # Compute residual differences dR_j = r_newest - R_j on the fly into reusable
-            # scratch buffers instead of materialising all m difference fields at once.
-            diff_i = torch.empty_like(r_newest)
-            diff_j = torch.empty_like(r_newest) if n_cols > 1 else None
-            gram = torch.zeros(B, n_cols, n_cols, device=device, dtype=dtype)
-            rhs = torch.zeros(B, n_cols, 1, device=device, dtype=dtype)
-            for i_col in range(n_cols):
-                torch.sub(r_newest, R_history[i_col], out=diff_i)
-                for b_idx in range(B):
-                    rhs[b_idx, i_col, 0] = _dot_1d(diff_i[b_idx], r_newest[b_idx])
-                    gram[b_idx, i_col, i_col] = _dot_1d(diff_i[b_idx], diff_i[b_idx])
-                for j_col in range(i_col + 1, n_cols):
-                    torch.sub(r_newest, R_history[j_col], out=diff_j)
+            from .kernels import fused_anderson_step_m5
+
+            v_new_flat = fused_anderson_step_m5(
+                r_newest=R_history[-1],
+                g_newest=G_history[-1],
+                r_hist=R_history,
+                g_hist=G_history,
+                eye_reg=eye_reg,
+                solve_spd_fn=_solve_small_spd,
+            )
+            if v_new_flat is None:
+                n_cols = m_k - 1
+                r_newest = R_history[-1]
+                g_newest = G_history[-1]
+                # Compute residual differences dR_j = r_newest - R_j on the fly into reusable
+                # scratch buffers instead of materialising all m difference fields at once.
+                diff_i = torch.empty_like(r_newest)
+                diff_j = torch.empty_like(r_newest) if n_cols > 1 else None
+                gram = torch.zeros(B, n_cols, n_cols, device=device, dtype=dtype)
+                rhs = torch.zeros(B, n_cols, 1, device=device, dtype=dtype)
+                for i_col in range(n_cols):
+                    torch.sub(r_newest, R_history[i_col], out=diff_i)
                     for b_idx in range(B):
-                        val = _dot_1d(diff_i[b_idx], diff_j[b_idx])
-                        gram[b_idx, i_col, j_col] = val
-                        gram[b_idx, j_col, i_col] = val
-            del diff_j
-            gram = gram + eye_reg[:n_cols, :n_cols]
-            gamma = _solve_small_spd(gram, rhs).squeeze(1)                    # (B, n)
-            v_new_flat = g_newest.clone()
-            tmp_flat = torch.empty_like(r_newest)
-            for j in range(n_cols):
-                torch.sub(r_newest, R_history[j], out=diff_i)
-                torch.sub(g_newest, G_history[j], out=tmp_flat)
-                tmp_flat.add_(diff_i)
-                tmp_flat.mul_(gamma[:, j:j + 1])
-                v_new_flat.sub_(tmp_flat)
-            del diff_i, tmp_flat
+                        rhs[b_idx, i_col, 0] = _dot_1d(diff_i[b_idx], r_newest[b_idx])
+                        gram[b_idx, i_col, i_col] = _dot_1d(diff_i[b_idx], diff_i[b_idx])
+                    for j_col in range(i_col + 1, n_cols):
+                        torch.sub(r_newest, R_history[j_col], out=diff_j)
+                        for b_idx in range(B):
+                            val = _dot_1d(diff_i[b_idx], diff_j[b_idx])
+                            gram[b_idx, i_col, j_col] = val
+                            gram[b_idx, j_col, i_col] = val
+                del diff_j
+                gram = gram + eye_reg[:n_cols, :n_cols]
+                gamma = _solve_small_spd(gram, rhs).squeeze(1)                    # (B, n)
+                v_new_flat = g_newest.clone()
+                tmp_flat = torch.empty_like(r_newest)
+                for j in range(n_cols):
+                    torch.sub(r_newest, R_history[j], out=diff_i)
+                    torch.sub(g_newest, G_history[j], out=tmp_flat)
+                    tmp_flat.add_(diff_i)
+                    tmp_flat.mul_(gamma[:, j:j + 1])
+                    v_new_flat.sub_(tmp_flat)
+                del diff_i, tmp_flat
 
             v_candidate = v_new_flat.reshape(W_disp.shape)
             del v_new_flat

@@ -2790,13 +2790,27 @@ def _batched_rigid_register_pass_core(
             else:
                 per_frame_loss = (elem * w_pts).sum(dim=1) / w_pts.sum(dim=1).clamp_min(1e-8)
         else:
-            w_x = parzen_weights(w_scaled.reshape(-1), num_bins=num_bins).reshape(*w_scaled.shape, num_bins)
-            if w_pts is not None:
-                # weighted joint histogram: each point enters with its frame's weight (sqrt on each factor)
-                sw = torch.sqrt(w_pts).unsqueeze(-1)
-                w_x = w_x * sw
-                w_y_stage = (w_y_stage if w_y_stage.dim() == 3 else w_y_stage.unsqueeze(0).expand(n_cur, -1, -1)) * sw
-            per_frame_loss = batched_mattes_mi_from_weights(w_x, w_y_stage)
+            from .core.kernels import RegisterParzenMattesMIFunction, has_mps_shader_backend
+            from .core.losses.mutual_information import _default_parzen_weights, _extract_sparse4_from_fixed_weights
+
+            if (
+                parzen_weights is _default_parzen_weights
+                and w_scaled.dtype == torch.float32
+                and int(num_bins) >= 6
+                and has_mps_shader_backend(w_scaled.device)
+            ):
+                fi_idx4, fi_w4 = _extract_sparse4_from_fixed_weights(w_y_stage)
+                per_frame_loss = RegisterParzenMattesMIFunction.apply(
+                    w_scaled, fi_idx4, fi_w4, int(num_bins), -1.0, 1.0, 2.0, w_pts
+                )
+            else:
+                w_x = parzen_weights(w_scaled.reshape(-1), num_bins=num_bins).reshape(*w_scaled.shape, num_bins)
+                if w_pts is not None:
+                    # weighted joint histogram: each point enters with its frame's weight (sqrt on each factor)
+                    sw = torch.sqrt(w_pts).unsqueeze(-1)
+                    w_x = w_x * sw
+                    w_y_stage = (w_y_stage if w_y_stage.dim() == 3 else w_y_stage.unsqueeze(0).expand(n_cur, -1, -1)) * sw
+                per_frame_loss = batched_mattes_mi_from_weights(w_x, w_y_stage)
         if corr_weight > 0.0 and fixed_vals_stage is not None:
             per_frame_loss = per_frame_loss + corr_weight * pearson_correlation_loss(warped, fixed_vals_stage)
         return per_frame_loss
@@ -3703,8 +3717,22 @@ def batched_group_bias_register_pass(
             per_frame_loss = huber_loss_nd(w_scaled, fixed_scaled_stage.unsqueeze(0).expand_as(w_scaled),
                                            delta=huber_delta, reduction="none").mean(dim=1)
         else:
-            w_x = parzen_weights(w_scaled.reshape(-1), num_bins=num_bins).reshape(*w_scaled.shape, num_bins)
-            per_frame_loss = batched_mattes_mi_from_weights(w_x, w_y_stage)
+            from .core.kernels import RegisterParzenMattesMIFunction, has_mps_shader_backend
+            from .core.losses.mutual_information import _default_parzen_weights, _extract_sparse4_from_fixed_weights
+
+            if (
+                parzen_weights is _default_parzen_weights
+                and w_scaled.dtype == torch.float32
+                and int(num_bins) >= 6
+                and has_mps_shader_backend(w_scaled.device)
+            ):
+                fi_idx4, fi_w4 = _extract_sparse4_from_fixed_weights(w_y_stage)
+                per_frame_loss = RegisterParzenMattesMIFunction.apply(
+                    w_scaled, fi_idx4, fi_w4, int(num_bins), -1.0, 1.0, 2.0, None
+                )
+            else:
+                w_x = parzen_weights(w_scaled.reshape(-1), num_bins=num_bins).reshape(*w_scaled.shape, num_bins)
+                per_frame_loss = batched_mattes_mi_from_weights(w_x, w_y_stage)
         if corr_weight > 0.0 and fixed_vals_stage is not None:
             per_frame_loss = per_frame_loss + corr_weight * pearson_correlation_loss(warped, fixed_vals_stage)
         return per_frame_loss

@@ -189,8 +189,20 @@ from .greedy import (
 )
 from .cohort import (
     FixedTarget,
+    batch_cc,
+    batch_cc2,
+    batch_correlation,
     batch_greedy,
+    batch_jacobian,
+    batch_mattes_mi,
     batch_robust_affine,
+    batch_syn,
+    batch_tbm,
+)
+from .hybrid import (
+    get_cached_voxelmorph_3d,
+    hybrid_greedy,
+    hybrid_syn,
 )
 from .joint_label_fusion import joint_label_fusion
 
@@ -374,7 +386,7 @@ from .liouville import liouville_determinant, determinant_summary
 syngs = syngs_registration
 affine_benchmark = evaluate_affine_benchmark
 
-__version__ = "6.46.0"
+__version__ = "6.47.0"
 
 
 
@@ -563,8 +575,18 @@ __all__ = [
     "greedy_registration",
     "GreedyRegistrationModel",
     "FixedTarget",
+    "batch_cc",
+    "batch_cc2",
+    "batch_correlation",
     "batch_greedy",
+    "batch_jacobian",
+    "batch_mattes_mi",
     "batch_robust_affine",
+    "batch_syn",
+    "batch_tbm",
+    "get_cached_voxelmorph_3d",
+    "hybrid_greedy",
+    "hybrid_syn",
     "ImageDiagnosis",
     "PairDiagnosis",
     "diagnose_image",

@@ -98,6 +98,10 @@ def _box_pool(x: torch.Tensor, window_size: int, count_include_pad: bool) -> tor
         )
     if window_size <= 1:
         return x.clone()
+    if x.dim() == 5 and x.dtype == torch.float32 and not (x.requires_grad and torch.is_grad_enabled()):
+        from ..kernels import fused_box_mean_3d
+
+        return fused_box_mean_3d(x, window_size, count_include_pad=count_include_pad)
     return _separable_avg_pool_nd(x, window_size, count_include_pad=count_include_pad)
 
 
@@ -117,6 +121,10 @@ class _DeterministicBoxMean(torch.autograd.Function):
             return g.clone(), None
         _, _, pad_ratios = _get_window_count_views(g.shape[2:], k, g.device, g.dtype)
         scaled = _scale_by_views_inplace(g.clone(), pad_ratios)
+        if scaled.dim() == 5 and scaled.dtype == torch.float32:
+            from ..kernels import fused_box_mean_3d
+
+            return fused_box_mean_3d(scaled, k, count_include_pad=True), None
         return _separable_avg_pool_nd(scaled, k, count_include_pad=True), None
 
 
@@ -642,6 +650,7 @@ def local_ncc_loss_nd(
     use_analytical_gradients: bool = False,
     metric_chunks: int = 1,
     single_pass: bool = False,
+    return_per_batch: bool = False,
 ) -> torch.Tensor:
     """
     Negative local normalised cross-correlation (LNCC) of 2-D or 3-D images I and J.
@@ -692,6 +701,34 @@ def local_ncc_loss_nd(
         window_size = min_spatial
         if window_size % 2 == 0:
             window_size = max(1, window_size - 1)
+
+    # Fast 3-D single-channel batched LNCC / CC^2 when J does not require grad (shared B_J==1 or paired B_J==B)
+    if (
+        dim == 3
+        and I.shape[1] == 1
+        and J.shape[1] == 1
+        and not use_pseudo
+        and not single_pass
+        and not J.requires_grad
+        and (return_per_batch or (int(I.shape[0]) > 1 and int(J.shape[0]) == 1))
+        and int(I[0, 0].numel()) <= _FUSE_MAX_VOXELS
+    ):
+        from ..kernels import BatchedLNCC3DFunction, fused_box_mean_3d
+
+        fl_b = max(float(var_floor), 1e-6)
+        with torch.no_grad():
+            j_f = J.to(torch.float32)
+            j_mean = fused_box_mean_3d(j_f, window_size, count_include_pad=False)
+            m_c = j_f - j_mean
+            del j_mean
+            j_var = torch.clamp(fused_box_mean_3d(m_c.square(), window_size, count_include_pad=False), min=0.0)
+            safe_j_var = torch.clamp(j_var, min=fl_b)
+            j_valid = ((j_var > fl_b) & (mask > 0.5)) if mask is not None else None
+            del j_var
+        losses_b = BatchedLNCC3DFunction.apply(
+            I, m_c, safe_j_var, window_size, bool(squared), fl_b, j_valid
+        )
+        return losses_b if return_per_batch else losses_b.mean()
 
     slab_axis = _longest_slab_axis(tuple(I.shape))
     spatial_vox = int(I[0, 0].numel()) if I.numel() > 0 else 0

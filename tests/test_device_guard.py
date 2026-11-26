@@ -44,6 +44,7 @@ ALLOW = {
     ("benchmark/evaluate.py", "avail"): (2, _CLEAR),
     ("benchmark/high_level.py", "avail"): (1, _CLEAR),
     ("cli.py", "avail"): (2, "`syntx info` environment report"),
+    ("core/kernels.py", "avail"): (1, "capability probe for the runtime-compiled Metal shader kernels"),
     ("core/mps_kernels.py", "avail"): (1, "capability probe for the Metal shader kernels"),
     ("generators.py", "avail"): (2, "RNG-state capture"),
     ("provenance.py", "avail"): (2, "environment report"),

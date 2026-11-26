@@ -126,6 +126,61 @@ def _correlation_tensors(a_zyx, b_zyx) -> float:
         return float(val.item())
 
 
+def _transport_warm_warps_to_next_template(
+    prev_disp_list: Sequence[Optional[Any]],
+    step_disp_zyx: Any,
+    xavg: ants.ANTsImage,
+) -> List[Optional[Any]]:
+    """Transport pure nonlinear physical displacements ``u_k`` from ``xavg_pre`` onto the updated template:
+    ``u_k^{(warm)}(x) = step(x) + u_k(x + step(x))``, returned as normalized ``[-1, 1]`` tensors."""
+    import torch
+    from .core.grid import sample_field_cf
+    from .spatial import (
+        get_physical_grid_torch,
+        physical_to_normalized_disp,
+        physical_to_normalized_torch_cached,
+        reverse_metadata,
+    )
+
+    dev = step_disp_zyx.device
+    spatial_zyx = tuple(int(s) for s in step_disp_zyx.shape[1:-1])
+    sp_rev, org_rev, dir_rev = reverse_metadata(xavg.spacing, xavg.origin, xavg.direction)
+    shape_t = torch.tensor(list(spatial_zyx), device=dev, dtype=torch.float32)
+    sp_t = torch.tensor(sp_rev, device=dev, dtype=torch.float32)
+    org_t = torch.tensor(org_rev, device=dev, dtype=torch.float32)
+    dir_t = torch.tensor(dir_rev, device=dev, dtype=torch.float32)
+
+    with torch.no_grad():
+        X_phys = get_physical_grid_torch(
+            spatial_zyx, xavg.spacing, xavg.origin, xavg.direction, device=dev, dtype=torch.float32
+        )
+        coords_norm = physical_to_normalized_torch_cached(
+            X_phys + step_disp_zyx, shape_t, sp_t, org_t, dir_t
+        )
+        del X_phys
+        out_norm: List[Optional[Any]] = []
+        for u_prev in prev_disp_list:
+            if u_prev is None:
+                out_norm.append(None)
+                continue
+            u_p = u_prev.to(device=dev, dtype=torch.float32)
+            u_samp = sample_field_cf(
+                torch.movedim(u_p, -1, 1), coords_norm, mode="bilinear", padding_mode="border"
+            )
+            u_warm_phys = step_disp_zyx + u_samp
+            u_warm_norm = physical_to_normalized_disp(
+                u_warm_phys,
+                spatial_zyx,
+                xavg.spacing,
+                xavg.direction,
+                device=dev,
+                dtype=torch.float32,
+            )
+            out_norm.append(u_warm_norm)
+        del coords_norm
+    return out_norm
+
+
 def build_template(
     initial_template: Optional[ants.ANTsImage] = None,
     image_list: Optional[List[ants.ANTsImage]] = None,
@@ -150,6 +205,8 @@ def build_template(
     return_warped: bool = True,
     amp: bool = False,
     sync_free: bool = False,
+    warm_start_iterations: bool = False,
+    continuation_iterations: Optional[Sequence[int]] = None,
     **kwargs
 ) -> Dict[str, Any]:
     """Build an unbiased group template -- ``syntx.build_template`` (a port of
@@ -306,8 +363,18 @@ def build_template(
     last_fwdtransforms: List[List[str]] = [[] for _ in range(n)]
     last_invtransforms: List[List[str]] = [[] for _ in range(n)]
     last_fwd_chains: List[Any] = [None] * n
+    last_inv_chains: List[Any] = [None] * n
+    last_wti_inv: List[List[bool]] = [[] for _ in range(n)]
     image_affine: List[Optional[Any]] = [None] * n    # each image's affine of the last full registration
-    image_quality: List[Optional[float]] = [None] * n  # greedy only: correlation recorded when image_affine[k] was last (re)computed
+    image_quality: List[Optional[float]] = [None] * n  # correlation recorded when image_affine[k] was last (re)computed
+    prev_disp_zyx: List[Optional[Any]] = [None] * n
+    warm_warps_norm: List[Optional[Any]] = [None] * n
+    cont_iters_default = (20, 15, 8) if int(xavg.dimension) == 3 else (20, 15, 10, 8)
+    cont_iters = (
+        [int(x) for x in continuation_iterations]
+        if continuation_iterations is not None
+        else list(cont_iters_default)
+    )
 
     for it in range(iterations):
         if verbose:
@@ -336,23 +403,46 @@ def build_template(
             )
 
         is_final_iter = (it == iterations - 1)
-        need_subject_disk_files = (not is_greedy) or (output_dir is not None) or (is_final_iter and write_transforms)
-        need_subject_warped_imgs = (not is_greedy) or (output_dir is not None) or (is_final_iter and return_warped)
+        is_syn_pt = bool(
+            not is_greedy
+            and backend == "pytorch"
+            and type_of_transform.lower() in ("syn", "synto", "synonly")
+            and "guided" not in kwargs
+            and not kwargs.get("midpoint_only", False)
+        )
+        use_warm_now = bool(
+            warm_start_iterations
+            and it > 0
+            and not affine_every_iteration
+            and any(ww is not None for ww in warm_warps_norm)
+        )
 
         xavg_target = None
         xavg_raw_zyx = None
         use_batched_greedy = False
-        if is_greedy:
+        use_batched_syn = False
+        if is_greedy or is_syn_pt:
             import torch
-            from .cohort import FixedTarget, _select_cohort_batch_size, batch_greedy
-            from .spatial import image_to_tensor
+            from .cohort import FixedTarget, _select_cohort_batch_size, batch_greedy, batch_syn
+            from .spatial import export_ants_affine_transform, image_to_tensor
 
-            xavg_target = FixedTarget.from_image(xavg, device=kwargs.get("device", "auto"))
-            xavg_raw_zyx = image_to_tensor(xavg, device=xavg_target.device, to_zyx=True).to(torch.float32)
-            eff_b_tmpl = _select_cohort_batch_size(
-                batch_size, len(image_list), int(np.prod(xavg.shape)), stage="deformable"
-            )
-            use_batched_greedy = bool(xavg.dimension == 3 and len(image_list) > 1 and eff_b_tmpl > 1)
+            if is_syn_pt:
+                eff_b_syn = _select_cohort_batch_size(
+                    batch_size, len(image_list), int(np.prod(xavg.shape)), stage="syn"
+                )
+                use_batched_syn = bool(xavg.dimension == 3 and len(image_list) > 1 and eff_b_syn > 1)
+            if is_greedy or use_batched_syn:
+                xavg_target = FixedTarget.from_image(xavg, device=kwargs.get("device", "auto"))
+                xavg_raw_zyx = image_to_tensor(xavg, device=xavg_target.device, to_zyx=True).to(torch.float32)
+            if is_greedy:
+                eff_b_tmpl = _select_cohort_batch_size(
+                    batch_size, len(image_list), int(np.prod(xavg.shape)), stage="deformable"
+                )
+                use_batched_greedy = bool(xavg.dimension == 3 and len(image_list) > 1 and eff_b_tmpl > 1)
+
+        gpu_defer_io = is_greedy or use_batched_syn
+        need_subject_disk_files = (not gpu_defer_io) or (output_dir is not None) or (is_final_iter and write_transforms)
+        need_subject_warped_imgs = (not gpu_defer_io) or (output_dir is not None) or (is_final_iter and return_warped)
 
         if is_greedy and use_batched_greedy:
             if it == 0 or affine_every_iteration:
@@ -360,11 +450,16 @@ def build_template(
             else:
                 chosen_inits = list(image_affine)
             op_list = [make_outprefix(it, k) for k in range(len(image_list))] if need_subject_disk_files else None
+            reg_kw_full = dict(kwargs)
             reg_kw_b = dict(kwargs)
+            if use_warm_now:
+                reg_kw_b.pop("iterations", None)
+                reg_kw_b["reg_iterations"] = cont_iters
             batch_res = batch_greedy(
                 xavg_target,
                 image_list,
                 initial_transforms=chosen_inits,
+                initial_warps=warm_warps_norm if use_warm_now else None,
                 batch_size=batch_size,
                 outprefixes=op_list,
                 write_transforms=need_subject_disk_files,
@@ -402,7 +497,7 @@ def build_template(
                         amp=amp,
                         sync_free=sync_free,
                         verbose=verbose,
-                        **reg_kw_b,
+                        **reg_kw_full,
                     )
                     for k, w_new in zip(redo_ids, redo_res):
                         batch_res[k] = w_new
@@ -411,11 +506,81 @@ def build_template(
             for k, w1 in enumerate(batch_res):
                 image_affine[k] = w1["affine_transform"] if w1["affine_transform"] is not None else "identity"
                 image_quality[k] = qualities[k]
+                prev_disp_zyx[k] = w1["disp_tensor_zyx"]
                 L = len(w1["fwdtransforms"])
                 last_warped[k] = w1["warpedmovout"]
                 last_fwdtransforms[k] = w1["fwdtransforms"]
                 last_invtransforms[k] = w1["invtransforms"]
                 last_fwd_chains[k] = w1.get("fwd_chain")
+                last_inv_chains[k] = w1.get("inv_chain")
+                last_wti_inv[k] = list(w1.get("whichtoinvert_inv", []))
+                wk = float(weights[k])
+                with torch.no_grad():
+                    if k == 0:
+                        wavg_zyx = w1["disp_tensor_zyx"] * wk
+                        xavg_new_zyx = w1["warpedmovout_tensor"] * wk
+                    else:
+                        wavg_zyx.add_(w1["disp_tensor_zyx"], alpha=wk)
+                        xavg_new_zyx.add_(w1["warpedmovout_tensor"], alpha=wk)
+            del batch_res
+        elif use_batched_syn:
+            if it == 0 or affine_every_iteration:
+                chosen_inits = list(initial_transforms) if initial_transforms is not None else [None] * len(image_list)
+            else:
+                chosen_inits = [image_affine[k] if image_affine[k] is not None else "identity" for k in range(len(image_list))]
+            op_list = [make_outprefix(it, k) for k in range(len(image_list))] if need_subject_disk_files else None
+            reg_kw_syn = dict(kwargs)
+            if use_warm_now:
+                reg_kw_syn.pop("iterations", None)
+                reg_kw_syn["reg_iterations"] = cont_iters
+            syn_tot_call = "SyN" if (iter_tot == "SyNOnly" and any(ci != "identity" for ci in chosen_inits)) else iter_tot
+            batch_res = batch_syn(
+                xavg_target,
+                image_list,
+                type_of_transform=syn_tot_call,
+                initial_transforms=chosen_inits,
+                initial_warps=warm_warps_norm if use_warm_now else None,
+                batch_size=batch_size,
+                outprefixes=op_list,
+                write_transforms=need_subject_disk_files,
+                return_warped=need_subject_warped_imgs,
+                _return_warped_tensor=True,
+                _return_disp_tensor=True,
+                sync_free=sync_free,
+                verbose=verbose,
+                **reg_kw_syn,
+            )
+            for k, w1 in enumerate(batch_res):
+                prev_disp_zyx[k] = w1["disp_tensor_zyx"]
+                if need_subject_disk_files:
+                    L = len(w1["fwdtransforms"])
+                    aff_path_k = w1["fwdtransforms"][L - 1]
+                else:
+                    aff_chain_k = w1["affine_transform"]
+                    aff_path_k = f"{make_outprefix(it, k)}0GenericAffine.mat"
+                    if aff_chain_k is not None and len(aff_chain_k) > 0 and aff_chain_k[0].matrix is not None:
+                        export_ants_affine_transform(
+                            aff_chain_k[0].matrix, aff_chain_k[0].offset, dim=int(xavg.dimension), filename=aff_path_k
+                        )
+                    elif isinstance(image_affine[k], str) and os.path.exists(image_affine[k]):
+                        aff_path_k = image_affine[k]
+                    else:
+                        export_ants_affine_transform(
+                            np.eye(int(xavg.dimension), dtype=np.float32),
+                            np.zeros(int(xavg.dimension), dtype=np.float32),
+                            dim=int(xavg.dimension),
+                            filename=aff_path_k,
+                        )
+                    L = 2
+                if iter_tot != "SyNOnly":
+                    image_affine[k] = aff_path_k
+                affinelist.append(aff_path_k)
+                last_warped[k] = w1["warpedmovout"]
+                last_fwdtransforms[k] = w1["fwdtransforms"]
+                last_invtransforms[k] = w1["invtransforms"]
+                last_fwd_chains[k] = w1.get("fwd_chain")
+                last_inv_chains[k] = w1.get("inv_chain")
+                last_wti_inv[k] = list(w1.get("whichtoinvert_inv", []))
                 wk = float(weights[k])
                 with torch.no_grad():
                     if k == 0:
@@ -438,6 +603,10 @@ def build_template(
                     else:
                         chosen_init = image_affine[k]
                     reg_kw["initial_transform"] = chosen_init
+                    if use_warm_now and warm_warps_norm[k] is not None:
+                        reg_kw["initial_warp"] = warm_warps_norm[k]
+                        reg_kw.pop("iterations", None)
+                        reg_kw["reg_iterations"] = cont_iters
 
                     op_k = make_outprefix(it, k) if need_subject_disk_files else None
                     w1 = greedy_registration(
@@ -466,7 +635,8 @@ def build_template(
                             print(f"\n  Subject {k + 1}: cached-affine quality dropped "
                                   f"({quality:.4f} < {image_quality[k]:.4f} - {affine_drop_tolerance}) "
                                   f"-- recomputing affine from scratch.", end=" ")
-                        reg_kw["initial_transform"] = None
+                        reg_kw_redo = dict(kwargs)
+                        reg_kw_redo["initial_transform"] = None
                         w1 = greedy_registration(
                             xavg_target,
                             image_list[k],
@@ -478,12 +648,13 @@ def build_template(
                             amp=amp,
                             sync_free=sync_free,
                             verbose=verbose,
-                            **reg_kw
+                            **reg_kw_redo
                         )
                         quality = _correlation_tensors(w1["warpedmovout_tensor"], xavg_raw_zyx)
 
                     image_affine[k] = w1["affine_transform"] if w1["affine_transform"] is not None else "identity"
                     image_quality[k] = quality
+                    prev_disp_zyx[k] = w1["disp_tensor_zyx"]
                 elif backend == "ants":
                     if iter_tot == "SyNOnly" and image_affine[k] is not None:
                         reg_kw["initial_transform"] = image_affine[k]   # deformable only, from its affine
@@ -546,7 +717,7 @@ def build_template(
                 if verbose:
                     print("done")
 
-        if is_greedy:
+        if is_greedy or use_batched_syn:
             from .spatial import disp_tensor_to_itk
 
             rev_sp_x = tuple(range(xavg.dimension - 1, -1, -1))
@@ -556,7 +727,7 @@ def build_template(
             wavg = disp_tensor_to_itk(wavg_zyx, xavg)
             del xavg_raw_zyx
 
-        has_field = is_greedy or L >= 2
+        has_field = is_greedy or use_batched_syn or L >= 2
 
         # Quantify the shape residual of the mean deformable warp (for greedy, the single
         # composed field stands in directly -- it already includes any affine component).
@@ -604,6 +775,10 @@ def build_template(
                     transformlist=avg_chain,
                     device=str(xavg_target.device),
                 )
+                if warm_start_iterations and not is_final_iter:
+                    warm_warps_norm = _transport_warm_warps_to_next_template(
+                        prev_disp_zyx, wavg_scaled_zyx, xavg
+                    )
                 del wavg_scaled_zyx, avg_chain
             else:
                 xavg = xavgNew
@@ -648,6 +823,14 @@ def build_template(
                     transformlist=[wavgfn, afffn],
                     whichtoinvert=[0, 1]
                 )
+                if use_batched_syn and warm_start_iterations and not is_final_iter:
+                    from .spatial import disp_itk_to_tensor
+
+                    wavgA_zyx = disp_itk_to_tensor(wavgA, device=xavg_target.device)
+                    warm_warps_norm = _transport_warm_warps_to_next_template(
+                        prev_disp_zyx, wavgA_zyx, xavg
+                    )
+                    del wavgA_zyx
             else:
                 xavg = _apply_transforms(
                     fixed=xavgNew,
@@ -655,6 +838,8 @@ def build_template(
                     transformlist=[afffn],
                     whichtoinvert=[1]
                 )
+            if use_batched_syn:
+                del wavg_zyx, xavg_new_zyx, xavg_target
 
         if blending_weight is not None and blending_weight < 1.0:
             xavg = xavg * blending_weight + ants.iMath(xavg, "Sharpen") * (1.0 - blending_weight)
@@ -666,11 +851,21 @@ def build_template(
             print(f"  Template MAE change: {c_val:.6f}")
 
         if convergence_threshold > 0.0 and sr['l2_norm'] < convergence_threshold:
-            if is_greedy and not need_subject_disk_files:
+            if gpu_defer_io and not need_subject_disk_files:
                 for k_m in range(len(image_list)):
                     if last_fwd_chains[k_m] is not None:
                         if write_transforms:
-                            last_fwdtransforms[k_m] = last_fwd_chains[k_m].save(make_outprefix(it, k_m), compresslevel=1)
+                            op_km = make_outprefix(it, k_m)
+                            last_fwdtransforms[k_m] = last_fwd_chains[k_m].save(op_km, compresslevel=1)
+                            if use_batched_syn and last_inv_chains[k_m] is not None and len(last_inv_chains[k_m]) > 0:
+                                inv_f_km = f"{op_km}1InverseWarp.nii.gz"
+                                inv_el = last_inv_chains[k_m][-1]
+                                ants.image_write(inv_el.to_ants_image(), inv_f_km)
+                                last_invtransforms[k_m] = (
+                                    [last_fwdtransforms[k_m][-1], inv_f_km]
+                                    if len(last_fwdtransforms[k_m]) >= 2
+                                    else [inv_f_km]
+                                )
                         if return_warped and last_warped[k_m] is None:
                             last_warped[k_m] = _apply_transforms(
                                 fixed=xavg_pre,

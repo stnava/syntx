@@ -359,17 +359,21 @@ class TransformElement:
             t = torch.flip(self.field.tensor.movedim(1, -1), dims=[-1]).contiguous()
             if device is not None:
                 t = t.to(device=device, dtype=torch.float32)
+            t.is_physical = True
             return t
         if self.disp_2d_yx is not None:
             t = self.disp_2d_yx
             if device is not None:
                 t = t.to(device=device, dtype=torch.float32)
+            t.is_physical = True
             return t
         import ants
         from .spatial import disp_itk_to_tensor
 
         disp_img = ants.image_read(self.path)
-        return disp_itk_to_tensor(disp_img, device=device)
+        t_disk = disp_itk_to_tensor(disp_img, device=device)
+        t_disk.is_physical = True
+        return t_disk
 
     def to_ants_image(self) -> Any:
         """Materialize a displacement ``TransformElement`` into an ``ants.ANTsImage`` (`has_components=True`)."""
@@ -503,6 +507,12 @@ class TransformChain:
 
     def __len__(self) -> int:
         return len(self.elements)
+
+    def __getitem__(self, idx):
+        return self.elements[idx]
+
+    def __iter__(self):
+        return iter(self.elements)
 
     def has_in_memory(self) -> bool:
         return any(e.is_in_memory() for e in self.elements)
@@ -1137,6 +1147,11 @@ def _sample_field_itk(
         C = field.tensor.shape[1]
         out = sampled_b.view(C, -1).T if field.is_vector else sampled_b.view(-1)
     elif mode == "genericlabel" and not field.is_vector:
+        from .core.kernels import fused_genericlabel_8corner_3d
+
+        fast_gl = fused_genericlabel_8corner_3d(field.tensor[0, 0], cidx, defaultvalue=defaultvalue)
+        if fast_gl is not None:
+            return fast_gl
         c_clamped = torch.minimum(torch.maximum(cidx, torch.zeros_like(shape_t)), shape_t - 1.0)
         n_pts = c_clamped.shape[0]
         pt_chunk = 524288

@@ -107,6 +107,32 @@ def compute_jacobian_determinant_nd(warp_field: torch.Tensor, physical_spacing=N
     Tensor (B, *spatial) ((*spatial) for unbatched input), or (B, 1, *spatial) when the input
     was channels-first.
     """
+    if method == 'central':
+        from .kernels import fused_jacobian_det_3d
+
+        channels_first = (
+            warp_field.dim() >= 3
+            and warp_field.shape[1] in [2, 3]
+            and warp_field.shape[-1] not in [2, 3]
+        )
+        wf = warp_field.movedim(1, -1) if channels_first else warp_field
+        if wf.shape[-1] == 3 and wf.dim() in (4, 5):
+            unbatched = wf.dim() == 4
+            wf_b = wf.unsqueeze(0) if unbatched else wf
+            is_phys = getattr(warp_field, 'is_physical', physical_spacing is not None) if is_physical is None else is_physical
+            comps_b = wf_b if is_phys else torch.flip(wf_b, dims=[-1])
+            if physical_spacing is not None:
+                steps_b = [float(sp) for sp in reversed(tuple(physical_spacing))]
+            elif is_phys:
+                steps_b = [1.0, 1.0, 1.0]
+            else:
+                steps_b = [2.0 / (n - 1) for n in wf_b.shape[1:-1]]
+            fast_res = fused_jacobian_det_3d(comps_b, steps_b, None)
+            if fast_res is not None:
+                if channels_first:
+                    return fast_res.unsqueeze(1)
+                return fast_res[0] if unbatched else fast_res
+
     G, channels_first, unbatched = _displacement_gradient(warp_field, physical_spacing, method, is_physical)
     res = _det_identity_plus(G)
     if channels_first:
@@ -332,10 +358,28 @@ def compute_physical_jacobian_determinant(
     dim = warp_field.shape[1] if (warp_field.dim() >= 3 and warp_field.shape[1] in [2, 3]
                                   and warp_field.shape[-1] not in [2, 3]) else warp_field.shape[-1]
     sp = [1.0] * dim if spacing is None else [float(x) for x in (spacing.tolist() if isinstance(spacing, torch.Tensor) else spacing)]
-    G, channels_first, unbatched = _displacement_gradient(warp_field, sp, method, True)
     D = np.eye(dim) if direction is None else np.asarray(
         direction.detach().cpu().numpy() if isinstance(direction, torch.Tensor) else direction, dtype=float)
-    D_rev_inv = torch.as_tensor(np.linalg.inv(D[::-1, ::-1].copy()), device=G.device, dtype=G.dtype)
+    D_rev_inv = torch.as_tensor(np.linalg.inv(D[::-1, ::-1].copy()), device=warp_field.device, dtype=warp_field.dtype)
+    if method == 'central' and dim == 3:
+        from .kernels import fused_jacobian_det_3d
+
+        channels_first = (
+            warp_field.dim() >= 3
+            and warp_field.shape[1] in [2, 3]
+            and warp_field.shape[-1] not in [2, 3]
+        )
+        wf = warp_field.movedim(1, -1) if channels_first else warp_field
+        if wf.dim() in (4, 5):
+            unbatched = wf.dim() == 4
+            wf_b = wf.unsqueeze(0) if unbatched else wf
+            fast_res = fused_jacobian_det_3d(wf_b, list(reversed(sp)), D_rev_inv)
+            if fast_res is not None:
+                if channels_first:
+                    return fast_res.unsqueeze(1)
+                return fast_res[0] if unbatched else fast_res
+
+    G, channels_first, unbatched = _displacement_gradient(warp_field, sp, method, True)
     res = _det_identity_plus(G @ D_rev_inv)
     if channels_first:
         return res.unsqueeze(1)

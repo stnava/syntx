@@ -294,6 +294,7 @@ class GreedyRegistrationModel(nn.Module):
         metric_chunks: int = 1,
         amp: bool = False,
         sync_free: bool = False,
+        control_stride: int = 1,
     ):
         super().__init__()
         self.digital_diffeomorphism = bool(digital_diffeomorphism)
@@ -301,6 +302,7 @@ class GreedyRegistrationModel(nn.Module):
         self.digital_diffeomorphism_steps = int(digital_diffeomorphism_steps)
         self.amp = bool(amp)
         self.sync_free = bool(sync_free)
+        self.control_stride = max(1, int(control_stride))
         eff_slope = None if self.sync_free else convergence_slope
         self.stop = LossSlopeStop(slope_threshold=eff_slope)   # the shared deformable stopping rule (core.convergence)
         self.convergence = []
@@ -514,13 +516,43 @@ class GreedyRegistrationModel(nn.Module):
             mi_down_eval = mi_down.to(torch.bfloat16) if use_amp_bf16 else mi_down
             mask_down = mask_lv[level_idx].tensor if mask_lv is not None else None
 
-            # Interpolate warp and optimizer state to current scale via centralized resize_field
-            if list(warp.shape[1:-1]) != size_down:
-                warp = resize_field(warp, size_down, mode=mode)
-                step_opt.on_level_change(size_down, interp_mode=mode)
+            eff_cstride = (
+                self.control_stride
+                if (int(scale) == 1 and self.control_stride >= 2 and min(size_down) >= 16 * self.control_stride)
+                else 1
+            )
+            ctrl_shape = (
+                [max(8, int(round(s / eff_cstride))) for s in size_down]
+                if eff_cstride > 1
+                else size_down
+            )
+            from .pyramid import level_spacing as _pyr_level_spacing
+            ctrl_spacing = (
+                _pyr_level_spacing(fixed_lv[level_idx].spacing, size_down, ctrl_shape)
+                if eff_cstride > 1
+                else fixed_lv[level_idx].spacing
+            )
+            eff_flow_sigma = float(self.flow_sigma) / float(eff_cstride)
+            eff_total_sigma = float(self.total_sigma) / float(eff_cstride)
+            eff_regadam_sigma = float(self.regadam_sigma) / float(eff_cstride)
+            eff_sobolev_alpha = (
+                None
+                if self.sobolev_alpha is None
+                else float(self.sobolev_alpha) / float(eff_cstride * eff_cstride)
+            )
+
+            # Interpolate warp and optimizer state to current control grid via centralized resize_field
+            if list(warp.shape[1:-1]) != ctrl_shape:
+                warp = resize_field(warp, ctrl_shape, mode=mode)
+                step_opt.on_level_change(ctrl_shape, interp_mode=mode)
 
             grid_shape = [1, 1, *size_down]
             id_grid = F.affine_grid(torch.eye(dim, dim + 1, device=self.device)[None], grid_shape, align_corners=True)
+            id_grid_ctrl = (
+                F.affine_grid(torch.eye(dim, dim + 1, device=self.device)[None], [1, 1, *ctrl_shape], align_corners=True)
+                if eff_cstride > 1
+                else id_grid
+            )
             if int(self.theta.shape[0]) == 1:
                 M_theta = self.theta[0, :, :dim].contiguous()
                 t_theta_flat = self.theta[0, :, dim].contiguous()
@@ -570,23 +602,67 @@ class GreedyRegistrationModel(nn.Module):
                 _lncc_safe_J_var = None
                 _lncc_j_valid = None
 
-            grad_gaussians = [gaussian_1d_compact(self.flow_sigma, truncated=2.0, device=self.device) for _ in range(dim)] if self.flow_sigma > 0 else None
-            reg_gaussians = [gaussian_1d_compact(self.regadam_sigma, truncated=2.0, device=self.device) for _ in range(dim)] if (self.optimizer in ('regadam', 'reg_adam') and self.regadam_sigma > 0) else None
-            warp_gaussians = [gaussian_1d_compact(self.total_sigma, truncated=2.0, device=self.device) for _ in range(dim)] if self.total_sigma > 0 else None
+            _lncc_pad_ratios = None
+            if use_fast_lncc and dim == 3 and ws_lvl % 2 == 1 and not use_amp_bf16:
+                from .core.losses.cross_correlation import _get_window_count_views
+                _, _, _lncc_pad_ratios = _get_window_count_views(tuple(size_down), ws_lvl, fi_down.device, torch.float32)
+
+            _mi_fi_idx4 = None
+            _mi_fi_w4 = None
+            _mi_samp_idx = None
+            _loss_cfg_g = getattr(self.loss_fn, 'config', None)
+            if (
+                dim == 3
+                and not use_amp_bf16
+                and _loss_cfg_g is not None
+                and _loss_cfg_g.metric == 'mattes_mi'
+                and _loss_cfg_g.fixed_range is not None
+                and isinstance(_loss_cfg_g.fixed_range[0], (int, float))
+                and not bool(_loss_cfg_g.auto_mask)
+                and int(_loss_cfg_g.num_bins) >= 6
+            ):
+                from .core.kernels import has_mps_shader_backend, prepack_fixed_parzen_sparse4
+                from .core.losses.mutual_information import mattes_sample_indices
+
+                if has_mps_shader_backend(fi_down.device):
+                    with torch.no_grad():
+                        f_flat_g = fi_down.float().reshape(-1)
+                        if mask_down is not None:
+                            valid_idx = (mask_down.reshape(-1) > 0.5).nonzero(as_tuple=False).squeeze(-1)
+                        else:
+                            valid_idx = None
+                        if _loss_cfg_g.sampling_percentage is not None and float(_loss_cfg_g.sampling_percentage) < 1.0:
+                            base_n = int(valid_idx.numel()) if valid_idx is not None else int(f_flat_g.numel())
+                            if base_n > 0:
+                                sub_i = mattes_sample_indices(base_n, float(_loss_cfg_g.sampling_percentage), fi_down.device)
+                                _mi_samp_idx = valid_idx.index_select(0, sub_i) if valid_idx is not None else sub_i
+                        else:
+                            _mi_samp_idx = valid_idx
+                        f_sel_g = f_flat_g.index_select(0, _mi_samp_idx) if _mi_samp_idx is not None else f_flat_g
+                        if int(f_sel_g.numel()) >= 64:
+                            fr0_g, fr1_g = float(_loss_cfg_g.fixed_range[0]), float(_loss_cfg_g.fixed_range[1])
+                            y_sc_g = (f_sel_g - fr0_g) / (fr1_g - fr0_g + 1e-8) * 2.0 - 1.0
+                            _mi_fi_idx4, _mi_fi_w4, _ = prepack_fixed_parzen_sparse4(
+                                y_sc_g, num_bins=int(_loss_cfg_g.num_bins), min_val=-1.0, max_val=1.0, pad=2.0
+                            )
+
+            grad_gaussians = [gaussian_1d_compact(eff_flow_sigma, truncated=2.0, device=self.device) for _ in range(dim)] if eff_flow_sigma > 0 else None
+            reg_gaussians = [gaussian_1d_compact(eff_regadam_sigma, truncated=2.0, device=self.device) for _ in range(dim)] if (self.optimizer in ('regadam', 'reg_adam') and eff_regadam_sigma > 0) else None
+            warp_gaussians = [gaussian_1d_compact(eff_total_sigma, truncated=2.0, device=self.device) for _ in range(dim)] if eff_total_sigma > 0 else None
 
             if self.regularizer not in ('gaussian', 'gauss', 'none', 'identity'):
                 grad_reg_fn = build_level_regularizer(
                     self.regularizer,
-                    alpha=self.sobolev_alpha,
-                    sobolev_alpha=self.sobolev_alpha,
-                    spacing=fixed_lv[level_idx].spacing,
+                    alpha=eff_sobolev_alpha,
+                    sobolev_alpha=eff_sobolev_alpha,
+                    spacing=ctrl_spacing,
                     origin=fixed_lv[level_idx].origin,
                     direction=fixed_lv[level_idx].direction,
-                    fluid_sigma=self.flow_sigma,
+                    fluid_sigma=eff_flow_sigma,
                     param_domain="normalized_grid",
-                    grid_shape=size_down,
-                    mask=mask_down,
-                    fixed_mask=mask_down,
+                    grid_shape=ctrl_shape,
+                    mask=mask_down if eff_cstride == 1 else None,
+                    fixed_mask=mask_down if eff_cstride == 1 else None,
                     extra_reg_kwargs=self.extra_reg_kwargs,
                     input_role="gradient",
                     output_units="voxel",
@@ -594,16 +670,16 @@ class GreedyRegistrationModel(nn.Module):
                 post_reg_fn = (
                     build_level_regularizer(
                         self.regularizer,
-                        alpha=self.sobolev_alpha,
-                        sobolev_alpha=self.sobolev_alpha,
-                        spacing=fixed_lv[level_idx].spacing,
+                        alpha=eff_sobolev_alpha,
+                        sobolev_alpha=eff_sobolev_alpha,
+                        spacing=ctrl_spacing,
                         origin=fixed_lv[level_idx].origin,
                         direction=fixed_lv[level_idx].direction,
-                        fluid_sigma=self.flow_sigma,
+                        fluid_sigma=eff_flow_sigma,
                         param_domain="normalized_grid",
-                        grid_shape=size_down,
-                        mask=mask_down,
-                        fixed_mask=mask_down,
+                        grid_shape=ctrl_shape,
+                        mask=mask_down if eff_cstride == 1 else None,
+                        fixed_mask=mask_down if eff_cstride == 1 else None,
                         extra_reg_kwargs=self.extra_reg_kwargs,
                         input_role="velocity",
                         output_units="voxel",
@@ -617,7 +693,7 @@ class GreedyRegistrationModel(nn.Module):
 
             grad_smooth_fn = (
                 (lambda f, _g=grad_gaussians: smooth_field(f, _g))
-                if (self.flow_sigma > 0 and grad_gaussians is not None)
+                if (eff_flow_sigma > 0 and grad_gaussians is not None)
                 else None
             )
             reg_smooth_fn = (
@@ -626,7 +702,7 @@ class GreedyRegistrationModel(nn.Module):
                 else None
             )
 
-            def _sobolev_fallback_fn(raw_u, ra_alpha, _sp=fixed_lv[level_idx].spacing):
+            def _sobolev_fallback_fn(raw_u, ra_alpha, _sp=ctrl_spacing):
                 from .core.smoothing import apply_sobolev_green_operator
                 if int(raw_u.shape[0]) == 1:
                     return apply_sobolev_green_operator(
@@ -650,71 +726,126 @@ class GreedyRegistrationModel(nn.Module):
 
             _stop_pending: List[Tuple[int, torch.Tensor]] = []
             _track_stop = bool(self.stop.enabled and batch_sz == 1)
+            from .core.kernels import (
+                exact_lncc_1sided_affine_warp_loss_and_grad_3d,
+                exact_mattes_mi_1sided_affine_warp_loss_and_grad_3d,
+            )
+            _ctrl_grad_scale = float(np.prod(size_down)) / float(max(np.prod(ctrl_shape), 1)) if eff_cstride > 1 else 1.0
+
             for it in range(n_iters):
-                warp_param = warp.detach().requires_grad_(True)
-
-                # Correct A∘(Id+u) composition: deform in fixed-space coords (clamped to [-1, 1]
-                # matching sample_field_cf's padding_mode='border'), then map through the affine.
-                if is_identity_theta:
-                    sample_grid = torch.clamp(id_grid + warp_param, -1.0, 1.0)
-                else:
-                    sample_grid = _Conv1x1AffineGrid.apply(id_grid + warp_param, M_theta, t_theta_flat)
-                if use_amp_bf16:
-                    moved = F.grid_sample(
-                        mi_down_eval, sample_grid.to(torch.bfloat16), mode='bilinear', padding_mode='zeros', align_corners=True
+                fused_out = None
+                if _lncc_pad_ratios is not None:
+                    warp_eval = resize_field(warp.detach(), size_down, mode=mode) if eff_cstride > 1 else warp.detach()
+                    fused_out = exact_lncc_1sided_affine_warp_loss_and_grad_3d(
+                        mi_down,
+                        id_grid,
+                        warp_eval,
+                        M_theta,
+                        t_theta_flat,
+                        is_identity_theta,
+                        _lncc_M_c,
+                        _lncc_safe_J_var,
+                        ws_lvl,
+                        _lncc_pad_ratios,
+                        squared=bool(self.squared),
+                        lncc_j_valid=_lncc_j_valid,
+                        padding_mode='zeros',
                     )
-                else:
-                    moved = F.grid_sample(mi_down_eval, sample_grid, mode='bilinear', padding_mode='zeros', align_corners=True)
+                    del warp_eval
+                elif _mi_fi_idx4 is not None:
+                    warp_eval = resize_field(warp.detach(), size_down, mode=mode) if eff_cstride > 1 else warp.detach()
+                    fused_out = exact_mattes_mi_1sided_affine_warp_loss_and_grad_3d(
+                        mi_down,
+                        id_grid,
+                        warp_eval,
+                        M_theta,
+                        t_theta_flat,
+                        is_identity_theta,
+                        _mi_fi_idx4,
+                        _mi_fi_w4,
+                        num_bins=int(_loss_cfg_g.num_bins),
+                        fixed_range=(float(_loss_cfg_g.fixed_range[0]), float(_loss_cfg_g.fixed_range[1])),
+                        sample_idx=_mi_samp_idx,
+                        padding_mode='zeros',
+                    )
+                    del warp_eval
 
-                if use_fast_lncc:
-                    moved_f = moved.float() if moved.dtype in (torch.float16, torch.bfloat16) else moved
-                    I_mean = box_mean_nd(moved_f, ws_lvl)
-                    F_c = moved_f - I_mean
-                    del I_mean
-                    c_ch = moved_f.shape[1]
-                    sec = box_mean_nd(torch.cat([F_c.square(), F_c * _lncc_M_c], dim=1), ws_lvl)
-                    I_var = torch.clamp(sec[:, :c_ch], min=0.0)
-                    IJ_cov = sec[:, c_ch:]
-                    del sec, F_c
-                    safe_I_var = torch.clamp(I_var, min=1e-6)
-                    if self.squared:
-                        cc_metric = torch.clamp((IJ_cov ** 2) / (safe_I_var * _lncc_safe_J_var + 1e-8), min=0.0, max=1.0)
+                if fused_out is not None:
+                    loss_t, grad_eval = fused_out
+                    if not self.sync_free:
+                        self.loss_history.append(loss_t)
+                    grad = (
+                        resize_field(grad_eval, ctrl_shape, mode=mode).mul_(_ctrl_grad_scale)
+                        if eff_cstride > 1
+                        else grad_eval
+                    )
+                    del grad_eval, fused_out
+                else:
+                    warp_param = warp.detach().requires_grad_(True)
+                    warp_eval_p = resize_field(warp_param, size_down, mode=mode) if eff_cstride > 1 else warp_param
+
+                    # Correct A∘(Id+u) composition: deform in fixed-space coords (clamped to [-1, 1]
+                    # matching sample_field_cf's padding_mode='border'), then map through the affine.
+                    if is_identity_theta:
+                        sample_grid = torch.clamp(id_grid + warp_eval_p, -1.0, 1.0)
                     else:
-                        cc_metric = torch.clamp(IJ_cov / (torch.sqrt(safe_I_var * _lncc_safe_J_var) + 1e-6), min=-1.0, max=1.0)
-                    if mask_down is not None:
-                        active_mask_f = ((I_var > 1e-6) & _lncc_j_valid).to(moved_f.dtype)
-                        if batch_sz == 1:
-                            loss = -torch.sum(cc_metric * active_mask_f) / (torch.sum(active_mask_f) + 1e-8)
+                        sample_grid = _Conv1x1AffineGrid.apply(id_grid + warp_eval_p, M_theta, t_theta_flat)
+                    if use_amp_bf16:
+                        moved = F.grid_sample(
+                            mi_down_eval, sample_grid.to(torch.bfloat16), mode='bilinear', padding_mode='zeros', align_corners=True
+                        )
+                    else:
+                        moved = F.grid_sample(mi_down_eval, sample_grid, mode='bilinear', padding_mode='zeros', align_corners=True)
+
+                    if use_fast_lncc:
+                        moved_f = moved.float() if moved.dtype in (torch.float16, torch.bfloat16) else moved
+                        I_mean = box_mean_nd(moved_f, ws_lvl)
+                        F_c = moved_f - I_mean
+                        del I_mean
+                        c_ch = moved_f.shape[1]
+                        sec = box_mean_nd(torch.cat([F_c.square(), F_c * _lncc_M_c], dim=1), ws_lvl)
+                        I_var = torch.clamp(sec[:, :c_ch], min=0.0)
+                        IJ_cov = sec[:, c_ch:]
+                        del sec, F_c
+                        safe_I_var = torch.clamp(I_var, min=1e-6)
+                        if self.squared:
+                            cc_metric = torch.clamp((IJ_cov ** 2) / (safe_I_var * _lncc_safe_J_var + 1e-8), min=0.0, max=1.0)
                         else:
-                            num_b = (cc_metric * active_mask_f).flatten(1).sum(dim=1)
-                            den_b = active_mask_f.flatten(1).sum(dim=1) + 1e-8
-                            loss = -torch.sum(num_b / den_b)
+                            cc_metric = torch.clamp(IJ_cov / (torch.sqrt(safe_I_var * _lncc_safe_J_var) + 1e-6), min=-1.0, max=1.0)
+                        if mask_down is not None:
+                            active_mask_f = ((I_var > 1e-6) & _lncc_j_valid).to(moved_f.dtype)
+                            if batch_sz == 1:
+                                loss = -torch.sum(cc_metric * active_mask_f) / (torch.sum(active_mask_f) + 1e-8)
+                            else:
+                                num_b = (cc_metric * active_mask_f).flatten(1).sum(dim=1)
+                                den_b = active_mask_f.flatten(1).sum(dim=1) + 1e-8
+                                loss = -torch.sum(num_b / den_b)
+                        else:
+                            loss = -torch.mean(cc_metric) if batch_sz == 1 else -cc_metric.flatten(1).mean(dim=1).sum()
+                        del I_var, IJ_cov, safe_I_var, cc_metric, moved_f
                     else:
-                        loss = -torch.mean(cc_metric) if batch_sz == 1 else -cc_metric.flatten(1).mean(dim=1).sum()
-                    del I_var, IJ_cov, safe_I_var, cc_metric, moved_f
-                else:
-                    moved_eval = moved.float() if moved.dtype in (torch.float16, torch.bfloat16) else moved
-                    if batch_sz == 1:
-                        loss = self.loss_fn(moved_eval, fi_down, mask=mask_down)
-                    else:
-                        loss = torch.stack(
-                            [self.loss_fn(moved_eval[b : b + 1], fi_down, mask=mask_down) for b in range(batch_sz)]
-                        ).sum()
+                        moved_eval = moved.float() if moved.dtype in (torch.float16, torch.bfloat16) else moved
+                        if batch_sz == 1:
+                            loss = self.loss_fn(moved_eval, fi_down, mask=mask_down)
+                        else:
+                            loss = torch.stack(
+                                [self.loss_fn(moved_eval[b : b + 1], fi_down, mask=mask_down) for b in range(batch_sz)]
+                            ).sum()
 
-                loss_t = loss.detach()
-                if not self.sync_free:
-                    self.loss_history.append(loss_t)
-                loss.backward()
+                    loss_t = loss.detach()
+                    if not self.sync_free:
+                        self.loss_history.append(loss_t)
+                    loss.backward()
 
-                grad = warp_param.grad.detach()
-                del loss, moved, sample_grid, warp_param
+                    grad = warp_param.grad.detach()
+                    del loss, moved, sample_grid, warp_param, warp_eval_p
 
                 with torch.no_grad():
                     update = step_opt.step(
                         grad,
-                        self.learning_rate,
-                        grid_shape=size_down,
-                        spacing=fixed_lv[level_idx].spacing,
+                        self.learning_rate / float(eff_cstride),
+                        grid_shape=ctrl_shape,
+                        spacing=ctrl_spacing,
                         reg_fn=grad_reg_fn,
                         post_reg_fn=post_reg_fn,
                         grad_smooth_fn=grad_smooth_fn,
@@ -726,12 +857,12 @@ class GreedyRegistrationModel(nn.Module):
                         update = update * restr_mask
 
                     # Eulerian compositive pullback: u_{k+1}(x) = v_k(x) + u_k(x + v_k(x))
-                    # compose_grids(warp, id_grid + update) samples warp at (x + update(x)).
-                    pulled = compose_grids(warp, id_grid + update.to(warp.dtype))
+                    # compose_grids(warp, id_grid_ctrl + update) samples warp at (x + update(x)).
+                    pulled = compose_grids(warp, id_grid_ctrl + update.to(warp.dtype))
 
                     u_new = update + pulled
                     del update, pulled
-                    if self.total_sigma > 0 and warp_gaussians is not None:
+                    if eff_total_sigma > 0 and warp_gaussians is not None:
                         u_new = smooth_field(u_new, warp_gaussians)
                     if restr_mask is not None:
                         u_new = u_new * restr_mask
@@ -836,6 +967,7 @@ def greedy_registration(
     write_transforms: bool = True,
     amp: bool = False,
     sync_free: bool = False,
+    control_stride: int = 1,
     **kwargs: Any
 ) -> Dict[str, Any]:
     """
@@ -1146,6 +1278,7 @@ def greedy_registration(
         metric_chunks=metric_chunks_val,
         amp=amp,
         sync_free=sync_free,
+        control_stride=control_stride,
     )
 
     model.has_initial_warp = resolved_init.has_initial_warp

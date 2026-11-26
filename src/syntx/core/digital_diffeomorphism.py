@@ -110,6 +110,12 @@ def _physical_fd_det_only(
     """Fast 1-pass physical central-difference ``det(I + (du/d_axis) @ D_rev_inv)`` without
     allocating cofactor tensors or running the 3-axis adjoint gradient pass."""
     dim = u.shape[-1]
+    if dim == 3:
+        from .kernels import fused_jacobian_det_3d
+
+        fast_det = fused_jacobian_det_3d(u, steps_rev, D_rev_inv)
+        if fast_det is not None:
+            return fast_det
     grads = torch.gradient(u, spacing=steps_rev, dim=tuple(range(1, dim + 1)))
     G = torch.stack(grads, dim=-1)  # (B, *spatial, comp_i, axis_j)
     del grads

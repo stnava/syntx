@@ -299,6 +299,32 @@ class BatchedMattesMIFunction(torch.autograd.Function):
         return grad_x, None, None, None, None, None, None
 
 
+def _extract_sparse4_from_fixed_weights(fixed_weights: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    """Extract and cache the 4 non-zero Parzen bins ``(fi_idx4, fi_w4)`` from ``(..., num_bins)``."""
+    cached = getattr(fixed_weights, "_cached_sparse4", None)
+    ver = getattr(fixed_weights, "_version", -1)
+    if cached is not None and cached[0] == ver:
+        return cached[1], cached[2]
+    with torch.no_grad():
+        fw_f = fixed_weights.to(torch.float32)
+        k_sz = int(fw_f.shape[-1])
+        if k_sz >= 4:
+            w4, idx4_l = torch.topk(fw_f, k=4, dim=-1, sorted=False)
+            fi_idx4 = idx4_l.to(torch.int32).contiguous()
+            fi_w4 = w4.contiguous()
+        else:
+            lead = fw_f.shape[:-1]
+            fi_idx4 = torch.zeros((*lead, 4), device=fw_f.device, dtype=torch.int32)
+            fi_w4 = torch.zeros((*lead, 4), device=fw_f.device, dtype=torch.float32)
+            fi_idx4[..., :k_sz] = torch.arange(k_sz, device=fw_f.device, dtype=torch.int32)
+            fi_w4[..., :k_sz] = fw_f
+    try:
+        fixed_weights._cached_sparse4 = (ver, fi_idx4, fi_w4)
+    except AttributeError:
+        pass
+    return fi_idx4, fi_w4
+
+
 def batched_mattes_mi_loss_shared_fixed(
     I_batch: torch.Tensor,
     fixed_weights: torch.Tensor,
@@ -311,6 +337,12 @@ def batched_mattes_mi_loss_shared_fixed(
         I_batch = I_batch.to(torch.float32)
     min_i, max_i = float(fixed_range[0]), float(fixed_range[1])
     x_scaled = (I_batch - min_i) / (max_i - min_i + 1e-8) * 2.0 - 1.0
+    if x_scaled.dtype == torch.float32 and int(num_bins) >= 6:
+        from ..kernels import RegisterParzenMattesMIFunction, has_mps_shader_backend
+
+        if has_mps_shader_backend(x_scaled.device):
+            fi_idx4, fi_w4 = _extract_sparse4_from_fixed_weights(fixed_weights)
+            return RegisterParzenMattesMIFunction.apply(x_scaled, fi_idx4, fi_w4, int(num_bins), -1.0, 1.0, 2.0)
     chunk_sz = max(2048, min(16384, 65536 // max(1, int(I_batch.shape[0]))))
     return BatchedMattesMIFunction.apply(x_scaled, fixed_weights, num_bins, -1.0, 1.0, 2.0, chunk_sz)
 
@@ -445,6 +477,25 @@ def mattes_mi_loss_core(
         w_y = fixed_weights if fixed_weights is not None else parzen_weights(y, num_bins, min_val, max_val)
         return mattes_mi_from_weights(w_x, w_y)
 
+    if (
+        x.dtype == torch.float32
+        and not y.requires_grad
+        and int(num_bins) >= 6
+        and x.numel() >= 256
+    ):
+        from ..kernels import RegisterParzenMattesMIFunction, has_mps_shader_backend, prepack_fixed_parzen_sparse4
+
+        if has_mps_shader_backend(x.device):
+            if fixed_weights is not None:
+                fi_idx4, fi_w4 = _extract_sparse4_from_fixed_weights(fixed_weights)
+            else:
+                fi_idx4, fi_w4, _ = prepack_fixed_parzen_sparse4(
+                    y.detach(), num_bins=int(num_bins), min_val=float(min_val), max_val=float(max_val), pad=2.0
+                )
+            return RegisterParzenMattesMIFunction.apply(
+                x.unsqueeze(0), fi_idx4, fi_w4, int(num_bins), float(min_val), float(max_val), 2.0
+            ).squeeze(0)
+
     return CanonicalMattesMIFunction.apply(x, y, num_bins, min_val, max_val, 2.0, 32768, fixed_weights)
 
 
@@ -457,6 +508,7 @@ def mattes_mi_loss_nd(
     auto_mask: bool = True,
     fixed_range: tuple[float, float] | tuple[tuple[float, float], tuple[float, float]] | None = (0.0, 1.0),
     fixed_weights: torch.Tensor | None = None,
+    return_per_batch: bool = False,
 ) -> torch.Tensor:
     """
     Negative Mattes mutual information of images I (moving) and J (fixed), any dimension.
@@ -503,6 +555,46 @@ def mattes_mi_loss_nd(
     if I.dtype in (torch.float16, torch.bfloat16):
         I = I.to(torch.float32)
         J = J.to(torch.float32)
+
+    # Vectorized multi-subject / multi-candidate evaluation when B > 1 against shared J (B_J == 1)
+    # or when explicit per-batch losses are requested.
+    if I.ndim >= 4 and I.shape[0] > 1 and (return_per_batch or J.shape[0] == 1):
+        from ..kernels import RegisterParzenMattesMIFunction, prepack_fixed_parzen_sparse4
+
+        b_sz = int(I.shape[0])
+        x_flat = I.reshape(b_sz, -1)
+        y_flat = J.reshape(int(J.shape[0]), -1)
+        if mask is not None and int(mask.shape[0]) == 1:
+            valid_1d = (mask.reshape(-1) > 0.5).nonzero(as_tuple=False).squeeze(-1)
+            x_flat = x_flat.index_select(1, valid_1d)
+            y_flat = y_flat.index_select(1, valid_1d)
+        if sampling_percentage is not None and sampling_percentage < 1.0 and x_flat.shape[1] > 0:
+            s_idx = mattes_sample_indices(int(x_flat.shape[1]), sampling_percentage, x_flat.device)
+            x_flat = x_flat.index_select(1, s_idx)
+            y_flat = y_flat.index_select(1, s_idx)
+        if x_flat.shape[1] == 0:
+            z_b = I.reshape(b_sz, -1).sum(dim=1) * 0.0
+            return z_b if return_per_batch else z_b.sum()
+        if fixed_range is None:
+            min_i = x_flat.amin(dim=1, keepdim=True).detach()
+            max_i = x_flat.amax(dim=1, keepdim=True).detach()
+            min_j = y_flat.amin(dim=1, keepdim=True).detach()
+            max_j = y_flat.amax(dim=1, keepdim=True).detach()
+        else:
+            fr_b = fixed_range if not isinstance(fixed_range[0], (int, float)) else (fixed_range, fixed_range)
+            min_i, max_i = float(fr_b[0][0]), float(fr_b[0][1])
+            min_j, max_j = float(fr_b[1][0]), float(fr_b[1][1])
+        x_sc_b = (x_flat - min_i) / (max_i - min_i + 1e-8) * 2.0 - 1.0
+        y_sc_b = (y_flat - min_j) / (max_j - min_j + 1e-8) * 2.0 - 1.0
+        fi_i4, fi_w4_b, _ = prepack_fixed_parzen_sparse4(
+            y_sc_b.squeeze(0) if int(y_sc_b.shape[0]) == 1 else y_sc_b,
+            num_bins=int(num_bins),
+            min_val=-1.0,
+            max_val=1.0,
+            pad=2.0,
+        )
+        losses_b = RegisterParzenMattesMIFunction.apply(x_sc_b, fi_i4, fi_w4_b, int(num_bins), -1.0, 1.0, 2.0, None)
+        return losses_b if return_per_batch else losses_b.mean()
 
     if fixed_weights is not None and (fixed_range is None or auto_mask):
         raise ValueError("fixed_weights needs fixed_range and auto_mask=False (a fixed sample set)")

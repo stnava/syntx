@@ -55,6 +55,9 @@ from .core.grid import (
     _physical_to_normalized_torch_yfirst,
     physical_to_normalized_torch,
     physical_to_normalized_torch_cached,
+    get_physical_to_normalized_affine,
+    physical_to_normalized_fast,
+    resize_field,
     prepare_mid_images_and_gradients_torch,
 )
 from .core.smoothing import (
@@ -1036,12 +1039,24 @@ class SyNTo(nn.Module):
         warp_l2r_inv = torch.zeros_like(warp_l2r)
         warp_r2l_inv = torch.zeros_like(warp_r2l)
         
+        raw_cstride_syn = max(1, int(kwargs.get('control_stride', 1)))
         for level_idx, scale in enumerate(levels):
             I_curr = I_pyr[level_idx]
             J_curr = J_pyr[level_idx]
-            curr_spatial = I_curr.shape[2:]
+            img_spatial = tuple(int(s) for s in I_curr.shape[2:])
+            img_spacing_fixed = tuple(I_lv[level_idx].spacing)
+            _eff_cstride_syn = (
+                raw_cstride_syn
+                if (int(scale) == 1 and raw_cstride_syn >= 2 and min(img_spatial) >= 16 * raw_cstride_syn)
+                else 1
+            )
+            curr_spatial = (
+                tuple(max(8, int(round(s / _eff_cstride_syn))) for s in img_spatial)
+                if _eff_cstride_syn > 1
+                else img_spatial
+            )
             
-            if level_idx > 0:
+            if level_idx > 0 and tuple(warp_l2r.shape[1:-1]) != curr_spatial:
                 interp_mode_lvl = 'bilinear' if dim == 2 else 'trilinear'
                 warp_l2r = F.interpolate(torch.movedim(warp_l2r, -1, 1), size=curr_spatial, mode=interp_mode_lvl, align_corners=True).movedim(1, -1)
                 warp_r2l = F.interpolate(torch.movedim(warp_r2l, -1, 1), size=curr_spatial, mode=interp_mode_lvl, align_corners=True).movedim(1, -1)
@@ -1051,12 +1066,22 @@ class SyNTo(nn.Module):
                 del w_l_inv_old
                 warp_r2l_inv = F.interpolate(torch.movedim(w_r_inv_old, -1, 1), size=curr_spatial, mode=interp_mode_lvl, align_corners=True).movedim(1, -1)
                 del w_r_inv_old
+            elif level_idx == 0 and tuple(warp_l2r.shape[1:-1]) != curr_spatial:
+                interp_mode_lvl = 'bilinear' if dim == 2 else 'trilinear'
+                warp_l2r = resize_field(warp_l2r, list(curr_spatial), mode=interp_mode_lvl)
+                warp_r2l = resize_field(warp_r2l, list(curr_spatial), mode=interp_mode_lvl)
+                warp_l2r_inv = resize_field(warp_l2r_inv, list(curr_spatial), mode=interp_mode_lvl)
+                warp_r2l_inv = resize_field(warp_r2l_inv, list(curr_spatial), mode=interp_mode_lvl)
                 
             warp_l2r.requires_grad_(True)
             warp_r2l.requires_grad_(True)
             
-            # Compute current level physical spacing
-            curr_spacing_fixed = tuple(I_lv[level_idx].spacing)
+            # Compute current level physical spacing (control lattice spacing when _eff_cstride_syn > 1)
+            curr_spacing_fixed = (
+                tuple(_level_spacing(img_spacing_fixed, img_spatial, curr_spatial))
+                if _eff_cstride_syn > 1
+                else img_spacing_fixed
+            )
             curr_spacing_moving = tuple(J_lv[level_idx].spacing)
             
             with torch.no_grad():
@@ -1076,6 +1101,11 @@ class SyNTo(nn.Module):
                     self.init_M_phys = None
                     self.init_t_phys = None
                 X_phys = get_physical_grid_torch(curr_spatial, curr_spacing_fixed, fixed_origin, fixed_direction, device=device, dtype=dtype)
+                X_phys_img = (
+                    get_physical_grid_torch(img_spatial, img_spacing_fixed, fixed_origin, fixed_direction, device=device, dtype=dtype)
+                    if _eff_cstride_syn > 1
+                    else X_phys
+                )
                 b_mask = get_boundary_mask(curr_spatial, device, dtype)
                 
                 # Cache physical parameter conversion tensors
@@ -1086,6 +1116,10 @@ class SyNTo(nn.Module):
                 fixed_spacing_t = torch.tensor(fixed_spacing_rev, device=device, dtype=dtype)
                 fixed_origin_t = torch.tensor(fixed_origin_rev, device=device, dtype=dtype)
                 fixed_direction_t = torch.tensor(fixed_direction_rev, device=device, dtype=dtype)
+
+                img_fixed_shape_t = torch.tensor(list(img_spatial), device=device, dtype=dtype) if _eff_cstride_syn > 1 else fixed_shape_t
+                img_fixed_spacing_rev, _, _ = reverse_metadata(img_spacing_fixed, fixed_origin, fixed_direction)
+                img_fixed_spacing_t = torch.tensor(img_fixed_spacing_rev, device=device, dtype=dtype) if _eff_cstride_syn > 1 else fixed_spacing_t
                 
                 moving_shape_t = torch.tensor(list(J_curr.shape[2:]), device=device, dtype=dtype)
                 moving_spacing_rev, moving_origin_rev, moving_direction_rev = reverse_metadata(
@@ -1402,27 +1436,159 @@ class SyNTo(nn.Module):
                         )
                     return w_l_inv, w_r_inv
             
+            from .core.kernels import (
+                exact_lncc_2sided_loss_and_grad_3d,
+                exact_mattes_mi_2sided_loss_and_grad_3d,
+                has_mps_shader_backend,
+            )
+            from .core.losses.cross_correlation import _get_window_count_views
+            _fn0_cfg = getattr(active_loss_functions[0], 'config', None) if len(active_loss_functions) == 1 else None
+            _boot_lvl = kwargs.get('bootstrap_mode', getattr(self, 'bootstrap_mode', None))
+            _jac_w_lvl = float(kwargs.get('jacobian_penalty_weight', getattr(self, 'jacobian_penalty_weight', 0.0)))
+            _dd_w_lvl = float(kwargs.get('digital_diffeomorphism_loss_weight', getattr(self, 'digital_diffeomorphism_loss_weight', 0.0)))
+            _common_fused_ok = bool(
+                dim == 3
+                and dtype == torch.float32
+                and has_mps_shader_backend(device)
+                and _fn0_cfg is not None
+                and not use_analytical_gradients
+                and not dual_gradient_level
+                and self.interpolator == 'linear'
+                and initial_grid_level is None
+                and I_curr.shape[1] == 1
+                and J_curr.shape[1] == 1
+                and int(np.prod(img_spatial)) <= 16_777_216
+                and verbose < 2
+                and _boot_lvl not in ('jitter', 'antithetic', 'strided')
+                and _jac_w_lvl == 0.0
+                and _dd_w_lvl == 0.0
+            )
+            _can_fused_2sided_lncc = bool(
+                _common_fused_ok
+                and _fn0_cfg.metric in ('cc2', 'lncc')
+                and not bool(getattr(_fn0_cfg, 'use_analytical_gradients', False))
+                and not bool(getattr(_fn0_cfg, 'single_pass', False))
+                and int(_fn0_cfg.window_size) % 2 == 1
+                and float(getattr(_fn0_cfg, 'var_floor', 1e-6)) <= 1e-6 + 1e-12
+            )
+            _can_fused_2sided_mi = bool(
+                _common_fused_ok
+                and _fn0_cfg.metric == 'mattes_mi'
+                and _fn0_cfg.sampling_percentage is None
+                and _fn0_cfg.fixed_range is not None
+                and isinstance(_fn0_cfg.fixed_range[0], (int, float))
+                and not bool(_fn0_cfg.auto_mask)
+                and int(_fn0_cfg.num_bins) >= 6
+            )
+            _can_fused_2sided = bool(_can_fused_2sided_lncc or _can_fused_2sided_mi)
+            if _can_fused_2sided:
+                with torch.no_grad():
+                    _M_nf_lvl, _b_nf_lvl = get_physical_to_normalized_affine(
+                        img_fixed_shape_t, img_fixed_spacing_t, fixed_origin_t, fixed_direction_t
+                    )
+                    _M_nm_lvl, _b_nm_lvl = get_physical_to_normalized_affine(
+                        moving_shape_t, moving_spacing_t, moving_origin_t, moving_direction_t
+                    )
+                    _sc_f_lvl = compute_autograd_physical_scale(img_fixed_shape_t, img_fixed_spacing_t, device=device, dtype=dtype)
+                    _sc_m_lvl = compute_autograd_physical_scale(moving_shape_t, moving_spacing_t, device=device, dtype=dtype)
+                    _w0_syn_lvl = float(curr_metric_weights[0])
+                    if _can_fused_2sided_lncc:
+                        _ws_syn_lvl = int(_fn0_cfg.window_size)
+                        _sq_syn_lvl = bool(_fn0_cfg.squared)
+                        _, _, _pad_ratios_syn_lvl = _get_window_count_views(img_spatial, _ws_syn_lvl, device, torch.float32)
+
             stop.start_level(level_idx, curr_syn_epochs)
             for epoch in range(curr_syn_epochs):
                 warp_l2r.grad = None
                 warp_r2l.grad = None
-                
-                # Real SyN: Pull both images to the midpoint domain
-                I_mid, J_mid, grad_I_mid_sampled, grad_J_mid_sampled, in_bounds_mask = prepare_mid_images_and_gradients_torch(
-                    warp_l2r, warp_r2l, I_curr, J_curr,
-                    X_phys,
-                    fixed_shape_t, fixed_spacing_t, fixed_origin_t, fixed_direction_t,
-                    moving_shape_t, moving_spacing_t, moving_origin_t, moving_direction_t,
-                    curr_spacing_fixed, curr_spacing_moving,
-                    M_phys, t_phys, initial_grid_level,
-                    interpolator=self.interpolator,
-                    grad_I_curr=grad_I_curr_level, grad_J_curr=grad_J_curr_level,
-                    use_analytical_gradients=use_analytical_gradients,
-                    precomputed_grad_I_vox=grad_I_vox_level,
-                    precomputed_grad_J_vox=grad_J_vox_level,
-                )
 
-                if verbose >= 2:
+                if _can_fused_2sided:
+                    I_mid = J_mid = grad_I_mid_sampled = grad_J_mid_sampled = in_bounds_mask = None
+                    with torch.no_grad():
+                        _wl_ev = (
+                            resize_field(warp_l2r.detach(), list(img_spatial), mode='trilinear')
+                            if _eff_cstride_syn > 1
+                            else warp_l2r.detach()
+                        )
+                        _wr_ev = (
+                            resize_field(warp_r2l.detach(), list(img_spatial), mode='trilinear')
+                            if _eff_cstride_syn > 1
+                            else warp_r2l.detach()
+                        )
+                        _c_norm = physical_to_normalized_fast(X_phys_img + _wl_ev, _M_nf_lvl, _b_nf_lvl)
+                        _y_norm = physical_to_normalized_fast((X_phys_img + _wr_ev) @ M_phys.t() + t_phys, _M_nm_lvl, _b_nm_lvl)
+                        del _wl_ev, _wr_ev
+                        _in_b = (
+                            ((_c_norm >= -1.0) & (_c_norm <= 1.0)).all(dim=-1)
+                            & ((_y_norm >= -1.0) & (_y_norm <= 1.0)).all(dim=-1)
+                        ).unsqueeze(1).to(dtype)
+                        if _can_fused_2sided_lncc:
+                            _val_l, _g_cn, _g_yn = exact_lncc_2sided_loss_and_grad_3d(
+                                I_curr, _c_norm, J_curr, _y_norm,
+                                _ws_syn_lvl, _pad_ratios_syn_lvl,
+                                squared=_sq_syn_lvl, in_bounds_mask=_in_b, padding_mode='border',
+                            )
+                        else:
+                            _val_l, _g_cn, _g_yn = exact_mattes_mi_2sided_loss_and_grad_3d(
+                                I_curr, _c_norm, J_curr, _y_norm,
+                                num_bins=int(_fn0_cfg.num_bins),
+                                fixed_range=(float(_fn0_cfg.fixed_range[0]), float(_fn0_cfg.fixed_range[1])),
+                                in_bounds_mask=_in_b, padding_mode='border',
+                            )
+                        del _c_norm, _y_norm, _in_b
+                        loss_t = _val_l * _w0_syn_lvl
+                        metric_losses_dict[_fn0_cfg.metric] = _val_l
+                        _gl_img = (_g_cn @ _M_nf_lvl.t()).mul_(_sc_f_lvl * _w0_syn_lvl)
+                        _gr_img = ((_g_yn @ _M_nm_lvl.t()) @ M_phys).mul_(_sc_m_lvl * _w0_syn_lvl)
+                        del _g_cn, _g_yn
+                        if _eff_cstride_syn > 1:
+                            _c_mult = float(np.prod(img_spatial)) / float(max(np.prod(curr_spatial), 1))
+                            warp_l2r.grad = resize_field(_gl_img, list(curr_spatial), mode='trilinear').mul_(_c_mult)
+                            warp_r2l.grad = resize_field(_gr_img, list(curr_spatial), mode='trilinear').mul_(_c_mult)
+                            del _gl_img, _gr_img
+                        else:
+                            warp_l2r.grad = _gl_img
+                            warp_r2l.grad = _gr_img
+                        self.syn_losses.append(loss_t)
+                        level_syn_losses.append(loss_t)
+                        improved = loss_t < best_level_loss_t
+                        best_level_loss_t = torch.minimum(best_level_loss_t, loss_t)
+                        if _large_level:
+                            if bool(improved.item()):
+                                best_warp_l2r.copy_(warp_l2r.detach())
+                                best_warp_r2l.copy_(warp_r2l.detach())
+                        else:
+                            torch.where(improved, warp_l2r.detach(), best_warp_l2r, out=best_warp_l2r)
+                            torch.where(improved, warp_r2l.detach(), best_warp_r2l, out=best_warp_r2l)
+                        have_best = True
+                else:
+                    # Real SyN: Pull both images to the midpoint domain
+                    _wl_mid = (
+                        resize_field(warp_l2r, list(img_spatial), mode='bilinear' if dim == 2 else 'trilinear')
+                        if _eff_cstride_syn > 1
+                        else warp_l2r
+                    )
+                    _wr_mid = (
+                        resize_field(warp_r2l, list(img_spatial), mode='bilinear' if dim == 2 else 'trilinear')
+                        if _eff_cstride_syn > 1
+                        else warp_r2l
+                    )
+                    I_mid, J_mid, grad_I_mid_sampled, grad_J_mid_sampled, in_bounds_mask = prepare_mid_images_and_gradients_torch(
+                        _wl_mid, _wr_mid, I_curr, J_curr,
+                        X_phys_img,
+                        img_fixed_shape_t, img_fixed_spacing_t, fixed_origin_t, fixed_direction_t,
+                        moving_shape_t, moving_spacing_t, moving_origin_t, moving_direction_t,
+                        img_spacing_fixed, curr_spacing_moving,
+                        M_phys, t_phys, initial_grid_level,
+                        interpolator=self.interpolator,
+                        grad_I_curr=grad_I_curr_level, grad_J_curr=grad_J_curr_level,
+                        use_analytical_gradients=use_analytical_gradients,
+                        precomputed_grad_I_vox=grad_I_vox_level,
+                        precomputed_grad_J_vox=grad_J_vox_level,
+                    )
+                    del _wl_mid, _wr_mid
+
+                if not _can_fused_2sided and verbose >= 2:
                     if dim == 2:
                         I_mid_np = I_mid.detach().squeeze(0).squeeze(0).cpu().numpy().T
                         J_mid_np = J_mid.detach().squeeze(0).squeeze(0).cpu().numpy().T
@@ -1448,7 +1614,7 @@ class SyNTo(nn.Module):
                 dual_gradient = kwargs.get('dual_gradient', getattr(self, 'dual_gradient', False))
                 dual_w = float(kwargs.get('dual_gradient_weight', getattr(self, 'dual_gradient_weight', 0.5)))
 
-                if dual_gradient:
+                if not _can_fused_2sided and dual_gradient:
                     # 1. Analytical Pseudo-Gradient Branch
                     metric_losses_dict = {}
                     if len(active_loss_functions) > 1:
@@ -1513,7 +1679,7 @@ class SyNTo(nn.Module):
                         loss_t = loss_auto.detach()
                         del loss_auto
 
-                    autograd_scale_fixed = compute_autograd_physical_scale(fixed_shape_t, fixed_spacing_t, device=device, dtype=dtype)
+                    autograd_scale_fixed = compute_autograd_physical_scale(img_fixed_shape_t, img_fixed_spacing_t, device=device, dtype=dtype)
                     autograd_scale_moving = compute_autograd_physical_scale(moving_shape_t, moving_spacing_t, device=device, dtype=dtype)
                     grad_l_autograd = (warp_l2r.grad * autograd_scale_fixed) if warp_l2r.grad is not None else torch.zeros_like(warp_l2r)
                     grad_r_autograd = (warp_r2l.grad * autograd_scale_moving) if warp_r2l.grad is not None else torch.zeros_like(warp_r2l)
@@ -1528,7 +1694,7 @@ class SyNTo(nn.Module):
                     self.syn_losses.append(loss_t)
                     level_syn_losses.append(loss_t)
 
-                elif use_analytical_gradients:
+                elif not _can_fused_2sided and use_analytical_gradients:
                     metric_losses_dict = {}
                     if verbose >= 2:
                         print(f"DEBUG PyTorch epoch {epoch} I_mid min/max: {I_mid.min().item()} {I_mid.max().item()} mean: {I_mid.mean().item()} var: {I_mid.var().item()}")
@@ -1593,7 +1759,7 @@ class SyNTo(nn.Module):
                         warp_r2l.grad = grad_r_raw
                     del g_im, g_jm, grad_l_raw, grad_r_raw
 
-                else:
+                elif not _can_fused_2sided:
                     loss = 0.0
                     metric_losses_dict = {}
                     dev_type = 'cuda' if 'cuda' in str(device) else ('mps' if 'mps' in str(device) else 'cpu')
@@ -1873,7 +2039,7 @@ class SyNTo(nn.Module):
                     # coords_norm = (x_phys - origin) * 2 / (spacing * (shape - 1)) - 1
                     # dLoss/dx_phys = dLoss/dcoords_norm * 2 / (spacing * (shape - 1))
                     # Rescaling by (shape - 1) * spacing / 2 converts back to consistent physical displacement gradient:
-                    autograd_scale_fixed = compute_autograd_physical_scale(fixed_shape_t, fixed_spacing_t, device=device, dtype=dtype)
+                    autograd_scale_fixed = compute_autograd_physical_scale(img_fixed_shape_t, img_fixed_spacing_t, device=device, dtype=dtype)
                     autograd_scale_moving = compute_autograd_physical_scale(moving_shape_t, moving_spacing_t, device=device, dtype=dtype)
                     with torch.no_grad():
                         if warp_l2r.grad is not None:
@@ -1907,7 +2073,7 @@ class SyNTo(nn.Module):
                     curr_fluid_var = self.fluid_sigma[min(level_idx, len(self.fluid_sigma) - 1)]
                 else:
                     curr_fluid_var = self.fluid_sigma
-                curr_fluid_sig = float(curr_fluid_var)
+                curr_fluid_sig = float(curr_fluid_var) / float(_eff_cstride_syn)
                     
                 kernel_type = kwargs.get('kernel_type', getattr(self, 'kernel_type', 'bessel'))
                 gauss_kernel_type = (
@@ -1923,6 +2089,8 @@ class SyNTo(nn.Module):
                     raw_alpha = kwargs.get('sobolev_alpha')
                     if raw_alpha is None:
                         raw_alpha = kwargs.get('alpha')
+                    if raw_alpha is not None and _eff_cstride_syn > 1:
+                        raw_alpha = float(raw_alpha) / float(_eff_cstride_syn * _eff_cstride_syn)
                     alpha_sobolev = float(raw_alpha) if raw_alpha is not None else float(curr_fluid_sig / 2.0)
 
                     _fs_raw = kwargs.get('fast_smooth', False)
@@ -3287,7 +3455,7 @@ SYN_ADVANCED_OPTIONS = frozenset({
     # Continuum mechanics regularizers
     'beta', 'gamma', 'poisson_ratio', 'darcy_permeability', 'bulk_modulus', 'num_iters', 'dilatation_weight', 'beltrami_dilation', 'mask',
     's', 'h3_envelope', 'sobolev_envelope', 'envelope_power',
-    'sync_free',
+    'sync_free', 'control_stride',
 })
 # set internally by registration() for fit()
 _SYN_INTERNAL_FIT_KEYS = frozenset({'init_M_phys', 'init_t_phys', 'fixed_spacing', 'fixed_origin',

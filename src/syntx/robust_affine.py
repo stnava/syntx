@@ -1981,6 +1981,43 @@ def _run_pytorch_affine_solver(fixed: ants.ANTsImage, moving: ants.ANTsImage, in
         loss = loss + ov_w * ov_deficit + (0.05 * has_def) * F.relu(max_abs_y - 1.0).mean()
         return loss
 
+    _can_batch_obj = bool(
+        dim == 3
+        and mask_mode != 'union'
+        and not is_internal_fov_pair
+        and mov_trunc_img_ax is None
+        and not use_mind_guidance
+        and fg_dice_weight <= 0
+        and ct_tomo_anchors is None
+        and fixed_range is not None
+    )
+
+    def objective_batched_matrices(A_m: torch.Tensor, t_m: torch.Tensor, level: int, full: bool = False, sampling: float = None, reg_terms=None) -> torch.Tensor:
+        from .core.losses.mutual_information import batched_mattes_mi_loss_shared_fixed
+        e = pyr[level]
+        samp = sampling_percentage if sampling is None else sampling
+        phys_p, _, _, fw = _get_cached_subset_and_fw(level, full, samp)
+        m_sz = int(A_m.shape[0])
+        n_pts = int(phys_p.shape[0])
+        teff_m = t_m + C_phys.unsqueeze(0) - torch.matmul(A_m, C_phys)
+        y_phys_m = torch.matmul(phys_p.unsqueeze(0), A_m.transpose(1, 2)) + teff_m.unsqueeze(1)
+        y_m = e['warp'](y_phys_m.reshape(-1, 3)).view(m_sz, n_pts, 3)
+        w_m = F.grid_sample(
+            e['mi'], y_m.view(1, 1, m_sz, n_pts, 3), mode='bilinear', padding_mode='zeros', align_corners=True
+        ).view(m_sz, n_pts)
+        fr0 = fixed_range[0] if not isinstance(fixed_range[0], (int, float)) else fixed_range
+        losses_m = batched_mattes_mi_loss_shared_fixed(w_m, fw, num_bins=num_bins, fixed_range=fr0)
+        if reg_terms is not None:
+            losses_m = losses_m + reg_terms
+        max_abs_y_m = y_m.abs().amax(dim=-1)
+        smooth_in_m = torch.sigmoid(20.0 * (1.02 - max_abs_y_m)).mean(dim=-1)
+        ov_req = 0.84 * expected_ov if (is_internal_fov_pair or has_slab_asymmetry) else 0.65 * expected_ov
+        ov_def_m = F.relu(ov_req - smooth_in_m)
+        ov_w = 3.5 if (is_internal_fov_pair or has_slab_asymmetry) else 1.8
+        has_def_m = (ov_def_m.detach() > 0.0).to(losses_m.dtype)
+        losses_m = losses_m + ov_w * ov_def_m + (0.05 * has_def_m) * F.relu(max_abs_y_m - 1.0).mean(dim=-1)
+        return losses_m
+
     coarse = levels[0]
 
     # 3. candidate starts, scored at the coarsest level -------------------------------------
@@ -2156,12 +2193,15 @@ def _run_pytorch_affine_solver(fixed: ants.ANTsImage, moving: ants.ANTsImage, in
                 dtype=torch.float32,
                 device=device_obj,
             )
-            cand_losses = []
-            for idx_c in range(len(cands)):
-                cand_probe.B = B_stack[idx_c]
-                cand_probe.t = t_stack[idx_c]
-                cand_losses.append(objective(cand_probe, 'rigid', coarse, full=True, sampling=1.0))
-            cand_vals = torch.stack(cand_losses).tolist()
+            if _can_batch_obj:
+                cand_vals = objective_batched_matrices(B_stack, t_stack, coarse, full=True, sampling=1.0).tolist()
+            else:
+                cand_losses = []
+                for idx_c in range(len(cands)):
+                    cand_probe.B = B_stack[idx_c]
+                    cand_probe.t = t_stack[idx_c]
+                    cand_losses.append(objective(cand_probe, 'rigid', coarse, full=True, sampling=1.0))
+                cand_vals = torch.stack(cand_losses).tolist()
             del B_stack, t_stack
         scored = [
             (float(sv), name, B, tt)
@@ -2435,6 +2475,121 @@ def _run_pytorch_affine_solver(fixed: ants.ANTsImage, moving: ants.ANTsImage, in
                 'tol_mm': tracker.tol, 'probe_rejections': int(rejected), 'converged': None, 'fixed_block': (not judged), 'final_step_mm': None,
                 '_active_t': act_t, '_step_t': step_t, 'seconds': round(time.time() - t_stage, 2)}
 
+    def _run_parallel_adam_paths(paths_list, dof, level, iters, step, lr, eta_frac, eta_min, use_full, samp):
+        t_stage = time.time()
+        iters_int = int(iters)
+        if iters_int <= 0:
+            return [
+                {'stage': f"adam@L{level}", 'level': int(level), 'path': p_.name, 'iterations': 0, 'blocks': 0,
+                 'tol_mm': None, 'probe_rejections': 0, 'converged': True, 'skipped': True, 'final_step_mm': 0.0}
+                for p_ in paths_list
+            ]
+        m_p = len(paths_list)
+        trackers = []
+        pt_radii = []
+        param_groups = []
+        lr_tuples = []
+        for p_ in paths_list:
+            trk = PointStepTracker(tol=1e-12, patience=2)
+            pts0 = _path_points(p_, dof, level)
+            trk.start(pts0)
+            trackers.append(trk)
+            pt_radii.append((pts0[0] - C_phys).pow(2).sum(-1).mean().sqrt())
+            axes_p = _path_axes(p_, dof, level)
+            if step is not None:
+                n_t, n_r = dim, 3
+                sc = [a.scale_mm for a in axes_p]
+                gs_l = [1.0, float(np.mean(sc[n_t:n_t + n_r]))]
+                if dof == 'affine':
+                    gs_l += [float(np.mean(sc[n_t + n_r:n_t + n_r + dim])), float(np.mean(sc[n_t + n_r + dim:]))]
+                else:
+                    gs_l += [1.0, 1.0]
+                lr_p = tuple(float(st) * sp_min_f / max(gs, 1e-12) for st, gs in zip(step, gs_l))
+            else:
+                lr_p = lr
+            lr_tuples.append(lr_p)
+            param_groups.extend(p_.params(dof, lr_p))
+
+        opt = torch.optim.Adam(param_groups)
+        if eta_frac is not None:
+            sched = torch.optim.lr_scheduler.LambdaLR(
+                opt, lambda i, f=float(eta_frac): f + (1.0 - f) * 0.5 * (1.0 + math.cos(math.pi * min(i, iters_int) / iters_int))
+            )
+        elif eta_min is not None:
+            sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=iters_int, eta_min=eta_min)
+        else:
+            sched = None
+
+        best_losses = torch.full((m_p,), float('inf'), device=device_obj, dtype=torch.float32)
+        have_best = torch.zeros((m_p,), device=device_obj, dtype=torch.bool)
+        best_states = [{n: getattr(p_, n).detach().clone() for n in ('t', 'omega', 'scale', 'shear')} for p_ in paths_list]
+        need_reg = (eff_lambda_shear > 0 or eff_lambda_scale > 0) and dof == 'affine'
+
+        done = 0
+        last_check = 0
+        for it in range(iters_int):
+            opt.zero_grad(set_to_none=True)
+            A_m = torch.stack([p_.matrix(dof) for p_ in paths_list], dim=0)
+            t_m = torch.stack([p_.t for p_ in paths_list], dim=0)
+            reg_m = (
+                torch.stack([p_.regularization_loss(dof, lambda_shear=eff_lambda_shear, lambda_scale=eff_lambda_scale) for p_ in paths_list], dim=0)
+                if need_reg
+                else None
+            )
+            losses_m = objective_batched_matrices(A_m, t_m, level, full=use_full, sampling=samp, reg_terms=reg_m)
+            with torch.no_grad():
+                ld = losses_m.detach().to(torch.float32)
+                imp = torch.isfinite(ld) & (ld < best_losses)
+                have_best = have_best | imp
+                best_losses = torch.where(imp, ld, best_losses)
+                for idx_p, p_ in enumerate(paths_list):
+                    imp_i = imp[idx_p]
+                    for n, buf in best_states[idx_p].items():
+                        torch.where(imp_i, getattr(p_, n).detach(), buf, out=buf)
+            losses_m.sum().backward()
+            opt.step()
+            if sched is not None:
+                sched.step()
+            for idx_p, p_ in enumerate(paths_list):
+                p_.clamp_()
+                last_loss[p_.name] = losses_m[idx_p].detach()
+            done += 1
+            if done % 10 == 0 or it == iters_int - 1:
+                cur = 0.02 + 0.98 * 0.5 * (1.0 + math.cos(math.pi * (it + 1) / iters_int))
+                dt_c = done - last_check
+                last_check = done
+                for idx_p, p_ in enumerate(paths_list):
+                    lr_p = lr_tuples[idx_p]
+                    cap = dt_c * cur * (lr_p[0] + lr_p[1] * pt_radii[idx_p])
+                    trackers[idx_p].update(_path_points(p_, dof, level), capacity=cap)
+
+        with torch.no_grad():
+            A_m = torch.stack([p_.matrix(dof) for p_ in paths_list], dim=0)
+            t_m = torch.stack([p_.t for p_ in paths_list], dim=0)
+            reg_m = (
+                torch.stack([p_.regularization_loss(dof, lambda_shear=eff_lambda_shear, lambda_scale=eff_lambda_scale) for p_ in paths_list], dim=0)
+                if need_reg
+                else None
+            )
+            end_ld = objective_batched_matrices(A_m, t_m, level, full=use_full, sampling=samp, reg_terms=reg_m).detach().to(torch.float32)
+            use_best = have_best & (~torch.isfinite(end_ld) | (best_losses < end_ld))
+            out_logs = []
+            dt_sec = round(time.time() - t_stage, 2)
+            for idx_p, p_ in enumerate(paths_list):
+                ub_i = use_best[idx_p]
+                for n, v in best_states[idx_p].items():
+                    cur_p = getattr(p_, n)
+                    torch.where(ub_i, v, cur_p, out=cur_p)
+                last_loss[p_.name] = torch.where(ub_i, best_losses[idx_p], end_ld[idx_p])
+                out_logs.append({
+                    'stage': f"adam@L{level}", 'level': int(level), 'path': p_.name, 'iterations': int(done), 'blocks': 1,
+                    'tol_mm': trackers[idx_p].tol, 'probe_rejections': 0, 'converged': None, 'fixed_block': True, 'final_step_mm': None,
+                    '_active_t': trackers[idx_p].active.any().to(torch.float32),
+                    '_step_t': trackers[idx_p].last_step[0].to(torch.float32),
+                    'seconds': dt_sec,
+                })
+        return out_logs
+
     def _run_schedule(paths):
         snap = {}
         for si, stage in enumerate(schedule):
@@ -2442,13 +2597,29 @@ def _run_pytorch_affine_solver(fixed: ants.ANTsImage, moving: ants.ANTsImage, in
                 snap = {p_.name: {n: getattr(p_, n).detach().clone() for n in ('t', 'omega', 'scale', 'shear')} for p_ in paths}
             level, iters, dof = int(stage['level']), int(stage['iters']), stage['dof']
             use_full = bool(stage.get('full_grid', False)); samp = stage.get('sampling', None)
-            for p in paths:
-                convergence_log.append(_run_converging_path(
-                    p, dof, level, stage.get('optimizer', 'adam'), iters, stage.get('step'), stage.get('lr'), stage.get('eta_frac'), stage.get('eta_min'),
-                    lambda p=p: objective(p, dof, level, full=use_full, sampling=samp)))
+            opt_stage = stage.get('optimizer', 'adam')
+            if _can_batch_obj and len(paths) > 1 and opt_stage == 'adam':
+                convergence_log.extend(_run_parallel_adam_paths(
+                    paths, dof, level, iters, stage.get('step'), stage.get('lr'), stage.get('eta_frac'), stage.get('eta_min'), use_full, samp
+                ))
+            else:
+                for p in paths:
+                    convergence_log.append(_run_converging_path(
+                        p, dof, level, opt_stage, iters, stage.get('step'), stage.get('lr'), stage.get('eta_frac'), stage.get('eta_min'),
+                        lambda p=p: objective(p, dof, level, full=use_full, sampling=samp)))
             if stage.get('select', False) and len(paths) > 1:
                 with torch.no_grad():
-                    scores_t = torch.stack([objective(p, dof, level, full=True, sampling=1.0) for p in paths])
+                    if _can_batch_obj:
+                        A_sel = torch.stack([p.matrix(dof) for p in paths], dim=0)
+                        t_sel = torch.stack([p.t for p in paths], dim=0)
+                        reg_sel = (
+                            torch.stack([p.regularization_loss(dof, lambda_shear=eff_lambda_shear, lambda_scale=eff_lambda_scale) for p in paths], dim=0)
+                            if ((eff_lambda_shear > 0 or eff_lambda_scale > 0) and dof == 'affine')
+                            else None
+                        )
+                        scores_t = objective_batched_matrices(A_sel, t_sel, level, full=True, sampling=1.0, reg_terms=reg_sel)
+                    else:
+                        scores_t = torch.stack([objective(p, dof, level, full=True, sampling=1.0) for p in paths])
                     best = int(torch.argmin(scores_t).item())
                 if verbose:
                     full_scores = [float(s.item()) for s in scores_t]
