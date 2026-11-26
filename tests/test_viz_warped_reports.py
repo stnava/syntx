@@ -13,7 +13,7 @@ from syntx.viz import (
     create_visualization_gallery,
     plot_edge_overlay,
     render_checkerboard_figure,
-    render_standard_4panel,
+    render_registration_qc,
     render_warped_comparison_figure,
 )
 
@@ -238,8 +238,8 @@ def test_render_warped_comparison_figure_2d_and_3d_themes(tmp_path):
         plt.close(fig_3d)
 
 
-def test_render_standard_4panel_show_header_moving_before_and_warped_after(tmp_path):
-    """(d) render_standard_4panel(show_header=True) renders Fixed, Moving (Before), and Warped (After)."""
+def test_render_registration_qc_4panel_show_header_moving_before_and_warped_after(tmp_path):
+    """(d) render_registration_qc(n_panels=4, show_header=True) renders Fixed, Moving (Before), and Warped (After)."""
     fi = _physical_gaussian_blob(
         shape=(18, 22, 24),
         spacing=(1.0, 1.0, 1.5),
@@ -273,13 +273,14 @@ def test_render_standard_4panel_show_header_moving_before_and_warped_after(tmp_p
     inv_err = fi.new_image_like(np.zeros(fi.shape, dtype=np.float32))
 
     out_with_mov = tmp_path / "4panel_hdr_moving.png"
-    fig_mov = render_standard_4panel(
+    fig_mov = render_registration_qc(
         fixed=fi,
         warped=warped,
         warp=warp,
         detJ=detJ,
         inv_err_map=inv_err,
         moving=mi,
+        n_panels=4,
         show_header=True,
         theme="light",
         output_path=str(out_with_mov),
@@ -292,13 +293,14 @@ def test_render_standard_4panel_show_header_moving_before_and_warped_after(tmp_p
     plt.close(fig_mov)
 
     out_no_mov = tmp_path / "4panel_hdr_no_moving.png"
-    fig_no_mov = render_standard_4panel(
+    fig_no_mov = render_registration_qc(
         fixed=fi,
         warped=warped,
         warp=warp,
         detJ=detJ,
         inv_err_map=inv_err,
         moving=None,
+        n_panels=4,
         show_header=True,
         theme="light",
         output_path=str(out_no_mov),

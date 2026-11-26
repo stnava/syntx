@@ -12,7 +12,7 @@ from syntx.viz.core import AnatomicalVisualizer, AnatomicalSlice
 from syntx.viz.colormaps import build_dkt_label_palette, get_dkt_colormap, get_dkt_label_color_dict
 from syntx.viz.figures import (
     render_input_pair_figure,
-    render_standard_4panel,
+    render_registration_qc,
     render_label_alignment_figure,
     plot_deformation_grid,
     plot_edge_overlay,

@@ -57,6 +57,7 @@ import numpy as np
 __all__ = [
     "PhaseEncode",
     "ParsedLabel",
+    "ParsedRestriction",
     "PhaseEncodeError",
     "PhaseEncodeUndecidable",
     "PhaseEncodeConflict",
@@ -70,6 +71,9 @@ __all__ = [
     "restrict_transformation",
     "restrict_for_image",
     "restrict_with_provenance",
+    "parse_restrict_transformation",
+    "apply_physical_restriction_zyx",
+    "build_normalized_restriction_matrix_xyz",
     "relate_phase_encodes",
     "pe_to_dict",
     "pe_from_dict",
@@ -268,15 +272,32 @@ def _fl(v: Any) -> list[float]:
     return [float(x) for x in v]
 
 
-def _check_oblique(alignment: float, tol: float, on_oblique: str, what: str) -> None:
+def _check_oblique(
+    alignment: float,
+    tol: float,
+    on_oblique: str,
+    what: str,
+    *,
+    kind: str = "bids",
+    has_bids_source: bool = False,
+) -> None:
     if alignment >= tol:
         return
+    if on_oblique == "allow":
+        if kind == "named" and not has_bids_source:
+            raise PhaseEncodeObliqueError(
+                f"{what}: anatomical world label on an oblique grid (alignment {alignment:.3f} < {tol}) "
+                "cannot unambiguously identify the phase-encoded voxel axis; supply a BIDS voxel-axis "
+                "source ('i'/'j'/'k'[-]) or pass on_oblique='warn' to accept the nearest-axis mapping."
+            )
+        return
     msg = (
-        f"{what}: phase-encode direction is oblique (alignment {alignment:.3f} < {tol}); an axis-aligned "
-        "restriction is only an approximation"
+        f"{what}: phase-encode direction is oblique (alignment {alignment:.3f} < {tol})"
     )
     if on_oblique == "raise":
-        raise PhaseEncodeObliqueError(msg + ". Pass on_oblique='warn' to accept the approximation explicitly.")
+        raise PhaseEncodeObliqueError(
+            msg + ". Pass on_oblique='allow' (exact directional vector projection) or on_oblique='warn'."
+        )
     warnings.warn(msg, UserWarning, stacklevel=4)
 
 
@@ -289,6 +310,7 @@ def _build(
     detail: str,
     oblique_tol: float,
     on_oblique: str,
+    has_bids_source: bool = False,
 ) -> PhaseEncode:
     if parsed.kind == "bids":
         axis, sign = int(parsed.voxel_axis), int(parsed.sign)
@@ -301,15 +323,27 @@ def _build(
         paxis = int(np.argmax(np.abs(v)))
         alignment = float(abs(v[paxis]))
     else:
-        v = np.asarray(_NAMED_VECTORS[parsed.name], dtype=float)
-        paxis = int(np.argmax(np.abs(v)))
-        if paxis >= ndim:
-            raise PhaseEncodeError(f"{parsed.raw!r} is along physical axis {'xyz'[paxis]}, absent in a {ndim}-D image")
-        cos = d3[:, :ndim].T @ v
+        w_world = np.asarray(_NAMED_VECTORS[parsed.name], dtype=float)
+        paxis_world = int(np.argmax(np.abs(w_world)))
+        if paxis_world >= ndim:
+            raise PhaseEncodeError(
+                f"{parsed.raw!r} is along physical axis {'xyz'[paxis_world]}, absent in a {ndim}-D image"
+            )
+        cos = d3[:, :ndim].T @ w_world
         axis = int(np.argmax(np.abs(cos)))
         sign = 1 if cos[axis] > 0 else -1
         alignment = float(abs(cos[axis]))
-    _check_oblique(alignment, oblique_tol, on_oblique, f"{detail} ({parsed.raw!r})")
+        col = d3[:, axis]
+        v = sign * col / np.linalg.norm(col)
+        paxis = int(np.argmax(np.abs(v)))
+    _check_oblique(
+        alignment,
+        oblique_tol,
+        on_oblique,
+        f"{detail} ({parsed.raw!r})",
+        kind=parsed.kind,
+        has_bids_source=has_bids_source,
+    )
     pvec = tuple(float(x) for x in v)
     anat = None
     if abs(pvec[paxis]) >= oblique_tol:
@@ -354,7 +388,7 @@ def resolve_phase_encode(
     allow_inference: bool = False,
     inference: Callable[[Any], Any] | None = None,
     oblique_tol: float = 0.85,
-    on_oblique: str = "raise",
+    on_oblique: str = "allow",
 ) -> PhaseEncode:
     """Resolve the phase-encode direction of ``image`` from every stated source, or raise.
 
@@ -376,43 +410,71 @@ def resolve_phase_encode(
         Explicit opt-in to a data-driven estimator when nothing states the direction; ``inference``
         must be a callable ``image -> physical axis (0/1/2) | PhaseEncode``. Without it: Undecidable.
     oblique_tol : float, default 0.85
-        Minimum |cos| to an axis (0.85 is about 31.8 degrees, accommodating clinical AC-PC slice tilt).
-    on_oblique : {'raise', 'warn'}, default 'raise'
+        Minimum |cos| to a world axis for assigning a single-axis ``anatomical`` name (0.85 is about
+        31.8 degrees). BIDS voxel-axis directions (``i``/``j``/``k``[``-``]) remain exact at any
+        obliquity (0--90 degrees) via their unit ``physical_vector``.
+    on_oblique : {'allow', 'warn', 'raise'}, default 'allow'
+        ``'allow'`` resolves BIDS voxel-axis phase encodes cleanly at any slice obliquity (while
+        refusing ambiguous bare world labels without a BIDS voxel-axis source below ``oblique_tol``);
+        ``'warn'`` emits a ``UserWarning`` when ``alignment < oblique_tol``; ``'raise'`` raises
+        :class:`PhaseEncodeObliqueError`.
 
     Precedence of the decisive source: sidecar > label > explicit > entity. All stated sources must
     agree (same voxel axis, sign and physical axis); otherwise :class:`PhaseEncodeConflict`.
     """
-    if on_oblique not in ("raise", "warn"):
-        raise ValueError("on_oblique must be 'raise' or 'warn'")
+    if on_oblique not in ("allow", "raise", "warn"):
+        raise ValueError("on_oblique must be 'allow', 'raise', or 'warn'")
     d3, ndim = _spatial_direction(image)
 
-    cands: list[PhaseEncode] = []
+    raw_sources: list[tuple[ParsedLabel, Any, str, str]] = []
     skipped: list[dict] = []
 
-    def add(parsed_raw: Any, source: str, detail: str) -> None:
+    def stage(parsed_raw: Any, source: str, detail: str) -> None:
         parsed = parse_pe_label(parsed_raw)
-        pe = _build(parsed, d3, ndim, source=source, detail=detail, oblique_tol=oblique_tol, on_oblique=on_oblique)
-        cands.append(pe)
-        evidence_items.append({"source": source, "detail": detail, "raw": str(parsed_raw), "label": pe.label,
-                               "anatomical": pe.anatomical, "physical_vector": _fl(pe.physical_vector)})
+        raw_sources.append((parsed, parsed_raw, source, detail))
 
-    evidence_items: list[dict] = []
     if sidecar is not None:
         det, raw, _ = _read_sidecar(sidecar)
         if raw is None:
             skipped.append({"source": "sidecar", "detail": det, "reason": "no PhaseEncodingDirection key"})
         else:
-            add(raw, "sidecar", det)
+            stage(raw, "sidecar", det)
     if label is not None:
-        add(label, "label", f"label {label!r}")
+        stage(label, "label", f"label {label!r}")
     if anatomical is not None:
-        add(anatomical, "explicit", f"anatomical {anatomical!r}")
+        stage(anatomical, "explicit", f"anatomical {anatomical!r}")
     if entity_path is not None:
         ent = pe_entity_from_path(entity_path)
         if ent is None:
             skipped.append({"source": "entity", "detail": str(entity_path), "reason": "no dir- entity (or dir-UNK)"})
         else:
-            add(ent, "entity", f"dir-{ent} in {Path(str(entity_path)).name}")
+            stage(ent, "entity", f"dir-{ent} in {Path(str(entity_path)).name}")
+
+    has_bids_source = any(p.kind == "bids" for p, _, _, _ in raw_sources)
+    cands: list[PhaseEncode] = []
+    evidence_items: list[dict] = []
+    for parsed, parsed_raw, source, detail in raw_sources:
+        pe = _build(
+            parsed,
+            d3,
+            ndim,
+            source=source,
+            detail=detail,
+            oblique_tol=oblique_tol,
+            on_oblique=on_oblique,
+            has_bids_source=has_bids_source,
+        )
+        cands.append(pe)
+        evidence_items.append(
+            {
+                "source": source,
+                "detail": detail,
+                "raw": str(parsed_raw),
+                "label": pe.label,
+                "anatomical": pe.anatomical,
+                "physical_vector": _fl(pe.physical_vector),
+            }
+        )
 
     if not cands:
         if allow_inference and inference is not None:
@@ -425,7 +487,14 @@ def resolve_phase_encode(
             cos = d3[:, :ndim].T @ np.eye(3)[paxis]
             vax = int(np.argmax(np.abs(cos)))
             alignment = float(abs(cos[vax]))
-            _check_oblique(alignment, oblique_tol, on_oblique, f"inferred axis {'xyz'[paxis]}")
+            _check_oblique(
+                alignment,
+                oblique_tol,
+                on_oblique,
+                f"inferred axis {'xyz'[paxis]}",
+                kind="inferred",
+                has_bids_source=False,
+            )
             col = d3[:, vax]
             return PhaseEncode(
                 voxel_axis=vax, sign=None, physical_vector=tuple(float(x) for x in col / np.linalg.norm(col)),
@@ -462,6 +531,22 @@ def resolve_phase_encode(
 # --------------------------------------------------------------------------------------------
 # restriction
 # --------------------------------------------------------------------------------------------
+@dataclass(frozen=True)
+class ParsedRestriction:
+    """Validated deformation restriction in physical ITK LPS (X, Y[, Z]) coordinates.
+
+    ``mode`` is either:
+    * ``'axis_weights'`` — diagonal per-axis scaling ``u_i <- w_i * u_i`` with ``w_i in [0, 1]``
+      (includes axis-aligned one-hot masks such as ``(0.0, 1.0, 0.0)`` and planar masks ``(1.0, 0.0, 1.0)``).
+    * ``'unit_vector'`` — rank-1 orthogonal directional projection ``u <- (u . v_PE) v_PE`` along
+      a unit physical vector ``v_PE`` (``||v_PE||_2 == 1``), exact at any EPI slice obliquity (0--90 deg).
+    """
+
+    mode: str  # "axis_weights" | "unit_vector"
+    values_xyz: tuple[float, ...]
+    operator_xyz: tuple[float, ...]
+
+
 def _coerce_pe(pe: Any) -> Any:
     if isinstance(pe, PhaseEncode):
         return pe
@@ -470,8 +555,157 @@ def _coerce_pe(pe: Any) -> Any:
     return pe
 
 
+def _canonicalize_unit_line_vector(vec: np.ndarray) -> np.ndarray:
+    """Normalize ``vec`` to unit length and orient its dominant component positive (`v v^T` is sign-invariant)."""
+    v = np.asarray(vec, dtype=np.float64)
+    norm = float(np.linalg.norm(v))
+    if not np.isfinite(norm) or norm <= 1e-12:
+        raise PhaseEncodeError(f"phase-encode physical vector has degenerate norm: {vec!r}")
+    v = v / norm
+    paxis = int(np.argmax(np.abs(v)))
+    if v[paxis] < 0.0:
+        v = -v
+    v = np.where(np.abs(v) < 1e-12, 0.0, v)
+    v = v / float(np.linalg.norm(v))
+    v = np.where(np.abs(v) < 1e-12, 0.0, v)
+    return v
+
+
+def parse_restrict_transformation(value: Any, *, dim: int) -> ParsedRestriction | None:
+    """Validate and classify ``restrict_transformation`` for ``syntx.syn``, ``greedy``, ``batch_syn``, and ``dewarp``.
+
+    Accepts:
+    * ``None`` -> ``None`` (unrestricted).
+    * :class:`PhaseEncode` or its :func:`pe_to_dict` mapping -> 1-D directional restriction along
+      ``pe.physical_vector`` (exact unit physical vector).
+    * Sequence of ``dim`` floats in physical ``(X, Y[, Z])`` LPS order:
+      - Any unit vector (``| ||v||_2 - 1 | <= 1e-2``, signed or unsigned, axis-aligned or oblique)
+        is normalized in float64 and applied as the rank-1 projector ``u <- (u . v) v`` (using the
+        equivalent single-axis mask fast path when strictly axis-aligned).
+      - Otherwise, per-axis weights ``w_i in [0, 1]`` (e.g. ``(1.0, 0.0, 1.0)``) are applied as a
+        diagonal world-axis mask ``u * w``.
+    """
+    if value is None:
+        return None
+    if isinstance(value, str) and value == PE_UNRESTRICTED:
+        return None
+    if isinstance(value, (PhaseEncode, Mapping)):
+        pe = _coerce_pe(value)
+        vec_tup = restrict_transformation(pe, dim=dim)
+        if vec_tup is None:
+            return None
+        v = np.asarray(vec_tup, dtype=np.float64)
+        if int(np.count_nonzero(v)) == 1:
+            op = tuple(float(abs(x)) for x in v)
+            return ParsedRestriction(mode="axis_weights", values_xyz=op, operator_xyz=op)
+        op = tuple(float(x) for x in v)
+        return ParsedRestriction(mode="unit_vector", values_xyz=op, operator_xyz=op)
+
+    try:
+        rt = [float(w) for w in value]
+    except TypeError as exc:
+        raise ValueError(
+            f"restrict_transformation must be a sequence of length {dim} or a PhaseEncode, got {value!r}"
+        ) from exc
+    if len(rt) != dim:
+        raise ValueError(
+            f"restrict_transformation must have length {dim} (physical XYZ order), "
+            f"got length {len(rt)}: {value!r}"
+        )
+    arr = np.asarray(rt, dtype=np.float64)
+    if not np.all(np.isfinite(arr)):
+        raise ValueError(f"restrict_transformation entries must be finite, got {rt!r}")
+
+    norm = float(np.linalg.norm(arr))
+    if abs(norm - 1.0) <= 1e-2:
+        v_unit = arr / norm
+        v_clean = np.where(np.abs(v_unit) < 1e-12, 0.0, v_unit)
+        v_clean = v_clean / float(np.linalg.norm(v_clean))
+        v_clean = np.where(np.abs(v_clean) < 1e-12, 0.0, v_clean)
+        if int(np.count_nonzero(v_clean)) == 1:
+            op = tuple(float(abs(x)) for x in v_clean)
+            vals = op if all(x >= 0.0 for x in rt) else tuple(float(x) for x in v_clean)
+            return ParsedRestriction(mode="axis_weights", values_xyz=vals, operator_xyz=op)
+        op = tuple(float(x) for x in v_clean)
+        return ParsedRestriction(mode="unit_vector", values_xyz=op, operator_xyz=op)
+
+    if all(0.0 <= w <= 1.0 for w in rt):
+        tup = tuple(rt)
+        return ParsedRestriction(mode="axis_weights", values_xyz=tup, operator_xyz=tup)
+
+    raise ValueError(
+        f"restrict_transformation must be a unit physical direction vector (||v||_2 == 1) "
+        f"or per-axis weights in [0, 1], got {rt!r} (norm={norm:.6g})"
+    )
+
+
+def apply_physical_restriction_zyx(
+    field_zyx: Any,
+    parsed: ParsedRestriction | None,
+    *,
+    inplace: bool = False,
+) -> Any:
+    """Apply ``parsed`` to a physical LPS field ``(..., dim)`` stored in reversed ``(dz, dy[, dx])`` order."""
+    if parsed is None or field_zyx is None:
+        return field_zyx
+    import torch
+
+    dim = len(parsed.operator_xyz)
+    shape = (1,) * (field_zyx.ndim - 1) + (dim,)
+    op_zyx = torch.tensor(parsed.operator_xyz[::-1], device=field_zyx.device, dtype=field_zyx.dtype).view(*shape)
+    if parsed.mode == "axis_weights":
+        if inplace:
+            field_zyx = field_zyx if field_zyx.is_contiguous() else field_zyx.contiguous()
+            return field_zyx.mul_(op_zyx)
+        return field_zyx * op_zyx
+    dot = torch.sum(field_zyx * op_zyx, dim=-1, keepdim=True)
+    proj = dot * op_zyx
+    if inplace:
+        field_zyx.copy_(proj)
+        return field_zyx
+    return proj
+
+
+def build_normalized_restriction_matrix_xyz(
+    parsed: ParsedRestriction | None,
+    shape_xyz: Any,
+    spacing_xyz: Any,
+    direction_mat: Any = None,
+) -> np.ndarray | None:
+    """Return the ``(dim, dim)`` matrix ``R_norm`` acting on normalized ``[-1, 1]`` displacements ``u_norm @ R_norm.T``.
+
+    Since ``u_phys = J_F @ u_norm`` with ``J_F = D_F @ diag(spacing * max(shape - 1, 1) / 2)``,
+    any physical-space linear restriction ``R_phys`` (either ``v_PE @ v_PE.T`` or ``diag(w)``)
+    corresponds in normalized grid coordinates to ``R_norm = J_F^{-1} @ R_phys @ J_F``.
+    """
+    if parsed is None:
+        return None
+    dim = len(parsed.operator_xyz)
+    sh = np.maximum(np.asarray(shape_xyz[:dim], dtype=np.float64) - 1.0, 1.0)
+    sp = np.asarray(spacing_xyz[:dim], dtype=np.float64)
+    half_ext = 0.5 * sp * sh
+    if direction_mat is None:
+        d_mat = np.eye(dim, dtype=np.float64)
+    else:
+        d_arr = np.asarray(direction_mat, dtype=np.float64)
+        d_mat = d_arr[:dim, :dim]
+    j_f = d_mat * half_ext[None, :]
+    j_f_inv = np.linalg.inv(j_f)
+    op = np.asarray(parsed.operator_xyz, dtype=np.float64)
+    if parsed.mode == "unit_vector":
+        r_phys = np.outer(op, op)
+    else:
+        r_phys = np.diag(op)
+    return (j_f_inv @ r_phys @ j_f).astype(np.float32)
+
+
 def restrict_transformation(pe: Any, *, dim: int = 3) -> tuple[float, ...] | None:
-    """One-hot physical-axis weights (1 = free axis) for ``syntx.syn(restrict_transformation=...)``.
+    """Unit physical-space direction vector (sign-canonicalized) for ``syntx.syn(restrict_transformation=...)``.
+
+    On axis-aligned headers this equals the legacy one-hot tuple (``(1.0, 0.0, 0.0)``,
+    ``(0.0, 1.0, 0.0)``, or ``(0.0, 0.0, 1.0)``); on oblique headers it is the exact unit physical
+    LPS vector ``v_PE`` along the phase-encoded voxel axis so ``syntx.syn`` projects updates via
+    ``u <- (u . v_PE) v_PE`` with zero orthogonal leakage at any slice tilt (0--90 deg).
 
     ``pe`` is a :class:`PhaseEncode` (or its dict) or the explicit :data:`PE_UNRESTRICTED` policy,
     which returns ``None``. ``dim`` is the number of spatial dimensions (3 even for 4-D images).
@@ -484,9 +718,10 @@ def restrict_transformation(pe: Any, *, dim: int = 3) -> tuple[float, ...] | Non
         raise TypeError(f"restrict_transformation needs a PhaseEncode, its dict or {PE_UNRESTRICTED!r}; got {pe!r}")
     if dim not in (2, 3) or pe.physical_axis >= dim:
         raise PhaseEncodeError(f"physical axis {'xyz'[pe.physical_axis]} does not exist in a {dim}-D restriction")
-    w = [0.0] * dim
-    w[pe.physical_axis] = 1.0
-    return tuple(w)
+    if dim == 2 and len(pe.physical_vector) >= 3 and abs(float(pe.physical_vector[2])) > 1e-6:
+        raise PhaseEncodeError(f"phase-encode vector {pe.physical_vector} has out-of-plane Z component for 2-D image")
+    v = _canonicalize_unit_line_vector(np.asarray(pe.physical_vector[:dim], dtype=np.float64))
+    return tuple(float(x) for x in v)
 
 
 _SOURCE_KEYS = ("sidecar", "label", "entity_path", "anatomical")

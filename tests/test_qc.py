@@ -120,7 +120,7 @@ def test_evaluate_registration_qc_folding():
 @pytest.mark.slow
 def test_evaluate_registration_qc_syn_integration():
     import syntx
-    from syntx.viz import registration_qc_section, render_standard_4panel
+    from syntx.viz import registration_qc_section, render_registration_qc
     import matplotlib.pyplot as plt
 
     fi = ants.image_read(ants.get_ants_data('r16')).resample_image((2, 2), 0, 0)
@@ -148,7 +148,7 @@ def test_evaluate_registration_qc_syn_integration():
     assert "inverse_identity_max_mm" in section
     assert section["inverse_identity_max_mm"]["status"] in ("pass", "warn", "not_assessable")
 
-    # Test render_standard_4panel direct dict integration
-    fig = render_standard_4panel(fixed=fi, warped=reg)
+    # Test render_registration_qc direct dict integration
+    fig = render_registration_qc(fixed=fi, warped=reg, n_panels=4)
     assert fig is not None
     plt.close(fig)

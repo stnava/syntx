@@ -1,10 +1,22 @@
 # Tracking Summary
-current phase: v6.48.0 (`R56`: lossless physical-space background cropping `syntx.crop_background` with scalar, per-axis, or per-face `margin` in `'voxels'` or `'mm'`, `divisor` pyramid/FFT grid rounding, `companions` co-cropping, and `allow_pad` boundary cushion; `R55` runtime-compiled Metal shader backend `core/kernels.py` & `batch_tbm`)
-next WP: all-GPU Blast Cohort Tensor-Based Morphometry (TBM) + `pysimlr` / `antsxviz` study (`24`-subject `ExpArt + FPA` custom Navier `SyN` template + `N = 295` session GPU `batch_syn` + `63` longitudinal `breacher` pairs)
+current phase: v6.49.0 (`R57`: exact 1-D oblique EPI phase-encoding directional vector projection $\mathbf{u} \leftarrow (\mathbf{u} \cdot \mathbf{v}_{\text{PE}})\mathbf{v}_{\text{PE}}$ across `phase_encode`, `syn`, `greedy`, `batch_syn`, `batch_greedy`, and `dewarp`, plus unified `syntx.viz.render_registration_qc` 4/6/8-panel registration QC renderer replacing `render_standard_4panel`; `R56` `syntx.crop_background`; `R55` runtime-compiled Metal shader backend & `batch_tbm`)
+next WP: cross-sectional Blast Cohort Tensor-Based Morphometry (TBM) + `pysimlr` / `antsxviz` study (`scratch/blast_tbm/`) and extraction to `antsxbrainmapping` / `antsxbrainmappingprivate`
 blockers: none
-active work: all-GPU Blast Cohort Navier `SyN` TBM + `pysimlr` / `antsxviz` study (`scratch/blast_tbm/`)
+active work: cross-sectional Blast Cohort Navier `SyN` TBM + `pysimlr` / `antsxviz` study (`scratch/blast_tbm/`)
 device: Apple Silicon MPS / CPU (macOS arm64)
-last updated: 2026-11-25
+last updated: 2026-11-26
+
+---
+
+## R57 (Oblique EPI 1-D Directional Vector Projection & Unified `syntx.viz.render_registration_qc`; v6.49.0, 2026-11-26)
+- **Exact 1-D Oblique EPI Phase-Encoding Directional Vector Projection (`src/syntx/{phase_encode,spatial,dewarp,syn,greedy,cohort}.py`, `docs/PHASE_ENCODE.md`, `tests/{test_phase_encode,test_oblique_pe_syn}.py`)**:
+  - Extended `resolve_phase_encode`, `restrict_for_image`, `restrict_with_provenance`, and `spatial.restriction_from_orientation` with `on_oblique="allow"`, preserving `on_oblique="raise"` as the strict default while enabling callers (including `antsxmm >= 4.25.0`) to resolve tilted/pitched EPI slabs onto their exact physical LPS encoding line without snapping to a cardinal axis.
+  - Added `ParsedRestriction`, `parse_restrict_transformation`, `apply_physical_restriction_zyx`, and `build_normalized_restriction_matrix_xyz` in `src/syntx/phase_encode.py`: axis-aligned acquisitions retain exact one-hot cardinal tuples `(1,0,0)` / `(0,1,0)` / `(0,0,1)`, while oblique acquisitions emit a sign-canonicalized unit physical LPS 3-vector $\mathbf{v}_{\text{PE}}$ and enforce exact rank-1 physical projection $\mathbf{u}_{\text{LPS}} \leftarrow (\mathbf{u}_{\text{LPS}} \cdot \mathbf{v}_{\text{PE}})\mathbf{v}_{\text{PE}}$ (conjugated into normalized `[-1, 1]` coordinates via $M_{\text{norm}} = A_{\text{phys}\to\text{norm}}\,(\mathbf{v}_{\text{PE}}\mathbf{v}_{\text{PE}}^\top)\,A_{\text{phys}\to\text{norm}}^{-1}$) at every velocity/displacement update, smoothing step, inverse solve, and digital diffeomorphism projection across `syn`, `greedy`, `batch_syn`, `batch_greedy`, and `dewarp`.
+  - Validated on real tilted `ds005237` rsfMRI sessions (`sub-NDARINVDK220VPQ` at `41.3 deg` pitch, `alignment = 0.7510`; `sub-NDARINVTU813PDR` at `32.2 deg` pitch, `alignment = 0.8465`): max orthogonal physical displacement leakage `<= 4.2e-7 mm` (`99.999999999999%` PE directional energy fraction) and `0.0000%` Liouville folding.
+- **Unified Multi-Panel Registration QC Renderer `syntx.viz.render_registration_qc` (`src/syntx/viz/{__init__,core,figures,gallery,reports}.py`, `src/syntx/{__init__,syn}.py`, `scripts/*.py`, `tests/test_viz_multipanel.py`)**:
+  - Replaced `render_standard_4panel` across `src/syntx`, `scripts/`, and `tests/` with a single unified `render_registration_qc(..., n_panels=6)` API supporting `n_panels=6` (default 2x3: `Fixed`, `Fixed with Deformation Grid`, `Log-Jacobian`, `Moving`, `Moving Deformed to Fixed`, `Edge Overlay`), `n_panels=8` (2x4 adding `Checkerboard` and auto-scaled `Inverse Identity Error` with `vmax = max(0.5, max_err)`), and `n_panels=4` (compact 1x4).
+  - Upgraded `resolve_lps_slice_pair` and `AnatomicalVisualizer` (`src/syntx/viz/core.py`) to compute deterministic foreground/brain axial content-span slices (`fraction=0.55`, striatal/thalamic level) independently for unregistered `Moving` scans when their native FOV or scanner frame differs from `Fixed`, eliminating vertex/neck slice mismatches while preserving exact radiological orientation and physical aspect ratios (`spacing_y / spacing_x`).
+- **Verification**: `python3 -m antsxqc.lint src/syntx` -> `0 finding(s)` (no `.antsxqc-allow`); `pytest` across all 16 guard, phase-encode, and visualization suites (`314 passed, 5 skipped, 0 failed`).
 
 ---
 

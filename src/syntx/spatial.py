@@ -1046,7 +1046,8 @@ def restriction_from_orientation(
     a BIDS phase-encoding direction.
 
     Thin shim over :mod:`syntx.phase_encode` (use ``resolve_phase_encode`` / ``restrict_for_image``
-    to keep the sign, provenance and conflict checks). The sidecar / BIDS paths are strict: a
+    for exact 3-D unit-vector directional projection on oblique acquisitions and to keep the sign,
+    provenance and conflict checks). The sidecar / BIDS paths are strict: a
     missing sidecar file, DICOM ``ROW``/``COL`` or any unknown label raises a
     ``syntx.phase_encode.PhaseEncodeError`` (a ValueError). ``anatomical_axis`` is the axis-only
     legacy path (no direction, no header lookup).
@@ -1148,7 +1149,10 @@ def restriction_from_orientation(
         ) from exc
     except PhaseEncodeError:
         raise
-    return _pe_restrict(pe, dim=dim)
+    _ = _pe_restrict(pe, dim=dim)
+    weights = [0.0] * dim
+    weights[pe.physical_axis] = 1.0
+    return tuple(weights)
 
 
 def get_physical_to_normalized_affine(shape_t, spacing_t, origin_t, direction_t):

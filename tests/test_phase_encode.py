@@ -115,13 +115,20 @@ def test_oblique_15_passes_45_raises_or_warns():
     assert pe.alignment == pytest.approx(np.cos(np.deg2rad(15)))
     assert pe.physical_axis == 1 and pe.anatomical == "AP"
     d45 = rot_z(45)
+    pe45 = resolve_phase_encode(img(d45), label="i")
+    assert np.allclose(pe45.physical_vector, d45[:, 0])
+    assert pe45.anatomical is None
+    assert pe45.alignment == pytest.approx(np.cos(np.deg2rad(45)))
+    w45 = restrict_transformation(pe45)
+    assert np.linalg.norm(w45) == pytest.approx(1.0)
+    assert np.allclose(w45, d45[:, 0])
     with pytest.raises(PhaseEncodeObliqueError):
-        resolve_phase_encode(img(d45), label="i")
+        resolve_phase_encode(img(d45), label="i", on_oblique="raise")
     with pytest.warns(UserWarning, match="oblique"):
-        pe = resolve_phase_encode(img(d45), label="i", on_oblique="warn")
-    assert pe.anatomical is None  # oblique: no anatomical name claimed
-    assert pe.alignment == pytest.approx(np.cos(np.deg2rad(45)))
-    # a named label on an oblique grid is also refused (it is not along a voxel axis)
+        pe_warn = resolve_phase_encode(img(d45), label="i", on_oblique="warn")
+    assert pe_warn.anatomical is None  # oblique: no anatomical name claimed
+    assert pe_warn.alignment == pytest.approx(np.cos(np.deg2rad(45)))
+    # a bare named world label on an oblique grid is still refused (it is not along a voxel axis)
     with pytest.raises(PhaseEncodeObliqueError):
         resolve_phase_encode(img(d45), label="AP")
 

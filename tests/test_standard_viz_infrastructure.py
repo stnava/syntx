@@ -2,7 +2,7 @@
 tests/test_standard_viz_infrastructure.py — Audit Suite for Syntx Standard Reporting Infrastructure
 ===================================================================================================
 
-Verifies that syntx.viz standard reporting tools (render_input_pair_figure, render_standard_4panel,
+Verifies that syntx.viz standard reporting tools (render_input_pair_figure, render_registration_qc,
 create_registration_report) strictly adhere to all GEMINI.md Section 3 reporting invariants:
 1. 2D and 3D ANTsImage & NumPy array support.
 2. Canonical LPI Anatomical Orientation (Anterior UP for Axial, Superior UP for Coronal/Sagittal).
@@ -17,7 +17,7 @@ import ants
 import numpy as np
 
 import syntx
-from syntx.viz import create_registration_report, render_standard_4panel, render_input_pair_figure, corner_watermark
+from syntx.viz import create_registration_report, render_registration_qc, render_input_pair_figure, corner_watermark
 from syntx.viz.core import AnatomicalVisualizer
 
 
@@ -86,7 +86,7 @@ def test_non_identity_header_rendering_2d_and_3d(tmp_path):
     detJ_2d = np.ones_like(arr_2d)
     inv_err_2d = np.zeros_like(arr_2d)
     warp_2d = np.zeros((*arr_2d.shape, 2))
-    render_standard_4panel(fixed=fi_2d, warped=fi_2d, moving=mi_2d, detJ=detJ_2d, inv_err_map=inv_err_2d, warp=warp_2d, output_path=out_fig2_2d)
+    render_registration_qc(fixed=fi_2d, warped=fi_2d, moving=mi_2d, detJ=detJ_2d, inv_err_map=inv_err_2d, warp=warp_2d, n_panels=4, output_path=out_fig2_2d)
     assert os.path.exists(out_fig2_2d) and os.path.getsize(out_fig2_2d) > 1000
 
     # 3D non-identity image
@@ -104,11 +104,11 @@ def test_non_identity_header_rendering_2d_and_3d(tmp_path):
     detJ_3d = np.ones_like(arr_3d)
     inv_err_3d = np.zeros_like(arr_3d)
     warp_3d = np.zeros((*arr_3d.shape, 3))
-    render_standard_4panel(fixed=fi_3d, warped=fi_3d, moving=mi_3d, detJ=detJ_3d, inv_err_map=inv_err_3d, warp=warp_3d, output_path=out_fig2_3d)
+    render_registration_qc(fixed=fi_3d, warped=fi_3d, moving=mi_3d, detJ=detJ_3d, inv_err_map=inv_err_3d, warp=warp_3d, n_panels=4, output_path=out_fig2_3d)
     assert os.path.exists(out_fig2_3d) and os.path.getsize(out_fig2_3d) > 1000
 
 
-def test_render_standard_4panel_2d(tmp_path):
+def test_render_registration_qc_4panel_2d(tmp_path):
     """Verifies Figure 2 standard 4-panel report rendering."""
     fi = ants.image_read(ants.get_data("r16"))
     mi = ants.image_read(ants.get_data("r64"))
@@ -118,13 +118,14 @@ def test_render_standard_4panel_2d(tmp_path):
     inv_err = np.zeros(fi.shape, dtype=np.float32)
 
     out_png = str(tmp_path / "test_fig2_4panel.png")
-    fig = render_standard_4panel(
+    fig = render_registration_qc(
         fixed=fi,
         warped=mi,
         warp=warp,
         detJ=detJ,
         inv_err_map=inv_err,
         moving=mi,
+        n_panels=4,
         output_path=out_png
     )
 

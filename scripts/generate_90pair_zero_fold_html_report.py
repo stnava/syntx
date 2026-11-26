@@ -22,7 +22,7 @@ from syntx.deformation_metrics import (
     compute_bending_energy
 )
 from syntx.core.inverse import calculate_inverse_identity_error
-from syntx.viz import render_standard_4panel, render_input_pair_figure
+from syntx.viz import render_registration_qc, render_input_pair_figure
 
 def normalize_intensity(img: ants.ANTsImage) -> ants.ANTsImage:
     arr = img.numpy()
@@ -86,13 +86,14 @@ def generate_90pair_html_report(
     inv_err_img = err_dict['error_map'].numpy()
 
     fig2_path = "results/figures/fig2_standard_4panel_mb15.png"
-    render_standard_4panel(
+    render_registration_qc(
         fixed=fi,
         warped=res_syntx["warpedmovout"],
         warp=warp_fwd,
         detJ=jac_img.numpy(),
         inv_err_map=inv_err_img,
         moving=mi,
+        n_panels=4,
         title_prefix=f"syntx.syn (σ={flow_sigma} mm, Antithetic)",
         output_path=fig2_path
     )

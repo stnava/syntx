@@ -151,9 +151,19 @@ def _convert_composed_grid_to_ants_displacement(
         raise ValueError(f"Unsupported spatial dimension: {dim}")
 
     if restrict_transformation is not None:
-        for i, w in enumerate(restrict_transformation):
-            if w == 0.0:
-                disp_itk[..., i] = 0.0
+        from .phase_encode import parse_restrict_transformation
+        parsed_rt = parse_restrict_transformation(restrict_transformation, dim=dim)
+        if parsed_rt is not None:
+            if parsed_rt.mode == "axis_weights":
+                for i, w in enumerate(parsed_rt.operator_xyz):
+                    if w == 0.0:
+                        disp_itk[..., i] = 0.0
+                    elif w != 1.0:
+                        disp_itk[..., i] *= np.float32(w)
+            else:
+                v64 = np.asarray(parsed_rt.operator_xyz, dtype=np.float64)
+                d64 = disp_itk.astype(np.float64)
+                disp_itk = ((d64 @ v64)[..., None] * v64).astype(np.float32)
 
     disp_img = ants.from_numpy(
         disp_itk,
@@ -307,21 +317,11 @@ class GreedyRegistrationModel(nn.Module):
         self.stop = LossSlopeStop(slope_threshold=eff_slope)   # the shared deformable stopping rule (core.convergence)
         self.convergence = []
         self.dim = dim
-        if restrict_transformation is not None:
-            rt = [float(w) for w in restrict_transformation]
-            if len(rt) != dim:
-                raise ValueError(
-                    f"restrict_transformation must have length {dim} (one weight per physical axis, "
-                    f"XYZ order), got length {len(rt)}: {restrict_transformation!r}"
-                )
-            for w in rt:
-                if not (0.0 <= w <= 1.0):
-                    raise ValueError(
-                        f"restrict_transformation weights must be in [0, 1], got {rt!r}"
-                    )
-            self.restrict_transformation = tuple(rt)
-        else:
-            self.restrict_transformation = None
+        from .phase_encode import parse_restrict_transformation
+        self._parsed_restriction = parse_restrict_transformation(restrict_transformation, dim=dim)
+        self.restrict_transformation = (
+            self._parsed_restriction.values_xyz if self._parsed_restriction is not None else None
+        )
         from .core.optimizers import validate_regularizer_optimizer_pair
         self.learning_rate = learning_rate
         self.flow_sigma = flow_sigma
@@ -461,6 +461,7 @@ class GreedyRegistrationModel(nn.Module):
         # Initialize displacement field u at the coarsest scale
         batch_sz = int(moving_tensor.shape[0])
         init_size = list(fixed_lv[0].shape)
+        from .phase_encode import build_normalized_restriction_matrix_xyz
         if initial_warp is not None:
             iw = initial_warp.to(device=self.device, dtype=torch.float32)
             if iw.ndim == dim + 1:
@@ -476,11 +477,12 @@ class GreedyRegistrationModel(nn.Module):
                 warp = resize_field(iw, init_size, mode=mode)
             else:
                 warp = iw.clone()
-            if self.restrict_transformation is not None:
-                restr_init = torch.tensor(
-                    self.restrict_transformation, device=self.device, dtype=warp.dtype
-                ).view(1, *([1] * dim), dim)
-                warp = warp * restr_init
+            if self._parsed_restriction is not None:
+                r_norm_init = build_normalized_restriction_matrix_xyz(
+                    self._parsed_restriction, tuple(reversed(init_size)), fixed_lv[0].spacing, dir_f
+                )
+                r_norm_init_T = torch.from_numpy(r_norm_init.T.copy()).to(device=self.device, dtype=warp.dtype)
+                warp = torch.matmul(warp, r_norm_init_T)
         else:
             warp = torch.zeros((batch_sz, *init_size, dim), dtype=torch.float32, device=self.device)
         from .core.optimizers import FieldStepOptimizer
@@ -568,11 +570,13 @@ class GreedyRegistrationModel(nn.Module):
                 M_theta = self.theta[:, :, :dim].contiguous()
                 t_theta_flat = self.theta[:, :, dim].contiguous()
                 is_identity_theta = False
-            restr_mask = (
-                torch.tensor(self.restrict_transformation, device=self.device, dtype=warp.dtype).view(1, *([1] * dim), dim)
-                if self.restrict_transformation is not None
-                else None
-            )
+            if self._parsed_restriction is not None:
+                r_norm_lvl = build_normalized_restriction_matrix_xyz(
+                    self._parsed_restriction, tuple(reversed(ctrl_shape)), ctrl_spacing, dir_f
+                )
+                r_norm_lvl_T = torch.from_numpy(r_norm_lvl.T.copy()).to(device=self.device, dtype=warp.dtype)
+            else:
+                r_norm_lvl_T = None
 
             # Precompute constant fixed-image LNCC local mean and variance once per pyramid level
             # for grids <= 256^3 (16.78M voxels); larger grids automatically slab via self.loss_fn.
@@ -853,8 +857,8 @@ class GreedyRegistrationModel(nn.Module):
                         sobolev_fallback_fn=_sobolev_fallback_fn,
                     )
                     del grad
-                    if restr_mask is not None:
-                        update = update * restr_mask
+                    if r_norm_lvl_T is not None:
+                        update = torch.matmul(update, r_norm_lvl_T.to(dtype=update.dtype))
 
                     # Eulerian compositive pullback: u_{k+1}(x) = v_k(x) + u_k(x + v_k(x))
                     # compose_grids(warp, id_grid_ctrl + update) samples warp at (x + update(x)).
@@ -864,8 +868,8 @@ class GreedyRegistrationModel(nn.Module):
                     del update, pulled
                     if eff_total_sigma > 0 and warp_gaussians is not None:
                         u_new = smooth_field(u_new, warp_gaussians)
-                    if restr_mask is not None:
-                        u_new = u_new * restr_mask
+                    if r_norm_lvl_T is not None:
+                        u_new = torch.matmul(u_new, r_norm_lvl_T.to(dtype=u_new.dtype))
                     warp = u_new.detach()
                     del u_new
 
@@ -899,6 +903,8 @@ class GreedyRegistrationModel(nn.Module):
                     print(f"  [greedy] Applying Anderson projection at scale {scale} ({self.anderson_steps} steps)...")
                 warp_inv = update_inverse_field_nd_anderson(warp, None, steps=self.anderson_steps, m=self.anderson_m)
                 warp = update_inverse_field_nd_anderson(warp_inv, None, steps=self.anderson_steps, m=self.anderson_m)
+                if r_norm_lvl_T is not None:
+                    warp = torch.matmul(warp, r_norm_lvl_T.to(dtype=warp.dtype))
 
         # Final upsample to full shape if required
         if list(warp.shape[1:-1]) != list(full_shape):
@@ -911,13 +917,12 @@ class GreedyRegistrationModel(nn.Module):
             warp_inv = update_inverse_field_nd_anderson(warp, None, steps=self.anderson_steps, m=self.anderson_m)
             warp = update_inverse_field_nd_anderson(warp_inv, None, steps=self.anderson_steps, m=self.anderson_m)
 
-        if self.restrict_transformation is not None:
-            restr_mask = torch.tensor(
-                self.restrict_transformation,
-                device=self.device,
-                dtype=warp.dtype
-            ).view(1, *([1] * dim), dim)
-            warp = warp * restr_mask
+        if self._parsed_restriction is not None:
+            r_norm_full = build_normalized_restriction_matrix_xyz(
+                self._parsed_restriction, tuple(reversed(tuple(full_shape))), sp_f, dir_f
+            )
+            r_norm_full_T = torch.from_numpy(r_norm_full.T.copy()).to(device=self.device, dtype=warp.dtype)
+            warp = torch.matmul(warp, r_norm_full_T)
 
         if self.loss_history and all(torch.is_tensor(l) for l in self.loss_history):
             self.loss_history = [float(x) for x in torch.stack(self.loss_history).tolist()]
@@ -1077,6 +1082,8 @@ def greedy_registration(
         fixed = _fixed_target.image
     require_finite_images(fixed=fixed, moving=moving)
     dim = fixed.dimension
+    from .phase_encode import apply_physical_restriction_zyx, parse_restrict_transformation
+    parsed_restr = parse_restrict_transformation(restrict_transformation, dim=dim)
     torch_device = auto_detect_device(backend='pytorch', requested_device=device)
     _do_write_tx = bool(write_transforms or outprefix is not None)
     _return_warped_tensor = bool(kwargs.pop('_return_warped_tensor', False))
@@ -1324,15 +1331,8 @@ def greedy_registration(
         disp_t = normalized_to_physical_disp(
             warp, full_shape, fixed.spacing, fixed.direction, device=torch_device, dtype=torch.float32
         )
-        if restrict_transformation is not None:
-            restr_t_zyx = torch.tensor(
-                list(reversed([0.0 if float(w) == 0.0 else 1.0 for w in restrict_transformation])),
-                device=disp_t.device,
-                dtype=disp_t.dtype,
-            ).view(1, *([1] * dim), dim)
-            disp_t = disp_t * restr_t_zyx
-        else:
-            restr_t_zyx = None
+        if parsed_restr is not None:
+            disp_t = apply_physical_restriction_zyx(disp_t, parsed_restr)
 
     # Unidirectional digital_diffeomorphism projection on disp_t first so return_inverse=True
     # never alters the forward displacement field or introduces artificial Dirichlet rim cliffs.
@@ -1348,9 +1348,9 @@ def greedy_registration(
             steps=digital_diffeomorphism_steps,
             stationary_boundary=False,
         )
-        if restr_t_zyx is not None:
+        if parsed_restr is not None:
             with torch.no_grad():
-                disp_t = disp_t * restr_t_zyx
+                disp_t = apply_physical_restriction_zyx(disp_t, parsed_restr)
 
     from .transforms import (
         ContinuousField as _ContinuousField,
@@ -1413,9 +1413,9 @@ def greedy_registration(
                 steps=digital_diffeomorphism_steps,
                 stationary_boundary=False,
             )
-        if restr_t_zyx is not None:
+        if parsed_restr is not None:
             with torch.no_grad():
-                inv_disp_t = inv_disp_t * restr_t_zyx
+                inv_disp_t = apply_physical_restriction_zyx(inv_disp_t, parsed_restr)
         if _do_write_tx:
             disp_img = disp_tensor_to_itk(disp_t, fixed)
             inv_disp_img = disp_tensor_to_itk(inv_disp_t, fixed)

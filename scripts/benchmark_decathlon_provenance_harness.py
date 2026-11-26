@@ -64,7 +64,7 @@ from syntx.deformation_metrics import compute_bidirectional_dice
 from syntx.pyramid import cap_ants_image
 from syntx.registration_metrics import evaluate_registration_qc
 from syntx.liouville import liouville_determinant
-from syntx.viz import render_standard_4panel
+from syntx.viz import render_registration_qc
 from syntx.data.surrogates import extract_brain_parenchyma, extract_ct_lung_parenchyma
 
 DEFAULT_DECATHLON_DIR = os.environ.get("DECATHLON_DIR", os.path.expanduser("~/data/decathlon"))
@@ -759,9 +759,10 @@ def evaluate_decathlon_task(
         try:
             with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as tmp_fig:
                 fig_path = tmp_fig.name
-            render_standard_4panel(
+            render_registration_qc(
                 fixed=pre0,
                 warped=res_syn_beltrami,
+                n_panels=4,
                 theme="light",
                 filename=fig_path,
             )

@@ -47,7 +47,6 @@ from .syn import (
     auto_reg,
     plot_deformation_grid,
     plot_edge_overlay,
-    render_standard_4panel,
 )
 from .core import (
     normalize_tensor,
@@ -130,7 +129,7 @@ from . import tabulate
 from . import viz
 from .viz import (
     render_input_pair_figure,
-    render_standard_4panel,
+    render_registration_qc,
     plot_deformation_grid,
     plot_edge_overlay,
     create_registration_report,
@@ -391,7 +390,7 @@ from .liouville import liouville_determinant, determinant_summary
 syngs = syngs_registration
 affine_benchmark = evaluate_affine_benchmark
 
-__version__ = "6.48.0"
+__version__ = "6.49.0"
 
 
 
@@ -509,7 +508,7 @@ __all__ = [
     "normalize_image",
     "plot_deformation_grid",
     "plot_edge_overlay",
-    "render_standard_4panel",
+    "render_registration_qc",
     "render_input_pair_figure",
     "create_registration_report",
     "create_population_benchmark_report",

@@ -16,7 +16,7 @@ from syntx.viz import (
     extract_2d_slice,
     plot_deformation_grid,
     plot_edge_overlay,
-    render_standard_4panel,
+    render_registration_qc,
     render_input_pair_figure,
 )
 
@@ -115,8 +115,8 @@ def test_render_input_pair_figure_3d(sample_3d_images, tmp_path):
     plt.close(fig)
 
 
-def test_render_standard_4panel_2d(sample_2d_images, tmp_path):
-    """Tests render_standard_4panel on 2D inputs."""
+def test_render_registration_qc_4panel_2d(sample_2d_images, tmp_path):
+    """Tests render_registration_qc(n_panels=4) on 2D inputs."""
     fi = sample_2d_images["fi_ants"]
     mi = sample_2d_images["mi_ants"]
     warp = sample_2d_images["warp_2d"]
@@ -124,13 +124,13 @@ def test_render_standard_4panel_2d(sample_2d_images, tmp_path):
     inv_err = np.zeros((64, 64), dtype=np.float32)
     out_png = str(tmp_path / "fig2_4panel_2d.png")
 
-    fig = render_standard_4panel(fi, mi, warp=warp, detJ=detJ, inv_err_map=inv_err, filename=out_png)
+    fig = render_registration_qc(fi, mi, warp=warp, detJ=detJ, inv_err_map=inv_err, n_panels=4, filename=out_png)
     assert os.path.exists(out_png)
     plt.close(fig)
 
 
-def test_render_standard_4panel_3d(sample_3d_images, tmp_path):
-    """Tests render_standard_4panel on 3D inputs."""
+def test_render_registration_qc_4panel_3d(sample_3d_images, tmp_path):
+    """Tests render_registration_qc(n_panels=4) on 3D inputs."""
     fi = sample_3d_images["fi_ants"]
     mi = sample_3d_images["mi_ants"]
     warp = sample_3d_images["warp_3d"]
@@ -138,7 +138,7 @@ def test_render_standard_4panel_3d(sample_3d_images, tmp_path):
     inv_err = np.zeros((32, 32, 32), dtype=np.float32)
     out_png = str(tmp_path / "fig2_4panel_3d.png")
 
-    fig = render_standard_4panel(fi, mi, warp=warp, detJ=detJ, inv_err_map=inv_err, filename=out_png)
+    fig = render_registration_qc(fi, mi, warp=warp, detJ=detJ, inv_err_map=inv_err, n_panels=4, filename=out_png)
     assert os.path.exists(out_png)
     plt.close(fig)
 
@@ -155,9 +155,10 @@ def test_plot_edge_overlay(sample_2d_images, tmp_path):
 
 
 def test_top_level_viz_exports():
-    """Verifies syntx exports render_input_pair_figure, render_standard_4panel, extract_2d_slice."""
+    """Verifies syntx exports render_input_pair_figure, render_registration_qc, extract_2d_slice."""
     assert hasattr(syntx, "render_input_pair_figure")
-    assert hasattr(syntx, "render_standard_4panel")
+    assert hasattr(syntx, "render_registration_qc")
+    assert not hasattr(syntx, "render_standard_" + "4panel")
     assert hasattr(syntx, "extract_2d_slice")
     assert hasattr(syntx, "plot_deformation_grid")
     assert hasattr(syntx, "plot_edge_overlay")

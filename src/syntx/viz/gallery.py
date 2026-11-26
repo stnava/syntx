@@ -19,7 +19,7 @@ from .figures import (
     render_input_pair_figure,
     render_warped_comparison_figure,
     render_checkerboard_figure,
-    render_standard_4panel,
+    render_registration_qc,
     render_label_alignment_figure,
     plot_deformation_grid,
     plot_edge_overlay
@@ -57,7 +57,7 @@ def create_visualization_gallery(
     """Render the syntx.viz figures for one registration into a single HTML page.
 
     Always: ``render_input_pair_figure`` in dark and light themes. Only when ``warped``,
-    ``warp``, ``detJ`` and ``inv_err_map`` are all given: ``render_standard_4panel``. With
+    ``warp``, ``detJ`` and ``inv_err_map`` are all given: ``render_registration_qc(..., n_panels=4)``. With
     ``warp``: ``plot_correspondence_vectors``, ``plot_vector_field`` and
     ``plot_deformation_tensor_rgb`` (the last skipped with a warning if it fails). With both
     3-D label maps: ``render_label_alignment_figure`` (2-D maps: skipped with a warning). With ``dice_scores``:
@@ -130,7 +130,7 @@ def create_visualization_gallery(
     # Generate Figure 2 (Standard 4-Panel) if warped/warp/detJ available
     uri_fig2 = None
     if warped is not None and warp is not None and detJ is not None and inv_err_map is not None:
-        fig2 = render_standard_4panel(fixed, warped, warp, detJ, inv_err_map, title_prefix="Syntx Registration Quality")
+        fig2 = render_registration_qc(fixed, warped, warp, detJ, inv_err_map, n_panels=4, title_prefix="Syntx Registration Quality")
         uri_fig2 = fig_to_base64_png(fig2)
 
     # Generate Vector & Tensor Displays

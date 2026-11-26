@@ -4,7 +4,7 @@ import torch
 import numpy as np
 import ants
 import syntx
-from syntx.viz import render_standard_4panel
+from syntx.viz import render_registration_qc
 
 def generate_report():
     os.makedirs('docs/reports/figures', exist_ok=True)
@@ -18,9 +18,10 @@ def generate_report():
     # Run a registration test to produce a figure
     reg = syntx.syn(r16, r64, similarity_metric='mattes_mi', reg_iterations=[20, 10], verbose=False)
     
-    fig = render_standard_4panel(
+    fig = render_registration_qc(
         fixed=r16,
         warped=reg['warpedmovout'],
+        n_panels=4,
         slice_axis=0,
         theme='light',
         registration_result=reg,

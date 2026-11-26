@@ -102,7 +102,7 @@ def evaluate_pair(pair_idx: int, device: str = 'cpu'):
     fig_dir = "/Users/stnava/.gemini/antigravity-cli/brain/ed9af813-1310-43df-bc86-a32aeec400a0/scratch/figures"
     os.makedirs(fig_dir, exist_ok=True)
     try:
-        from syntx.viz import render_input_pair_figure, render_standard_4panel, render_label_alignment_figure
+        from syntx.viz import render_input_pair_figure, render_registration_qc, render_label_alignment_figure
         fig1_path = os.path.join(fig_dir, f"pair_{pair_idx:02d}_input.png")
         if not os.path.exists(fig1_path):
             render_input_pair_figure(fi, mi, output_path=fig1_path, title=f"Pair {pair_idx:02d} ({pair_type})")

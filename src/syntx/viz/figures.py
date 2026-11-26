@@ -6,7 +6,7 @@ Image figures use ``AnatomicalVisualizer.extract_slice`` (see ``syntx.viz.core``
 slice orientation and default-slice rules):
 
 - ``render_input_pair_figure``: fixed and moving images before registration.
-- ``render_standard_4panel``: deformed grid, Jacobian determinant, inverse-consistency error
+- ``render_registration_qc``: deformed grid, Jacobian determinant, inverse-consistency error
   and edge overlap for one slice.
 - ``plot_deformation_grid``, ``plot_edge_overlay``, ``plot_correspondence_vectors``,
   ``plot_vector_field``, ``plot_deformation_tensor_rgb``: single views of a field / pair.
@@ -24,14 +24,14 @@ Label colours come from ``syntx.viz.colormaps`` (one palette for every figure).
 """
 
 import os
-from typing import Dict, List, Optional, Tuple, Union
+from typing import Dict, List, Literal, Optional, Sequence, Tuple, Union
 import numpy as np
 import matplotlib.pyplot as plt
 import matplotlib.colors as mcolors
 import ants
 
 
-from .core import AnatomicalSlice, AnatomicalVisualizer
+from .core import AnatomicalSlice, AnatomicalVisualizer, resolve_lps_slice_pair
 from .colormaps import dkt_colormap, get_dkt_colormap, get_dkt_label_color_dict
 
 
@@ -340,15 +340,7 @@ def plot_edge_overlay(
         return (a - amin) / (amax - amin + 1e-8) if amax > amin else a.copy()
 
     fi_norm = _norm(fi_arr)
-    mi_norm = _norm(mi_arr)
-
-    if fi_norm.shape != mi_norm.shape:
-        try:
-            from skimage.transform import resize
-            mi_norm = resize(mi_norm, fi_norm.shape, mode='edge', anti_aliasing=True)
-        except ImportError:                       # same fallback policy as the edge detector
-            from scipy.ndimage import zoom
-            mi_norm = zoom(mi_norm, [a / b for a, b in zip(fi_norm.shape, mi_norm.shape)], order=1)
+    mi_norm = _match_display_slice_shape(_norm(mi_arr), fi_norm.shape)
 
     try:
         from skimage.feature import canny
@@ -1071,7 +1063,580 @@ def render_input_pair_figure(
     return fig
 
 
-def render_standard_4panel(
+_QC_PANEL_ALIASES = {
+    "fixed": "fixed",
+    "moving": "moving",
+    "warped": "warped",
+    "deformation_grid": "deformation_grid",
+    "grid": "deformation_grid",
+    "deformed_grid": "deformation_grid",
+    "jacobian": "jacobian",
+    "detj": "jacobian",
+    "det_j": "jacobian",
+    "edge_overlay": "edge_overlay",
+    "edge": "edge_overlay",
+    "edges": "edge_overlay",
+    "checkerboard": "checkerboard",
+    "checker": "checkerboard",
+    "ice": "ice",
+    "inverse_identity_error": "ice",
+    "inv_err": "ice",
+}
+
+
+def _viz_theme_palette(theme: str) -> Dict[str, str]:
+    is_dark = str(theme).lower() == "dark"
+    if is_dark:
+        return {
+            "bg": "#0d1117",
+            "text": "#f8fafc",
+            "title": "#f8fafc",
+            "sub": "#94a3b8",
+            "cbar_tick": "#c9d1d9",
+            "fixed": "#38bdf8",
+            "moving": "#fb923c",
+            "warped": "#3fb950",
+            "grid_line": "#38bdf8",
+            "jac_nominal": "#3fb950",
+            "jac_fold": "#f85149",
+            "ice": "#d29922",
+            "edge_line": "#f85149",
+            "edge_title": "#bc8cff",
+            "checker": "#38bdf8",
+        }
+    return {
+        "bg": "#ffffff",
+        "text": "#0f172a",
+        "title": "#1e293b",
+        "sub": "#475569",
+        "cbar_tick": "#334155",
+        "fixed": "#0284c7",
+        "moving": "#d97706",
+        "warped": "#059669",
+        "grid_line": "#0284c7",
+        "jac_nominal": "#059669",
+        "jac_fold": "#dc2626",
+        "ice": "#d97706",
+        "edge_line": "#dc2626",
+        "edge_title": "#7c3aed",
+        "checker": "#0f172a",
+    }
+
+
+def _normalize_panel_key(key) -> str:
+    if not isinstance(key, str):
+        raise ValueError(f"Panel key must be a string, got {key!r}")
+    norm = _QC_PANEL_ALIASES.get(key.strip().lower())
+    if norm is None:
+        valid = sorted(set(_QC_PANEL_ALIASES.values()))
+        raise ValueError(f"Unknown panel key {key!r}; valid panel keys: {valid}")
+    return norm
+
+
+def _normalize_panel_layout(n_panels: int, panels) -> Tuple[List[List[Optional[str]]], bool]:
+    if panels is None:
+        if n_panels == 4:
+            return [["deformation_grid", "jacobian"], ["ice", "edge_overlay"]], True
+        if n_panels == 6:
+            return [["fixed", "deformation_grid", "jacobian"], ["moving", "warped", "edge_overlay"]], False
+        if n_panels == 8:
+            return [
+                ["fixed", "deformation_grid", "jacobian", "checkerboard"],
+                ["moving", "warped", "edge_overlay", "ice"],
+            ], False
+        raise ValueError(f"n_panels must be 4, 6, or 8 when panels is None, got {n_panels!r}")
+
+    if isinstance(panels, (str, bytes)) or not isinstance(panels, Sequence):
+        raise ValueError(f"panels must be a non-empty sequence of panel keys or 2-D grid, got {panels!r}")
+
+    seq = list(panels)
+    if not seq:
+        raise ValueError("panels must not be empty")
+
+    has_subseq = any(isinstance(item, (list, tuple)) for item in seq)
+    if has_subseq:
+        if not all(isinstance(item, (list, tuple)) for item in seq):
+            raise ValueError("2-D panels layout must contain only rows (lists/tuples) of panel keys")
+        grid: List[List[Optional[str]]] = []
+        max_cols = max((len(r) for r in seq), default=0)
+        if max_cols == 0:
+            raise ValueError("2-D panels layout must contain at least one column")
+        for row in seq:
+            norm_row: List[Optional[str]] = [
+                None if cell is None else _normalize_panel_key(cell) for cell in row
+            ]
+            while len(norm_row) < max_cols:
+                norm_row.append(None)
+            grid.append(norm_row)
+        if not any(cell is not None for row in grid for cell in row):
+            raise ValueError("panels layout must contain at least one non-empty panel")
+        return grid, False
+
+    flat = [_normalize_panel_key(item) for item in seq]
+    k = len(flat)
+    if k <= 3:
+        return [flat], False
+    if k == 4:
+        return [flat[0:2], flat[2:4]], False
+    if k <= 6:
+        return [flat[0:3], flat[3:6] + [None] * (6 - k)], False
+    if k <= 8:
+        return [flat[0:4], flat[4:8] + [None] * (8 - k)], False
+    ncols = 4
+    rows = [flat[i:i + ncols] for i in range(0, k, ncols)]
+    while len(rows[-1]) < ncols:
+        rows[-1].append(None)
+    return rows, False
+
+
+def _resolve_warp_from_reg(reg: dict):
+    fwd_transforms = reg.get("fwdtransforms") or []
+    for t in fwd_transforms:
+        if isinstance(t, str) and (t.endswith(".nii.gz") or t.endswith(".nii") or "Warp" in t):
+            return t
+        if not isinstance(t, str):
+            return t
+    if len(fwd_transforms) > 0:
+        return fwd_transforms[0]
+
+    fwd_chain = reg.get("fwd_chain")
+    if fwd_chain is not None and hasattr(fwd_chain, "elements"):
+        for elem in fwd_chain.elements:
+            if getattr(elem, "kind", None) in ("displacement", "inverse_displacement") and hasattr(elem, "to_ants_image"):
+                return elem.to_ants_image()
+
+    if reg.get("disp_tensor_zyx") is not None:
+        return reg.get("disp_tensor_zyx")
+
+    model = reg.get("model")
+    if model is not None and hasattr(model, "warp_l2r") and model.warp_l2r is not None:
+        return model.warp_l2r
+    return None
+
+
+def _resolve_detj(reg, warp, fixed, detJ=None, jac_measure=None):
+    if detJ is None and reg is not None and isinstance(fixed, ants.ANTsImage):
+        try:
+            from ..liouville import liouville_determinant
+
+            det_res = liouville_determinant(reg, fixed, return_details=True)
+            if isinstance(det_res, tuple):
+                detJ, d_info = det_res
+                if jac_measure is None:
+                    jac_measure = d_info.get("measure", "Liouville det")
+            else:
+                detJ = det_res
+        except Exception:
+            pass
+    if detJ is None and warp is not None and isinstance(fixed, ants.ANTsImage):
+        try:
+            warp_img = _as_displacement_image(warp, fixed)
+            if isinstance(warp_img, ants.ANTsImage) and getattr(warp_img, "components", 1) == fixed.dimension:
+                detJ = ants.create_jacobian_determinant_image(fixed, warp_img, do_log=False)
+                if jac_measure is None:
+                    jac_measure = "finite difference"
+        except Exception:
+            pass
+    return detJ, jac_measure
+
+
+def _infer_spatial_dim(img) -> Optional[int]:
+    if isinstance(img, ants.ANTsImage):
+        return int(img.dimension)
+    if hasattr(img, "detach") or hasattr(img, "shape"):
+        arr = img.detach().cpu().numpy() if hasattr(img, "detach") else np.asarray(img)
+        sq = np.squeeze(arr)
+        if sq.ndim in (2, 3):
+            return int(sq.ndim)
+    return None
+
+
+def _extract_ice_info(
+    reg: Optional[dict],
+    inv_err_map=None,
+    inv_err_max=None,
+    inv_err_mean=None,
+    inv_err_p95=None,
+    fixed_dim: Optional[int] = None,
+):
+    if reg is not None:
+        ice_dict = (
+            reg.get("inverse_identity_errors")
+            or reg.get("inverse_identity_error")
+            or reg.get("inv_identity_error")
+            or reg.get("inv_err_dict")
+        )
+        if isinstance(ice_dict, dict):
+            sub = ice_dict
+            for key in ("composed", "phi_1", "phi_2"):
+                candidate = ice_dict.get(key)
+                if isinstance(candidate, dict):
+                    sub = candidate
+                    break
+            if inv_err_map is None:
+                inv_err_map = sub.get("error_map")
+            if inv_err_max is None:
+                val = sub.get("max_error") if "max_error" in sub else sub.get("max")
+                if val is not None:
+                    inv_err_max = float(val)
+            if inv_err_mean is None:
+                val = sub.get("mean_error") if "mean_error" in sub else sub.get("mean")
+                if val is not None:
+                    inv_err_mean = float(val)
+            if inv_err_p95 is None:
+                val = sub.get("p95_error") if "p95_error" in sub else sub.get("p95")
+                if val is not None:
+                    inv_err_p95 = float(val)
+        if inv_err_map is None and "inverse_identity_error_map" in reg:
+            inv_err_map = reg["inverse_identity_error_map"]
+
+    if inv_err_map is not None and (inv_err_p95 is None or inv_err_max is None or inv_err_mean is None):
+        err_obj = inv_err_map
+        if isinstance(err_obj, str) and not err_obj.endswith(".mat"):
+            err_obj = ants.image_read(err_obj)
+            inv_err_map = err_obj
+        arr = None
+        if isinstance(err_obj, ants.ANTsImage):
+            arr = err_obj.numpy()
+            if getattr(err_obj, "components", 1) > 1 or arr.ndim == err_obj.dimension + 1:
+                arr = np.linalg.norm(arr, axis=-1)
+        elif hasattr(err_obj, "detach") or hasattr(err_obj, "shape"):
+            arr = np.squeeze(err_obj.detach().cpu().numpy() if hasattr(err_obj, "detach") else np.asarray(err_obj))
+            if fixed_dim == 2 and arr.ndim == 3:
+                if arr.shape[-1] == 2 and arr.shape[0] != 2:
+                    arr = np.linalg.norm(arr, axis=-1)
+                elif arr.shape[0] == 2 and arr.shape[-1] != 2:
+                    arr = np.linalg.norm(arr, axis=0)
+                elif arr.shape[-1] == 2:
+                    arr = np.linalg.norm(arr, axis=-1)
+            elif fixed_dim == 3 and arr.ndim == 4:
+                if arr.shape[-1] == 3 and arr.shape[0] != 3:
+                    arr = np.linalg.norm(arr, axis=-1)
+                elif arr.shape[0] == 3 and arr.shape[-1] != 3:
+                    arr = np.linalg.norm(arr, axis=0)
+                elif arr.shape[-1] == 3:
+                    arr = np.linalg.norm(arr, axis=-1)
+            elif fixed_dim is None:
+                if arr.ndim == 4:
+                    if arr.shape[0] in (2, 3) and arr.shape[-1] not in (2, 3):
+                        arr = np.linalg.norm(arr, axis=0)
+                    elif arr.shape[-1] in (2, 3):
+                        arr = np.linalg.norm(arr, axis=-1)
+                elif arr.ndim == 3:
+                    if arr.shape[0] in (2, 3) and arr.shape[-1] not in (2, 3):
+                        arr = np.linalg.norm(arr, axis=0)
+                    elif arr.shape[-1] == 2 and arr.shape[0] > 4:
+                        arr = np.linalg.norm(arr, axis=-1)
+
+        if arr is not None and arr.size > 0:
+            arr = np.asarray(arr, dtype=np.float32)
+            finite = arr[np.isfinite(arr)]
+            pos = finite[finite > 0]
+            if inv_err_p95 is None:
+                inv_err_p95 = (
+                    float(np.percentile(pos, 95))
+                    if pos.size > 0
+                    else (0.0 if finite.size > 0 else float("nan"))
+                )
+            if inv_err_max is None:
+                inv_err_max = float(np.max(finite)) if finite.size > 0 else float("nan")
+            if inv_err_mean is None:
+                inv_err_mean = (
+                    float(np.mean(pos))
+                    if pos.size > 0
+                    else (0.0 if finite.size > 0 else float("nan"))
+                )
+
+    return inv_err_map, inv_err_max, inv_err_mean, inv_err_p95
+
+
+def _robust_grayscale_clim(arr: np.ndarray) -> Tuple[float, float]:
+    a = np.asarray(arr, dtype=np.float32)
+    finite = a[np.isfinite(a)]
+    if finite.size == 0:
+        return 0.0, 1.0
+    nonzero = finite[finite != 0]
+    vals = nonzero if nonzero.size > 0 else finite
+    lo, hi = float(np.percentile(vals, 1)), float(np.percentile(vals, 99))
+    if hi <= lo:
+        lo, hi = float(np.min(finite)), float(np.max(finite))
+    if hi <= lo:
+        hi = lo + 1.0
+    return lo, hi
+
+
+def _normalize_percentile_01(arr: np.ndarray) -> np.ndarray:
+    a = np.asarray(arr, dtype=np.float32)
+    if a.ndim == 3:
+        a = np.linalg.norm(a, axis=-1)
+    lo, hi = _robust_grayscale_clim(a)
+    return np.clip((a - lo) / (hi - lo), 0.0, 1.0)
+
+
+def _draw_anatomy_panel(
+    ax,
+    arr,
+    aspect: float,
+    title: str,
+    title_color: str,
+    palette: Dict[str, str],
+    unavailable_msg: Optional[str] = None,
+):
+    if arr is None:
+        bg_placeholder = np.zeros((32, 32), dtype=np.float32)
+        ax.imshow(bg_placeholder, cmap="gray", vmin=0.0, vmax=1.0, aspect=aspect)
+        ax.text(
+            0.5,
+            0.5,
+            unavailable_msg or "Unavailable (N/A)",
+            transform=ax.transAxes,
+            ha="center",
+            va="center",
+            color=palette["sub"],
+            fontsize=11,
+            fontweight="bold",
+        )
+        ax.set_title(title, color=title_color, fontsize=11, fontweight="bold")
+        return
+    lo, hi = _robust_grayscale_clim(arr)
+    ax.imshow(arr, cmap="gray", aspect=aspect, vmin=lo, vmax=hi)
+    ax.set_title(title, color=title_color, fontsize=11, fontweight="bold")
+
+
+def _draw_deformation_grid_panel(
+    ax,
+    fi_arr,
+    dcol,
+    drow,
+    aspect: float,
+    title: str,
+    title_color: str,
+    palette: Dict[str, str],
+    grid_spacing: int = 8,
+    draw_grid: bool = True,
+):
+    H, W = fi_arr.shape[:2]
+    ax.imshow(fi_arr, cmap="gray", alpha=0.5, aspect=aspect)
+    if draw_grid and dcol is not None and drow is not None:
+        step = max(1, int(grid_spacing))
+        grid_y, grid_x = np.mgrid[0:H:step, 0:W:step]
+        disp_y = drow[::step, ::step][:grid_y.shape[0], :grid_x.shape[1]]
+        disp_x = dcol[::step, ::step][:grid_y.shape[0], :grid_x.shape[1]]
+        def_x = grid_x + disp_x
+        def_y = grid_y + disp_y
+        for i in range(def_y.shape[0]):
+            ax.plot(def_x[i, :], def_y[i, :], color=palette["grid_line"], linewidth=1.1)
+        for j in range(def_x.shape[1]):
+            ax.plot(def_x[:, j], def_y[:, j], color=palette["grid_line"], linewidth=1.1)
+    else:
+        ax.text(
+            0.5,
+            0.5,
+            "Displacement unavailable (N/A)",
+            transform=ax.transAxes,
+            ha="center",
+            va="center",
+            color=palette["sub"],
+            fontsize=10,
+            fontweight="bold",
+        )
+    ax.set_title(title, color=title_color, fontsize=11, fontweight="bold")
+
+
+def _draw_jacobian_panel(
+    fig,
+    ax,
+    detJ_arr,
+    fi_arr,
+    aspect: float,
+    jac_measure: Optional[str],
+    min_detJ,
+    palette: Dict[str, str],
+    is_legacy_4panel: bool = False,
+):
+    if detJ_arr is None:
+        ax.imshow(fi_arr, cmap="gray", alpha=0.25, aspect=aspect)
+        ax.text(
+            0.5,
+            0.5,
+            "Jacobian det(J) unavailable (N/A)",
+            transform=ax.transAxes,
+            ha="center",
+            va="center",
+            color=palette["sub"],
+            fontsize=11,
+            fontweight="bold",
+        )
+        title = "Panel B: Standard Jacobian det(J)\nUnavailable (N/A)" if is_legacy_4panel else "Jacobian (det(J))\nUnavailable (N/A)"
+        ax.set_title(title, color=palette["sub"], fontsize=11, fontweight="bold")
+        return
+
+    norm_jac = mcolors.TwoSlopeNorm(vmin=0.0, vcenter=1.0, vmax=2.5)
+    im_jac = ax.imshow(detJ_arr, cmap="seismic", norm=norm_jac, aspect=aspect)
+
+    folding_mask = detJ_arr <= 0.0
+    if np.any(folding_mask):
+        fold_overlay = np.zeros((*detJ_arr.shape[:2], 4), dtype=np.float32)
+        fold_overlay[folding_mask] = [0.0, 1.0, 0.0, 1.0]
+        ax.imshow(fold_overlay, aspect=aspect)
+
+    folding_pct = float(np.mean(folding_mask) * 100.0)
+    min_j_val = float(min_detJ) if min_detJ is not None else float(np.min(detJ_arr))
+    fold_str = "0.00% Folding" if folding_pct == 0.0 else f"{folding_pct:.4f}% Folding"
+    title_color = palette["jac_nominal"] if folding_pct == 0.0 else palette["jac_fold"]
+    fold_note = " [Green = Folding det(J) ≤ 0]" if np.any(folding_mask) else ""
+    if is_legacy_4panel:
+        jac_title = f"Panel B: det(J) [{jac_measure}]" if jac_measure else "Panel B: Standard Jacobian det(J)"
+    else:
+        jac_title = f"Jacobian (det(J)) [{jac_measure}]" if jac_measure else "Jacobian (det(J))"
+    ax.set_title(
+        f"{jac_title}\nmin det(J) = {min_j_val:+.6f} ({fold_str}){fold_note}",
+        color=title_color,
+        fontsize=11,
+        fontweight="bold",
+    )
+    cbar_j = fig.colorbar(im_jac, ax=ax, fraction=0.046, pad=0.04)
+    cbar_j.set_label("det(J)", color=palette["cbar_tick"], fontsize=10)
+    cbar_j.ax.tick_params(colors=palette["cbar_tick"])
+
+
+def _draw_edge_overlay_panel(
+    ax,
+    fixed,
+    warped,
+    slice_axis: int,
+    resolved_slice_idx: int,
+    reorient: bool,
+    theme: str,
+    title: str,
+    title_color: str,
+    palette: Dict[str, str],
+):
+    plot_edge_overlay(
+        fixed,
+        warped,
+        slice_axis=slice_axis,
+        slice_idx=resolved_slice_idx,
+        edge_color=palette["edge_line"],
+        fixed_edge_color=None,
+        theme=theme,
+        reorient=reorient,
+        ax=ax,
+        title="",
+    )
+    ax.set_title(title, color=title_color, fontsize=11, fontweight="bold")
+
+
+def _match_display_slice_shape(arr: np.ndarray, target_shape: Tuple[int, ...]) -> np.ndarray:
+    """Match 2D oriented display-slice shape when pre-resampled vs fixed display grids differ."""
+    if arr.shape == target_shape:
+        return arr
+    try:
+        from skimage.transform import resize
+
+        return resize(arr, target_shape, mode="edge", anti_aliasing=True)
+    except ImportError:
+        from scipy.ndimage import zoom
+
+        return zoom(arr, [a / b for a, b in zip(target_shape, arr.shape)], order=1)
+
+
+def _draw_checkerboard_panel(
+    ax,
+    fi_arr,
+    warped_arr,
+    aspect: float,
+    title: str,
+    title_color: str,
+    palette: Dict[str, str],
+    pattern_size: int = 8,
+):
+    fi_norm = _normalize_percentile_01(fi_arr)
+    wa_norm = _match_display_slice_shape(_normalize_percentile_01(warped_arr), fi_norm.shape)
+    h, w = fi_norm.shape[:2]
+    p_size = max(1, int(pattern_size))
+    tile_row = np.arange(h)[:, None] // p_size
+    tile_col = np.arange(w)[None, :] // p_size
+    checker = np.where((tile_row + tile_col) % 2 == 0, fi_norm, wa_norm)
+    ax.imshow(checker, cmap="gray", aspect=aspect, vmin=0.0, vmax=1.0)
+    ax.set_title(title, color=title_color, fontsize=11, fontweight="bold")
+
+
+def _draw_ice_panel(
+    fig,
+    ax,
+    inv_err_arr,
+    fi_arr,
+    aspect: float,
+    inv_err_max,
+    inv_err_mean,
+    inv_err_p95,
+    palette: Dict[str, str],
+    is_legacy_4panel: bool = False,
+):
+    def _fmt_mm(val) -> str:
+        if val is None or not np.isfinite(val):
+            return "N/A"
+        return f"{float(val):.4f}mm"
+
+    if inv_err_arr is None:
+        ax.imshow(fi_arr, cmap="gray", alpha=0.25, aspect=aspect)
+        ax.text(
+            0.5,
+            0.5,
+            "ICE map unavailable (N/A)",
+            transform=ax.transAxes,
+            ha="center",
+            va="center",
+            color=palette["sub"],
+            fontsize=11,
+            fontweight="bold",
+        )
+        base = "Panel C: Inverse Identity Error (mm)" if is_legacy_4panel else "Inverse Identity Error (ICE, mm)"
+        if any(v is not None and np.isfinite(v) for v in (inv_err_max, inv_err_mean, inv_err_p95)):
+            stats_line = f"Max: {_fmt_mm(inv_err_max)} | Mean: {_fmt_mm(inv_err_mean)} | p95: {_fmt_mm(inv_err_p95)}"
+        else:
+            stats_line = "Unavailable (N/A)"
+        ax.set_title(f"{base}\n{stats_line}", color=palette["ice"], fontsize=11, fontweight="bold")
+        return
+
+    finite_ice = inv_err_arr[np.isfinite(inv_err_arr)]
+    max_err_val = (
+        inv_err_max
+        if inv_err_max is not None
+        else (float(np.max(finite_ice)) if finite_ice.size > 0 else float("nan"))
+    )
+    mean_err_val = (
+        inv_err_mean
+        if inv_err_mean is not None
+        else (float(np.mean(finite_ice)) if finite_ice.size > 0 else float("nan"))
+    )
+    p95_err_val = (
+        inv_err_p95
+        if inv_err_p95 is not None
+        else (float(np.percentile(finite_ice, 95)) if finite_ice.size > 0 else float("nan"))
+    )
+
+    ax.imshow(fi_arr, cmap="gray", alpha=0.3, aspect=aspect)
+    vmax_err = (
+        max(0.5, float(max_err_val))
+        if (max_err_val is not None and np.isfinite(max_err_val) and float(max_err_val) > 0.0)
+        else 0.5
+    )
+    im_err = ax.imshow(inv_err_arr, cmap="inferno", alpha=0.85, vmin=0.0, vmax=vmax_err, aspect=aspect)
+    base = "Panel C: Inverse Identity Error (mm)" if is_legacy_4panel else "Inverse Identity Error (ICE, mm)"
+    ax.set_title(
+        f"{base}\nMax: {_fmt_mm(max_err_val)} | Mean: {_fmt_mm(mean_err_val)} | p95: {_fmt_mm(p95_err_val)}",
+        color=palette["ice"],
+        fontsize=11,
+        fontweight="bold",
+    )
+    cbar_e = fig.colorbar(im_err, ax=ax, fraction=0.046, pad=0.04)
+    cbar_e.set_label("Inverse Error (mm)", color=palette["cbar_tick"], fontsize=10)
+    cbar_e.ax.tick_params(colors=palette["cbar_tick"])
+
+
+def render_registration_qc(
     fixed,
     warped,
     warp=None,
@@ -1080,8 +1645,10 @@ def render_standard_4panel(
     moving=None,
     slice_axis: int = 2,
     slice_idx=None,
+    n_panels: Literal[4, 6, 8] = 6,
+    panels=None,
     show_header: bool = False,
-    theme: str = "dark",
+    theme: Optional[str] = None,
     reorient: bool = True,
     lncc_val=None,
     mi_val=None,
@@ -1089,239 +1656,210 @@ def render_standard_4panel(
     inv_err_mean=None,
     inv_err_p95=None,
     min_detJ=None,
-    title_prefix="Registration Report",
+    title_prefix: str = "Registration Report",
     jac_measure=None,
     registration_result=None,
     filename=None,
-    output_path=None
+    output_path=None,
+    grid_spacing: int = 8,
+    checkerboard_pattern_size: int = 8,
+    dpi: int = 200,
+    show_figure: bool = False,
+    match_moving_lps: bool = False,
 ):
-    """Four QC panels for one slice of a registration (2 x 2; 3 x 2 with ``show_header``).
+    """Unified multi-panel registration QC figure supporting 4-, 6-, 8-panel, and custom layouts.
 
-    A: deformed grid of ``warp`` (every 8 pixels, over ``fixed``; see the module notes on
-    sign and units). B: ``detJ`` with a seismic colormap, ``TwoSlopeNorm`` 0 / 1 / 2.5, voxels
-    <= 0 painted green; title gives the min and the percentage <= 0 *of this slice* (evaluated
-    via Liouville determinant when available). C: ``inv_err_map`` (inferno, range 0 .. max(3,
-    max error), over ``fixed``) with max / mean / 95th percentile *of this slice* from inverse
-    identity scores. D: ``plot_edge_overlay(fixed, warped)`` with the optional LNCC / MI values
-    in the title. With ``show_header`` a first row shows ``fixed`` and ``moving`` (or ``warped``
-    if ``moving`` is None).
+    Presets when ``panels is None``:
+    - ``n_panels=6`` (default, ``theme="light"``): 2x3 grid with top row
+      (``Fixed``, ``Fixed with Deformation Grid``, ``Jacobian (det(J))``) and bottom row
+      (``Moving``, ``Moving Deformed to Fixed (Warped)``, ``Edge Overlay``). Does not
+      require ``inv_err_map`` and does not materialize lazy ICE error maps.
+    - ``n_panels=8`` (``theme="light"``): 2x4 grid adding ``Checkerboard (Fixed / Warped)``
+      and ``Inverse Identity Error (ICE, mm)`` alongside the 6-panel views.
+    - ``n_panels=4`` (``theme="dark"``): 2x2 grid (3x2 when ``show_header=True``) matching
+      the 4-panel layout and requiring ``inv_err_map``.
 
-    If ``warped`` is a registration result dict (or ``registration_result`` is passed),
-    ``warpedmovout``, ``warp``, ``detJ`` (via ``syntx.liouville_determinant``), and
-    ``inv_err_map`` (via ``inverse_identity_errors``) are automatically populated.
-
-    If ``fixed`` is an ANTsImage, array inputs (``warped``, ``moving``, ``detJ``,
-    ``inv_err_map``, ``warp``) are in syntx tensor layout (z, y, x[, c]; components (z, y, x))
-    and must be on ``fixed``'s grid (ValueError otherwise); they get ``fixed``'s geometry; a
-    vector ``inv_err_map`` is reduced to its norm. Panel A's displacement comes from
-    ``_display_displacement`` (ANTs image / file or tensor-layout array; resampled onto ``fixed`` and
-    converted to display pixels). Inputs on ``fixed``'s grid share the default slice. A failing
-    displacement / ``inv_err_map`` slice leaves that panel blank with a warning (and a note in
-    panel A's title).
-
-    Parameters
-    ----------
-    fixed, warped : image
-        Fixed image and warped moving image.
-    warp : image, optional
-        Displacement field for panel A (blank, with a warning, if missing or unusable).
-    detJ : image, optional
-        Jacobian determinant map for panel B. Required in practice (slicing None fails).
-    inv_err_map : image
-        Inverse-consistency error map (mm). Required.
-    moving : image, optional
-        Shown only in the header row.
-    slice_axis : int, default 2
-        0 sagittal, 1 coronal, 2 axial.
-    slice_idx : int, optional
-    show_header : bool, default False
-    theme : str, default "dark"
-    reorient : bool, default True
-    lncc_val, mi_val : float, optional
-        Printed in panel D's title.
-    inv_err_max, inv_err_mean, inv_err_p95 : float, optional
-        Override the slice statistics printed in panel C (``inv_err_max`` also sets the
-        colour range).
-    min_detJ : float, optional
-        Override the min printed in panel B (the folding percentage is still per slice).
-    title_prefix : str, default "Registration Report"
-        First line of panel A's title.
-    filename, output_path : str, optional
-        Save the figure here at dpi 200 (``output_path`` wins).
-
-    Returns
-    -------
-    matplotlib.figure.Figure
-        Not closed.
-
-    Raises
-    ------
-    ValueError
-        If ``inv_err_map`` is None.
+    Axial slice selection defaults to the content-span striatal slice
+    (:data:`STRIATAL_AXIAL_CONTENT_FRACTION`). When ``moving`` shares ``fixed``'s physical
+    grid, it slices at the same index and physical LPS coordinate; when ``moving`` is on a
+    different physical grid (unregistered native scan), ``match_moving_lps=False`` (default)
+    slices ``moving`` at the matching fractional position inside ``moving``'s own foreground
+    content span without attaching ``fixed``'s LPS coordinate to ``Moving``'s title. Set
+    ``match_moving_lps=True`` to force physical LPS coordinate lookup across different grids.
     """
+    panel_grid, is_legacy_4panel = _normalize_panel_layout(n_panels, panels)
+    active_panels = {cell for row in panel_grid for cell in row if cell is not None}
+
+    if theme is None:
+        theme = "dark" if is_legacy_4panel else "light"
+    palette = _viz_theme_palette(theme)
+
     if output_path is not None:
         filename = output_path
 
+    if isinstance(fixed, str):
+        if fixed.endswith(".mat"):
+            raise ValueError(f"render_registration_qc: {fixed!r} is an affine transform file, not an image")
+        fixed = ants.image_read(fixed)
+
     reg = registration_result if registration_result is not None else (warped if isinstance(warped, dict) else None)
     if reg is not None:
-        if isinstance(warped, dict):
-            warped = reg.get('warpedmovout', fixed)
+        if warped is None or isinstance(warped, dict):
+            warped = reg.get("warpedmovout", fixed)
         if warp is None:
-            fwd_transforms = reg.get('fwdtransforms', [])
-            for t in fwd_transforms:
-                if isinstance(t, str) and (t.endswith('.nii.gz') or t.endswith('.nii') or 'Warp' in t):
-                    warp = t
-                    break
-                elif not isinstance(t, str):
-                    warp = t
-                    break
-            if warp is None and len(fwd_transforms) > 0:
-                warp = fwd_transforms[0]
-        if detJ is None:
-            try:
-                from ..liouville import liouville_determinant
-                det_res = liouville_determinant(reg, fixed, return_details=True)
-                if isinstance(det_res, tuple):
-                    detJ, d_info = det_res
-                    if jac_measure is None:
-                        jac_measure = d_info.get('measure', 'Liouville det')
-                else:
-                    detJ = det_res
-            except Exception:
-                pass
-        if inv_err_map is None:
-            ice_dict = (
-                reg.get('inverse_identity_errors') or
-                reg.get('inverse_identity_error') or
-                reg.get('inv_identity_error') or
-                reg.get('inv_err_dict')
+            warp = _resolve_warp_from_reg(reg)
+        if "jacobian" in active_panels:
+            detJ, jac_measure = _resolve_detj(reg, warp, fixed, detJ=detJ, jac_measure=jac_measure)
+        if "ice" in active_panels:
+            fixed_dim = _infer_spatial_dim(fixed)
+            inv_err_map, inv_err_max, inv_err_mean, inv_err_p95 = _extract_ice_info(
+                reg,
+                inv_err_map=inv_err_map,
+                inv_err_max=inv_err_max,
+                inv_err_mean=inv_err_mean,
+                inv_err_p95=inv_err_p95,
+                fixed_dim=fixed_dim,
             )
-            if isinstance(ice_dict, dict):
-                if 'phi_1' in ice_dict and isinstance(ice_dict['phi_1'], dict):
-                    ice_dict = ice_dict['phi_1']
-                inv_err_map = ice_dict.get('error_map')
-                if inv_err_max is None and 'max_error' in ice_dict:
-                    inv_err_max = float(ice_dict['max_error'])
-                if inv_err_mean is None and 'mean_error' in ice_dict:
-                    inv_err_mean = float(ice_dict['mean_error'])
-                if inv_err_p95 is None and 'p95_error' in ice_dict:
-                    inv_err_p95 = float(ice_dict['p95_error'])
-                elif inv_err_p95 is None and 'p95' in ice_dict:
-                    inv_err_p95 = float(ice_dict['p95'])
-            if inv_err_map is None and 'inverse_identity_error_map' in reg:
-                inv_err_map = reg['inverse_identity_error_map']
+    else:
+        if "jacobian" in active_panels and detJ is None and warp is not None:
+            detJ, jac_measure = _resolve_detj(None, warp, fixed, detJ=detJ, jac_measure=jac_measure)
+        if "ice" in active_panels and inv_err_map is not None:
+            fixed_dim = _infer_spatial_dim(fixed)
+            inv_err_map, inv_err_max, inv_err_mean, inv_err_p95 = _extract_ice_info(
+                None,
+                inv_err_map=inv_err_map,
+                inv_err_max=inv_err_max,
+                inv_err_mean=inv_err_mean,
+                inv_err_p95=inv_err_p95,
+                fixed_dim=fixed_dim,
+            )
 
-    if inv_err_map is None:
+    if is_legacy_4panel and inv_err_map is None:
         raise ValueError(
-            "render_standard_4panel requires a valid inv_err_map (ANTsImage or Tensor representing physical inverse identity error in mm). "
+            "render_registration_qc(..., n_panels=4) requires a valid inv_err_map (ANTsImage or Tensor representing physical inverse identity error in mm). "
             "Without it panel C (inverse consistency) would be meaningless; pass the error map or registration_result."
         )
 
-    # arrays / tensors (syntx tensor layout) get the fixed image's geometry;
-    # ANTsImages for warped/detJ/inv_err_map are resampled onto fixed's physical grid.
     if isinstance(fixed, ants.ANTsImage):
         def _on_fixed(x):
             if x is None:
                 return None
-            if isinstance(x, str) and not x.endswith('.mat'):
+            if isinstance(x, str) and not x.endswith(".mat"):
                 x = ants.image_read(x)
             if isinstance(x, ants.ANTsImage):
                 return _align_to_reference_grid(x, fixed, interp_type="linear")
-            if not hasattr(x, 'shape'):
+            if not hasattr(x, "shape"):
                 return x
             return AnatomicalVisualizer._array_to_image(x, fixed)
 
-        warped, detJ = _on_fixed(warped), _on_fixed(detJ)
-        if moving is not None and not isinstance(moving, ants.ANTsImage):
-            if isinstance(moving, str) and not moving.endswith('.mat'):
-                moving = ants.image_read(moving)
-            elif hasattr(moving, 'shape'):
-                arr_m = moving.detach().cpu().numpy() if hasattr(moving, 'detach') else np.asarray(moving)
-                arr_m_sq = np.squeeze(arr_m)
-                if tuple(arr_m_sq.shape) == tuple(reversed(fixed.shape)):
-                    moving = AnatomicalVisualizer._array_to_image(moving, fixed)
-                else:
-                    moving = AnatomicalVisualizer._array_to_image(moving, None)
-        if isinstance(inv_err_map, str) and not inv_err_map.endswith('.mat'):
-            inv_err_map = ants.image_read(inv_err_map)
-        if isinstance(inv_err_map, ants.ANTsImage):
-            if getattr(inv_err_map, 'components', 1) > 1:
-                inv_norm_arr = np.linalg.norm(inv_err_map.numpy(), axis=-1).astype(np.float32)
-                inv_err_map = ants.from_numpy(
-                    inv_norm_arr,
-                    origin=inv_err_map.origin,
-                    spacing=inv_err_map.spacing,
-                    direction=inv_err_map.direction,
-                )
-            inv_err_map = _align_to_reference_grid(inv_err_map, fixed, interp_type="linear")
-        elif hasattr(inv_err_map, 'shape'):
-            e = inv_err_map.detach().cpu().numpy() if hasattr(inv_err_map, 'detach') else np.asarray(inv_err_map)
-            e = np.squeeze(e)
-            if e.ndim == fixed.dimension + 1 and e.shape[-1] == fixed.dimension:
-                e = np.linalg.norm(e, axis=-1)
-            inv_err_map = _on_fixed(e)
-        if warp is not None and not isinstance(warp, ants.ANTsImage) and hasattr(warp, 'shape'):
+        warped = _on_fixed(warped)
+        if detJ is not None:
+            detJ = _on_fixed(detJ)
+        if moving is not None and isinstance(moving, str) and not moving.endswith(".mat"):
+            moving = ants.image_read(moving)
+        if "ice" in active_panels and inv_err_map is not None:
+            if isinstance(inv_err_map, str) and not inv_err_map.endswith(".mat"):
+                inv_err_map = ants.image_read(inv_err_map)
+            if isinstance(inv_err_map, ants.ANTsImage):
+                if getattr(inv_err_map, "components", 1) > 1:
+                    inv_norm_arr = np.linalg.norm(inv_err_map.numpy(), axis=-1).astype(np.float32)
+                    inv_err_map = ants.from_numpy(
+                        inv_norm_arr,
+                        origin=inv_err_map.origin,
+                        spacing=inv_err_map.spacing,
+                        direction=inv_err_map.direction,
+                    )
+                inv_err_map = _align_to_reference_grid(inv_err_map, fixed, interp_type="linear")
+            elif hasattr(inv_err_map, "shape"):
+                e = inv_err_map.detach().cpu().numpy() if hasattr(inv_err_map, "detach") else np.asarray(inv_err_map)
+                e = np.squeeze(e)
+                if e.ndim == fixed.dimension + 1:
+                    if e.shape[0] == fixed.dimension and e.shape[-1] != fixed.dimension:
+                        e = np.linalg.norm(e, axis=0)
+                    elif e.shape[-1] == fixed.dimension:
+                        e = np.linalg.norm(e, axis=-1)
+                inv_err_map = _on_fixed(e)
+        if warp is not None and not isinstance(warp, ants.ANTsImage) and hasattr(warp, "shape"):
             warp = _as_displacement_image(warp, fixed)
 
-    fi_slice = AnatomicalVisualizer.extract_slice(
-        fixed, plane=slice_axis, slice_idx=slice_idx, reorient=reorient, ref_image=fixed
+    fixed_ref = fixed if isinstance(fixed, ants.ANTsImage) else None
+    lps_res = resolve_lps_slice_pair(
+        fixed,
+        moving=moving,
+        plane=slice_axis,
+        slice_idx=slice_idx,
+        reorient=reorient,
+        ref_image=None,
+        match_physical_lps=match_moving_lps,
     )
-    resolved_slice_idx = fi_slice.slice_idx
+    resolved_slice_idx = lps_res.fixed_slice_idx
+
+    fi_slice = AnatomicalVisualizer.extract_slice(
+        fixed, plane=slice_axis, slice_idx=resolved_slice_idx, reorient=reorient, ref_image=fixed_ref
+    )
     fi_arr, aspect_ratio = fi_slice.data, fi_slice.aspect_ratio
     warped_arr, _ = extract_oriented_slice(
-        warped, slice_axis=slice_axis, slice_idx=resolved_slice_idx, reorient=reorient, ref_image=fixed
+        warped, slice_axis=slice_axis, slice_idx=resolved_slice_idx, reorient=reorient, ref_image=fixed_ref
     )
-    detJ_arr, _ = extract_oriented_slice(
-        detJ, slice_axis=slice_axis, slice_idx=resolved_slice_idx, reorient=reorient, ref_image=fixed
-    )
+
+    detJ_arr = None
+    if "jacobian" in active_panels and detJ is not None:
+        detJ_arr, _ = extract_oriented_slice(
+            detJ, slice_axis=slice_axis, slice_idx=resolved_slice_idx, reorient=reorient, ref_image=fixed_ref
+        )
 
     import warnings
-    panel_a_note = ""
-    try:
-        # in-plane displacement in display pixels (mm converted with the slice geometry)
-        dcol, drow, _, _, _ = _display_displacement(warp, fixed, slice_axis, resolved_slice_idx, reorient)
-    except Exception as e:
-        warnings.warn(f"render_standard_4panel: no displacement for panel A ({e})")
-        dcol = drow = np.zeros_like(fi_arr, dtype=float)
-        panel_a_note = " (displacement unavailable)"
 
+    panel_a_note = ""
+    dcol = drow = None
+    has_grid_disp = False
+    if "deformation_grid" in active_panels:
+        if warp is None and not is_legacy_4panel:
+            panel_a_note = " (displacement unavailable)"
+        else:
+            try:
+                dcol, drow, _, _, _ = _display_displacement(warp, fixed, slice_axis, resolved_slice_idx, reorient)
+                has_grid_disp = True
+            except Exception as e:
+                warnings.warn(f"render_registration_qc: no displacement for deformation grid ({e})")
+                if is_legacy_4panel:
+                    dcol = drow = np.zeros_like(fi_arr, dtype=float)
+                    has_grid_disp = True
+                panel_a_note = " (displacement unavailable)"
+
+    mov_arr = None
+    mov_aspect = aspect_ratio
+    mov_slice_idx = lps_res.moving_slice_idx
     if moving is not None:
-        mov_slice_idx = (
-            slice_idx
-            if (
-                not isinstance(moving, ants.ANTsImage)
-                or not isinstance(fixed, ants.ANTsImage)
-                or _same_physical_grid(fixed, moving)
-            )
-            else None
-        )
         mov_arr, mov_aspect = extract_oriented_slice(
-            moving, slice_axis=slice_axis, slice_idx=mov_slice_idx, reorient=reorient
+            moving, slice_axis=slice_axis, slice_idx=mov_slice_idx, reorient=reorient, ref_image=None
         )
-    else:
+    elif is_legacy_4panel:
         mov_arr, mov_aspect = warped_arr, aspect_ratio
 
-    try:
-        inv_err_arr, _ = extract_oriented_slice(
-            inv_err_map, slice_axis=slice_axis, slice_idx=resolved_slice_idx, reorient=reorient, ref_image=fixed
-        )
-        if inv_err_arr.ndim == 3:
-            inv_err_arr = np.linalg.norm(inv_err_arr, axis=-1)
-        inv_err_arr = np.asarray(inv_err_arr, dtype=np.float32)
-    except Exception as e:
-        warnings.warn(f"render_standard_4panel: inverse-error slice failed ({e}); panel C blank")
+    inv_err_arr = None
+    if "ice" in active_panels and inv_err_map is not None:
+        try:
+            inv_err_arr, _ = extract_oriented_slice(
+                inv_err_map, slice_axis=slice_axis, slice_idx=resolved_slice_idx, reorient=reorient, ref_image=fixed_ref
+            )
+            if inv_err_arr.ndim == 3:
+                inv_err_arr = np.linalg.norm(inv_err_arr, axis=-1)
+            inv_err_arr = np.asarray(inv_err_arr, dtype=np.float32)
+            if inv_err_arr.size == 0:
+                inv_err_arr = None
+        except Exception as e:
+            warnings.warn(f"render_registration_qc: inverse-error slice failed ({e})")
+            inv_err_arr = np.zeros_like(fi_arr, dtype=np.float32) if is_legacy_4panel else None
+
+    if is_legacy_4panel and (not isinstance(inv_err_arr, np.ndarray) or inv_err_arr.size == 0):
         inv_err_arr = np.zeros_like(fi_arr, dtype=np.float32)
 
-    if not isinstance(inv_err_arr, np.ndarray) or inv_err_arr.size == 0:
-        inv_err_arr = np.zeros_like(fi_arr, dtype=np.float32)
+    bg_color = palette["bg"]
+    plane_label = {0: "X", 1: "Y", 2: "Z"}.get(int(slice_axis), "Z")
+    lps_note = f", LPS {lps_res.lps_coord_mm:+.1f}mm" if lps_res.lps_coord_mm is not None else ""
 
-    is_dark = (theme.lower() == "dark")
-    bg_color = "#0d1117" if is_dark else "#ffffff"
-    text_color = "#f8fafc" if is_dark else "#0f172a"
-    sub_color = "#94a3b8" if is_dark else "#475569"
-    cbar_tick_color = "#c9d1d9" if is_dark else "#334155"
-
-    if show_header:
+    if is_legacy_4panel and show_header:
         fig = plt.figure(figsize=(15, 16) if moving is not None else (14, 16), facecolor=bg_color)
         gs = fig.add_gridspec(3, 6)
         if moving is not None:
@@ -1330,107 +1868,191 @@ def render_standard_4panel(
             ax_hdr_warped = fig.add_subplot(gs[0, 4:6])
             header_axes = [ax_hdr_fixed, ax_hdr_moving, ax_hdr_warped]
 
-            ax_hdr_fixed.imshow(fi_arr, cmap='gray', aspect=aspect_ratio)
-            ax_hdr_fixed.set_title('Fixed Target Image', color='#38bdf8', fontsize=11, fontweight='bold')
+            ax_hdr_fixed.imshow(fi_arr, cmap="gray", aspect=aspect_ratio)
+            ax_hdr_fixed.set_title("Fixed Target Image", color="#38bdf8", fontsize=11, fontweight="bold")
 
-            ax_hdr_moving.imshow(mov_arr, cmap='gray', aspect=mov_aspect)
-            ax_hdr_moving.set_title('Moving Image (Before)', color='#fb923c', fontsize=11, fontweight='bold')
+            ax_hdr_moving.imshow(mov_arr, cmap="gray", aspect=mov_aspect)
+            ax_hdr_moving.set_title("Moving Image (Before)", color="#fb923c", fontsize=11, fontweight="bold")
 
-            ax_hdr_warped.imshow(warped_arr, cmap='gray', aspect=aspect_ratio)
-            ax_hdr_warped.set_title('Warped Moving Image (After)', color='#3fb950', fontsize=11, fontweight='bold')
+            ax_hdr_warped.imshow(warped_arr, cmap="gray", aspect=aspect_ratio)
+            ax_hdr_warped.set_title("Warped Moving Image (After)", color="#3fb950", fontsize=11, fontweight="bold")
         else:
             ax_hdr_fixed = fig.add_subplot(gs[0, 0:3])
             ax_hdr_warped = fig.add_subplot(gs[0, 3:6])
             header_axes = [ax_hdr_fixed, ax_hdr_warped]
 
-            ax_hdr_fixed.imshow(fi_arr, cmap='gray', aspect=aspect_ratio)
-            ax_hdr_fixed.set_title('Fixed Target Image', color='#38bdf8', fontsize=11, fontweight='bold')
+            ax_hdr_fixed.imshow(fi_arr, cmap="gray", aspect=aspect_ratio)
+            ax_hdr_fixed.set_title("Fixed Target Image", color="#38bdf8", fontsize=11, fontweight="bold")
 
-            ax_hdr_warped.imshow(warped_arr, cmap='gray', aspect=aspect_ratio)
-            ax_hdr_warped.set_title('Warped Moving Image (Aligned to Fixed)', color='#3fb950', fontsize=11, fontweight='bold')
+            ax_hdr_warped.imshow(warped_arr, cmap="gray", aspect=aspect_ratio)
+            ax_hdr_warped.set_title("Warped Moving Image (Aligned to Fixed)", color="#3fb950", fontsize=11, fontweight="bold")
 
-        ax_panel_a = fig.add_subplot(gs[1, 0:3])
-        ax_panel_b = fig.add_subplot(gs[1, 3:6])
-        ax_panel_c = fig.add_subplot(gs[2, 0:3])
-        ax_panel_d = fig.add_subplot(gs[2, 3:6])
-        for ax in [*header_axes, ax_panel_a, ax_panel_b, ax_panel_c, ax_panel_d]:
+        ax_grid_rows = [
+            [fig.add_subplot(gs[1, 0:3]), fig.add_subplot(gs[1, 3:6])],
+            [fig.add_subplot(gs[2, 0:3]), fig.add_subplot(gs[2, 3:6])],
+        ]
+        for ax in [*header_axes, *ax_grid_rows[0], *ax_grid_rows[1]]:
             ax.set_facecolor(bg_color)
-            ax.axis('off')
+            ax.axis("off")
     else:
-        fig, axes = plt.subplots(2, 2, figsize=(14, 12), facecolor=bg_color)
-        for ax_row in axes:
-            for ax in ax_row:
-                ax.set_facecolor(bg_color)
-                ax.axis('off')
+        n_rows = len(panel_grid)
+        n_cols = len(panel_grid[0])
+        if is_legacy_4panel:
+            figsize = (14, 12)
+        elif n_rows == 2 and n_cols == 3:
+            figsize = (16.5, 10.5)
+        elif n_rows == 2 and n_cols == 4:
+            figsize = (21.5, 10.5)
+        else:
+            figsize = (5.4 * n_cols + 0.5, 5.1 * n_rows + 0.6)
 
-        ax_panel_a = axes[0, 0]
-        ax_panel_b = axes[0, 1]
-        ax_panel_c = axes[1, 0]
-        ax_panel_d = axes[1, 1]
+        fig, axes = plt.subplots(n_rows, n_cols, figsize=figsize, facecolor=bg_color)
+        axes_2d = np.atleast_2d(axes)
+        if axes_2d.shape != (n_rows, n_cols):
+            axes_2d = axes_2d.reshape(n_rows, n_cols)
+        ax_grid_rows = [[axes_2d[r, c] for c in range(n_cols)] for r in range(n_rows)]
+        for r in range(n_rows):
+            for c in range(n_cols):
+                ax_grid_rows[r][c].set_facecolor(bg_color)
+                ax_grid_rows[r][c].axis("off")
 
-    # Panel A: Standard Deformed Mesh Grid
-    H, W = fi_arr.shape
-    grid_spacing = 8
-    grid_y, grid_x = np.mgrid[0:H:grid_spacing, 0:W:grid_spacing]
-    disp_y = drow[::grid_spacing, ::grid_spacing][:grid_y.shape[0], :grid_x.shape[1]]
-    disp_x = dcol[::grid_spacing, ::grid_spacing][:grid_y.shape[0], :grid_x.shape[1]]
-    def_x = grid_x + disp_x
-    def_y = grid_y + disp_y
-
-    ax_panel_a.imshow(fi_arr, cmap='gray', alpha=0.5, aspect=aspect_ratio)
-    for i in range(def_y.shape[0]):
-        ax_panel_a.plot(def_x[i, :], def_y[i, :], color='#38bdf8', linewidth=1.1)
-    for j in range(def_x.shape[1]):
-        ax_panel_a.plot(def_x[:, j], def_y[:, j], color='#38bdf8', linewidth=1.1)
-    ax_panel_a.set_title(f'{title_prefix}\nPanel A: Standard Deformed Mesh Grid{panel_a_note}', color='#38bdf8', fontsize=11, fontweight='bold')
-
-    # Panel B: Standard Divergent Jacobian Determinant Map (seismic centered at 1.0)
-    norm_jac = mcolors.TwoSlopeNorm(vmin=0.0, vcenter=1.0, vmax=2.5)
-    im_jac = ax_panel_b.imshow(detJ_arr, cmap='seismic', norm=norm_jac, aspect=aspect_ratio)
-    
-    # Overlay folding voxels (detJ <= 0) explicitly in high-visibility bright green
-    folding_mask = (detJ_arr <= 0.0)
-    if np.any(folding_mask):
-        fold_overlay = np.zeros((*detJ_arr.shape, 4), dtype=np.float32)
-        fold_overlay[folding_mask] = [0.0, 1.0, 0.0, 1.0]  # Bright solid green
-        ax_panel_b.imshow(fold_overlay, aspect=aspect_ratio)
-
-    folding_pct = float(np.mean(detJ_arr <= 0.0) * 100.0)
-    min_j_val = min_detJ if min_detJ is not None else float(np.min(detJ_arr))
-    status_str = "0.00% Folding" if folding_pct == 0.0 else f"{folding_pct:.4f}% Folding"
-    title_color = "#3fb950" if folding_pct == 0.0 else "#f85149"
-    fold_note = " [Green = Folding det(J) ≤ 0]" if np.any(folding_mask) else ""
-    jac_title = f"Panel B: det(J) [{jac_measure}]" if jac_measure else "Panel B: Standard Jacobian det(J)"
-    ax_panel_b.set_title(f'{jac_title}\nmin det(J) = {min_j_val:+.6f} ({status_str}){fold_note}', color=title_color, fontsize=11, fontweight='bold')
-    cbar_j = fig.colorbar(im_jac, ax=ax_panel_b, fraction=0.046, pad=0.04)
-    cbar_j.set_label('det(J)', color=cbar_tick_color, fontsize=10)
-    cbar_j.ax.tick_params(colors=cbar_tick_color)
-
-    # Panel C: Standardized Inverse Identity Error Map (mm)
-    max_err_val = inv_err_max if inv_err_max is not None else float(np.max(inv_err_arr))
-    mean_err_val = inv_err_mean if inv_err_mean is not None else float(np.mean(inv_err_arr))
-    p95_err_val = inv_err_p95 if inv_err_p95 is not None else float(np.percentile(inv_err_arr, 95))
-
-    ax_panel_c.imshow(fi_arr, cmap='gray', alpha=0.3, aspect=aspect_ratio)
-    vmax_err = max(3.0, float(max_err_val)) if np.isfinite(max_err_val) else 3.0
-    im_err = ax_panel_c.imshow(inv_err_arr, cmap='inferno', alpha=0.85, vmin=0.0, vmax=vmax_err, aspect=aspect_ratio)
-    ax_panel_c.set_title(f'Panel C: Inverse Identity Error (mm)\nMax: {max_err_val:.4f}mm | Mean: {mean_err_val:.4f}mm | p95: {p95_err_val:.4f}mm', color='#d29922', fontsize=11, fontweight='bold')
-
-    cbar_e = fig.colorbar(im_err, ax=ax_panel_c, fraction=0.046, pad=0.04)
-    cbar_e.set_label('Inverse Error (mm)', color=cbar_tick_color, fontsize=10)
-    cbar_e.ax.tick_params(colors=cbar_tick_color)
-
-    # Panel D: Standardized High-Contrast Canny Edge Overlap
-    plot_edge_overlay(fixed, warped, slice_axis=slice_axis, slice_idx=resolved_slice_idx, edge_color='#f85149', fixed_edge_color=None, theme=theme, reorient=reorient, ax=ax_panel_d, title="")
     lncc_str = f"Target LNCC: {lncc_val:.4f}" if lncc_val is not None else ""
     mi_str = f"Mattes MI: {mi_val:.4f}" if mi_val is not None else ""
     metrics_sub = " | ".join(filter(None, [lncc_str, mi_str]))
-    ax_panel_d.set_title(f'Panel D: Edge Alignment Overlap (Canny Red Contours)\n{metrics_sub}', color='#bc8cff', fontsize=11, fontweight='bold')
 
-    plt.tight_layout()
+    for r_idx, row in enumerate(panel_grid):
+        for c_idx, key in enumerate(row):
+            ax = ax_grid_rows[r_idx][c_idx]
+            if key is None:
+                ax.set_visible(False)
+                continue
+            if key == "fixed":
+                _draw_anatomy_panel(
+                    ax,
+                    fi_arr,
+                    aspect_ratio,
+                    f"Fixed ({plane_label}={resolved_slice_idx}{lps_note})",
+                    palette["fixed"],
+                    palette,
+                )
+            elif key == "moving":
+                if moving is None:
+                    _draw_anatomy_panel(
+                        ax,
+                        None,
+                        aspect_ratio,
+                        "Moving (Unavailable)",
+                        palette["moving"],
+                        palette,
+                        unavailable_msg="Moving Image\nUnavailable (N/A)",
+                    )
+                else:
+                    mov_note = f"{plane_label}={mov_slice_idx}{lps_note if lps_res.moving_mapped_from_lps else ''}"
+                    _draw_anatomy_panel(
+                        ax,
+                        mov_arr,
+                        mov_aspect,
+                        f"Moving ({mov_note})",
+                        palette["moving"],
+                        palette,
+                    )
+            elif key == "warped":
+                _draw_anatomy_panel(
+                    ax,
+                    warped_arr,
+                    aspect_ratio,
+                    f"Moving Deformed to Fixed (Warped)\n({plane_label}={resolved_slice_idx}{lps_note})",
+                    palette["warped"],
+                    palette,
+                )
+            elif key == "deformation_grid":
+                if is_legacy_4panel:
+                    grid_title = f"{title_prefix}\nPanel A: Standard Deformed Mesh Grid{panel_a_note}"
+                else:
+                    grid_title = f"Fixed with Deformation Grid{panel_a_note}"
+                _draw_deformation_grid_panel(
+                    ax,
+                    fi_arr,
+                    dcol,
+                    drow,
+                    aspect_ratio,
+                    grid_title,
+                    palette["grid_line"],
+                    palette,
+                    grid_spacing=grid_spacing,
+                    draw_grid=has_grid_disp,
+                )
+            elif key == "jacobian":
+                _draw_jacobian_panel(
+                    fig,
+                    ax,
+                    detJ_arr,
+                    fi_arr,
+                    aspect_ratio,
+                    jac_measure,
+                    min_detJ,
+                    palette,
+                    is_legacy_4panel=is_legacy_4panel,
+                )
+            elif key == "edge_overlay":
+                if is_legacy_4panel:
+                    edge_title = f"Panel D: Edge Alignment Overlap (Canny Red Contours)\n{metrics_sub}"
+                else:
+                    edge_title = f"Edge Overlay\n{metrics_sub}" if metrics_sub else "Edge Overlay"
+                _draw_edge_overlay_panel(
+                    ax,
+                    fixed,
+                    warped,
+                    slice_axis,
+                    resolved_slice_idx,
+                    reorient,
+                    theme,
+                    edge_title,
+                    palette["edge_title"],
+                    palette,
+                )
+            elif key == "checkerboard":
+                _draw_checkerboard_panel(
+                    ax,
+                    fi_arr,
+                    warped_arr,
+                    aspect_ratio,
+                    f"Checkerboard (Fixed / Warped)\n(tile={checkerboard_pattern_size}px)",
+                    palette["checker"],
+                    palette,
+                    pattern_size=checkerboard_pattern_size,
+                )
+            elif key == "ice":
+                _draw_ice_panel(
+                    fig,
+                    ax,
+                    inv_err_arr,
+                    fi_arr,
+                    aspect_ratio,
+                    inv_err_max,
+                    inv_err_mean,
+                    inv_err_p95,
+                    palette,
+                    is_legacy_4panel=is_legacy_4panel,
+                )
+
+    if not is_legacy_4panel and title_prefix:
+        fig.suptitle(
+            f"{title_prefix} — {plane_label}={resolved_slice_idx}{lps_note}",
+            color=palette["title"],
+            fontsize=14,
+            fontweight="bold",
+            y=0.98,
+        )
+        fig.tight_layout(rect=[0.01, 0.01, 0.99, 0.93])
+    else:
+        fig.tight_layout()
 
     if filename:
-        fig.savefig(filename, dpi=200, bbox_inches='tight', facecolor=bg_color)
+        os.makedirs(os.path.dirname(os.path.abspath(filename)) or ".", exist_ok=True)
+        fig.savefig(filename, dpi=dpi, bbox_inches="tight", facecolor=bg_color)
+    if show_figure:
+        plt.show()
 
     return fig
 

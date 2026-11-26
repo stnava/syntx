@@ -23,7 +23,8 @@ def temp_viz_dir():
 
 def test_viz_subpackage_exports():
     assert hasattr(viz, "render_input_pair_figure")
-    assert hasattr(viz, "render_standard_4panel")
+    assert hasattr(viz, "render_registration_qc")
+    assert not hasattr(viz, "render_standard_" + "4panel")
     assert hasattr(viz, "render_label_alignment_figure")
     assert hasattr(viz, "plot_label_overlap_stats")
     assert hasattr(viz, "plot_jacobian_distribution")
@@ -171,7 +172,7 @@ def test_anatomical_orientation_in_all_plots(temp_viz_dir):
     # 2. Figure 2 Standard 4-Panel
     detJ = ants.from_numpy(np.ones((20, 30, 40), dtype=np.float32))
     inv_err = ants.from_numpy(np.zeros((20, 30, 40), dtype=np.float32))
-    fig2 = viz.render_standard_4panel(img, img, warp, detJ, inv_err, output_path=os.path.join(temp_viz_dir, "fig2_orient.png"))
+    fig2 = viz.render_registration_qc(img, img, warp, detJ, inv_err, n_panels=4, output_path=os.path.join(temp_viz_dir, "fig2_orient.png"))
     assert fig2 is not None
 
     # 3. Label Alignment

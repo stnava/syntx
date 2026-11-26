@@ -492,29 +492,16 @@ class SyNTo(nn.Module):
         self.dim = dim
         self.grid_shape = grid_shape
 
-        # Per-axis deformation restriction weights, matching ants.registration's
-        # `restrict_transformation`: a length-`dim` sequence of weights in [0, 1], in
-        # physical XYZ order (same order as `spacing`/`origin`/`direction`). A weight of
-        # 1.0 leaves that physical axis free; 0.0 fully suppresses deformation along it.
-        # None (default) means no restriction -- behaviour is unchanged from before this
-        # option existed. Validated eagerly so a malformed value fails at construction,
-        # not silently inside the optimization loop.
-        if restrict_transformation is not None:
-            rt = list(restrict_transformation)
-            if len(rt) != dim:
-                raise ValueError(
-                    f"restrict_transformation must have length {dim} (one weight per physical "
-                    f"axis, XYZ order), got length {len(rt)}: {restrict_transformation!r}"
-                )
-            rt = [float(w) for w in rt]
-            if any(w < 0.0 or w > 1.0 for w in rt):
-                raise ValueError(
-                    f"restrict_transformation weights must be in [0, 1], got {rt!r}"
-                )
-            self.restrict_transformation = tuple(rt)
-        else:
-            self.restrict_transformation = None
-        self._restrict_mask_cache = None  # (device, dtype) -> broadcastable mask tensor
+        # Deformation restriction in physical ITK LPS (X, Y[, Z]) coordinates:
+        # accepts either per-axis weights in [0, 1] (e.g. (0, 1, 0) or (1, 0, 1)), a unit
+        # physical direction vector v_PE (||v_PE||_2 == 1, signed or unsigned, projecting
+        # updates via u <- (u . v_PE) v_PE at any slice obliquity 0--90 deg), or a PhaseEncode.
+        from .phase_encode import parse_restrict_transformation
+        self._parsed_restriction = parse_restrict_transformation(restrict_transformation, dim=dim)
+        self.restrict_transformation = (
+            self._parsed_restriction.values_xyz if self._parsed_restriction is not None else None
+        )
+        self._restrict_mask_cache = None  # (device, dtype) -> broadcastable operator tensor
         self.seed = int(seed) if seed is not None else None
         self._rng = None
         self.spacing = spacing
@@ -590,24 +577,37 @@ class SyNTo(nn.Module):
         return grid_inv
 
     def _get_restrict_mask(self, device, dtype):
-        """Broadcastable (1,1,...,1,dim) mask of per-axis restriction weights, or None.
+        """Broadcastable ``(1, ..., 1, dim)`` restriction operator in reversed ``(dz, dy, dx)`` order, or None.
 
-        Applied to the fully-regularized update field immediately before it is used to
-        step the displacement field, so it takes effect regardless of which similarity
-        metric, regularizer (sobolev/dsti/bspline/gaussian), or optimizer branch produced
-        that update -- see the three call sites in `fit()`.
+        When ``self._parsed_restriction.mode == 'axis_weights'``, holds per-axis weights in ``[0, 1]``;
+        when ``mode == 'unit_vector'``, holds the unit physical vector ``v_PE`` for rank-1 orthogonal
+        projection ``u <- (u . v_PE) v_PE`` via :meth:`_apply_restriction`.
         """
-        if self.restrict_transformation is None:
+        if self._parsed_restriction is None:
             return None
         cached = self._restrict_mask_cache
         if cached is not None and cached[0] == device and cached[1] == dtype:
             return cached[2]
         shape = [1] * (self.dim + 1) + [self.dim]
-        # restrict_transformation is documented and passed in physical (X, Y, Z) order.
-        # Tensor displacement components are stored in reverse (dz, dy, dx) order.
-        mask = torch.tensor(self.restrict_transformation[::-1], device=device, dtype=dtype).view(*shape)
-        self._restrict_mask_cache = (device, dtype, mask)
-        return mask
+        op = torch.tensor(self._parsed_restriction.operator_xyz[::-1], device=device, dtype=dtype).view(*shape)
+        self._restrict_mask_cache = (device, dtype, op)
+        return op
+
+    def _apply_restriction(self, field_zyx, *, inplace=False):
+        """Apply physical-space restriction (rank-1 directional projection or diagonal axis mask) to ``field_zyx``."""
+        if self._parsed_restriction is None or field_zyx is None:
+            return field_zyx
+        op = self._get_restrict_mask(field_zyx.device, field_zyx.dtype)
+        if self._parsed_restriction.mode == "axis_weights":
+            if inplace:
+                field_zyx = field_zyx if field_zyx.is_contiguous() else field_zyx.contiguous()
+                return field_zyx.mul_(op)
+            return field_zyx * op
+        proj = torch.sum(field_zyx * op, dim=-1, keepdim=True) * op
+        if inplace:
+            field_zyx.copy_(proj)
+            return field_zyx
+        return proj
 
     def _apply_sobolev_green_operator(self, m, fluid_sigma=3.0, alpha=None, spacing=None):
         """Sobolev smoothing of field ``m`` (see ``core.smoothing.apply_sobolev_green_operator``)."""
@@ -2280,12 +2280,9 @@ class SyNTo(nn.Module):
                         grad_l = _deformed_smooth(grad_l, warp_l2r, warp_l2r_inv)
                         grad_r = _deformed_smooth(grad_r, warp_r2l, warp_r2l_inv)
 
-                    restrict_mask = self._get_restrict_mask(grad_l.device, grad_l.dtype)
-                    if restrict_mask is not None:
-                        grad_l = grad_l if grad_l.is_contiguous() else grad_l.contiguous()
-                        grad_r = grad_r if grad_r.is_contiguous() else grad_r.contiguous()
-                        grad_l.mul_(restrict_mask)
-                        grad_r.mul_(restrict_mask)
+                    if self._parsed_restriction is not None:
+                        grad_l = self._apply_restriction(grad_l, inplace=True)
+                        grad_r = self._apply_restriction(grad_r, inplace=True)
 
                     from .core.inverse import _scaled_sq_sum
                     sp_flat = curr_spacing_fixed_xyz.reshape(-1)
@@ -2421,6 +2418,9 @@ class SyNTo(nn.Module):
                         del grad_l
                         update_r, self._rprop_step_r, self._rprop_prev_grad_r = rprop_update(grad_r, self._rprop_prev_grad_r, self._rprop_step_r)
                         del grad_r
+                        if self._parsed_restriction is not None:
+                            update_l = self._apply_restriction(update_l, inplace=True)
+                            update_r = self._apply_restriction(update_r, inplace=True)
                         
                         warp_l2r.add_(update_l)
                         warp_r2l.add_(update_r)
@@ -2525,10 +2525,9 @@ class SyNTo(nn.Module):
                             u_reg_r = u_raw_r
                             del u_raw_l, u_raw_r
 
-                        restrict_mask = self._get_restrict_mask(u_reg_l.device, u_reg_l.dtype)
-                        if restrict_mask is not None:
-                            u_reg_l = u_reg_l * restrict_mask
-                            u_reg_r = u_reg_r * restrict_mask
+                        if self._parsed_restriction is not None:
+                            u_reg_l = self._apply_restriction(u_reg_l)
+                            u_reg_r = self._apply_restriction(u_reg_r)
 
                         # Adaptive CFL step scaling (100% on-device asynchronous execution)
                         effective_cfl = float(level_cfl_voxels)
@@ -2898,6 +2897,12 @@ class SyNTo(nn.Module):
                     stationary_boundary=self.stationary_boundary,
                 )
 
+            if self._parsed_restriction is not None:
+                w_l2r = self._apply_restriction(w_l2r, inplace=True)
+                w_r2l = self._apply_restriction(w_r2l, inplace=True)
+                w_l2r_inv = self._apply_restriction(w_l2r_inv, inplace=True)
+                w_r2l_inv = self._apply_restriction(w_r2l_inv, inplace=True)
+
             if not _dd_on:
                 # Preserve inverse of fixed-side half-warp for syntx.liouville_determinant;
                 # offload midpoint fields to CPU above 256^3 voxels so they do not occupy GPU memory.
@@ -3026,6 +3031,11 @@ class SyNTo(nn.Module):
                         steps=_dd_steps,
                         stationary_boundary=self.stationary_boundary,
                     )
+                if self._parsed_restriction is not None:
+                    w_l2r = self._apply_restriction(w_l2r, inplace=True)
+                    w_r2l = self._apply_restriction(w_r2l, inplace=True)
+                    w_l2r_inv = self._apply_restriction(w_l2r_inv, inplace=True)
+                    w_r2l_inv = self._apply_restriction(w_r2l_inv, inplace=True)
 
                 comp_spacing_rev, comp_origin_rev, comp_direction_rev = reverse_metadata(
                     fixed_spacing, fixed_origin, fixed_direction
@@ -3154,6 +3164,15 @@ class SyNTo(nn.Module):
                 del mid_l2r
 
             del X_phys
+            if self._parsed_restriction is not None:
+                fwd_composed = self._apply_restriction(fwd_composed, inplace=True)
+                algebraic_inv = self._apply_restriction(algebraic_inv, inplace=True)
+                if hasattr(self, 'midpoint_warp_l2r') and self.midpoint_warp_l2r is not None:
+                    self._apply_restriction(self.midpoint_warp_l2r.data, inplace=True)
+                if hasattr(self, 'midpoint_warp_r2l') and self.midpoint_warp_r2l is not None:
+                    self._apply_restriction(self.midpoint_warp_r2l.data, inplace=True)
+                if hasattr(self, 'midpoint_warp_l2r_inv') and self.midpoint_warp_l2r_inv is not None:
+                    self._apply_restriction(self.midpoint_warp_l2r_inv.data, inplace=True)
 
             self.warp_l2r = nn.Parameter(fwd_composed)
             self.warp_l2r.is_physical = True
@@ -5451,7 +5470,7 @@ from .viz import (
     extract_2d_slice,
     plot_deformation_grid,
     plot_edge_overlay,
-    render_standard_4panel,
+    render_registration_qc,
     render_input_pair_figure
 )
 

@@ -251,10 +251,11 @@ class TestBugH6BaselinesAndQC:
     def test_light_theme_visualizer_call(self, hippocampus_syn_run):
         im0, _, reg_syn = hippocampus_syn_run
         with tempfile.NamedTemporaryFile(suffix=".png") as tmp_png:
-            from syntx.viz import render_standard_4panel
-            render_standard_4panel(
+            from syntx.viz import render_registration_qc
+            render_registration_qc(
                 fixed=im0,
                 warped=reg_syn,
+                n_panels=4,
                 theme="light",
                 filename=tmp_png.name
             )

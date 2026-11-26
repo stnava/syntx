@@ -541,12 +541,18 @@ def _resolve_restrict_transformation(value: Any, image: Any) -> tuple[float, ...
     ``syntx.phase_encode`` vocabulary, or ``'unrestricted'``. ``None`` is refused: there is no
     default axis and no implicit opt-out.
     """
-    from .phase_encode import PE_UNRESTRICTED, PhaseEncode, restrict_for_image, restrict_transformation as _rt, _spatial_dim
+    from .phase_encode import (
+        PE_UNRESTRICTED,
+        PhaseEncode,
+        _spatial_dim,
+        parse_restrict_transformation,
+        restrict_for_image,
+    )
 
     if value is None:
         raise TypeError(
-            "restrict_transformation=None is not accepted: pass a PhaseEncode, weights, a sidecar path, a "
-            "label, or the explicit 'unrestricted' opt-out"
+            "restrict_transformation=None is not accepted: pass a PhaseEncode, weights, a unit physical vector, "
+            "a sidecar path, a label, or the explicit 'unrestricted' opt-out"
         )
     if isinstance(value, str):
         if value == PE_UNRESTRICTED:
@@ -556,11 +562,9 @@ def _resolve_restrict_transformation(value: Any, image: Any) -> tuple[float, ...
         return restrict_for_image(image, label=value)
     if isinstance(value, (PhaseEncode, dict)):
         return restrict_for_image(image, pe=value)
-    weights = tuple(float(w) for w in value)
     n = _spatial_dim(image)
-    if len(weights) != n or any(w < 0.0 or w > 1.0 for w in weights):
-        raise ValueError(f"restrict_transformation weights must have length {n} and lie in [0, 1], got {weights!r}")
-    return weights
+    parsed = parse_restrict_transformation(value, dim=n)
+    return None if parsed is None else parsed.values_xyz
 
 
 # ==============================================================================

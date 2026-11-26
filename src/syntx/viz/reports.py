@@ -23,7 +23,7 @@ import torch
 import torch.nn.functional as F
 import ants
 
-from .figures import extract_2d_slice, render_standard_4panel, render_input_pair_figure
+from .figures import extract_2d_slice, render_registration_qc, render_input_pair_figure
 
 
 def _parse_image_metadata(img, name="Image"):
@@ -302,7 +302,7 @@ def create_registration_report(
     6. Inverse error stats (max / mean / p95, and "interior" ones inside
        ``ants.get_mask(fixed)`` eroded by 5 voxels); n/a when no ``inv_err_map`` is available.
     7. Figures in ``assets_dir`` (names carry a Unix timestamp): input pair, 4-panel
-       (``render_standard_4panel``), flow dynamics on target anatomy
+       (``render_registration_qc``), flow dynamics on target anatomy
        (``render_flow_on_anatomy_report_figure``), segmentation overlap
        (``render_segmentation_overlap_report_figure``), TVF keyframes (if ``reg['model']`` is a
        TVFModel), loss curve (``model.losses`` / ``model.syn_losses``, or ``reg['loss_history']``
@@ -361,7 +361,7 @@ def create_registration_report(
         render_input_pair_figure,
         render_warped_comparison_figure,
         render_checkerboard_figure,
-        render_standard_4panel,
+        render_registration_qc,
         plot_time_varying_velocity_grid,
     )
     from .stats import plot_label_overlap_stats, plot_loss_convergence
@@ -765,7 +765,7 @@ def create_registration_report(
 
     fig2_paths = _render_dual_theme(
         f"fig2_4panel_{ts}",
-        lambda _th, _p: render_standard_4panel(
+        lambda _th, _p: render_registration_qc(
             fixed=fixed,
             warped=warped,
             warp=warp_for_4panel,
@@ -773,7 +773,7 @@ def create_registration_report(
             inv_err_map=inv_err_map,
             slice_axis=slice_axis,
             slice_idx=slice_idx,
-            theme=_th,
+            n_panels=4, theme=_th,
             lncc_val=metrics.get('LNCC (w=9)', 0.0),
             inv_err_max=inv_stats.get("interior_max", inv_stats["max"]),
             inv_err_mean=inv_stats.get("interior_mean", inv_stats["mean"]),

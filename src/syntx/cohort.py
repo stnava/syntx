@@ -1354,6 +1354,8 @@ def batch_greedy(
         require_finite_images(moving=m_img)
 
     dim = int(fixed_img.dimension)
+    from .phase_encode import apply_physical_restriction_zyx, parse_restrict_transformation
+    parsed_restr = parse_restrict_transformation(restrict_transformation, dim=dim)
     if reg_iterations is None:
         reg_iterations = iterations
     if reg_iterations is None:
@@ -1578,15 +1580,6 @@ def batch_greedy(
             t_opt_per_subj = (time.time() - t0_opt) / max(b_c, 1)
 
             full_shape_zyx = target.tensor_zyx.shape[2:]
-            restr_t_zyx = (
-                torch.tensor(
-                    list(reversed([0.0 if float(w) == 0.0 else 1.0 for w in restrict_transformation])),
-                    device=dev_obj,
-                    dtype=torch.float32,
-                ).view(1, *([1] * dim), dim)
-                if restrict_transformation is not None
-                else None
-            )
 
             from .core.digital_diffeomorphism import enforce_digital_diffeomorphism_nd
 
@@ -1605,8 +1598,8 @@ def batch_greedy(
                         device=dev_str,
                         dtype=torch.float32,
                     )
-                    if restr_t_zyx is not None:
-                        disp_i = disp_i * restr_t_zyx
+                    if parsed_restr is not None:
+                        disp_i = apply_physical_restriction_zyx(disp_i, parsed_restr)
 
                 if digital_diffeomorphism and (sum(reg_iters_list) > 0 or res_init.has_initial_warp):
                     disp_i = enforce_digital_diffeomorphism_nd(
@@ -1619,9 +1612,9 @@ def batch_greedy(
                         steps=digital_diffeomorphism_steps,
                         stationary_boundary=False,
                     )
-                    if restr_t_zyx is not None:
+                    if parsed_restr is not None:
                         with torch.no_grad():
-                            disp_i = disp_i * restr_t_zyx
+                            disp_i = apply_physical_restriction_zyx(disp_i, parsed_restr)
 
                 inv_disp_i = None
                 inv_err_dict: Dict[str, Any] = {}
@@ -1651,9 +1644,9 @@ def batch_greedy(
                             steps=digital_diffeomorphism_steps,
                             stationary_boundary=False,
                         )
-                    if restr_t_zyx is not None:
+                    if parsed_restr is not None:
                         with torch.no_grad():
-                            inv_disp_i = inv_disp_i * restr_t_zyx
+                            inv_disp_i = apply_physical_restriction_zyx(inv_disp_i, parsed_restr)
                     with torch.no_grad():
                         ice_c = calculate_inverse_identity_error(
                             disp_i,
@@ -2005,6 +1998,8 @@ def batch_syn(
         require_finite_images(moving=m_img)
 
     dim = int(fixed_img.dimension)
+    from .phase_encode import apply_physical_restriction_zyx, parse_restrict_transformation
+    parsed_restr = parse_restrict_transformation(restrict_transformation, dim=dim)
     if reg_iterations is None:
         reg_iterations = iterations
     if reg_iterations is None:
@@ -2201,16 +2196,6 @@ def batch_syn(
     eff_b = _select_cohort_batch_size(batch_size, n_subj, n_vox, stage="syn")
     raw_cstride = max(1, int(control_stride))
 
-    restr_mask = (
-        torch.tensor(
-            list(reversed([float(w) for w in restrict_transformation])),
-            device=dev_obj,
-            dtype=torch.float32,
-        ).view(1, *([1] * dim), dim)
-        if restrict_transformation is not None
-        else None
-    )
-
     groups_by_geom: Dict[Tuple[Tuple[int, ...], Tuple[float, ...]], List[int]] = {}
     for idx_s, m_img in enumerate(mov_seq):
         g_key = (
@@ -2310,6 +2295,9 @@ def batch_syn(
                             wri_init_list.append(z_u0)
                     warp_r2l = torch.cat(wr_init_list, dim=0)
                     warp_r2l_inv = torch.cat(wri_init_list, dim=0)
+                    if parsed_restr is not None:
+                        warp_r2l = apply_physical_restriction_zyx(warp_r2l, parsed_restr, inplace=True)
+                        warp_r2l_inv = apply_physical_restriction_zyx(warp_r2l_inv, parsed_restr, inplace=True)
                 else:
                     warp_r2l = torch.zeros_like(warp_l2r)
                     warp_r2l_inv = torch.zeros_like(warp_l2r)
@@ -2532,9 +2520,9 @@ def batch_syn(
                         grad_r = g_sm[b_c:]
                         del g_sm
 
-                        if restr_mask is not None:
-                            grad_l = grad_l.contiguous().mul_(restr_mask)
-                            grad_r = grad_r.contiguous().mul_(restr_mask)
+                        if parsed_restr is not None:
+                            grad_l = apply_physical_restriction_zyx(grad_l, parsed_restr, inplace=True)
+                            grad_r = apply_physical_restriction_zyx(grad_r, parsed_restr, inplace=True)
 
                         max_nl = _scaled_sq_sum(grad_l, sp_flat, divide=True).amax(dim=sp_dims_w).sqrt()
                         max_nr = _scaled_sq_sum(grad_r, sp_flat, divide=True).amax(dim=sp_dims_w).sqrt()
@@ -2575,6 +2563,9 @@ def batch_syn(
                         if elastic_sigma_val > 0.0:
                             warp_l2r.copy_(separable_gaussian_filter(warp_l2r, elastic_sigma_val, kernel_type="bessel"))
                             warp_r2l.copy_(separable_gaussian_filter(warp_r2l, elastic_sigma_val, kernel_type="bessel"))
+                        if parsed_restr is not None:
+                            warp_l2r = apply_physical_restriction_zyx(warp_l2r, parsed_restr, inplace=True)
+                            warp_r2l = apply_physical_restriction_zyx(warp_r2l, parsed_restr, inplace=True)
 
                         if lvl_inv_steps > 0 and (((epoch + 1) % curr_inv_every == 0) or (epoch == n_epochs - 1)):
                             if split_inv:
@@ -2621,6 +2612,9 @@ def batch_syn(
                                 warp_l2r_inv = out_p[:b_c]
                                 warp_r2l_inv = out_p[b_c:]
                                 del out_p
+                            if parsed_restr is not None:
+                                warp_l2r_inv = apply_physical_restriction_zyx(warp_l2r_inv, parsed_restr, inplace=True)
+                                warp_r2l_inv = apply_physical_restriction_zyx(warp_r2l_inv, parsed_restr, inplace=True)
 
                         if stationary_boundary:
                             for _w_sb in (warp_l2r, warp_r2l, warp_l2r_inv, warp_r2l_inv):
@@ -2662,6 +2656,9 @@ def batch_syn(
                             max_error_threshold=p_tol,
                             mean_error_threshold=p_tol * 0.01,
                         )
+                        if parsed_restr is not None:
+                            warp_l2r_inv = apply_physical_restriction_zyx(warp_l2r_inv, parsed_restr, inplace=True)
+                            warp_r2l_inv = apply_physical_restriction_zyx(warp_r2l_inv, parsed_restr, inplace=True)
                     J_lv[level_idx] = None
                     del X_phys, X_phys_img, b_mask
 
@@ -2738,6 +2735,11 @@ def batch_syn(
                             steps=digital_diffeomorphism_steps,
                             stationary_boundary=stationary_boundary,
                         )
+                    if parsed_restr is not None:
+                        wl_i = apply_physical_restriction_zyx(wl_i, parsed_restr, inplace=True)
+                        wr_i = apply_physical_restriction_zyx(wr_i, parsed_restr, inplace=True)
+                        wli_i = apply_physical_restriction_zyx(wli_i, parsed_restr, inplace=True)
+                        wri_i = apply_physical_restriction_zyx(wri_i, parsed_restr, inplace=True)
 
                     cn_fwd = physical_to_normalized_torch_cached(
                         X_phys_full + wli_i, c_shape_t, c_sp_t, c_org_t, c_dir_t
@@ -2758,6 +2760,9 @@ def batch_syn(
                     if b_mask_full is not None:
                         fwd_comp.mul_(b_mask_full)
                         inv_comp.mul_(b_mask_full)
+                    if parsed_restr is not None:
+                        fwd_comp = apply_physical_restriction_zyx(fwd_comp, parsed_restr, inplace=True)
+                        inv_comp = apply_physical_restriction_zyx(inv_comp, parsed_restr, inplace=True)
 
                     if run_def and inverse_steps > 0 and compose_polish_tol is not None and float(compose_polish_tol) > 0.0:
                         cp_tol = float(compose_polish_tol)
@@ -2773,6 +2778,8 @@ def batch_syn(
                             X_phys=X_phys_full,
                             stationary_boundary=stationary_boundary,
                         )
+                        if parsed_restr is not None:
+                            inv_comp = apply_physical_restriction_zyx(inv_comp, parsed_restr, inplace=True)
 
                     if digital_diffeomorphism and run_def and inverse_steps > 0:
                         fwd_pre = fwd_comp
@@ -2805,6 +2812,12 @@ def batch_syn(
                             )
                             del d_dd
                         del fwd_pre
+                    if parsed_restr is not None:
+                        fwd_comp = apply_physical_restriction_zyx(fwd_comp, parsed_restr, inplace=True)
+                        inv_comp = apply_physical_restriction_zyx(inv_comp, parsed_restr, inplace=True)
+                        wl_i = apply_physical_restriction_zyx(wl_i, parsed_restr, inplace=True)
+                        wr_i = apply_physical_restriction_zyx(wr_i, parsed_restr, inplace=True)
+                        wli_i = apply_physical_restriction_zyx(wli_i, parsed_restr, inplace=True)
 
                     ice_c = calculate_inverse_identity_error(
                         fwd_comp,

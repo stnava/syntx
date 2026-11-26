@@ -84,7 +84,7 @@ from syntx.robust_affine import (
     _ct_axial_tomography_anchor_3d,
     robust_affine,
 )
-from syntx.viz import AnatomicalVisualizer, render_input_pair_figure, render_standard_4panel
+from syntx.viz import AnatomicalVisualizer, render_input_pair_figure, render_registration_qc
 from syntx.viz.anatomical_overlays import (
     extract_oriented_slice,
     render_segmentation_alignment_series,
@@ -1202,9 +1202,10 @@ def _render_single_task_visual_suite(
         # 4. RESULTS 4-PANEL QC FIGURE (same LPI axial slice best_z!)
         res_qc_dict = dict(res_syn)
         res_qc_dict["warpedmovout"] = warped_pre
-        fig_qc4 = render_standard_4panel(
+        fig_qc4 = render_registration_qc(
             fixed=pre0,
             warped=res_qc_dict,
+            n_panels=4,
             slice_axis=2,
             slice_idx=best_z,
             theme="light",

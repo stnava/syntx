@@ -27,7 +27,7 @@ from syntx.viz import (
     extract_oriented_slice,
     plot_deformation_grid,
     plot_edge_overlay,
-    render_standard_4panel,
+    render_registration_qc,
     render_checkerboard_figure,
     registration_qc_section,
 )
@@ -280,10 +280,11 @@ def run_benchmark():
 
         # 2. Canonical Standard 4-Panel Figure via syntx.viz.render_standard_4panel
         four_panel_path = os.path.join(ASSETS_DIR, f"4panel_{name}.png")
-        fig_4p = render_standard_4panel(
+        fig_4p = render_registration_qc(
             fixed=r16,
             warped=reg,
             moving=r64,
+            n_panels=4,
             theme='light',
             title_prefix=f"{dname} QC Diagnostic Suite",
             output_path=four_panel_path

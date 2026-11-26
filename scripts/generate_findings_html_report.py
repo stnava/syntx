@@ -17,7 +17,7 @@ import ants
 import syntx
 from syntx.benchmark.data import load_mindboggle_pair
 from syntx.deformation_metrics import compute_harmonic_energy, compute_bending_energy
-from syntx.viz import render_standard_4panel, render_input_pair_figure
+from syntx.viz import render_registration_qc, render_input_pair_figure
 
 def normalize_intensity(img: ants.ANTsImage) -> ants.ANTsImage:
     arr = img.numpy()
@@ -70,12 +70,13 @@ def generate_report():
 
     # Generate Figure 2: Standard 4-Panel Diagnostic
     fig2_path = "results/figures/report_fig2_standard_4panel.png"
-    render_standard_4panel(
+    render_registration_qc(
         fixed=fi,
         warped=res_syntx["warpedmovout"],
         warp=warp_file,
         detJ=jac_img.numpy(),
         moving=mi,
+        n_panels=6,
         title_prefix="syntx.syn (flow_sigma=5.4, def=False)",
         output_path=fig2_path
     )
