@@ -39,6 +39,64 @@ def b_spline_3_deriv(x: torch.Tensor) -> torch.Tensor:
     return torch.where(abs_x < 1.0, d1, torch.where(abs_x < 2.0, d2, torch.zeros_like(x)))
 
 
+def _eval_4tap_splines(
+    v: torch.Tensor,
+    num_bins: int = 32,
+    min_val: float = -1.0,
+    max_val: float = 1.0,
+    pad: float = 2.0,
+    need_weights: bool = True,
+    need_grad: bool = True,
+):
+    """Evaluate 4-tap cubic B-spline bin indices, weights, and optional derivatives without stack/cat temporaries."""
+    scale = (float(num_bins - 1) - 2.0 * pad) / (max_val - min_val)
+    fin = torch.isfinite(v)
+    all_fin = bool(fin.all()) if v.device.type == "cpu" else False
+    if all_fin:
+        v_clean = torch.clamp(v, min_val, max_val)
+    else:
+        v_clean = torch.clamp(torch.nan_to_num(v, nan=0.0), min_val, max_val)
+    u = pad + (v_clean - min_val) * scale
+    u_fl = torch.floor(u)
+    k0 = u_fl.long()
+    d = u - u_fl
+    d2 = d * d
+
+    bins = torch.empty((*v.shape, 4), dtype=torch.int64, device=v.device)
+    torch.clamp(k0 - 1, 0, num_bins - 1, out=bins[..., 0])
+    torch.clamp(k0, 0, num_bins - 1, out=bins[..., 1])
+    torch.clamp(k0 + 1, 0, num_bins - 1, out=bins[..., 2])
+    torch.clamp(k0 + 2, 0, num_bins - 1, out=bins[..., 3])
+
+    weights = None
+    omd = None
+    if need_weights:
+        d3 = d2 * d
+        omd = 1.0 - d
+        weights = torch.empty((*v.shape, 4), dtype=v.dtype, device=v.device)
+        weights[..., 0] = (1.0 / 6.0) * (omd * omd * omd)
+        weights[..., 1] = (2.0 / 3.0) - d2 + 0.5 * d3
+        weights[..., 2] = (1.0 / 6.0) + 0.5 * (d + d2 - d3)
+        weights[..., 3] = (1.0 / 6.0) * d3
+        if not all_fin:
+            weights.mul_(fin.unsqueeze(-1).to(v.dtype))
+
+    dweights = None
+    if need_grad:
+        omd_g = (1.0 - d) if omd is None else omd
+        clamp_mask = (v >= min_val) & (v <= max_val)
+        if not all_fin:
+            clamp_mask = clamp_mask & fin
+        sc_mask = clamp_mask.to(v.dtype) * scale
+        dweights = torch.empty((*v.shape, 4), dtype=v.dtype, device=v.device)
+        dweights[..., 0] = (-0.5 * (omd_g * omd_g)) * sc_mask
+        dweights[..., 1] = (-2.0 * d + 1.5 * d2) * sc_mask
+        dweights[..., 2] = (0.5 + d - 1.5 * d2) * sc_mask
+        dweights[..., 3] = (0.5 * d2) * sc_mask
+
+    return bins, weights, dweights
+
+
 def get_4tap_splines(
     v: torch.Tensor,
     num_bins: int = 32,
@@ -52,34 +110,7 @@ def get_4tap_splines(
     Cubic B-splines have compact support radius of 2. For any intensity sample, at most
     4 consecutive bins have non-zero weight. Evaluates non-zero taps in O(1) polynomial operations.
     """
-    scale = (float(num_bins - 1) - 2.0 * pad) / (max_val - min_val)
-    fin = torch.isfinite(v)
-    v_clean = torch.clamp(torch.nan_to_num(v, nan=0.0), min_val, max_val)
-    u = pad + (v_clean - min_val) * scale
-    k0 = torch.floor(u).long()
-    d = (u - k0.to(v.dtype)).unsqueeze(-1)
-
-    b0 = torch.clamp(k0 - 1, 0, num_bins - 1)
-    b1 = torch.clamp(k0, 0, num_bins - 1)
-    b2 = torch.clamp(k0 + 1, 0, num_bins - 1)
-    b3 = torch.clamp(k0 + 2, 0, num_bins - 1)
-    bins = torch.stack([b0, b1, b2, b3], dim=-1)
-
-    omd = 1.0 - d
-    w0 = (1.0 / 6.0) * (omd * omd * omd)
-    w1 = (2.0 / 3.0) - d * d + 0.5 * d * d * d
-    w2 = (1.0 / 6.0) + 0.5 * d + 0.5 * d * d - 0.5 * d * d * d
-    w3 = (1.0 / 6.0) * (d * d * d)
-    weights = torch.cat([w0, w1, w2, w3], dim=-1) * fin.unsqueeze(-1).to(v.dtype)
-
-    clamp_mask = (v >= min_val) & (v <= max_val) & fin
-    dw0 = -0.5 * (omd * omd)
-    dw1 = -2.0 * d + 1.5 * d * d
-    dw2 = 0.5 + d - 1.5 * d * d
-    dw3 = 0.5 * (d * d)
-    dweights = torch.cat([dw0, dw1, dw2, dw3], dim=-1) * (scale * clamp_mask.unsqueeze(-1).to(v.dtype))
-
-    return bins, weights, dweights
+    return _eval_4tap_splines(v, num_bins=num_bins, min_val=min_val, max_val=max_val, pad=pad, need_weights=True, need_grad=True)
 
 
 class CanonicalMattesMIFunction(torch.autograd.Function):
@@ -306,7 +337,7 @@ def _extract_sparse4_from_fixed_weights(fixed_weights: torch.Tensor) -> tuple[to
     if cached is not None and cached[0] == ver:
         return cached[1], cached[2]
     with torch.no_grad():
-        fw_f = fixed_weights.to(torch.float32)
+        fw_f = fixed_weights.to(torch.float32).contiguous()
         k_sz = int(fw_f.shape[-1])
         if k_sz >= 4:
             w4, idx4_l = torch.topk(fw_f, k=4, dim=-1, sorted=False)
@@ -318,6 +349,10 @@ def _extract_sparse4_from_fixed_weights(fixed_weights: torch.Tensor) -> tuple[to
             fi_w4 = torch.zeros((*lead, 4), device=fw_f.device, dtype=torch.float32)
             fi_idx4[..., :k_sz] = torch.arange(k_sz, device=fw_f.device, dtype=torch.int32)
             fi_w4[..., :k_sz] = fw_f
+    try:
+        fi_w4._dense_fw = fw_f
+    except AttributeError:
+        pass
     try:
         fixed_weights._cached_sparse4 = (ver, fi_idx4, fi_w4)
     except AttributeError:
@@ -373,7 +408,9 @@ def parzen_weights(
 ) -> torch.Tensor:
     """Cubic B-spline Parzen weights of intensity samples, shape [N, num_bins], float32."""
     v = v.float().reshape(-1)
-    bins, weights, _ = get_4tap_splines(v, num_bins=num_bins, min_val=min_val, max_val=max_val, pad=pad)
+    bins, weights, _ = _eval_4tap_splines(
+        v, num_bins=num_bins, min_val=min_val, max_val=max_val, pad=pad, need_weights=True, need_grad=False
+    )
     out = torch.zeros(v.numel(), num_bins, device=v.device, dtype=torch.float32)
     out.scatter_(1, bins, weights)
     return out

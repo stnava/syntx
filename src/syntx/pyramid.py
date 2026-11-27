@@ -375,21 +375,43 @@ def prebuild_warp(origin, direction, native_spacing, f, off, shape_zyx, device=N
     if consts is None:
         dir_inv_t_np = np.linalg.inv(dir_arr).T
         den_np = np.asarray(sh_tup[::-1], dtype=np.float64) - 1.0
-        rows_np = np.vstack([
-            dir_inv_t_np,
-            np.asarray(o_tup, dtype=np.float64)[None, :],
-            np.asarray(sp_tup, dtype=np.float64)[None, :],
-            np.asarray(f_tup, dtype=np.float64)[None, :],
-            np.asarray(off_tup, dtype=np.float64)[None, :],
-            den_np[None, :],
-        ])
+        sp_np = np.asarray(sp_tup, dtype=np.float64)
+        f_np = np.asarray(f_tup, dtype=np.float64)
+        off_np = np.asarray(off_tup, dtype=np.float64)
         np_dt = np.float64 if dtype == torch.float64 else (np.float16 if dtype == torch.float16 else np.float32)
-        packed = torch.as_tensor(rows_np.astype(np_dt, copy=False), dtype=dtype, device=dev_obj)
-        consts = (packed[:dim], packed[dim], packed[dim + 1], packed[dim + 2], packed[dim + 3], packed[dim + 4])
+        if np.all(den_np > 0.0) and np.all(sp_np > 0.0) and np.all(f_np > 0.0):
+            fd_np = f_np * den_np
+            m_lin_np = dir_inv_t_np * (2.0 / (sp_np * fd_np))[None, :]
+            b_lin_np = -2.0 * (off_np / fd_np) - 1.0
+            rows_np = np.vstack([
+                m_lin_np,
+                np.asarray(o_tup, dtype=np.float64)[None, :],
+                b_lin_np[None, :],
+            ])
+            packed = torch.as_tensor(rows_np.astype(np_dt, copy=False), dtype=dtype, device=dev_obj)
+            consts = ("fused", packed[:dim], packed[dim], packed[dim + 1])
+        else:
+            rows_np = np.vstack([
+                dir_inv_t_np,
+                np.asarray(o_tup, dtype=np.float64)[None, :],
+                sp_np[None, :],
+                f_np[None, :],
+                off_np[None, :],
+                den_np[None, :],
+            ])
+            packed = torch.as_tensor(rows_np.astype(np_dt, copy=False), dtype=dtype, device=dev_obj)
+            consts = ("legacy", packed[:dim], packed[dim], packed[dim + 1], packed[dim + 2], packed[dim + 3], packed[dim + 4])
         if len(_PREBUILD_WARP_CONST_CACHE) >= 128:
             _PREBUILD_WARP_CONST_CACHE.pop(next(iter(_PREBUILD_WARP_CONST_CACHE)))
         _PREBUILD_WARP_CONST_CACHE[cache_key] = consts
-    dir_inv_t, o, sp, ff, oo, den = consts
+    if consts[0] == "fused":
+        _, m_lin, o, b_lin = consts
+
+        def warp(y_phys):
+            return (y_phys - o) @ m_lin + b_lin
+
+        return warp
+    _, dir_inv_t, o, sp, ff, oo, den = consts
 
     def warp(y_phys):
         y_vox = (y_phys - o) @ dir_inv_t / sp

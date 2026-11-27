@@ -42,7 +42,7 @@ from .motion_batched import batched_rigid_register_pass, estimate_coarse_fd, is_
 
 def _mean_image(imgs: Sequence[ants.ANTsImage]) -> ants.ANTsImage:
     """Plain unweighted voxelwise mean of a list of same-grid images."""
-    arr = np.mean(np.stack([im.numpy() for im in imgs], axis=0), axis=0)
+    arr = np.mean(np.stack([im.view() if hasattr(im, "view") else im.numpy() for im in imgs], axis=0), axis=0)
     return imgs[0].new_image_like(arr.astype(np.float32))
 
 
@@ -295,16 +295,24 @@ def build_bilateral_window_references(
     if isinstance(frames, ants.ANTsImage):
         if frames.dimension != 4:
             raise ValueError(f"Expected 4D ANTsImage or sequence of 3D images, got {frames.dimension}D")
-        frame_list = [ants.slice_image(frames, axis=3, idx=t) for t in range(frames.shape[3])]
+        T = int(frames.shape[3])
+        if T == 0:
+            return []
+        f0 = ants.slice_image(frames, axis=3, idx=0)
+        if T == 1:
+            return [f0]
+        raw4 = frames.view() if hasattr(frames, "view") else frames.numpy()
+        stack = np.moveaxis(raw4, -1, 0).astype(np.float32, copy=False)
+        ref_template = f0
     else:
         frame_list = list(frames)
-    T = len(frame_list)
-    if T == 0:
-        return []
-    if T == 1:
-        return [frame_list[0].clone()]
-
-    stack = np.stack([f.numpy().astype(np.float32) for f in frame_list], axis=0)  # (T, X, Y, Z)
+        T = len(frame_list)
+        if T == 0:
+            return []
+        if T == 1:
+            return [frame_list[0].clone()]
+        stack = np.stack([(f.view() if hasattr(f, "view") else f.numpy()).astype(np.float32, copy=False) for f in frame_list], axis=0)
+        ref_template = frame_list[0]
     if window_size is None:
         k_time = np.ones((T, T), dtype=np.float64)
     else:
@@ -335,9 +343,9 @@ def build_bilateral_window_references(
         np.fill_diagonal(W, 0.0)
     W = W / np.maximum(np.sum(W, axis=1, keepdims=True), 1e-12)
     W = W.astype(np.float32)
-    ref_dtype = frame_list[0].dtype
+    ref_dtype = ref_template.dtype
     # one reference at a time: peak memory is the input stack plus the returned images, not a second 4-D stack
-    return [ants.new_image_like(frame_list[0], np.tensordot(W[t], stack, axes=(0, 0)).astype(ref_dtype)) for t in range(T)]
+    return [ants.new_image_like(ref_template, np.tensordot(W[t], stack, axes=(0, 0)).astype(ref_dtype)) for t in range(T)]
 
 
 def level_adjacency(levels: np.ndarray) -> np.ndarray:
@@ -505,7 +513,8 @@ def _cross_link(fixed, moving, link, *, verbose, device, num_bins, convergence_t
         from .robust_affine import robust_affine
 
         return robust_affine(fixed=fixed, moving=moving, dof="rigid", mode="auto", verbose=verbose, device=device,
-                             num_bins=num_bins, convergence_tol_vox=convergence_tol_vox, max_extend_factor=max_extend_factor)
+                             num_bins=num_bins, convergence_tol_vox=convergence_tol_vox, max_extend_factor=max_extend_factor,
+                             multi_start=False, return_warped=False)
     if link != "identity":
         raise ValueError(f"cross_link entries must be 'registration' or 'identity', got {link!r}")
     import tempfile
@@ -799,7 +808,7 @@ def motion_correct_grouped(
     org4 = list(ants.get_origin(ref3d)) + [0.0]
     dir4 = np.eye(4, dtype=float)
     dir4[:3, :3] = np.asarray(ants.get_direction(ref3d), dtype=float)[:3, :3]
-    arr4d_full = image.numpy()
+    arr4d_full = image.view() if hasattr(image, "view") else image.numpy()
     arr_tzyx_full = arr4d_full.T if arr4d_full.flags["F_CONTIGUOUS"] else np.ascontiguousarray(arr4d_full.T)
     img4d, means = [], []
     for g in range(n_groups):
@@ -810,15 +819,18 @@ def motion_correct_grouped(
             direction=dir4,
         )
         img4d.append(c4)
-        imgs_g = [ants.slice_image(c4, axis=3, idx=i) for i in range(len(idx[g]))]
-        means.append(
-            build_low_motion_reference(
-                imgs_g,
-                n_low_motion=n_low_motion,
-                device=kwargs.get("device") or "auto",
-                verbose=verbose,
+        if n_low_motion is None or int(n_low_motion) <= 0:
+            means.append(ref3d.new_image_like(arr_tzyx_full[idx[g]].mean(axis=0).T.astype(np.float32)))
+        else:
+            imgs_g = [ants.slice_image(c4, axis=3, idx=i) for i in range(len(idx[g]))]
+            means.append(
+                build_low_motion_reference(
+                    imgs_g,
+                    n_low_motion=n_low_motion,
+                    device=kwargs.get("device") or "auto",
+                    verbose=verbose,
+                )
             )
-        )
     if verbose:
         print(f"[syntx.motion_reference] motion_correct_grouped: group sizes {[len(i) for i in idx]} of {n_frames} frames.")
 
@@ -981,7 +993,11 @@ def motion_correct_grouped(
     ref_shape3d = tuple(int(s) for s in means[0].shape[:3])
     out_tzyx = np.empty((n_frames, ref_shape3d[2], ref_shape3d[1], ref_shape3d[0]), dtype=np.float32)
     out4d = out_tzyx.T
-    mc0_tzyx = results[0].motion_corrected.numpy().T
+    mc_views_tzyx = [
+        (r.motion_corrected.view() if hasattr(r.motion_corrected, "view") else r.motion_corrected.numpy()).T
+        for r in results
+    ]
+    interp_is_linear = str(interp).lower() in ("linear", "bilinear")
     vol_scales = np.ones(n_frames, dtype=np.float64)
     todo_gi: list[int] = []
     for g in range(n_groups):
@@ -990,8 +1006,8 @@ def motion_correct_grouped(
             gi_int = int(gi)
             if pe_g is not None:
                 vol_scales[gi_int] = float(pe_g["jacobian"][li])
-            if g == 0 and len(chains[gi_int]) == len(results[0].fwdtransforms[li]):
-                out_tzyx[gi_int] = mc0_tzyx[li]
+            if (g == 0 or interp_is_linear) and len(chains[gi_int]) == len(results[g].fwdtransforms[li]):
+                out_tzyx[gi_int] = mc_views_tzyx[g][li]
             else:
                 todo_gi.append(gi_int)
     if todo_gi:

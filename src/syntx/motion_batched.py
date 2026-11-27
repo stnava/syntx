@@ -1059,10 +1059,175 @@ def _solve_coupled_spd_f32(Ha: torch.Tensor, rhs: torch.Tensor) -> torch.Tensor:
     return torch.linalg.solve(A + (1e-2 * diag_scale) * eye_n, b)
 
 
+def surround_prior_hessian_blocks(
+    t_param: torch.Tensor,
+    omega: torch.Tensor,
+    weight: float,
+    delta_mm: float,
+    rot_radius_mm: float = 50.0,
+    shrinkage: float = 0.0,
+    form: str = "charbonnier",
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Compact O(B) block-pentadiagonal representation ``(D0, D1, D2)`` of ``surround_prior_hessian_full``:
+    ``D0`` ``(B, 6, 6)`` main diagonal blocks, ``D1`` ``(B-1, 6, 6)`` +1 super-diagonal blocks, and
+    ``D2`` ``(B-2, 6, 6)`` +2 super-diagonal blocks in parameter units."""
+    B = int(t_param.shape[0])
+    f32 = dict(dtype=t_param.dtype, device=t_param.device)
+    D0 = torch.zeros((B, 6, 6), **f32)
+    D1 = torch.zeros((max(B - 1, 0), 6, 6), **f32)
+    D2 = torch.zeros((max(B - 2, 0), 6, 6), **f32)
+    unit = torch.tensor([1.0, 1.0, 1.0, rot_radius_mm, rot_radius_mm, rot_radius_mm], **f32)
+    if float(shrinkage) > 0.0:
+        D0 = D0 + 2.0 * float(shrinkage) * torch.diag(unit * unit)
+    if B < 3 or float(weight) <= 0.0:
+        return D0, D1, D2
+    with torch.no_grad():
+        Hu = _surround_hessian_terms(t_param, omega, weight, delta_mm, rot_radius_mm, form)
+        Hu = Hu * unit.view(1, 6, 1) * unit.view(1, 1, 6)
+        D0[1:-1] += Hu
+        D0[:-2] += 0.25 * Hu
+        D0[2:] += 0.25 * Hu
+        D1[:-1] += -0.5 * Hu
+        D1[1:] += -0.5 * Hu
+        D2 += 0.25 * Hu
+    return D0, D1, D2
+
+
+def _solve_coupled_banded_f32(
+    D0: torch.Tensor,
+    D1: torch.Tensor,
+    D2: torch.Tensor,
+    Hv_img_act: torch.Tensor,
+    act: torch.Tensor,
+    rhs: torch.Tensor,
+) -> torch.Tensor:
+    """Solve the coupled active-frame SPD Newton system in O(n_act * P^3) via banded Cholesky."""
+    import scipy.linalg
+
+    n_act = int(act.numel())
+    P = int(Hv_img_act.shape[1])
+    n = n_act * P
+    if n == 0:
+        return rhs.new_zeros((0,))
+    act_np = act.detach().cpu().numpy().astype(np.int64)
+    d0_np = (D0.index_select(0, act) + Hv_img_act).detach().cpu().to(torch.float32).numpy()
+    d0_np = np.nan_to_num(d0_np, nan=0.0, posinf=0.0, neginf=0.0)
+    d0_np = 0.5 * (d0_np + np.swapaxes(d0_np, 1, 2))
+    d1_np = np.nan_to_num(D1.detach().cpu().to(torch.float32).numpy(), nan=0.0, posinf=0.0, neginf=0.0)
+    d2_np = np.nan_to_num(D2.detach().cpu().to(torch.float32).numpy(), nan=0.0, posinf=0.0, neginf=0.0)
+    b_np = np.nan_to_num(rhs.detach().cpu().to(torch.float32).numpy(), nan=0.0, posinf=0.0, neginf=0.0).astype(np.float64)
+
+    u = min(3 * P - 1, max(n - 1, 0))
+    ab_base = np.zeros((u + 1, n), dtype=np.float64)
+
+    ii = np.arange(n_act)[:, None]
+    pr_u, pc_u = np.triu_indices(P)
+    r_u = ii * P + pr_u[None, :]
+    c_u = ii * P + pc_u[None, :]
+    ab_base[u + r_u - c_u, c_u] = d0_np[:, pr_u, pc_u]
+
+    pr = np.arange(P)[None, :, None]
+    pc = np.arange(P)[None, None, :]
+    if n_act >= 2:
+        gap1 = act_np[1:] - act_np[:-1]
+        m1 = np.flatnonzero(gap1 == 1)
+        if m1.size > 0:
+            r1 = m1[:, None, None] * P + pr
+            c1 = (m1[:, None, None] + 1) * P + pc
+            ab_base[u + r1 - c1, c1] = d1_np[act_np[m1]]
+        m12 = np.flatnonzero(gap1 == 2)
+        if m12.size > 0:
+            r12 = m12[:, None, None] * P + pr
+            c12 = (m12[:, None, None] + 1) * P + pc
+            ab_base[u + r12 - c12, c12] = d2_np[act_np[m12]]
+
+    if n_act >= 3:
+        gap2 = act_np[2:] - act_np[:-2]
+        m2 = np.flatnonzero(gap2 == 2)
+        if m2.size > 0:
+            r2 = m2[:, None, None] * P + pr
+            c2 = (m2[:, None, None] + 2) * P + pc
+            ab_base[u + r2 - c2, c2] = d2_np[act_np[m2]]
+
+    diag_scale = float(max(np.mean(np.abs(ab_base[u])), 1e-12))
+    for rel_jit in (1e-7, 1e-6, 1e-5, 1e-4, 1e-3, 1e-2):
+        ab_try = ab_base.copy()
+        ab_try[u] += rel_jit * diag_scale
+        try:
+            sol = scipy.linalg.solveh_banded(
+                ab_try, b_np, lower=False, overwrite_ab=True, overwrite_b=False, check_finite=False
+            )
+            return torch.from_numpy(sol.astype(np.float32)).to(device=rhs.device)
+        except scipy.linalg.LinAlgError:
+            continue
+    ab_try = ab_base.copy()
+    ab_try[u] += 1e-1 * diag_scale
+    sol = scipy.linalg.solveh_banded(ab_try, b_np, lower=False, overwrite_ab=True, overwrite_b=False, check_finite=False)
+    return torch.from_numpy(sol.astype(np.float32)).to(device=rhs.device)
+
+
+def _compute_batch_com_zyx(
+    moving_stack_zyx: torch.Tensor,
+    origin_xyz: Any,
+    spacing_xyz: Any,
+    direction_xyz: Any,
+) -> np.ndarray:
+    """Vectorized physical Center of Mass for a ``(B, Z, Y, X)`` tensor stack, matching
+    ``compute_center_of_mass(..., weighted=True)`` per volume without per-frame host copies."""
+    B_n, nz, ny, nx = moving_stack_zyx.shape
+    orig = np.asarray(origin_xyz, dtype=np.float64)
+    sp = np.asarray(spacing_xyz, dtype=np.float64)
+    direction = np.asarray(direction_xyz, dtype=np.float64)
+    thresh = 1e-6
+
+    with torch.no_grad():
+        z0 = torch.zeros((), dtype=moving_stack_zyx.dtype, device=moving_stack_zyx.device)
+        pos_mask = moving_stack_zyx > thresh
+        pos_cnt = pos_mask.sum(dim=(1, 2, 3)).cpu().numpy()
+        w_pos = torch.where(pos_mask, moving_stack_zyx, z0)
+        mx_p = w_pos.sum(dim=(1, 2)).cpu().numpy().astype(np.float64)
+        my_p = w_pos.sum(dim=(1, 3)).cpu().numpy().astype(np.float64)
+        mz_p = w_pos.sum(dim=(2, 3)).cpu().numpy().astype(np.float64)
+
+        need_neg = bool((pos_cnt < 10).any()) or bool((mx_p.sum(axis=1) <= 1e-6).any())
+        if need_neg:
+            neg_mask = moving_stack_zyx < -thresh
+            neg_cnt = neg_mask.sum(dim=(1, 2, 3)).cpu().numpy()
+            w_neg = torch.where(neg_mask, -moving_stack_zyx, z0)
+            mx_n = w_neg.sum(dim=(1, 2)).cpu().numpy().astype(np.float64)
+            my_n = w_neg.sum(dim=(1, 3)).cpu().numpy().astype(np.float64)
+            mz_n = w_neg.sum(dim=(2, 3)).cpu().numpy().astype(np.float64)
+
+    ix = np.arange(nx, dtype=np.float64)
+    iy = np.arange(ny, dtype=np.float64)
+    iz = np.arange(nz, dtype=np.float64)
+    center_fallback = orig + direction @ ((np.array([nx, ny, nz], dtype=np.float64) - 1.0) * 0.5 * sp)
+
+    out = np.empty((B_n, 3), dtype=np.float64)
+    tot_p = mx_p.sum(axis=1)
+    ok_p = (pos_cnt >= 10) & (tot_p > 1e-6)
+    if np.any(ok_p):
+        vx = (mx_p[ok_p] @ ix) / tot_p[ok_p]
+        vy = (my_p[ok_p] @ iy) / tot_p[ok_p]
+        vz = (mz_p[ok_p] @ iz) / tot_p[ok_p]
+        vox = np.stack([vx, vy, vz], axis=1)
+        out[ok_p] = orig[None, :] + (vox * sp[None, :]) @ direction.T
+
+    for b in np.flatnonzero(~ok_p):
+        if need_neg and neg_cnt[b] >= 10 and mx_n[b].sum() > 1e-6:
+            tn = mx_n[b].sum()
+            vox_b = np.array([(mx_n[b] @ ix) / tn, (my_n[b] @ iy) / tn, (mz_n[b] @ iz) / tn])
+            out[b] = orig + direction @ (vox_b * sp)
+        else:
+            out[b] = center_fallback
+    return out
+
+
 def _run_converging_stage(*, optimizer, params, per_frame_params, loss_fn, points_fn, iters, B, dev, tol, max_extend,
                           lr_groups=None, lr_t=None, lr_r=0.0, point_radius=0.0, probe_fn=None, confirm_vox=None, axes=None, stage_voxel=None,
                           max_step_vox=1.0, label="", level=1, shared_params=None, reg_loss_fn=None, resample_fn=None,
-                          reg_hess_fn=None, reg_frame_fn=None, reg_hess_full_fn=None, loss_active_fn=None):
+                          reg_hess_fn=None, reg_frame_fn=None, reg_hess_full_fn=None, loss_active_fn=None,
+                          probe_active_fn=None, reg_hess_blocks_fn=None, grad_multi_fn=None, loss_multi_fn=None):
     """One optimiser stage that ends when every frame has CONVERGED, not when an iteration count is spent.
 
     ``loss_fn()`` returns the (B,) per-frame loss; ``points_fn()`` the (B, S, 3) physical positions of a fixed subset of the
@@ -1097,11 +1262,33 @@ def _run_converging_stage(*, optimizer, params, per_frame_params, loss_fn, point
 
     n_rejected = [0]
     has_any_frozen = [False]
+    act_idx_cache = [torch.arange(B, device=dev, dtype=torch.long)]
+    act_idx_dirty = [False]
+
+    def _get_act_idx():
+        if act_idx_dirty[0]:
+            act_idx_cache[0] = torch.nonzero(tracker.active).flatten()
+            act_idx_dirty[0] = False
+        return act_idx_cache[0]
 
     def _confirm(newly):
         """A small step is only evidence of convergence: the manifold probe measures the remaining distance (first-order Newton
         step, in voxels). Frames still far from the optimum (a slow valley, a plateau) go back to being active."""
-        if probe_fn is None:
+        if probe_fn is None and probe_active_fn is None:
+            return newly
+        if probe_active_fn is not None:
+            newly_idx = torch.nonzero(newly).flatten()
+            if int(newly_idx.numel()) == 0:
+                return newly
+            rem_sub = probe_active_fn(newly_idx)
+            far_sub = ~(rem_sub <= confirm_vox)
+            n_far = int(far_sub.sum().item())
+            if n_far > 0:
+                far = torch.zeros_like(newly)
+                far[newly_idx] = far_sub
+                tracker.reject(far)
+                n_rejected[0] += n_far
+                return newly & ~far
             return newly
         pr = probe_fn()
         far = newly & ~(pr.remaining_vox <= confirm_vox)
@@ -1115,11 +1302,13 @@ def _run_converging_stage(*, optimizer, params, per_frame_params, loss_fn, point
         counts_init = [int(v) for v in torch.stack([newly.sum(), tracker.active.sum()]).tolist()]
         n_act_now = counts_init[1]
         if counts_init[0] > 0:
-            if probe_fn is not None:
+            act_idx_dirty[0] = True
+            if probe_fn is not None or probe_active_fn is not None:
                 newly = _confirm(newly)
                 post_counts = [int(v) for v in torch.stack([newly.sum(), tracker.active.sum()]).tolist()]
                 changed = post_counts[0] > 0
                 n_act_now = post_counts[1]
+                act_idx_dirty[0] = True
             else:
                 changed = True
         else:
@@ -1148,7 +1337,17 @@ def _run_converging_stage(*, optimizer, params, per_frame_params, loss_fn, point
                     p.copy_(frozen_shared[id(p)])
 
     def _active_loss():
-        base_loss = loss_fn()[tracker.active].sum()
+        if loss_active_fn is not None:
+            act_cur = _get_act_idx()
+            n_cur = int(act_cur.numel())
+            if n_cur == 0:
+                base_loss = torch.zeros((), device=dev, dtype=torch.float32)
+            elif n_cur < B:
+                base_loss = loss_active_fn(act_cur).sum()
+            else:
+                base_loss = loss_fn().sum()
+        else:
+            base_loss = loss_fn()[tracker.active].sum()
         if reg_loss_fn is not None:
             base_loss = base_loss + reg_loss_fn()
         return base_loss
@@ -1193,57 +1392,90 @@ def _run_converging_stage(*, optimizer, params, per_frame_params, loss_fn, point
             with torch.no_grad():
                 axes[a].tensor[axes[a].index] = axes[a].tensor[axes[a].index] + delta
 
+        coupled_mode = (reg_hess_blocks_fn is not None) or (reg_hess_full_fn is not None)
+        deltas_py = [0.5 * vox / scale_py[a] for a in range(P)]
         trust = torch.full((B,), float(max_step_vox), device=dev)
         lam = torch.zeros(B, device=dev)
         calls = max(1, int(iters)) * max_extend
         for call in range(calls):
             if resample_fn is not None and call > 0:
                 resample_fn()
-            g_par = _grad_param()                                          # gradient of the TOTAL objective (image + prior)
-            # the image Hessian by central differences of the IMAGE gradient alone (the prior's Hessian is analytic and is added
-            # exactly once below: the diagonal block when the stage is uncoupled, the full block-tridiagonal matrix when coupled;
-            # audit 2026-10-28 found the surround block counted twice and the shrinkage block three times)
-            H_par = torch.zeros(B, P, P, device=dev)
-            for a in range(P):
-                d = 0.5 * vox / scale_py[a]
-                _shift(a, +d); gp = _grad_param(include_reg=False)
-                _shift(a, -2 * d); gm = _grad_param(include_reg=False)
-                _shift(a, +d)
-                H_par[:, :, a] = (gp - gm) / (2.0 * d)
-            H_par = 0.5 * (H_par + H_par.transpose(1, 2))
-            if reg_hess_fn is not None and reg_hess_full_fn is None:
+            n_act = int(act.numel())
+            if n_act == 0:
+                break
+            if grad_multi_fn is not None:
+                g_img_act, H_act = grad_multi_fn(act, deltas_py)
+                g_par = torch.zeros(B, P, device=dev)
+                g_par[act] = g_img_act
+                if reg_loss_fn is not None:
+                    with torch.enable_grad():
+                        r_tot = reg_loss_fn()
+                        gs_r = torch.autograd.grad(r_tot, leaves, allow_unused=True)
+                    for col_i, ax in enumerate(axes):
+                        gr = gs_r[[i for i, lf in enumerate(leaves) if lf is ax.tensor][0]]
+                        if gr is not None:
+                            g_par[:, col_i] = g_par[:, col_i] + gr[ax.index]
+                H_par = torch.zeros(B, P, P, device=dev)
+                H_par[act] = H_act
+            else:
+                g_par = _grad_param()                                          # gradient of the TOTAL objective (image + prior)
+                H_par = torch.zeros(B, P, P, device=dev)
+                for a in range(P):
+                    d = deltas_py[a]
+                    _shift(a, +d); gp = _grad_param(include_reg=False)
+                    _shift(a, -2 * d); gm = _grad_param(include_reg=False)
+                    _shift(a, +d)
+                    H_par[:, :, a] = (gp - gm) / (2.0 * d)
+                H_par = 0.5 * (H_par + H_par.transpose(1, 2))
+            if reg_hess_fn is not None and not coupled_mode:
                 H_par = H_par + reg_hess_fn()
             Gv = g_par * to_vox
             Hv = H_par * to_vox.view(1, P, 1) * to_vox.view(1, 1, P)
-            ev, Q = _safe_batched_eigh(Hv, dev)   # pure-PyTorch float32 eigh + cyclic Jacobi fallback
-            floor = 1e-3 * ev.abs().max(dim=1, keepdim=True).values.clamp_min(1e-12)
-            inv = 1.0 / (torch.maximum(ev.abs(), floor) + lam.unsqueeze(1))
-            inv0 = 1.0 / torch.maximum(ev.abs(), floor)                   # undamped: the convergence test must not see the damping
-            if reg_hess_full_fn is None:
-                dv = -(Q @ (inv * (Q.transpose(1, 2) @ Gv.unsqueeze(-1)).squeeze(-1)).unsqueeze(-1)).squeeze(-1)   # (B, P) voxels
-                dv0 = -(Q @ (inv0 * (Q.transpose(1, 2) @ Gv.unsqueeze(-1)).squeeze(-1)).unsqueeze(-1)).squeeze(-1)
+            ev_act, Q_act = _safe_batched_eigh(Hv.index_select(0, act), dev)
+            floor_act = 1e-3 * ev_act.abs().max(dim=1, keepdim=True).values.clamp_min(1e-12)
+            lam_act = lam.index_select(0, act)
+            inv_act = 1.0 / (torch.maximum(ev_act.abs(), floor_act) + lam_act.unsqueeze(1))
+            inv0_act = 1.0 / torch.maximum(ev_act.abs(), floor_act)
+            ev_max = torch.full((B,), 1e-12, device=dev, dtype=Hv.dtype)
+            ev_max[act] = ev_act.abs().max(dim=1).values.clamp_min(1e-12)
+            dv = torch.zeros(B, P, device=dev)
+            dv0 = torch.zeros(B, P, device=dev)
+            Gv_act = Gv.index_select(0, act)
+            if not coupled_mode:
+                qt_g = (Q_act.transpose(1, 2) @ Gv_act.unsqueeze(-1)).squeeze(-1)
+                dv[act] = -(Q_act @ (inv_act * qt_g).unsqueeze(-1)).squeeze(-1)
+                dv0[act] = -(Q_act @ (inv0_act * qt_g).unsqueeze(-1)).squeeze(-1)
+            elif reg_hess_blocks_fn is not None:
+                Hv_img0_act = Q_act @ torch.diag_embed(torch.maximum(ev_act.abs(), floor_act)) @ Q_act.transpose(1, 2)
+                D0_p, D1_p, D2_p = reg_hess_blocks_fn()
+                sc_vox = to_vox.view(1, P, 1) * to_vox.view(1, 1, P)
+                D0_v, D1_v, D2_v = D0_p * sc_vox, D1_p * sc_vox, D2_p * sc_vox
+                neg_ga = -Gv_act.reshape(-1)
+                sol0 = _solve_coupled_banded_f32(D0_v, D1_v, D2_v, Hv_img0_act, act, neg_ga).view(n_act, P).to(dtype=dv0.dtype, device=dev)
+                dv0[act] = sol0
+                if bool((lam_act > 0).any()):
+                    Hv_img_act = Q_act @ torch.diag_embed(torch.maximum(ev_act.abs(), floor_act) + lam_act.unsqueeze(1)) @ Q_act.transpose(1, 2)
+                    sol = _solve_coupled_banded_f32(D0_v, D1_v, D2_v, Hv_img_act, act, neg_ga).view(n_act, P).to(dtype=dv.dtype, device=dev)
+                    dv[act] = sol
+                else:
+                    dv[act] = sol0
             else:
-                # coupled Newton step: the image Hessian per frame (saddle-free, damped) on the block diagonal, the prior's
-                # full block-pentadiagonal Hessian between frames (added ONCE); solved in pure PyTorch float32 over ACTIVE frames
-                Hv_img0 = Q @ torch.diag_embed(torch.maximum(ev.abs(), floor)) @ Q.transpose(1, 2)
-                Hp = reg_hess_full_fn() * to_vox.view(1, P, 1, 1) * to_vox.view(1, 1, 1, P)       # (B,P,B,P) voxel units
-                dv = torch.zeros(B, P, device=dev); dv0 = torch.zeros(B, P, device=dev)
-                n_act = int(act.numel())
-                if n_act > 0:
-                    idx_a = torch.arange(n_act, device=dev)
-                    Hp_act = Hp.index_select(0, act).index_select(2, act)
-                    neg_ga = -Gv.index_select(0, act).reshape(-1)
-                    H0_act = Hp_act.clone()
-                    H0_act[idx_a, :, idx_a, :] += Hv_img0.index_select(0, act)
-                    sol0 = _solve_coupled_spd_f32(H0_act.reshape(n_act * P, n_act * P), neg_ga).view(n_act, P).to(dtype=dv0.dtype, device=dev)
-                    dv0[act] = sol0
-                    if bool((lam.index_select(0, act) > 0).any()):
-                        Hv_img = Q @ torch.diag_embed(torch.maximum(ev.abs(), floor) + lam.unsqueeze(1)) @ Q.transpose(1, 2)
-                        Hp_act[idx_a, :, idx_a, :] += Hv_img.index_select(0, act)
-                        sol = _solve_coupled_spd_f32(Hp_act.reshape(n_act * P, n_act * P), neg_ga).view(n_act, P).to(dtype=dv.dtype, device=dev)
-                        dv[act] = sol
-                    else:
-                        dv[act] = sol0
+                Hv_img0_act = Q_act @ torch.diag_embed(torch.maximum(ev_act.abs(), floor_act)) @ Q_act.transpose(1, 2)
+                Hp = reg_hess_full_fn() * to_vox.view(1, P, 1, 1) * to_vox.view(1, 1, 1, P)
+                idx_a = torch.arange(n_act, device=dev)
+                Hp_act = Hp.index_select(0, act).index_select(2, act)
+                neg_ga = -Gv_act.reshape(-1)
+                H0_act = Hp_act.clone()
+                H0_act[idx_a, :, idx_a, :] += Hv_img0_act
+                sol0 = _solve_coupled_spd_f32(H0_act.reshape(n_act * P, n_act * P), neg_ga).view(n_act, P).to(dtype=dv0.dtype, device=dev)
+                dv0[act] = sol0
+                if bool((lam_act > 0).any()):
+                    Hv_img_act = Q_act @ torch.diag_embed(torch.maximum(ev_act.abs(), floor_act) + lam_act.unsqueeze(1)) @ Q_act.transpose(1, 2)
+                    Hp_act[idx_a, :, idx_a, :] += Hv_img_act
+                    sol = _solve_coupled_spd_f32(Hp_act.reshape(n_act * P, n_act * P), neg_ga).view(n_act, P).to(dtype=dv.dtype, device=dev)
+                    dv[act] = sol
+                else:
+                    dv[act] = sol0
             # convergence is judged on the UNDAMPED Newton step (the remaining distance to the optimum to second order); the
             # damped step shrinks with every rejected line search and would declare a stuck frame converged (audit 2026-10-28)
             remaining = dv0.abs().max(dim=1).values
@@ -1259,39 +1491,66 @@ def _run_converging_stage(*, optimizer, params, per_frame_params, loss_fn, point
             dv = dv * torch.clamp(trust.unsqueeze(1) / dv.norm(dim=1, keepdim=True).clamp_min(1e-12), max=1.0) * tracker.active.unsqueeze(1).float()
             with torch.no_grad():
                 base = [ax.tensor[ax.index].clone() for ax in axes]
-                coupled = reg_hess_full_fn is not None
+                coupled = coupled_mode
                 best_a = torch.zeros(B, device=dev)
-                if coupled:
-                    tot0 = float(_loss_act().detach().sum() + reg_loss_fn().detach())
-                    best_tot, best_alpha = tot0, 0.0
-                else:
-                    best_f_act = _loss_act().detach()
-                    if reg_frame_fn is not None:
-                        best_f_act = best_f_act + reg_frame_fn().index_select(0, act)
-                for alpha in (1.0, 0.5, 0.25, 0.1):
-                    for k, ax in enumerate(axes):
-                        ax.tensor[ax.index] = base[k] + alpha * dv[:, k] * to_vox[k]   # voxels of displacement -> parameter units (dp = dv * dparam/dvox)
+                alphas_ls = (1.0, 0.5, 0.25, 0.1)
+                if loss_multi_fn is not None and int(act.numel()) > 0:
+                    f_multi = loss_multi_fn(act, dv, to_vox, (0.0,) + alphas_ls)  # (n_act_ls, 5)
                     if coupled:
-                        # one objective, one line search: the frames' steps are a joint step of the coupled system
-                        tot = float(_loss_act().detach().sum() + reg_loss_fn().detach())
-                        if tot < best_tot:
-                            best_tot, best_alpha = tot, alpha
-                        continue
-                    f_act = _loss_act().detach()
-                    if reg_frame_fn is not None:
-                        f_act = f_act + reg_frame_fn().index_select(0, act)
-                    better_act = f_act < best_f_act
-                    best_f_act = torch.where(better_act, f_act, best_f_act)
-                    best_a[act] = torch.where(better_act, torch.full_like(best_f_act, alpha), best_a.index_select(0, act))
-                if coupled:
-                    best_a = torch.where(tracker.active, torch.full_like(best_a, best_alpha), best_a)
+                        r0 = float(reg_loss_fn().detach()) if reg_loss_fn is not None else 0.0
+                        tot0 = float(f_multi[:, 0].sum()) + r0
+                        best_tot, best_alpha = tot0, 0.0
+                        for m_i, alpha in enumerate(alphas_ls, start=1):
+                            for k, ax in enumerate(axes):
+                                ax.tensor[ax.index] = base[k] + alpha * dv[:, k] * to_vox[k]
+                            r_a = float(reg_loss_fn().detach()) if reg_loss_fn is not None else 0.0
+                            tot = float(f_multi[:, m_i].sum()) + r_a
+                            if tot < best_tot:
+                                best_tot, best_alpha = tot, alpha
+                        best_a = torch.where(tracker.active, torch.full_like(best_a, best_alpha), best_a)
+                    else:
+                        best_f_act = f_multi[:, 0].clone()
+                        if reg_frame_fn is not None:
+                            best_f_act = best_f_act + reg_frame_fn().index_select(0, act)
+                        for m_i, alpha in enumerate(alphas_ls, start=1):
+                            f_act = f_multi[:, m_i]
+                            if reg_frame_fn is not None:
+                                for k, ax in enumerate(axes):
+                                    ax.tensor[ax.index] = base[k] + alpha * dv[:, k] * to_vox[k]
+                                f_act = f_act + reg_frame_fn().index_select(0, act)
+                            better_act = f_act < best_f_act
+                            best_f_act = torch.where(better_act, f_act, best_f_act)
+                            best_a[act] = torch.where(better_act, torch.full_like(best_f_act, alpha), best_a.index_select(0, act))
+                else:
+                    if coupled:
+                        tot0 = float(_loss_act().detach().sum() + (reg_loss_fn().detach() if reg_loss_fn is not None else 0.0))
+                        best_tot, best_alpha = tot0, 0.0
+                    else:
+                        best_f_act = _loss_act().detach()
+                        if reg_frame_fn is not None:
+                            best_f_act = best_f_act + reg_frame_fn().index_select(0, act)
+                    for alpha in alphas_ls:
+                        for k, ax in enumerate(axes):
+                            ax.tensor[ax.index] = base[k] + alpha * dv[:, k] * to_vox[k]
+                        if coupled:
+                            tot = float(_loss_act().detach().sum() + (reg_loss_fn().detach() if reg_loss_fn is not None else 0.0))
+                            if tot < best_tot:
+                                best_tot, best_alpha = tot, alpha
+                            continue
+                        f_act = _loss_act().detach()
+                        if reg_frame_fn is not None:
+                            f_act = f_act + reg_frame_fn().index_select(0, act)
+                        better_act = f_act < best_f_act
+                        best_f_act = torch.where(better_act, f_act, best_f_act)
+                        best_a[act] = torch.where(better_act, torch.full_like(best_f_act, alpha), best_a.index_select(0, act))
+                    if coupled:
+                        best_a = torch.where(tracker.active, torch.full_like(best_a, best_alpha), best_a)
                 moved = best_a > 0
                 for k, ax in enumerate(axes):
                     step_k = best_a * dv[:, k] * to_vox[k]
                     ax.tensor[ax.index] = torch.where(moved & torch.isfinite(step_k), base[k] + step_k, base[k])
             n_rejected[0] += int((tracker.active & ~moved).sum())
             full_step = best_a >= 1.0
-            ev_max = ev.abs().max(dim=1).values.clamp_min(1e-12)
             trust = torch.where(full_step, torch.clamp(trust * 2.0, max=4.0 * float(max_step_vox)), torch.where(moved, trust, torch.clamp(trust * 0.5, min=1e-4)))
             lam = torch.where(moved, lam * 0.5, torch.clamp(lam * 4.0 + 1e-3 * ev_max, max=1e6 * ev_max))
             done += 1
@@ -1413,6 +1672,7 @@ def _run_converging_stage(*, optimizer, params, per_frame_params, loss_fn, point
                     p.copy_(torch.where(mask_k, entry_frame[id(p)], saved_end[id(p)]))
                 if bool(keep_rev.any()):
                     tracker.active = tracker.active | keep_rev
+                    act_idx_dirty[0] = True
         blocks = math.ceil((call + 1) / n_blocks)
     else:
         lr_scale = 1.0
@@ -1493,6 +1753,7 @@ def batched_rigid_register_pass(
     frame_gain: bool = False,
     pe_b0_split: bool = False,
     slice_axis: Optional[int] = None,
+    _moving_zyx: Optional[np.ndarray] = None,
 ):
     """Rigidly register every frame in ``moving_imgs`` to the same ``reference_img``, in one
     or more batched optimisations, optionally with a per-frame eddy-current (phase-encode affine) term whose
@@ -1557,7 +1818,7 @@ def batched_rigid_register_pass(
             init_pose=init_pose, design_matrix=design_matrix, design_point_scale=design_point_scale,
             design_levels=design_levels, design_model_live=design_model_live, surround_scale=surround_scale, surround_form=surround_form,
             design_gauge=design_gauge, pose_shrinkage=pose_shrinkage, frame_gain=frame_gain,
-            pe_b0_split=pe_b0_split, slice_axis=slice_axis,
+            pe_b0_split=pe_b0_split, slice_axis=slice_axis, _moving_zyx=_moving_zyx,
         )
         return out if return_pe_affine else out[:3]
 
@@ -1599,6 +1860,7 @@ def batched_rigid_register_pass(
             design_gauge=None if design_gauge is None else np.asarray(design_gauge)[start:start + chunk_size],
             pose_shrinkage=pose_shrinkage, frame_gain=frame_gain,
             pe_b0_split=pe_b0_split, slice_axis=slice_axis,
+            _moving_zyx=None if _moving_zyx is None else _moving_zyx[start:start + chunk_size],
         )
         fwd_all.extend(fwd_c)
         inv_all.extend(inv_c)
@@ -1639,6 +1901,25 @@ def batched_rigid_register_pass(
             })
         if any(pc is not None and pc.get("pe_b0_debias") is not None for pc in pe_chunks):
             pe_info["pe_b0_debias"] = next(pc["pe_b0_debias"] for pc in pe_chunks if pc is not None and pc.get("pe_b0_debias") is not None)
+        if all(pc is not None and pc.get("_poses") is not None for pc in pe_chunks):
+            p_chunks = [pc["_poses"] for pc in pe_chunks]
+            any_eddy_c = any(bool(p.get("has_eddy")) for p in p_chunks)
+            p_axis_c = next((p["p"] for p in p_chunks if p.get("p") is not None), None)
+            pe_info["_poses"] = {
+                "R": np.concatenate([p["R"] for p in p_chunks], axis=0),
+                "t": np.concatenate([p["t"] for p in p_chunks], axis=0),
+                "com": p_chunks[0]["com"],
+                "has_eddy": any_eddy_c,
+                "p": p_axis_c,
+                "a": (
+                    np.concatenate(
+                        [np.zeros((n, 4), dtype=np.float64) if p.get("a") is None else p["a"] for p, n in zip(p_chunks, sizes)],
+                        axis=0,
+                    )
+                    if any_eddy_c
+                    else None
+                ),
+            }
     return (fwd_all, inv_all, elapsed_total, pe_info) if return_pe_affine else (fwd_all, inv_all, elapsed_total)
 
 
@@ -1683,6 +1964,7 @@ def _batched_rigid_register_pass_core(
     frame_gain: bool = False,
     pe_b0_split: bool = False,
     slice_axis: Optional[int] = None,
+    _moving_zyx: Optional[np.ndarray] = None,
 ) -> Tuple[List[List[str]], List[List[str]], float, Optional[dict]]:
     """
     Rigidly register every frame in ``moving_imgs`` to the same ``reference_img`` in one
@@ -1846,9 +2128,9 @@ def _batched_rigid_register_pass_core(
             "motion_batched.batched_rigid_register_pass only implements the 3D path. "
             "Use backend='pytorch' (per-frame robust_affine) or backend='ants' for 2D+t series."
         )
-    _check_frames_on_reference(reference_img, moving_imgs)
+    _check_frames_on_reference(reference_img, moving_imgs[:1] if _moving_zyx is not None else moving_imgs)
     dev = torch.device(_auto_device() if device == "auto" else device)
-    B = len(moving_imgs)
+    B = int(_moving_zyx.shape[0]) if _moving_zyx is not None else len(moving_imgs)
     if B == 0:
         return [], [], 0.0
 
@@ -1976,7 +2258,10 @@ def _batched_rigid_register_pass_core(
         return y_phys + disp.unsqueeze(-1) * p_vec
 
     def to_tensor(img):
-        arr = np.transpose(img.numpy().astype(np.float32), (2, 1, 0))
+        raw = img.view() if hasattr(img, "view") else img.numpy()
+        if raw.dtype == np.float32 and raw.flags["F_CONTIGUOUS"]:
+            return torch.from_numpy(raw.T).to(dev)
+        arr = np.transpose(raw.astype(np.float32, copy=False), (2, 1, 0))
         return torch.from_numpy(np.ascontiguousarray(arr)).to(dev)
 
     if per_frame_ref:
@@ -1985,7 +2270,10 @@ def _batched_rigid_register_pass_core(
     else:
         fixed_stack_zyx = None
         fixed_t_zyx = to_tensor(reference_img)
-    moving_stack = torch.stack([to_tensor(m) for m in moving_imgs], dim=0)
+    if _moving_zyx is not None:
+        moving_stack = torch.from_numpy(np.ascontiguousarray(_moving_zyx, dtype=np.float32)).to(dev)
+    else:
+        moving_stack = torch.stack([to_tensor(m) for m in moving_imgs], dim=0)
     fixed_t = fixed_t_zyx.permute(2, 1, 0)
     shape_xyz = torch.tensor(list(reference_img.shape), **f32)
 
@@ -2163,10 +2451,10 @@ def _batched_rigid_register_pass_core(
     # -- translation + rotation seed search (large-jump capture-range fix; see session doc
     # Sec 4.2 for why both need seeding, and jointly, not rotation-only with translation
     # frozen) --
-    t_init_com = np.zeros((B, 3), dtype=np.float32)
-    for b, m in enumerate(moving_imgs):
-        com_m = np.asarray(compute_center_of_mass(m, weighted=True), dtype=np.float64)
-        t_init_com[b] = (com_m - com_f).astype(np.float32)
+    com_m_all = _compute_batch_com_zyx(
+        moving_stack, reference_img.origin, reference_img.spacing, reference_img.direction
+    )
+    t_init_com = (com_m_all - com_f[None, :]).astype(np.float32)
 
     def phase_correlation_candidates(level=4, topk=5, min_sep_vox=2):
         level = min(level, max_level)
@@ -2282,6 +2570,12 @@ def _batched_rigid_register_pass_core(
         t_param = tw_init[0].clone().requires_grad_(True)
         omega = tw_init[1].clone().requires_grad_(True)
         n_seed_combos = 0
+    elif seed_mode == "narrow" and schedule is None and schedule_mode in ("default", "medium"):
+        # Direct coarse-to-fine Mattes-MI + correlation schedule from (t_init_com, 0): avoids both the redundant 30-step
+        # pre-walk before the 80-step coarse Adam stage and pure-Pearson sign-inversion spins on high-b DWI shells.
+        t_param = torch.as_tensor(t_init_com, **f32).clone().requires_grad_(True)
+        omega = torch.zeros((B, 3), **f32).requires_grad_(True)
+        n_seed_combos = 0
     else:
         n_seed_combos = len(all_t_candidates) * len(rot_seeds)
         lr_t_seed = 0.075 * ref_min_sp
@@ -2301,6 +2595,7 @@ def _batched_rigid_register_pass_core(
         w_all_bk = tw_seeds[1]
         del tw_seeds
 
+        max_narrow_rad = float(np.radians(25.0))
         n_pts_seed = max(int(Xc_seed.shape[0]), 1)
         seed_chunk_k = max(1, min(n_seed_combos, 2_000_000 // max(B * n_pts_seed, 1)))
         scores_chunks = []
@@ -2315,7 +2610,7 @@ def _batched_rigid_register_pass_core(
                 else lvl_c["fixed_vals"].repeat_interleave(kc, dim=0)
             )
             t_cand_c = t_all_bk[:, k0:k1, :].reshape(B * kc, 3).clone().requires_grad_(True)
-            w_cand_c = w_all_bk[:, k0:k1, :].reshape(B * kc, 3).clone().requires_grad_(True)
+            w_cand_c = w_all_bk[:, k0:k1, :].reshape(B * kc, 3).reshape(B * kc, 3).clone().requires_grad_(True)
             opt_seed = torch.optim.Adam(
                 [{"params": [t_cand_c], "lr": lr_t_seed}, {"params": [w_cand_c], "lr": lr_r_seed}]
             )
@@ -2333,6 +2628,10 @@ def _batched_rigid_register_pass_core(
                 opt_seed.zero_grad(set_to_none=True)
                 _eval_seed_chunk().sum().backward()
                 opt_seed.step()
+                if seed_mode == "narrow":
+                    with torch.no_grad():
+                        wn = w_cand_c.norm(dim=-1, keepdim=True).clamp_min(1e-12)
+                        w_cand_c.mul_(torch.clamp(max_narrow_rad / wn, max=1.0))
 
             with torch.no_grad():
                 scores_chunks.append(_eval_seed_chunk().view(B, kc))
@@ -2533,6 +2832,28 @@ def _batched_rigid_register_pass_core(
             H = torch.einsum("ij,bjck,kl->bicl", P6_orth, H_raw, P6_orth) + torch.einsum("ij,bjck,kl->bicl", P6_pe, H, P6_pe)
         return H[:, cols][:, :, :, cols]
 
+    def _surround_reg_hess_blocks(axes):
+        """Compact O(B) pentadiagonal blocks ``(D0, D1, D2)`` of the surround prior in the order of ``axes``."""
+        cols = [(3 if ax.tensor is omega else 0) + int(ax.index[1]) for ax in axes]
+        t_h = _head_t(t_param.detach())
+        D0, D1, D2 = surround_prior_hessian_blocks(
+            t_h, omega.detach(), surr_scale[0] * surr_w, surr_delta, shrinkage=surr_scale[0] * shrink_w, form=surround_form
+        )
+        if pe_on and a0_pe is not None:
+            t_raw = t_h + a0_pe.detach().unsqueeze(1) * p_vec
+            D0_r, D1_r, D2_r = surround_prior_hessian_blocks(
+                t_raw, omega.detach(), surr_scale[0] * surr_w, surr_delta, shrinkage=surr_scale[0] * shrink_w, form=surround_form
+            )
+            P6_pe = torch.zeros((6, 6), **f32)
+            P6_pe[:3, :3] = torch.outer(p_vec, p_vec)
+            P6_orth = torch.eye(6, **f32) - P6_pe
+            D0 = torch.einsum("ij,bjk,kl->bil", P6_orth, D0_r, P6_orth) + torch.einsum("ij,bjk,kl->bil", P6_pe, D0, P6_pe)
+            if D1.shape[0] > 0:
+                D1 = torch.einsum("ij,bjk,kl->bil", P6_orth, D1_r, P6_orth) + torch.einsum("ij,bjk,kl->bil", P6_pe, D1, P6_pe)
+            if D2.shape[0] > 0:
+                D2 = torch.einsum("ij,bjk,kl->bil", P6_orth, D2_r, P6_orth) + torch.einsum("ij,bjk,kl->bil", P6_pe, D2, P6_pe)
+        return D0[:, cols][:, :, cols], D1[:, cols][:, :, cols], D2[:, cols][:, :, cols]
+
     def _project_pe_eddy_gauge():
         """Attribute the odd-in-g linear eddy translation along p_vec from t_param into a0_pe using the surround Tukey
         estimator, keeping the total displacement y_phys invariant while ensuring t_param holds pure head translation."""
@@ -2601,6 +2922,7 @@ def _batched_rigid_register_pass_core(
     # doc for why correlation specifically helps at coarse resolution for this
     # intra-subject case.
     mid_level = min(2, max_level)
+    _coarse_corr_w = 0.0 if pe_affine_covariates is not None else 1.0
     if schedule is not None:
         schedule = [dict(st) for st in schedule]   # explicit stage list (see ``schedule`` in the docstring)
     elif schedule_mode == "fast":
@@ -2609,7 +2931,7 @@ def _batched_rigid_register_pass_core(
         # joint LBFGS polish at level 1, no alternating translation-only/rotation-only
         # final-polish pass (the most expensive stages per iter, per the note below).
         schedule = [
-            dict(optimizer="adam", iters=30, step_t_vox=0.04, step_r_vox=1.2, level=coarse_level, sampling=0.2, corr_weight=1.0),
+            dict(optimizer="adam", iters=30, step_t_vox=0.04, step_r_vox=1.2, level=coarse_level, sampling=0.2, corr_weight=_coarse_corr_w),
             dict(optimizer="lbfgs", iters=10, sampling=0.2, level=1),
         ]
     elif schedule_mode in ("default", "medium"):
@@ -2620,8 +2942,8 @@ def _batched_rigid_register_pass_core(
         # voxels at any spacing (mouse x0.1, human, x10: 0.178 voxel at all three; L-BFGS 0.20-0.23). With the eddy
         # PE-affine (extra non-rigid shared parameters) L-BFGS fits the shared terms at L1 and Newton polishes the per-frame rigid poses.
         schedule = [
-            dict(optimizer="adam", iters=80, step_t_vox=0.04, step_r_vox=1.2, level=coarse_level, sampling=0.2, corr_weight=1.0),
-            dict(optimizer="adam", iters=40, step_t_vox=0.015, step_r_vox=0.45, level=mid_level, sampling=0.2, corr_weight=1.0),
+            dict(optimizer="adam", iters=80, step_t_vox=0.04, step_r_vox=1.2, level=coarse_level, sampling=0.2, corr_weight=_coarse_corr_w),
+            dict(optimizer="adam", iters=40, step_t_vox=0.015, step_r_vox=0.45, level=mid_level, sampling=0.2, corr_weight=_coarse_corr_w),
             *(
                 [
                     dict(optimizer="lbfgs", iters=15, sampling=0.2, level=1),
@@ -2669,7 +2991,20 @@ def _batched_rigid_register_pass_core(
             gain_t.copy_(g)
             gain_log.append(g.detach().cpu().numpy().astype(float).tolist())
 
-    _act_slice_cache: dict = {"key": None, "act_ref": None, "mov": None, "grad": None}
+    _act_slice_cache: dict = {"key": None, "act_ref": None, "mov": None, "grad": None, "wy_key": None, "fi_i": None, "fi_w": None}
+
+    def _get_mov_grad_sub(moving_tensor, active_idx):
+        use_sub = active_idx is not None and int(active_idx.numel()) < B
+        grad_full = get_grad_I(moving_tensor)
+        if use_sub:
+            ckey = (id(moving_tensor), id(active_idx))
+            if _act_slice_cache["key"] != ckey:
+                _act_slice_cache["key"] = ckey
+                _act_slice_cache["act_ref"] = active_idx
+                _act_slice_cache["mov"] = moving_tensor.index_select(0, active_idx).unsqueeze(1)
+                _act_slice_cache["grad"] = None if grad_full is None else grad_full.index_select(0, active_idx)
+            return _act_slice_cache["mov"], _act_slice_cache["grad"]
+        return moving_tensor.unsqueeze(1), grad_full
 
     def _warped_values(X_stage, moving_tensor, shape_stage, level_stage=1, active_idx=None):
         """Intensities (B_cur, S) of every (or ``active_idx``) frame at the physical points ``X_stage`` under the current
@@ -2694,19 +3029,7 @@ def _batched_rigid_register_pass_core(
             y_phys = apply_pe(y_phys, a_pe)
         grid_norm = warp_to_moving_norm(y_phys, shape_stage, level=level_stage)
         grid = grid_norm.view(n_cur, 1, 1, -1, 3)
-        grad_full = get_grad_I(moving_tensor)
-        if use_sub:
-            ckey = (id(moving_tensor), id(active_idx))
-            if _act_slice_cache["key"] != ckey:
-                _act_slice_cache["key"] = ckey
-                _act_slice_cache["act_ref"] = active_idx
-                _act_slice_cache["mov"] = moving_tensor.index_select(0, active_idx).unsqueeze(1)
-                _act_slice_cache["grad"] = None if grad_full is None else grad_full.index_select(0, active_idx)
-            mov_in = _act_slice_cache["mov"]
-            grad_in = _act_slice_cache["grad"]
-        else:
-            mov_in = moving_tensor.unsqueeze(1)
-            grad_in = grad_full
+        mov_in, grad_in = _get_mov_grad_sub(moving_tensor, active_idx if use_sub else None)
         warped = grid_sample_nd(mov_in, grid, mode="bilinear",
                                  padding_mode="zeros", align_corners=True,
                                  interpolator="linear", use_analytical_gradients=True,
@@ -2778,6 +3101,7 @@ def _batched_rigid_register_pass_core(
             fixed_vals_stage = fixed_vals_stage.index_select(0, active_idx)
         if use_sub and w_pts is not None:
             w_pts = w_pts.index_select(0, active_idx)
+        w_y_full = w_y_stage
         if use_sub and w_y_stage is not None and w_y_stage.dim() == 3:
             w_y_stage = w_y_stage.index_select(0, active_idx)
         w_scaled = _scale(warped, True, active_idx=sub_idx)
@@ -2790,16 +3114,30 @@ def _batched_rigid_register_pass_core(
             else:
                 per_frame_loss = (elem * w_pts).sum(dim=1) / w_pts.sum(dim=1).clamp_min(1e-8)
         else:
-            from .core.kernels import RegisterParzenMattesMIFunction, has_mps_shader_backend
+            from .core.kernels import RegisterParzenMattesMIFunction
             from .core.losses.mutual_information import _default_parzen_weights, _extract_sparse4_from_fixed_weights
 
             if (
                 parzen_weights is _default_parzen_weights
                 and w_scaled.dtype == torch.float32
                 and int(num_bins) >= 6
-                and has_mps_shader_backend(w_scaled.device)
             ):
-                fi_idx4, fi_w4 = _extract_sparse4_from_fixed_weights(w_y_stage)
+                if use_sub and w_y_full is not None and w_y_full.dim() == 3:
+                    wy_ckey = (id(w_y_full), getattr(w_y_full, "_version", -1), id(active_idx))
+                    if _act_slice_cache["wy_key"] != wy_ckey:
+                        fi_i_full, fi_w_full = _extract_sparse4_from_fixed_weights(w_y_full)
+                        fi_i_sub = fi_i_full.index_select(0, active_idx).contiguous()
+                        fi_w_sub = fi_w_full.index_select(0, active_idx).contiguous()
+                        try:
+                            fi_w_sub._dense_fw = w_y_stage.to(torch.float32).contiguous()
+                        except AttributeError:
+                            pass
+                        _act_slice_cache["wy_key"] = wy_ckey
+                        _act_slice_cache["fi_i"] = fi_i_sub
+                        _act_slice_cache["fi_w"] = fi_w_sub
+                    fi_idx4, fi_w4 = _act_slice_cache["fi_i"], _act_slice_cache["fi_w"]
+                else:
+                    fi_idx4, fi_w4 = _extract_sparse4_from_fixed_weights(w_y_stage)
                 per_frame_loss = RegisterParzenMattesMIFunction.apply(
                     w_scaled, fi_idx4, fi_w4, int(num_bins), -1.0, 1.0, 2.0, w_pts
                 )
@@ -2814,6 +3152,159 @@ def _batched_rigid_register_pass_core(
         if corr_weight > 0.0 and fixed_vals_stage is not None:
             per_frame_loss = per_frame_loss + corr_weight * pearson_correlation_loss(warped, fixed_vals_stage)
         return per_frame_loss
+
+    def _eval_multi_poses(
+        t_bm: torch.Tensor,
+        om_bm: torch.Tensor,
+        X_stage: torch.Tensor,
+        w_y_stage: Optional[torch.Tensor],
+        moving_tensor: torch.Tensor,
+        shape_stage: torch.Tensor,
+        level_stage: int,
+        fixed_vals_stage: Optional[torch.Tensor],
+        corr_weight: float,
+        w_pts: Optional[torch.Tensor],
+        active_idx: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """Evaluate ``M`` rigid poses ``(t_bm, om_bm)`` of shape ``(n_cur, M, 3)`` against ``moving_tensor`` in a single
+        5-D ``grid_sample_nd`` pass without duplicating the 3-D volume or spatial gradient across the ``M`` poses."""
+        from .core.kernels import RegisterParzenMattesMIFunction
+        from .core.losses.mutual_information import _default_parzen_weights, _extract_sparse4_from_fixed_weights
+
+        use_sub = active_idx is not None and int(active_idx.numel()) < B
+        sub_idx = active_idx if use_sub else None
+        n_cur, M_tot, _ = t_bm.shape
+        S_pts = int(X_stage.shape[0])
+        if n_cur == 0 or M_tot == 0:
+            return t_bm.new_zeros((n_cur, M_tot))
+
+        mov_in, grad_in = _get_mov_grad_sub(moving_tensor, sub_idx)
+        Xc = X_stage - C_phys
+        if enc_on:
+            dY_det = _encoding_offset().detach()
+            if use_sub:
+                dY_det = dY_det.index_select(0, active_idx)
+            t_eff_bm = t_bm + dY_det[:, None, :3]
+            om_eff_bm = om_bm + dY_det[:, None, 3:]
+        else:
+            t_eff_bm = t_bm
+            om_eff_bm = om_bm
+
+        if pe_on:
+            a_pe_b, jac_pe_b = (x.detach() for x in pe_terms())
+            if use_sub:
+                a_pe_b = a_pe_b.index_select(0, active_idx)
+                jac_pe_b = jac_pe_b.index_select(0, active_idx)
+        if frame_gain:
+            gt_b = gain_t.index_select(0, active_idx) if use_sub else gain_t
+        hb_sub = (hi_b.index_select(0, active_idx) if use_sub else hi_b) if hi_b is not None else None
+
+        fv_sub = (
+            fixed_vals_stage.index_select(0, active_idx)
+            if (use_sub and fixed_vals_stage is not None and fixed_vals_stage.dim() == 2)
+            else fixed_vals_stage
+        )
+        wp_sub = w_pts.index_select(0, active_idx) if (use_sub and w_pts is not None) else w_pts
+        wy_sub = (
+            w_y_stage.index_select(0, active_idx)
+            if (use_sub and w_y_stage is not None and w_y_stage.dim() == 3)
+            else w_y_stage
+        )
+
+        use_fast_mi = (
+            metric != "huber"
+            and parzen_weights is _default_parzen_weights
+            and t_bm.dtype == torch.float32
+            and int(num_bins) >= 6
+        )
+        if use_fast_mi:
+            if use_sub and w_y_stage is not None and w_y_stage.dim() == 3:
+                wy_ckey = (id(w_y_stage), getattr(w_y_stage, "_version", -1), id(active_idx))
+                if _act_slice_cache["wy_key"] != wy_ckey:
+                    fi_i_full, fi_w_full = _extract_sparse4_from_fixed_weights(w_y_stage)
+                    fi_i_sub = fi_i_full.index_select(0, active_idx).contiguous()
+                    fi_w_sub = fi_w_full.index_select(0, active_idx).contiguous()
+                    try:
+                        fi_w_sub._dense_fw = wy_sub.to(torch.float32).contiguous()
+                    except AttributeError:
+                        pass
+                    _act_slice_cache["wy_key"] = wy_ckey
+                    _act_slice_cache["fi_i"] = fi_i_sub
+                    _act_slice_cache["fi_w"] = fi_w_sub
+                fi_idx4, fi_w4 = _act_slice_cache["fi_i"], _act_slice_cache["fi_w"]
+            else:
+                fi_idx4, fi_w4 = _extract_sparse4_from_fixed_weights(wy_sub)
+
+        b_chunk = max(1, min(n_cur, 6_000_000 // max(M_tot * S_pts, 1)))
+        fs_all = _scale(fv_sub, fv_sub.dim() == 2, active_idx=sub_idx) if (metric == "huber" and fv_sub is not None) else None
+        dense_fw_sub = getattr(fi_w4, "_dense_fw", None) if use_fast_mi else None
+        out_chunks = []
+        for b0 in range(0, n_cur, b_chunk):
+            b1 = min(n_cur, b0 + b_chunk)
+            bc = b1 - b0
+            q_len = bc * M_tot
+            R_c = _batched_rodrigues(om_eff_bm[b0:b1].reshape(q_len, 3))
+            y_phys = torch.einsum("qij,sj->qsi", R_c, Xc) + C_phys + t_eff_bm[b0:b1].reshape(q_len, 3).unsqueeze(1)
+            if pe_on:
+                a_rep = a_pe_b[b0:b1].unsqueeze(1).expand(bc, M_tot, 4).reshape(q_len, 4)
+                y_phys = apply_pe(y_phys, a_rep)
+            grid_norm = warp_to_moving_norm(y_phys, shape_stage, level=level_stage)
+            grid = grid_norm.view(bc, M_tot, 1, S_pts, 3)
+            mov_c = mov_in if bc == n_cur else mov_in[b0:b1]
+            grad_c = grad_in if (grad_in is None or bc == n_cur) else grad_in[b0:b1]
+            warped_bm = grid_sample_nd(
+                mov_c, grid, mode="bilinear", padding_mode="zeros", align_corners=True,
+                interpolator="linear", use_analytical_gradients=True, precomputed_grad_I=grad_c,
+            ).reshape(bc, M_tot, S_pts)
+            if pe_on:
+                warped_bm = warped_bm * jac_pe_b[b0:b1].view(bc, 1, 1)
+            if frame_gain:
+                warped_bm = warped_bm * gt_b[b0:b1].view(bc, 1, 1)
+            if hb_sub is not None:
+                ws_bm = (warped_bm - lo) / (hb_sub[b0:b1].view(bc, 1, 1) - lo + 1e-8) * 2.0 - 1.0
+            else:
+                ws_bm = (warped_bm - lo) / (hi - lo + 1e-8) * 2.0 - 1.0
+
+            wp_c = wp_sub[b0:b1] if (wp_sub is not None and wp_sub.ndim == 2 and int(wp_sub.shape[0]) == n_cur and bc < n_cur) else wp_sub
+            if metric == "huber":
+                fs_c = fs_all[b0:b1] if (fs_all.dim() == 2 and bc < n_cur) else fs_all
+                tgt = fs_c.unsqueeze(1).expand_as(ws_bm) if fs_c.dim() == 2 else fs_c.view(1, 1, S_pts).expand_as(ws_bm)
+                elem = huber_loss_nd(ws_bm, tgt, delta=huber_delta, reduction="none")
+                if wp_c is None:
+                    loss_c = elem.mean(dim=2)
+                else:
+                    wp3 = wp_c.unsqueeze(1)
+                    loss_c = (elem * wp3).sum(dim=2) / wp3.sum(dim=2).clamp_min(1e-8)
+            elif use_fast_mi:
+                if bc < n_cur and fi_idx4.ndim == 3:
+                    fi_i_c = fi_idx4[b0:b1]
+                    fi_w_c = fi_w4[b0:b1]
+                    if dense_fw_sub is not None and dense_fw_sub.ndim == 3:
+                        try:
+                            fi_w_c._dense_fw = dense_fw_sub[b0:b1]
+                        except AttributeError:
+                            pass
+                else:
+                    fi_i_c, fi_w_c = fi_idx4, fi_w4
+                loss_c = RegisterParzenMattesMIFunction.apply(
+                    ws_bm.reshape(q_len, S_pts), fi_i_c, fi_w_c, int(num_bins), -1.0, 1.0, 2.0, wp_c
+                ).view(bc, M_tot)
+            else:
+                w_x = parzen_weights(ws_bm.reshape(-1), num_bins=num_bins).reshape(q_len, S_pts, num_bins)
+                wy_b = wy_sub[b0:b1] if (wy_sub.dim() == 3 and bc < n_cur) else wy_sub
+                wy_c = wy_b.unsqueeze(1).expand(bc, M_tot, S_pts, num_bins).reshape(q_len, S_pts, num_bins) if wy_b.dim() == 3 else wy_b
+                if wp_c is not None:
+                    sw = torch.sqrt(wp_c.unsqueeze(1).expand(bc, M_tot, S_pts).reshape(q_len, S_pts)).unsqueeze(-1)
+                    w_x = w_x * sw
+                    wy_c = (wy_c if wy_c.dim() == 3 else wy_c.unsqueeze(0).expand(q_len, -1, -1)) * sw
+                loss_c = batched_mattes_mi_from_weights(w_x, wy_c).view(bc, M_tot)
+
+            if corr_weight > 0.0 and fv_sub is not None:
+                fv_b = fv_sub[b0:b1] if (fv_sub.dim() == 2 and bc < n_cur) else fv_sub
+                fv_rep = fv_b.unsqueeze(1).expand(bc, M_tot, S_pts).reshape(q_len, S_pts) if fv_b.dim() == 2 else fv_b
+                loss_c = loss_c + corr_weight * pearson_correlation_loss(warped_bm.reshape(q_len, S_pts), fv_rep).view(bc, M_tot)
+            out_chunks.append(loss_c)
+        return out_chunks[0] if len(out_chunks) == 1 else torch.cat(out_chunks, dim=0)
 
     convergence_log = []
     for stage_idx, stage in enumerate(schedule):
@@ -2905,10 +3396,137 @@ def _batched_rigid_register_pass_core(
         _pts = X_pool[::max(1, X_pool.shape[0] // _N_CONVERGENCE_POINTS)]
         probe_axes = [ax for ax in rigid_axes(t_param, omega, _pts, C_phys)
                       if not ((freeze == "r" and ax.tensor is omega) or (freeze == "t" and ax.tensor is t_param))]
-        _prior_scale_curvature(lambda: compute_loss(cur["X"], cur["w_y"], moving_tensor, shape_stage, level_stage=level,
-                                                    fixed_vals_stage=cur["fixed_vals"], corr_weight=corr_weight,
-                                                    fixed_tensor=lvl_data["fixed_tensor"], w_pts=cur["w_pts"]),
-                               probe_axes, stage_voxel)
+        can_multi_pose = not (design_model is not None and design_model.get("live"))
+        if prior_stage:
+            if can_multi_pose and surround_scale == "curvature" and (surr_w > 0.0 or shrink_w > 0.0):
+                tr_axes_only = [ax for ax in probe_axes if ax.tensor is t_param]
+                if tr_axes_only:
+                    with torch.no_grad():
+                        n_tr = len(tr_axes_only)
+                        M_tr = 1 + 2 * n_tr
+                        t_pr = t_param.detach().unsqueeze(1).expand(B, M_tr, 3).clone()
+                        om_pr = omega.detach().unsqueeze(1).expand(B, M_tr, 3).clone()
+                        for k_ax, ax_tr in enumerate(tr_axes_only):
+                            d_tr = 0.5 * float(stage_voxel) / float(ax_tr.scale_mm)
+                            col_tr = int(ax_tr.index[1])
+                            t_pr[:, 1 + 2 * k_ax, col_tr] += d_tr
+                            t_pr[:, 2 + 2 * k_ax, col_tr] -= d_tr
+                        f_pr = _eval_multi_poses(
+                            t_pr, om_pr, cur["X"], cur["w_y"], moving_tensor, shape_stage,
+                            level, cur["fixed_vals"], corr_weight, cur["w_pts"], None,
+                        )
+                        f0_pr = f_pr[:, 0:1]
+                        fp_pr = f_pr[:, 1::2]
+                        fm_pr = f_pr[:, 2::2]
+                        curv_mm2 = ((fp_pr + fm_pr - 2.0 * f0_pr) / (0.5 ** 2)) / (float(stage_voxel) ** 2)
+                        c_valid = curv_mm2[torch.isfinite(curv_mm2) & (curv_mm2 > 0)]
+                        if c_valid.numel() > 0:
+                            surr_scale[0] = float(c_valid.median())
+                            prior_scale_log.append(
+                                {"curvature_per_mm2": surr_scale[0], "points": int(cur_points[0]), "scale": surr_scale[0]}
+                            )
+            else:
+                _prior_scale_curvature(lambda: compute_loss(cur["X"], cur["w_y"], moving_tensor, shape_stage, level_stage=level,
+                                                            fixed_vals_stage=cur["fixed_vals"], corr_weight=corr_weight,
+                                                            fixed_tensor=lvl_data["fixed_tensor"], w_pts=cur["w_pts"]),
+                                       [ax for ax in probe_axes if ax.tensor is t_param] or probe_axes, stage_voxel)
+
+        def _probe_active_sub(act_sub, probe_axes=probe_axes, stage_voxel=stage_voxel, cur=cur,
+                              moving_tensor=moving_tensor, shape_stage=shape_stage, level=level, corr_weight=corr_weight):
+            with torch.no_grad():
+                n_s = int(act_sub.numel())
+                P_ax = len(probe_axes)
+                M_p = 1 + 2 * P_ax
+                t_s = t_param.detach().index_select(0, act_sub).unsqueeze(1).expand(n_s, M_p, 3).clone()
+                om_s = omega.detach().index_select(0, act_sub).unsqueeze(1).expand(n_s, M_p, 3).clone()
+                for k_ax, ax_p in enumerate(probe_axes):
+                    d_p = 0.5 * float(stage_voxel) / float(ax_p.scale_mm)
+                    col_p = int(ax_p.index[1])
+                    if ax_p.tensor is t_param:
+                        t_s[:, 1 + 2 * k_ax, col_p] += d_p
+                        t_s[:, 2 + 2 * k_ax, col_p] -= d_p
+                    else:
+                        om_s[:, 1 + 2 * k_ax, col_p] += d_p
+                        om_s[:, 2 + 2 * k_ax, col_p] -= d_p
+                f_all = _eval_multi_poses(
+                    t_s, om_s, cur["X"], cur["w_y"], moving_tensor, shape_stage,
+                    level, cur["fixed_vals"], corr_weight, cur["w_pts"], act_sub,
+                )
+                f0 = f_all[:, 0:1]
+                fp = f_all[:, 1::2]
+                fm = f_all[:, 2::2]
+                grad = (fp - fm) / 1.0
+                curv = (fp + fm - 2.0 * f0) / 0.25
+                top = curv.clamp_min(0.0).max(dim=1, keepdim=True).values
+                flr = torch.maximum(top * 1e-3, torch.full_like(top, 1e-12))
+                nwt = torch.where(top > 1e-12, (grad / torch.maximum(curv, flr)).abs(), torch.full_like(curv, float("inf")))
+                return nwt.max(dim=1).values
+
+        def _grad_multi_newton(act_sub, deltas_list, probe_axes=probe_axes, cur=cur,
+                               moving_tensor=moving_tensor, shape_stage=shape_stage, level=level, corr_weight=corr_weight):
+            n_s = int(act_sub.numel())
+            P_ax = len(probe_axes)
+            M_g = 1 + 2 * P_ax
+            t_m = t_param.detach().index_select(0, act_sub).unsqueeze(1).expand(n_s, M_g, 3).clone()
+            om_m = omega.detach().index_select(0, act_sub).unsqueeze(1).expand(n_s, M_g, 3).clone()
+            for k_ax, ax_g in enumerate(probe_axes):
+                d_g = float(deltas_list[k_ax])
+                col_g = int(ax_g.index[1])
+                if ax_g.tensor is t_param:
+                    t_m[:, 1 + 2 * k_ax, col_g] += d_g
+                    t_m[:, 2 + 2 * k_ax, col_g] -= d_g
+                else:
+                    om_m[:, 1 + 2 * k_ax, col_g] += d_g
+                    om_m[:, 2 + 2 * k_ax, col_g] -= d_g
+            need_t = any(ax_g.tensor is t_param for ax_g in probe_axes)
+            need_om = any(ax_g.tensor is omega for ax_g in probe_axes)
+            if need_t:
+                t_m.requires_grad_(True)
+            if need_om:
+                om_m.requires_grad_(True)
+            req_leaves = ([t_m] if need_t else []) + ([om_m] if need_om else [])
+            with torch.enable_grad():
+                losses_m = _eval_multi_poses(
+                    t_m, om_m, cur["X"], cur["w_y"], moving_tensor, shape_stage,
+                    level, cur["fixed_vals"], corr_weight, cur["w_pts"], act_sub,
+                )
+                grads_req = torch.autograd.grad(losses_m.sum(), req_leaves)
+            gt_m = grads_req[0] if need_t else None
+            gom_m = grads_req[1 if need_t else 0] if need_om else None
+            cols_g = []
+            for ax_g in probe_axes:
+                col_g = int(ax_g.index[1])
+                cols_g.append(gt_m[:, :, col_g] if ax_g.tensor is t_param else gom_m[:, :, col_g])
+            g_all = torch.stack(cols_g, dim=2)  # (n_s, M_g, P_ax)
+            g0 = g_all[:, 0, :]
+            gp = g_all[:, 1::2, :]
+            gm = g_all[:, 2::2, :]
+            d_vec = torch.tensor(deltas_list, device=dev, dtype=g_all.dtype).view(1, P_ax, 1)
+            H_s = ((gp - gm) / (2.0 * d_vec)).transpose(1, 2)
+            H_s = 0.5 * (H_s + H_s.transpose(1, 2))
+            return g0, H_s
+
+        def _loss_multi_newton(act_sub, dv_full, to_vox_vec, alphas_tup, probe_axes=probe_axes, cur=cur,
+                               moving_tensor=moving_tensor, shape_stage=shape_stage, level=level, corr_weight=corr_weight):
+            with torch.no_grad():
+                n_s = int(act_sub.numel())
+                M_ls = len(alphas_tup)
+                t_ls = t_param.detach().index_select(0, act_sub).unsqueeze(1).expand(n_s, M_ls, 3).clone()
+                om_ls = omega.detach().index_select(0, act_sub).unsqueeze(1).expand(n_s, M_ls, 3).clone()
+                dv_sub = dv_full.index_select(0, act_sub)
+                a_vec = torch.tensor(alphas_tup, device=dev, dtype=t_ls.dtype).view(1, M_ls)
+                for k_ax, ax_l in enumerate(probe_axes):
+                    col_l = int(ax_l.index[1])
+                    step_bm = dv_sub[:, k_ax:k_ax + 1] * float(to_vox_vec[k_ax]) * a_vec
+                    if ax_l.tensor is t_param:
+                        t_ls[:, :, col_l] += step_bm
+                    else:
+                        om_ls[:, :, col_l] += step_bm
+                return _eval_multi_poses(
+                    t_ls, om_ls, cur["X"], cur["w_y"], moving_tensor, shape_stage,
+                    level, cur["fixed_vals"], corr_weight, cur["w_pts"], act_sub,
+                )
+
         rec = _run_converging_stage(
             optimizer=stage.get("optimizer", "adam"), params=opt_params, per_frame_params=per_frame_params,
             loss_fn=lambda: compute_loss(cur["X"], cur["w_y"], moving_tensor, shape_stage, level_stage=level,
@@ -2927,19 +3545,22 @@ def _batched_rigid_register_pass_core(
                                                                  fixed_vals_stage=cur["fixed_vals"], corr_weight=corr_weight,
                                                                  fixed_tensor=lvl_data["fixed_tensor"], w_pts=cur["w_pts"]),
                                             probe_axes, stage_voxel, probe_vox=0.5),
+            probe_active_fn=_probe_active_sub if can_multi_pose else None,
             confirm_vox=float(stage.get("confirm_vox", _CONFIRM_FACTOR * float(convergence_tol_vox))), axes=probe_axes, stage_voxel=stage_voxel,
             label=f"{stage.get('optimizer', 'adam')}@L{level}" + (f"/{freeze}" if freeze else ""), level=level,
             shared_params=shared_stage_params if shared_stage_params else None,
             reg_loss_fn=_surround_reg_loss if prior_stage else None,
             reg_hess_fn=(lambda: _surround_reg_hess(probe_axes)) if prior_stage else None,
-            reg_hess_full_fn=(lambda: _surround_reg_hess_full(probe_axes)) if prior_stage else None,
-            reg_frame_fn=_surround_frame_terms if prior_stage else None)
-        _act_slice_cache.update(key=None, act_ref=None, mov=None, grad=None)
+            reg_hess_blocks_fn=(lambda: _surround_reg_hess_blocks(probe_axes)) if prior_stage else None,
+            reg_frame_fn=_surround_frame_terms if prior_stage else None,
+            grad_multi_fn=_grad_multi_newton if can_multi_pose else None,
+            loss_multi_fn=_loss_multi_newton if can_multi_pose else None)
+        _act_slice_cache.update(key=None, act_ref=None, mov=None, grad=None, wy_key=None, fi_i=None, fi_w=None)
         _project_encoding_gauge()
         _project_level_gauge()
         convergence_log.append(rec)
 
-    if init_pose is not None and convergence_log and not all(convergence_log[-1]["converged"]) and cur:
+    if (init_pose is not None or seed_mode == "narrow") and convergence_log and not all(convergence_log[-1]["converged"]) and cur:
         with torch.no_grad():
             unconv_idx = torch.nonzero(
                 torch.tensor([not c for c in convergence_log[-1]["converged"]], dtype=torch.bool, device=dev)
@@ -2957,8 +3578,12 @@ def _batched_rigid_register_pass_core(
                     )
                     _pts1 = cur["X"][::max(1, cur["X"].shape[0] // _N_CONVERGENCE_POINTS)]
                     t_eff_u, om_eff_u = (x.index_select(0, unconv_idx) for x in _total_pose())
-                    t_ini_u = torch.tensor(t_init, device=dev, dtype=t_param.dtype).index_select(0, unconv_idx)
-                    om_ini_u = torch.tensor(omega_init, device=dev, dtype=omega.dtype).index_select(0, unconv_idx)
+                    if init_pose is not None:
+                        t_ini_u = torch.as_tensor(t_init_np, device=dev, dtype=t_param.dtype).index_select(0, unconv_idx)
+                        om_ini_u = torch.as_tensor(omega_init_np, device=dev, dtype=omega.dtype).index_select(0, unconv_idx)
+                    else:
+                        t_ini_u = torch.zeros((int(unconv_idx.numel()), 3), device=dev, dtype=t_param.dtype)
+                        om_ini_u = torch.zeros((int(unconv_idx.numel()), 3), device=dev, dtype=omega.dtype)
                     y_end = torch.einsum("bij,sj->bsi", _batched_rodrigues(om_eff_u), _pts1 - C_phys) + C_phys + t_eff_u.unsqueeze(1)
                     y_ini = torch.einsum("bij,sj->bsi", _batched_rodrigues(om_ini_u), _pts1 - C_phys) + C_phys + t_ini_u.unsqueeze(1)
                     drift_u = (y_end - y_ini).pow(2).sum(-1).mean(-1).sqrt()
@@ -3136,6 +3761,14 @@ def _batched_rigid_register_pass_core(
                            "n_sample_full_resolution": int(n_sample)}
     fwd_transforms, inv_transforms = [], []
     has_eddy = pe_on or (pe_b0_split and pe_info is not None and pe_info.get("a") is not None)
+    pe_info["_poses"] = {
+        "R": R_final.astype(np.float64, copy=True),
+        "t": t_final.astype(np.float64, copy=True),
+        "com": np.asarray(com_f, dtype=np.float64).copy(),
+        "has_eddy": bool(has_eddy),
+        "p": (np.asarray(p_np, dtype=np.float64).copy() if has_eddy else None),
+        "a": (np.asarray(a_np, dtype=np.float64).copy() if has_eddy else None),
+    }
     for b in range(B):
         tx = ants.create_ants_transform(transform_type="AffineTransform", precision="float", dimension=3)
         tx.set_parameters(np.concatenate([R_final[b].flatten(), t_final[b]]))
@@ -3602,7 +4235,10 @@ def batched_group_bias_register_pass(
     C_phys = torch.tensor(com_f, **f32)
 
     def to_tensor(img):
-        arr = np.transpose(img.numpy().astype(np.float32), (2, 1, 0))
+        raw = img.view() if hasattr(img, "view") else img.numpy()
+        if raw.dtype == np.float32 and raw.flags["F_CONTIGUOUS"]:
+            return torch.from_numpy(raw.T).to(dev)
+        arr = np.transpose(raw.astype(np.float32, copy=False), (2, 1, 0))
         return torch.from_numpy(np.ascontiguousarray(arr)).to(dev)
 
     fixed_t_zyx = to_tensor(reference_img)
@@ -3648,10 +4284,10 @@ def batched_group_bias_register_pass(
     # common component) and each group frame's own t_param from its RESIDUAL after
     # subtracting that mean -- starting near the right per-frame/group decomposition
     # instead of leaving the optimizer to discover the split from scratch.
-    com_offsets = np.zeros((B, 3), dtype=np.float32)
-    for b, m in enumerate(moving_imgs):
-        com_m = np.asarray(compute_center_of_mass(m, weighted=True), dtype=np.float64)
-        com_offsets[b] = (com_m - com_f).astype(np.float32)
+    com_m_gb = _compute_batch_com_zyx(
+        moving_stack, reference_img.origin, reference_img.spacing, reference_img.direction
+    )
+    com_offsets = (com_m_gb - com_f[None, :]).astype(np.float32)
     t_group_init = com_offsets[dwi_mask_np].mean(axis=0) if Ndwi > 0 else np.zeros(3, dtype=np.float32)
     t_init = com_offsets.copy()
     t_init[dwi_mask_np] -= t_group_init
@@ -3717,14 +4353,13 @@ def batched_group_bias_register_pass(
             per_frame_loss = huber_loss_nd(w_scaled, fixed_scaled_stage.unsqueeze(0).expand_as(w_scaled),
                                            delta=huber_delta, reduction="none").mean(dim=1)
         else:
-            from .core.kernels import RegisterParzenMattesMIFunction, has_mps_shader_backend
+            from .core.kernels import RegisterParzenMattesMIFunction
             from .core.losses.mutual_information import _default_parzen_weights, _extract_sparse4_from_fixed_weights
 
             if (
                 parzen_weights is _default_parzen_weights
                 and w_scaled.dtype == torch.float32
                 and int(num_bins) >= 6
-                and has_mps_shader_backend(w_scaled.device)
             ):
                 fi_idx4, fi_w4 = _extract_sparse4_from_fixed_weights(w_y_stage)
                 per_frame_loss = RegisterParzenMattesMIFunction.apply(

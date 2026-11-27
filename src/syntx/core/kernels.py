@@ -1578,23 +1578,42 @@ class RegisterParzenMattesMIFunction(torch.autograd.Function):
         k_bins = int(num_bins)
         scale_bin = (float(k_bins - 1) - 2.0 * float(pad)) / (float(max_val) - float(min_val))
         dev = mv.device
-        per_frame_fi = fi_idx4.ndim == 3 and int(fi_idx4.shape[0]) == m_sz
+        dense_fw = getattr(fi_w4, "_dense_fw", None)
+        if dense_fw is not None and (dense_fw.device != dev or int(dense_fw.shape[-1]) != k_bins):
+            dense_fw = None
         if fi_idx4.ndim == 3 and int(fi_idx4.shape[0]) == 1 and m_sz > 1:
             fi_idx4 = fi_idx4.squeeze(0)
             fi_w4 = fi_w4.squeeze(0)
-            per_frame_fi = False
+            if dense_fw is not None and dense_fw.ndim == 3 and int(dense_fw.shape[0]) == 1:
+                dense_fw = dense_fw.squeeze(0)
+        fi_b_sz = int(fi_idx4.shape[0]) if fi_idx4.ndim == 3 else 0
+        per_frame_fi = fi_idx4.ndim == 3 and (fi_b_sz == m_sz or (fi_b_sz > 0 and m_sz % fi_b_sz == 0))
+        fi_n_rep = (m_sz // fi_b_sz) if (per_frame_fi and fi_b_sz < m_sz) else 1
 
         has_pw = point_weights is not None
         pw_bcast = bool(has_pw and (point_weights.ndim == 1 or int(point_weights.shape[0]) == 1))
+        pw_b_sz = int(point_weights.shape[0]) if (has_pw and point_weights.ndim == 2 and not pw_bcast) else 0
+        pw_n_rep = (m_sz // pw_b_sz) if (pw_b_sz > 0 and pw_b_sz < m_sz and m_sz % pw_b_sz == 0) else 1
         pw_t = (
             point_weights.to(device=dev, dtype=torch.float32).contiguous()
             if has_pw
             else torch.empty((1,), device=dev, dtype=torch.float32)
         )
 
-        if has_mps_shader_backend(dev) and k_bins >= 6:
-            fi_i_c = fi_idx4 if fi_idx4.is_contiguous() else fi_idx4.contiguous()
-            fi_w_c = fi_w4 if fi_w4.is_contiguous() else fi_w4.contiguous()
+        need_grad = bool(ctx.needs_input_grad[0])
+        use_mps = has_mps_shader_backend(dev) and k_bins >= 6
+        bx_save: Optional[torch.Tensor] = None
+        dwx_save: Optional[torch.Tensor] = None
+        mat_y_full: Optional[torch.Tensor] = None
+        s_blk = n_samp
+        m_blk = m_sz
+
+        if use_mps:
+            fi_i_mps = fi_idx4.repeat_interleave(fi_n_rep, dim=0) if fi_n_rep > 1 else fi_idx4
+            fi_w_mps = fi_w4.repeat_interleave(fi_n_rep, dim=0) if fi_n_rep > 1 else fi_w4
+            pw_mps = pw_t.repeat_interleave(pw_n_rep, dim=0).contiguous() if pw_n_rep > 1 else pw_t
+            fi_i_c = fi_i_mps if fi_i_mps.is_contiguous() else fi_i_mps.contiguous()
+            fi_w_c = fi_w_mps if fi_w_mps.is_contiguous() else fi_w_mps.contiguous()
             block_sz = _select_parzen_block_sz(n_samp)
             n_blocks = max(1, (n_samp + block_sz - 1) // block_sz)
             flags = (1 if per_frame_fi else 0) | ((1 if has_pw else 0) << 1) | ((1 if pw_bcast else 0) << 2)
@@ -1603,32 +1622,74 @@ class RegisterParzenMattesMIFunction(torch.autograd.Function):
             cfg_t = torch.tensor([float(min_val), float(max_val), float(scale_bin), float(pad)], device=dev, dtype=torch.float32)
             lib = _get_msl_lib("parzen_mi_3d", _MSL_PARZEN_MI_3D)
             lib.parzen_joint_hist_det_blocks_3d(
-                mv, fi_i_c, fi_w_c, pw_t, joint_blocks, dims_t, cfg_t, threads=(n_blocks, m_sz, 1)
+                mv, fi_i_c, fi_w_c, pw_mps, joint_blocks, dims_t, cfg_t, threads=(n_blocks, m_sz, 1)
             )
             joint = joint_blocks.sum(dim=1)
             del joint_blocks
         else:
-            from .losses.mutual_information import get_4tap_splines
+            from .losses.mutual_information import _eval_4tap_splines
 
-            chunk_sz = max(2048, min(16384, 65536 // max(1, m_sz)))
-            joint = torch.zeros((m_sz, k_bins, k_bins), device=dev, dtype=torch.float32)
-            for start in range(0, n_samp, chunk_sz):
-                end = min(start + chunk_sz, n_samp)
-                c_len = end - start
-                bx, wx, _ = get_4tap_splines(mv[:, start:end], k_bins, float(min_val), float(max_val), pad=float(pad))
-                if has_pw:
-                    pw_slice = pw_t.reshape(-1)[start:end].unsqueeze(0) if pw_bcast else pw_t[:, start:end]
-                    wx = wx * pw_slice.unsqueeze(-1)
-                mat_x = torch.zeros((m_sz, c_len, k_bins), device=dev, dtype=torch.float32)
-                mat_x.scatter_add_(2, bx, wx)
-                if per_frame_fi:
-                    mat_y = torch.zeros((m_sz, c_len, k_bins), device=dev, dtype=torch.float32)
-                    mat_y.scatter_add_(2, fi_idx4[:, start:end].long(), fi_w4[:, start:end])
-                    joint = joint + torch.bmm(mat_x.transpose(1, 2), mat_y)
+            bx, wx, dwx = _eval_4tap_splines(
+                mv, k_bins, float(min_val), float(max_val), pad=float(pad), need_weights=True, need_grad=need_grad
+            )
+            if has_pw:
+                if pw_bcast:
+                    wx = wx * pw_t.reshape(1, n_samp, 1)
+                elif pw_n_rep > 1:
+                    wx = (wx.view(pw_b_sz, pw_n_rep, n_samp, 4) * pw_t.view(pw_b_sz, 1, n_samp, 1)).reshape(m_sz, n_samp, 4)
                 else:
-                    mat_y = torch.zeros((c_len, k_bins), device=dev, dtype=torch.float32)
-                    mat_y.scatter_add_(1, fi_idx4[start:end].long(), fi_w4[start:end])
-                    joint = joint + torch.matmul(mat_x.transpose(1, 2), mat_y)
+                    wx = wx * pw_t.view(m_sz, n_samp, 1)
+
+            if per_frame_fi:
+                if dense_fw is not None and dense_fw.ndim == 3 and int(dense_fw.shape[0]) == fi_b_sz:
+                    mat_y_full = dense_fw
+                else:
+                    mat_y_full = torch.zeros((fi_b_sz, n_samp, k_bins), device=dev, dtype=torch.float32)
+                    mat_y_full.scatter_add_(2, fi_idx4.long(), fi_w4)
+            else:
+                if dense_fw is not None and dense_fw.ndim == 2:
+                    mat_y_full = dense_fw
+                else:
+                    mat_y_full = torch.zeros((n_samp, k_bins), device=dev, dtype=torch.float32)
+                    mat_y_full.scatter_add_(1, fi_idx4.long(), fi_w4)
+
+            max_elems = 3_145_728
+            s_blk = min(n_samp, 4096)
+            if fi_n_rep * s_blk * k_bins > max_elems:
+                s_blk = max(512, max_elems // max(fi_n_rep * k_bins, 1))
+            m_blk = max(1, min(m_sz, max_elems // max(s_blk * k_bins, 1)))
+            if per_frame_fi and fi_n_rep > 1 and m_blk > fi_n_rep:
+                m_blk = (m_blk // fi_n_rep) * fi_n_rep
+            elif per_frame_fi and fi_n_rep > 1:
+                m_blk = fi_n_rep
+
+            joint = torch.zeros((m_sz, k_bins, k_bins), device=dev, dtype=torch.float32)
+            for m0 in range(0, m_sz, m_blk):
+                m1 = min(m_sz, m0 + m_blk)
+                mc_b = m1 - m0
+                j_blk = joint[m0:m1]
+                for start in range(0, n_samp, s_blk):
+                    end = min(start + s_blk, n_samp)
+                    c_len = end - start
+                    mat_x = torch.zeros((mc_b, c_len, k_bins), device=dev, dtype=torch.float32)
+                    mat_x.scatter_add_(2, bx[m0:m1, start:end], wx[m0:m1, start:end])
+                    if per_frame_fi:
+                        fb0 = m0 // fi_n_rep
+                        fb1 = m1 // fi_n_rep
+                        fb_c = fb1 - fb0
+                        mat_y = mat_y_full[fb0:fb1, start:end]
+                        if fi_n_rep > 1:
+                            mx_g = mat_x.view(fb_c, fi_n_rep, c_len, k_bins).transpose(2, 3).reshape(fb_c, fi_n_rep * k_bins, c_len)
+                            j_blk.add_(torch.bmm(mx_g, mat_y).view(mc_b, k_bins, k_bins))
+                        else:
+                            j_blk.add_(torch.bmm(mat_x.transpose(1, 2), mat_y))
+                    else:
+                        mat_y = mat_y_full[start:end]
+                        j_blk.add_(torch.matmul(mat_x.transpose(1, 2), mat_y))
+
+            if need_grad:
+                bx_save = bx.to(torch.uint8) if k_bins <= 256 else bx.to(torch.int16)
+                dwx_save = dwx
 
         total_sum = joint.sum(dim=(1, 2), keepdim=True) + 1e-12
         pxy = joint / total_sum
@@ -1637,63 +1698,101 @@ class RegisterParzenMattesMIFunction(torch.autograd.Function):
         ratio = pxy / (px * py + 1e-12)
         losses = -torch.sum(pxy * torch.log(torch.clamp(ratio, min=1e-12)), dim=(1, 2))
 
-        ctx.save_for_backward(mv, fi_idx4, fi_w4, pw_t, ratio, total_sum)
+        if use_mps:
+            ctx.save_for_backward(mv, fi_idx4, fi_w4, pw_t, ratio, total_sum)
+        elif need_grad:
+            ctx.save_for_backward(bx_save, dwx_save, mat_y_full, pw_t, ratio, total_sum)
+        else:
+            ctx.save_for_backward(ratio, total_sum)
+        ctx.use_mps = use_mps
+        ctx.m_sz = m_sz
+        ctx.n_samp = n_samp
+        ctx.s_blk = s_blk
+        ctx.m_blk = m_blk
         ctx.k_bins = k_bins
         ctx.min_val = float(min_val)
         ctx.max_val = float(max_val)
         ctx.scale_bin = float(scale_bin)
         ctx.pad = float(pad)
         ctx.per_frame_fi = per_frame_fi
+        ctx.fi_b_sz = fi_b_sz
+        ctx.fi_n_rep = fi_n_rep
         ctx.has_pw = has_pw
         ctx.pw_bcast = pw_bcast
+        ctx.pw_b_sz = pw_b_sz
+        ctx.pw_n_rep = pw_n_rep
         return losses.to(moving_vals.dtype)
 
     @staticmethod
     def backward(ctx, grad_output: torch.Tensor):
         if not ctx.needs_input_grad[0]:
             return None, None, None, None, None, None, None, None
-        mv, fi_idx4, fi_w4, pw_t, ratio, total_sum = ctx.saved_tensors
-        m_sz, n_samp = mv.shape
-        m_mat = (-(1.0 + torch.log(torch.clamp(ratio, min=1e-12))) / total_sum) * grad_output.to(torch.float32).view(
-            m_sz, 1, 1
-        )
-        m_mat = m_mat.contiguous()
-        dev = mv.device
+        m_sz = ctx.m_sz
+        n_samp = ctx.n_samp
 
-        if has_mps_shader_backend(dev) and ctx.k_bins >= 6:
+        if ctx.use_mps:
+            mv, fi_idx4, fi_w4, pw_t, ratio, total_sum = ctx.saved_tensors
+            m_mat = (-(1.0 + torch.log(torch.clamp(ratio, min=1e-12))) / total_sum) * grad_output.to(torch.float32).view(
+                m_sz, 1, 1
+            )
+            m_mat = m_mat.contiguous()
+            dev = mv.device
             grad_mv = torch.empty_like(mv)
+            fi_i_mps = fi_idx4.repeat_interleave(ctx.fi_n_rep, dim=0) if ctx.fi_n_rep > 1 else fi_idx4
+            fi_w_mps = fi_w4.repeat_interleave(ctx.fi_n_rep, dim=0) if ctx.fi_n_rep > 1 else fi_w4
+            pw_mps = pw_t.repeat_interleave(ctx.pw_n_rep, dim=0).contiguous() if ctx.pw_n_rep > 1 else pw_t
             flags = (1 if ctx.per_frame_fi else 0) | ((1 if ctx.has_pw else 0) << 1) | ((1 if ctx.pw_bcast else 0) << 2)
             dims_t = torch.tensor([n_samp, m_sz, ctx.k_bins | (flags << 16), 0], device=dev, dtype=torch.int32)
             cfg_t = torch.tensor([ctx.min_val, ctx.max_val, ctx.scale_bin, ctx.pad], device=dev, dtype=torch.float32)
             lib = _get_msl_lib("parzen_mi_3d", _MSL_PARZEN_MI_3D)
             lib.parzen_mi_grad_mv_3d(
-                mv, fi_idx4.contiguous(), fi_w4.contiguous(), pw_t, m_mat, grad_mv, dims_t, cfg_t, threads=(n_samp, m_sz, 1)
+                mv, fi_i_mps.contiguous(), fi_w_mps.contiguous(), pw_mps, m_mat, grad_mv, dims_t, cfg_t, threads=(n_samp, m_sz, 1)
             )
             return grad_mv.to(grad_output.dtype), None, None, None, None, None, None, None
 
-        from .losses.mutual_information import get_4tap_splines
-
-        chunk_sz = max(2048, min(16384, 65536 // max(1, m_sz)))
-        grad_mv = torch.empty_like(mv)
-        for start in range(0, n_samp, chunk_sz):
-            end = min(start + chunk_sz, n_samp)
-            c_len = end - start
-            bx, _, dwx = get_4tap_splines(mv[:, start:end], ctx.k_bins, ctx.min_val, ctx.max_val, pad=ctx.pad)
-            dmat_x = torch.zeros((m_sz, c_len, ctx.k_bins), device=dev, dtype=torch.float32)
-            dmat_x.scatter_add_(2, bx, dwx)
-            if ctx.per_frame_fi:
-                mat_y = torch.zeros((m_sz, c_len, ctx.k_bins), device=dev, dtype=torch.float32)
-                mat_y.scatter_add_(2, fi_idx4[:, start:end].long(), fi_w4[:, start:end])
-                wym = torch.bmm(m_mat, mat_y.transpose(1, 2)).transpose(1, 2)
-            else:
-                mat_y = torch.zeros((c_len, ctx.k_bins), device=dev, dtype=torch.float32)
-                mat_y.scatter_add_(1, fi_idx4[start:end].long(), fi_w4[start:end])
-                wym = torch.matmul(m_mat, mat_y.t()).transpose(1, 2)
-            g_slice = torch.sum(dmat_x * wym, dim=2)
-            if ctx.has_pw:
-                pw_slice = pw_t.reshape(-1)[start:end].unsqueeze(0) if ctx.pw_bcast else pw_t[:, start:end]
-                g_slice = g_slice * pw_slice
-            grad_mv[:, start:end] = g_slice
+        bx_save, dwx_save, mat_y_full, pw_t, ratio, total_sum = ctx.saved_tensors
+        dev = dwx_save.device
+        m_mat = (-(1.0 + torch.log(torch.clamp(ratio, min=1e-12))) / total_sum) * grad_output.to(torch.float32).view(
+            m_sz, 1, 1
+        )
+        m_blk = ctx.m_blk
+        s_blk = ctx.s_blk
+        k_bins = ctx.k_bins
+        fi_n_rep = ctx.fi_n_rep
+        grad_mv = torch.empty((m_sz, n_samp), device=dev, dtype=torch.float32)
+        for m0 in range(0, m_sz, m_blk):
+            m1 = min(m_sz, m0 + m_blk)
+            mc_b = m1 - m0
+            mm_sub = m_mat[m0:m1]
+            for start in range(0, n_samp, s_blk):
+                end = min(start + s_blk, n_samp)
+                c_len = end - start
+                if ctx.per_frame_fi:
+                    fb0 = m0 // fi_n_rep
+                    fb1 = m1 // fi_n_rep
+                    fb_c = fb1 - fb0
+                    mat_y = mat_y_full[fb0:fb1, start:end]
+                    if fi_n_rep > 1:
+                        mm_g = mm_sub.view(fb_c, fi_n_rep * k_bins, k_bins)
+                        wym = torch.bmm(mm_g, mat_y.transpose(1, 2)).view(mc_b, k_bins, c_len).transpose(1, 2)
+                    else:
+                        wym = torch.bmm(mm_sub, mat_y.transpose(1, 2)).transpose(1, 2)
+                else:
+                    mat_y = mat_y_full[start:end]
+                    wym = torch.matmul(mm_sub, mat_y.t()).transpose(1, 2)
+                bx_l = bx_save[m0:m1, start:end].long()
+                g_slice = torch.sum(dwx_save[m0:m1, start:end] * torch.gather(wym, 2, bx_l), dim=2)
+                if ctx.has_pw:
+                    if ctx.pw_bcast:
+                        g_slice = g_slice * pw_t.reshape(-1)[start:end].unsqueeze(0)
+                    elif ctx.pw_n_rep > 1:
+                        pb0 = m0 // ctx.pw_n_rep
+                        pb1 = m1 // ctx.pw_n_rep
+                        pb_c = pb1 - pb0
+                        g_slice = (g_slice.view(pb_c, ctx.pw_n_rep, c_len) * pw_t[pb0:pb1, start:end].unsqueeze(1)).reshape(mc_b, c_len)
+                    else:
+                        g_slice = g_slice * pw_t[m0:m1, start:end]
+                grad_mv[m0:m1, start:end] = g_slice
         return grad_mv.to(grad_output.dtype), None, None, None, None, None, None, None
 
 

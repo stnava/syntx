@@ -636,11 +636,10 @@ def _joint(image, design: Design, *, init: str = "levels", surround_weight: Opti
         kw0.pop("debias_pe_pseudomotion", None)
     if design.name == "shells":
         kw0 = {"preset": "dwi", **_DWI_DEFAULTS, **kw0}
-        if projected:
-            # In projected mode, inter-level offsets below GAUGE_MIN_FRAMES stay in the P_D nullspace at H0's pose;
-            # using the unweighted full-group mean preserves both spherical gradient isotropy and temporal mean-pose
-            # alignment across interleaved levels without un-demeaned fast-pass orientation drift.
-            kw0.setdefault("n_low_motion", None)
+        # Using the unweighted full-shell mean in H0 preserves both spherical gradient isotropy across diffusion
+        # directions and temporal mean-pose alignment across interleaved shells without un-demeaned fast-pass
+        # orientation drift from a 10-direction low-motion subset.
+        kw0.setdefault("n_low_motion", None)
         if design.pe_affine_covariates is not None and design.pe_axis is not None:
             kw0.setdefault("pe_affine_covariates", design.pe_affine_covariates)
             kw0.setdefault("pe_axis", design.pe_axis)
@@ -667,7 +666,7 @@ def _joint(image, design: Design, *, init: str = "levels", surround_weight: Opti
     else:
         h0 = motion_correct_grouped(image, levels, cross_link=links, cross_group_debias=False, **kw0)
     corrected0 = h0["motion_corrected"]
-    arr0 = corrected0.numpy()
+    arr0 = corrected0.view() if hasattr(corrected0, "view") else corrected0.numpy()
     ref0_3d = h0["group_means"][0]
     ref_level = {
         int(k): ref0_3d.new_image_like(arr0[..., levels == k].mean(axis=-1).astype(np.float32))

@@ -3395,7 +3395,7 @@ def resample_series(
         jac_t = torch.as_tensor(jac.reshape(-1), dtype=torch.float32, device=dev) if jac is not None else None
         jac_motion_t = torch.as_tensor(jac_motion, dtype=torch.float32, device=dev)
 
-        raw4d = img4d.numpy()
+        raw4d = img4d.view() if hasattr(img4d, "view") else img4d.numpy()
         vols_tzyx = (
             raw4d.T
             if (raw4d.dtype == np.float32 and raw4d.flags["F_CONTIGUOUS"])
@@ -3437,7 +3437,7 @@ def resample_series(
                     for el in ch.elements:
                         if el.kind == "identity":
                             continue
-                        M_step, b_step = _read_itk_affine(el.path, invert=el.invert)
+                        M_step, b_step = _resolve_element_linear(el)
                         b_acc = M_step @ b_acc + b_step
                         M_acc = M_step @ M_acc
                 M_list.append(M_acc)
@@ -3575,7 +3575,7 @@ def resample_series(
                     for el in ch.elements:
                         if el.kind == "identity":
                             continue
-                        M_step, b_step = _read_itk_affine(el.path, invert=el.invert)
+                        M_step, b_step = _resolve_element_linear(el)
                         b_acc = M_step @ b_acc + b_step
                         M_acc = M_step @ M_acc
                 M_list.append(M_acc)

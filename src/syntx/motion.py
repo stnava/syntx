@@ -271,6 +271,66 @@ class MotionCorrectionResult(dict):
         )
 
 
+def _extract_rigid_parameters_from_matrix(
+    A: np.ndarray,
+    t: np.ndarray,
+    c: np.ndarray,
+    dim: int,
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Pure-NumPy rigid parameter and homogeneous matrix extraction from ``y = A(x - c) + c + t``."""
+    A = np.asarray(A, dtype=np.float64)
+    t = np.asarray(t, dtype=np.float64)
+    c = np.asarray(c, dtype=np.float64)
+    if not np.all(np.isfinite(A)) or not np.all(np.isfinite(t)) or not np.all(np.isfinite(c)):
+        rotations = np.zeros(1 if dim == 2 else 3, dtype=np.float64)
+        translations = np.zeros(dim, dtype=np.float64)
+        T_homog = np.eye(dim + 1, dtype=np.float64)
+        return translations, rotations, T_homog
+
+    if dim == 2:
+        try:
+            U, _, Vt = np.linalg.svd(A.reshape((2, 2)))
+        except np.linalg.LinAlgError:
+            return np.zeros(2, dtype=np.float64), np.zeros(1, dtype=np.float64), np.eye(3, dtype=np.float64)
+        det = np.linalg.det(U @ Vt)
+        R = U @ np.diag([1.0, det]) @ Vt
+        theta = np.arctan2(R[1, 0], R[0, 0])
+        rotations = np.array([theta], dtype=np.float64)
+        translations = t[:2].copy()
+        c2 = c[:2] if len(c) >= 2 else np.zeros(2, dtype=np.float64)
+        b = translations + c2 - R @ c2
+        T_homog = np.eye(3, dtype=np.float64)
+        T_homog[:2, :2] = R
+        T_homog[:2, 2] = b
+    elif dim == 3:
+        try:
+            U, _, Vt = np.linalg.svd(A.reshape((3, 3)))
+        except np.linalg.LinAlgError:
+            return np.zeros(3, dtype=np.float64), np.zeros(3, dtype=np.float64), np.eye(4, dtype=np.float64)
+        det = np.linalg.det(U @ Vt)
+        R = U @ np.diag([1.0, 1.0, det]) @ Vt
+        sy = -R[2, 0]
+        if np.abs(sy) < 0.999999:
+            ry = np.arcsin(np.clip(sy, -1.0, 1.0))
+            rx = np.arctan2(R[2, 1], R[2, 2])
+            rz = np.arctan2(R[1, 0], R[0, 0])
+        else:
+            ry = (np.pi / 2.0) if sy > 0 else (-np.pi / 2.0)
+            rx = np.arctan2(-R[1, 2], R[1, 1])
+            rz = 0.0
+        rotations = np.array([rx, ry, rz], dtype=np.float64)
+        translations = t[:3].copy()
+        c3 = c[:3] if len(c) >= 3 else np.zeros(3, dtype=np.float64)
+        b = translations + c3 - R @ c3
+        T_homog = np.eye(4, dtype=np.float64)
+        T_homog[:3, :3] = R
+        T_homog[:3, 3] = b
+    else:
+        raise ValueError(f"Unsupported spatial dimensionality {dim}. Expected 2 or 3.")
+
+    return translations, rotations, T_homog
+
+
 def _extract_rigid_parameters(
     tx: ants.ANTsTransform,
     dim: int,
@@ -278,105 +338,14 @@ def _extract_rigid_parameters(
     """
     Extracts physical translations, rotation angles (radians), and homogeneous matrix
     from an ITK/ANTs rigid or affine transform.
-
-    Parameters
-    ----------
-    tx : ants.ANTsTransform
-        Read transform object.
-    dim : int
-        Spatial dimensionality (2 or 3).
-
-    Returns
-    -------
-    translations : np.ndarray
-        Translation parameters at center of rotation in mm, shape (dim,).
-    rotations : np.ndarray
-        Rotation angles in radians: [rx, ry, rz] for 3D or [theta] for 2D.
-    T_homog : np.ndarray
-        Full (dim+1, dim+1) homogeneous affine transformation matrix.
     """
     params = np.array(tx.parameters, dtype=np.float64)
     fixed = np.array(tx.fixed_parameters, dtype=np.float64)
-
-    # Defensive guard: a degenerate per-frame registration (e.g. a near-blank or very
-    # low-count frame in a dynamic PET series) can produce a non-finite affine matrix,
-    # which makes np.linalg.svd raise LinAlgError("SVD did not converge") and crash the
-    # whole batch -- confirmed directly on real ds002898 FDG-PET data (antsxfunctional's
-    # FDG-template build, 2026-10-02). Falling back to the identity rotation (zero
-    # rotation, zero translation) for just that one frame lets the caller's own
-    # per-frame accept/fallback safeguard (e.g.
-    # antsxfunctional.pet.static_frame.motion_corrected_static_pet_from_dynamic) reject
-    # this frame's "correction" on its own merits (it will not correlate better than the
-    # raw frame) instead of the whole series failing outright.
-    if not np.all(np.isfinite(params)) or not np.all(np.isfinite(fixed)):
-        rotations = np.zeros(1 if dim == 2 else 3, dtype=np.float64)
-        translations = np.zeros(dim, dtype=np.float64)
-        T_homog = np.eye(dim + 1, dtype=np.float64)
-        return translations, rotations, T_homog
-
     if dim == 2:
-        A = params[:4].reshape((2, 2))
-        t = params[4:6]
-        c = fixed[:2] if len(fixed) >= 2 else np.zeros(2, dtype=np.float64)
-
-        # Robust SO(2) projection via SVD (falls back to identity on non-convergence --
-        # see the finite-value guard above for why this can happen on real data).
-        try:
-            U, _, Vt = np.linalg.svd(A)
-        except np.linalg.LinAlgError:
-            return np.zeros(2, dtype=np.float64), np.zeros(1, dtype=np.float64), np.eye(3, dtype=np.float64)
-        det = np.linalg.det(U @ Vt)
-        R = U @ np.diag([1.0, det]) @ Vt
-
-        theta = np.arctan2(R[1, 0], R[0, 0])
-        rotations = np.array([theta], dtype=np.float64)
-        translations = t.copy()
-
-        # Homogeneous matrix: y = A(x - c) + c + t = A x + (t + c - A c)
-        b = t + c - R @ c
-        T_homog = np.eye(3, dtype=np.float64)
-        T_homog[:2, :2] = R
-        T_homog[:2, 2] = b
-
-    elif dim == 3:
-        A = params[:9].reshape((3, 3))
-        t = params[9:12]
-        c = fixed[:3] if len(fixed) >= 3 else np.zeros(3, dtype=np.float64)
-
-        # Robust SO(3) projection via SVD (falls back to identity on non-convergence --
-        # see the finite-value guard above for why this can happen on real data).
-        try:
-            U, _, Vt = np.linalg.svd(A)
-        except np.linalg.LinAlgError:
-            return np.zeros(3, dtype=np.float64), np.zeros(3, dtype=np.float64), np.eye(4, dtype=np.float64)
-        det = np.linalg.det(U @ Vt)
-        R = U @ np.diag([1.0, 1.0, det]) @ Vt
-
-        # Cardan / Euler angle decomposition (XYZ convention: R = Rz * Ry * Rx)
-        sy = -R[2, 0]
-        if np.abs(sy) < 0.999999:
-            ry = np.arcsin(np.clip(sy, -1.0, 1.0))
-            rx = np.arctan2(R[2, 1], R[2, 2])
-            rz = np.arctan2(R[1, 0], R[0, 0])
-        else:
-            # Gimbal lock singularity
-            ry = (np.pi / 2.0) if sy > 0 else (-np.pi / 2.0)
-            rx = np.arctan2(-R[1, 2], R[1, 1])
-            rz = 0.0
-
-        rotations = np.array([rx, ry, rz], dtype=np.float64)
-        translations = t.copy()
-
-        # Homogeneous matrix
-        b = t + c - R @ c
-        T_homog = np.eye(4, dtype=np.float64)
-        T_homog[:3, :3] = R
-        T_homog[:3, 3] = b
-
-    else:
-        raise ValueError(f"Unsupported spatial dimensionality {dim}. Expected 2 or 3.")
-
-    return translations, rotations, T_homog
+        return _extract_rigid_parameters_from_matrix(params[:4].reshape((2, 2)), params[4:6], fixed, 2)
+    if dim == 3:
+        return _extract_rigid_parameters_from_matrix(params[:9].reshape((3, 3)), params[9:12], fixed, 3)
+    raise ValueError(f"Unsupported spatial dimensionality {dim}. Expected 2 or 3.")
 
 
 def jenkinson_framewise_displacement(
@@ -672,7 +641,7 @@ def calculate_dvars(
         the series' own raw intensity units.
     """
     if isinstance(series, ants.ANTsImage):
-        arr = series.numpy()
+        arr = series.view() if hasattr(series, "view") else series.numpy()
     else:
         arr = np.asarray(series)
 
@@ -684,7 +653,7 @@ def calculate_dvars(
 
     if mask is not None:
         if isinstance(mask, ants.ANTsImage):
-            mask_arr = mask.numpy() > 0
+            mask_arr = (mask.view() if hasattr(mask, "view") else mask.numpy()) > 0
         else:
             mask_arr = np.asarray(mask) > 0
     else:
@@ -986,10 +955,15 @@ def motion_correction(
             f"{spatial_dim}D+t series. Use backend='pytorch' or backend='ants' for 2D+t."
         )
 
-    # 2. Extract frames along the last dimension using ants.slice_image
-    frames: List[ants.ANTsImage] = [
-        ants.slice_image(image, axis=dim - 1, idx=t) for t in range(num_frames)
-    ]
+    # 2. Extract 3D template header and zero-copy 4D array view; slice individual 3D ANTsImages lazily only if needed
+    frame0 = ants.slice_image(image, axis=dim - 1, idx=0)
+    img_arr = image.view() if hasattr(image, "view") else image.numpy()
+    _frames_cache: List[Optional[List[ants.ANTsImage]]] = [None]
+
+    def _get_frames() -> List[ants.ANTsImage]:
+        if _frames_cache[0] is None:
+            _frames_cache[0] = [frame0] + [ants.slice_image(image, axis=dim - 1, idx=t) for t in range(1, num_frames)]
+        return _frames_cache[0]
 
     # Setup directory for transform output files
     if outprefix is None:
@@ -1003,19 +977,19 @@ def motion_correction(
     per_frame_refs = None
     if isinstance(reference, str):
         if reference.lower() == "mean":
-            mean_data = np.mean(image.numpy(), axis=-1)
-            ref_img = ants.new_image_like(frames[0], mean_data.astype(frames[0].dtype))
+            mean_data = np.mean(img_arr, axis=-1)
+            ref_img = ants.new_image_like(frame0, mean_data.astype(frame0.dtype))
         elif reference.lower() == "bilateral":
             from .motion_reference import build_bilateral_window_references
 
             # encoding-matched references averaged over the whole series (K_time = 1): one common head position
             per_frame_refs = build_bilateral_window_references(
-                frames,
+                image,
                 encoding_covariates=kwargs.get("encoding_covariates"),
             )
             ref_img = ants.new_image_like(
                 per_frame_refs[0],
-                np.mean([r.numpy() for r in per_frame_refs], axis=0).astype(per_frame_refs[0].dtype),
+                np.mean([r.view() if hasattr(r, "view") else r.numpy() for r in per_frame_refs], axis=0).astype(per_frame_refs[0].dtype),
             )
         else:
             raise ValueError(f"Unknown reference string '{reference}'. Expected 'mean' or 'bilateral'.")
@@ -1025,7 +999,7 @@ def motion_correction(
             raise IndexError(
                 f"Reference frame index {ref_idx} out of valid range [0, {num_frames - 1}]."
             )
-        ref_img = frames[ref_idx]
+        ref_img = frame0 if ref_idx == 0 else ants.slice_image(image, axis=dim - 1, idx=ref_idx)
     elif isinstance(reference, ants.ANTsImage):
         if reference.dimension != spatial_dim:
             raise ValueError(
@@ -1043,7 +1017,10 @@ def motion_correction(
         if backend not in ("pytorch_batched", "pytorch_batched_temporal", "pytorch_batched_adaptive"):
             raise ValueError("per-frame references need a pytorch_batched backend")
         per_frame_refs = list(reference)
-        ref_img = ants.new_image_like(per_frame_refs[0], np.mean([r.numpy() for r in per_frame_refs], axis=0).astype(per_frame_refs[0].dtype))
+        ref_img = ants.new_image_like(
+            per_frame_refs[0],
+            np.mean([r.view() if hasattr(r, "view") else r.numpy() for r in per_frame_refs], axis=0).astype(per_frame_refs[0].dtype),
+        )
     else:
         raise TypeError(
             f"Unsupported reference type: {type(reference)}. Expected 'mean', int, ants.ANTsImage or a list of per-frame images."
@@ -1094,6 +1071,7 @@ def motion_correction(
 
             return cap_resolution_for_registration(im, _cap_mm)
 
+        in_mem_poses: Dict[int, dict] = {}
         if backend in ("pytorch_batched", "pytorch_batched_temporal", "pytorch_batched_adaptive"):
             batch_indices = [t for t in range(num_frames) if not (current_ref_idx is not None and t == current_ref_idx)]
             if batch_indices:
@@ -1101,9 +1079,10 @@ def motion_correction(
                 if backend == "pytorch_batched_temporal":
                     from .motion_batched import batched_rigid_register_pass_temporal
 
+                    frames_all = _get_frames()
                     fwd_batch, inv_batch, batch_elapsed = batched_rigid_register_pass_temporal(
                         reference_img=current_ref,
-                        moving_imgs=[frames[t] for t in batch_indices],
+                        moving_imgs=[frames_all[t] for t in batch_indices],
                         num_bins=kwargs.get("num_bins", 32),
                         verbose=verbose,
                         outprefix=batch_prefix,
@@ -1114,9 +1093,10 @@ def motion_correction(
                 elif backend == "pytorch_batched_adaptive":
                     from .motion_batched import batched_rigid_register_pass_adaptive
 
+                    frames_all = _get_frames()
                     fwd_batch, inv_batch, batch_elapsed = batched_rigid_register_pass_adaptive(
                         reference_img=current_ref,
-                        moving_imgs=[frames[t] for t in batch_indices],
+                        moving_imgs=[frames_all[t] for t in batch_indices],
                         num_bins=kwargs.get("num_bins", 32),
                         verbose=verbose,
                         outprefix=batch_prefix,
@@ -1141,9 +1121,21 @@ def motion_correction(
                             )
                         except (AcquisitionAxisUndecidable, ValueError):
                             slice_axis_vox = None
+                    if _cap_mm:
+                        frames_all = _get_frames()
+                        mov_imgs_arg = [_cap(frames_all[t]) for t in batch_indices]
+                        mov_zyx_arg = None
+                    else:
+                        vols_tzyx = (
+                            img_arr.T
+                            if (img_arr.dtype == np.float32 and img_arr.flags["F_CONTIGUOUS"])
+                            else np.ascontiguousarray(np.transpose(img_arr, (3, 2, 1, 0)), dtype=np.float32)
+                        )
+                        mov_zyx_arg = vols_tzyx if len(batch_indices) == num_frames else vols_tzyx[batch_indices]
+                        mov_imgs_arg = [frame0] * len(batch_indices)
                     fwd_batch, inv_batch, batch_elapsed, pe_batch = batched_rigid_register_pass(
                         reference_img=[_cap(per_frame_refs[t]) for t in batch_indices] if per_frame_refs is not None else _cap(current_ref),
-                        moving_imgs=[_cap(frames[t]) for t in batch_indices],
+                        moving_imgs=mov_imgs_arg,
                         num_bins=kwargs.get("num_bins", 32),
                         verbose=verbose,
                         outprefix=batch_prefix,
@@ -1182,8 +1174,20 @@ def motion_correction(
                         frame_gain=bool(kwargs.get("frame_gain", False)),
                         pe_b0_split=bool(kwargs.get("pe_b0_split", False)),
                         slice_axis=slice_axis_vox,
+                        _moving_zyx=mov_zyx_arg,
                     )
                     if pe_batch is not None:
+                        poses_b = pe_batch.get("_poses")
+                        if poses_b is not None:
+                            for local_i, t in enumerate(batch_indices):
+                                in_mem_poses[t] = {
+                                    "R": poses_b["R"][local_i],
+                                    "t": poses_b["t"][local_i],
+                                    "com": poses_b["com"],
+                                    "has_eddy": bool(poses_b["has_eddy"]) and poses_b["a"] is not None and bool(np.any(poses_b["a"][local_i] != 0)),
+                                    "p": poses_b["p"],
+                                    "a": None if poses_b["a"] is None else poses_b["a"][local_i],
+                                }
                         for k_pe in (
                             "sampling", "design_model", "prior",
                             "frame_gain", "bias", "pe_b0_debias",
@@ -1225,8 +1229,9 @@ def motion_correction(
 
         if backend in ("pytorch_batched", "pytorch_batched_temporal", "pytorch_batched_adaptive"):
             from .motion_batched import rigid_transform_of
-            from .transforms import TransformChain, resample_series
+            from .transforms import TransformChain, TransformElement, resample_series
 
+            pe_frames["_in_mem_poses"] = in_mem_poses
             chains_pass: List[Optional[TransformChain]] = []
             vol_scales = np.ones(num_frames, dtype=np.float64)
             for t in range(num_frames):
@@ -1238,6 +1243,22 @@ def motion_correction(
                     inv_tx = [id_tx_path]
                     chains_pass.append(None)
                     trans, rot, T_h = _extract_rigid_parameters(tx_obj, spatial_dim)
+                elif t in in_mem_poses:
+                    fwd_tx, inv_tx = batched_results[t]
+                    mp_t = in_mem_poses[t]
+                    R_t, t_t, com_t = mp_t["R"], mp_t["t"], mp_t["com"]
+                    b_rig = t_t + com_t - R_t @ com_t
+                    elems = [TransformElement.from_affine(R_t, b_rig, invert=False, kind="affine", path=fwd_tx[0])]
+                    if mp_t["has_eddy"] and len(fwd_tx) > 1:
+                        p_e, a_e = mp_t["p"], mp_t["a"]
+                        M_e = np.eye(3, dtype=np.float64) + np.outer(p_e, a_e[1:4])
+                        t_e = p_e * a_e[0]
+                        b_e = t_e + com_t - M_e @ com_t
+                        elems.append(TransformElement.from_affine(M_e, b_e, invert=False, kind="affine", path=fwd_tx[1]))
+                    chains_pass.append(TransformChain(elems))
+                    if t in pe_frames["jacobian"]:
+                        vol_scales[t] = float(pe_frames["jacobian"][t])
+                    trans, rot, T_h = _extract_rigid_parameters_from_matrix(R_t, t_t, com_t, spatial_dim)
                 else:
                     fwd_tx, inv_tx = batched_results[t]
                     chains_pass.append(TransformChain.from_paths(fwd_tx))
@@ -1265,8 +1286,9 @@ def motion_correction(
             )
             return corrected_4d, fwd_tx_all, inv_tx_all, params_all, homog_all
 
+        frames_seq = _get_frames()
         for t in range(num_frames):
-            frame_t = frames[t]
+            frame_t = frames_seq[t]
             frame_prefix = f"{run_prefix}_{pass_tag}vol{t:04d}_"
 
             # Check if this frame is identically the reference volume
@@ -1351,10 +1373,11 @@ def motion_correction(
     if two_pass and isinstance(reference, str) and reference.lower() == "mean":
         # Pass 2: compute sharp mean from Pass 1 corrected images
         if isinstance(corrected_frames, ants.ANTsImage):
-            pass1_mean = np.mean(corrected_frames.numpy(), axis=-1)
+            c_view = corrected_frames.view() if hasattr(corrected_frames, "view") else corrected_frames.numpy()
+            pass1_mean = np.mean(c_view, axis=-1)
         else:
-            pass1_mean = np.mean([f.numpy() for f in corrected_frames], axis=0)
-        ref_img = ants.new_image_like(frames[0], pass1_mean.astype(frames[0].dtype))
+            pass1_mean = np.mean([f.view() if hasattr(f, "view") else f.numpy() for f in corrected_frames], axis=0)
+        ref_img = ants.new_image_like(frame0, pass1_mean.astype(frame0.dtype))
         corrected_frames, fwd_transforms, inv_transforms, raw_params, homog_matrices = _run_pass(
             ref_img, None, "p2_"
         )
@@ -1390,15 +1413,14 @@ def motion_correction(
     # 9. Calculate DVARS (pre and post) & temporal variance metrics from single 4-D array views,
     # avoiding four redundant 1+ GiB `.numpy()` copies on long BOLD / DWI series.
     if dvars_reference_intensity is None:
-        ref_arr = ref_img.numpy()
+        ref_arr = ref_img.view() if hasattr(ref_img, "view") else ref_img.numpy()
         ref_fg = ref_arr[ref_arr > 0]
         dvars_reference_intensity = float(np.mean(ref_fg)) if ref_fg.size > 0 else None
 
-    img_arr = image.numpy()
-    corr_arr = motion_corrected.numpy()
+    corr_arr = motion_corrected.view() if hasattr(motion_corrected, "view") else motion_corrected.numpy()
 
     if mask is not None:
-        mask_arr = mask.numpy() > 0 if isinstance(mask, ants.ANTsImage) else np.asarray(mask) > 0
+        mask_arr = (mask.view() if hasattr(mask, "view") else mask.numpy()) > 0 if isinstance(mask, ants.ANTsImage) else np.asarray(mask) > 0
         dvars_pre = calculate_dvars(img_arr, mask=mask_arr, reference_intensity=dvars_reference_intensity)
         dvars_post = calculate_dvars(corr_arr, mask=mask_arr, reference_intensity=dvars_reference_intensity)
     else:
@@ -1478,16 +1500,24 @@ def motion_correction(
     if a_full is not None and spatial_dim == 3:
         homog_all_composed = []
         raw_params_composed = np.zeros_like(raw_params)
+        in_mem_map = pe_frames.get("_in_mem_poses") or {}
+        c_ref = np.asarray(center_of_sphere, dtype=np.float64)
         for t_i, chain in enumerate(fwd_transforms):
-            h = np.eye(4)
-            for p_tx in chain:
-                h = _extract_rigid_parameters(ants.read_transform(p_tx), 3)[2] @ h
+            if t_i in in_mem_map:
+                mp_i = in_mem_map[t_i]
+                h = _extract_rigid_parameters_from_matrix(mp_i["R"], mp_i["t"], mp_i["com"], 3)[2]
+                if mp_i["has_eddy"] and len(chain) > 1:
+                    p_e, a_e = mp_i["p"], mp_i["a"]
+                    M_e = np.eye(3, dtype=np.float64) + np.outer(p_e, a_e[1:4])
+                    h = _extract_rigid_parameters_from_matrix(M_e, p_e * a_e[0], mp_i["com"], 3)[2] @ h
+            else:
+                h = np.eye(4)
+                for p_tx in chain:
+                    h = _extract_rigid_parameters(ants.read_transform(p_tx), 3)[2] @ h
             homog_all_composed.append(h)
-            tx_c = ants.create_ants_transform(transform_type="AffineTransform", precision="float", dimension=3)
-            c_ref = np.asarray(center_of_sphere, dtype=np.float64)
-            tx_c.set_parameters(np.concatenate([h[:3, :3].flatten(), h[:3, 3] + (h[:3, :3] - np.eye(3)) @ c_ref]))
-            tx_c.set_fixed_parameters(c_ref)
-            tr_c, rot_c, _ = _extract_rigid_parameters(tx_c, 3)
+            tr_c, rot_c, _ = _extract_rigid_parameters_from_matrix(
+                h[:3, :3], h[:3, 3] + (h[:3, :3] - np.eye(3)) @ c_ref, c_ref, 3
+            )
             raw_params_composed[t_i] = np.concatenate([tr_c, rot_c])
         mp_raw = MotionParameters(raw_params_composed, columns=col_names, rad_to_deg_cols=rad_cols, spatial_dim=3)
         fd_p_raw, fd_j_raw = calculate_framewise_displacement(

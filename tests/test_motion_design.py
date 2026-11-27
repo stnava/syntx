@@ -897,3 +897,84 @@ def test_debias_pe_pseudomotion_with_pe_b0_split_preserves_rigid_pose_and_fd():
     )
     assert float(np.mean(res_tc["fd"][1:])) > 0.05
     assert float(np.max(np.ptp(res_tc["rotations_deg"], axis=0))) > 0.15
+
+
+def test_init_pose_unconverged_fallback_does_not_raise_name_error():
+    """Regression test: when ``init_pose`` is provided and at least one frame remains unconverged after a short
+    schedule, the ``init_pose`` fallback guard must execute cleanly without raising ``NameError`` on ``t_init``."""
+    from syntx.motion_batched import batched_rigid_register_pass
+    from syntx.motion_simulation import simulate_bold_series
+
+    sim = simulate_bold_series(n_frames=6, seed=11)
+    import ants
+
+    frames = [ants.slice_image(sim.image, axis=3, idx=t) for t in range(6)]
+    t_init = np.zeros((6, 3), dtype=np.float32)
+    t_init[2, 0] = 3.5
+    om_init = np.zeros((6, 3), dtype=np.float32)
+    fwd, inv, _, pe = batched_rigid_register_pass(
+        frames[0],
+        frames,
+        device="cpu",
+        init_pose=(t_init, om_init),
+        schedule=[dict(optimizer="newton", iters=1, sampling=0.2, level=1, confirm_vox=1e-4)],
+        max_extend_factor=1,
+        return_pe_affine=True,
+    )
+    assert len(fwd) == 6 and len(inv) == 6
+    assert pe is not None and "_poses" in pe
+
+
+@pytest.mark.parametrize("form", ["charbonnier", "sparse", "cauchy"])
+def test_surround_prior_hessian_blocks_and_banded_solver_match_dense(form):
+    """``surround_prior_hessian_blocks`` + ``_solve_coupled_banded_f32`` match dense ``surround_prior_hessian_full`` +
+    ``_solve_coupled_spd_f32`` to float32 precision across active subsets with gaps of 1, 2, and >2."""
+    from syntx.motion_batched import (
+        _solve_coupled_banded_f32,
+        _solve_coupled_spd_f32,
+        surround_prior_hessian_blocks,
+        surround_prior_hessian_full,
+    )
+
+    rng = torch.Generator().manual_seed(31)
+    B = 36
+    t_p = 0.25 * torch.randn(B, 3, generator=rng)
+    om_p = 0.008 * torch.randn(B, 3, generator=rng)
+    Hv_img = torch.randn(B, 6, 6, generator=rng)
+    Hv_img = torch.bmm(Hv_img, Hv_img.transpose(1, 2)) + 0.5 * torch.eye(6)
+    to_vox = torch.tensor([2.2, 2.2, 2.2, 0.045, 0.045, 0.045])
+    keep = torch.rand(B, generator=rng) > 0.35
+    keep[0] = True
+    keep[-1] = True
+    act = torch.nonzero(keep).flatten()
+    n_act = int(act.numel())
+    rhs = torch.randn(n_act * 6, generator=rng)
+
+    Hp_full = surround_prior_hessian_full(t_p, om_p, 0.03, 0.05, shrinkage=0.01, form=form)
+    Hp_vox = Hp_full * to_vox.view(1, 6, 1, 1) * to_vox.view(1, 1, 1, 6)
+    Hp_act = Hp_vox.index_select(0, act).index_select(2, act).clone()
+    idx_a = torch.arange(n_act)
+    Hp_act[idx_a, :, idx_a, :] += Hv_img.index_select(0, act)
+    sol_dense = _solve_coupled_spd_f32(Hp_act.reshape(n_act * 6, n_act * 6), rhs)
+
+    D0, D1, D2 = surround_prior_hessian_blocks(t_p, om_p, 0.03, 0.05, shrinkage=0.01, form=form)
+    sc = to_vox.view(1, 6, 1) * to_vox.view(1, 1, 6)
+    sol_band = _solve_coupled_banded_f32(D0 * sc, D1 * sc, D2 * sc, Hv_img.index_select(0, act), act, rhs)
+    rel_err = float((sol_dense - sol_band).norm() / sol_dense.norm().clamp_min(1e-12))
+    assert rel_err < 1e-5, rel_err
+
+
+@pytest.mark.slow
+def test_joint_multishell_dwi_preserves_isotropy_and_converges():
+    """Multi-shell DWI (b0 + b1500 + b3000) under ``engine='joint'`` keeps unweighted full-shell means in H0
+    (``n_low_motion=None``) and narrow cross-shell registration so high-b shells do not drift in orientation."""
+    from syntx.motion_simulation import evaluate_motion_estimate, simulate_multishell_dwi_series
+
+    sim = simulate_multishell_dwi_series(
+        n_dirs_per_shell=10, seed=44, shells=(1500.0, 3000.0), b0_every=8, eddy_mm_per_unit=0.4
+    )
+    d = make_design("shells", bvals=sim.extra["bvals"], bvecs=sim.extra["bvecs"], pe_axis=sim.pe_axis)
+    rj = motion_correct_design(sim.image, d, engine="joint", device=DEV)
+    ev = evaluate_motion_estimate(rj["fwdtransforms"], sim)
+    assert ev["pose_error_mm"] < 0.5, ev
+    assert rj["prior"] is not None
